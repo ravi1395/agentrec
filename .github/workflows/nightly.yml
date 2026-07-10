@@ -1,0 +1,58 @@
+name: Nightly torture
+
+# J3 (nightly) + D36 launch gate: the #[ignore]d adversarial torture harness
+# runs on a cron. AGENTREC_TORTURE_SEED is left UNSET on scheduled runs so
+# env_seed() derives a fresh wall-clock seed each night (7 consecutive green
+# nights = the D36 gate; a fixed seed would repeat one interleaving 7×). The
+# resolved seed is printed in the run and captured in the uploaded log, so any
+# failing night stays reproducible via workflow_dispatch with that seed.
+
+on:
+  schedule:
+    - cron: '17 7 * * *' # 07:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Explicit AGENTREC_TORTURE_SEED (blank = wall-clock derived)'
+        required: false
+        default: ''
+      ops:
+        description: 'AGENTREC_TORTURE_OPS'
+        required: false
+        default: '2000'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  torture:
+    name: torture (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: torture --ignored
+        env:
+          # Empty on scheduled runs → env_seed() falls back to wall clock.
+          AGENTREC_TORTURE_SEED: ${{ github.event.inputs.seed }}
+          AGENTREC_TORTURE_OPS: ${{ github.event.inputs.ops || '2000' }}
+        run: |
+          set -o pipefail
+          cargo test --test torture -- --ignored --nocapture \
+            2>&1 | tee "torture-${{ matrix.os }}.log"
+      - name: upload torture log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torture-${{ matrix.os }}-${{ github.run_id }}
+          path: torture-*.log
+          retention-days: 30

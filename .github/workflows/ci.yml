@@ -1,0 +1,54 @@
+name: CI
+
+# J3: per-commit matrix — macOS-14 + Ubuntu-22.04/24.04 must be green.
+# fmt + clippy run once (OS-independent); the test matrix runs the workspace
+# suite on every platform. #[ignore]d tests (the heavy torture run) are excluded
+# by default — the nightly workflow drives those.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace
+        # Excludes #[ignore]d torture heavy run; torture_smoke still runs here.
+        # On Ubuntu legs this also compiles + runs the Linux-only doctor paths
+        # (inotify headroom, 0700/0600 perms) — AC Y++2 / I++1.
+        run: cargo test --workspace --all-features

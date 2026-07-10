@@ -1,0 +1,580 @@
+//! Pure turn-boundary engine (no fs access) — the v0.2 capture design:
+//! start/stop bracketing with retroactive merge, git-turn classification,
+//! quiet-window fallback for unattributed activity, crash rule, fold window.
+//! Retroactive merge respects append-only logs: absorbed bare turns stay in
+//! the log; the rich turn lists them in `merges` and consumers drop them.
+
+use crate::{FOLD_WINDOW_MS, GIT_SETTLE_MS, MAX_BRACKET_MS, QUIET_MS};
+use serde::{Deserialize, Serialize};
+
+/// One observed file change, fingerprinted by the scanner (hashes, not bytes).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangeObs {
+    pub path: String,
+    pub before_hash: Option<String>,
+    pub snapshotted: bool, // false = over cap / unreadable (content not captured)
+    pub withheld: bool,    // secret-pattern file
+    pub baseline_unknown: bool, // first seen post-change; original unrecoverable
+    #[serde(default)]
+    pub deleted: bool, // file absent at observation — a true delete, NOT
+                           // merely "no snapshot captured" (distinguishes
+                           // `op:delete` from an over-cap `op:modify`)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    Bracket,
+    Git,
+    Quiet,
+}
+
+#[derive(Clone, Debug)]
+struct OpenTurn {
+    source: Source,
+    tool: Option<String>,
+    prompt: Option<String>,
+    session: Option<String>,
+    opened_at: u64,
+    files: Vec<ChangeObs>,
+}
+
+/// A closed turn, engine-level (unix-ms times; persistence converts).
+#[derive(Clone, Debug)]
+pub struct ClosedTurn {
+    pub id: String,
+    pub grade: &'static str,    // "rich" | "bare"
+    pub boundary: &'static str, // "bracket" | "stop-only" | "git" | "quiet" | "timeout"
+    pub truncated: bool,
+    pub tool: Option<String>,
+    pub prompt: Option<String>,
+    pub session: Option<String>,
+    pub opened_at: u64,
+    pub closed_at: u64,
+    pub files: Vec<ChangeObs>,
+    /// Ids of previously-closed bare turns absorbed into this rich turn.
+    pub merges: Vec<String>,
+}
+
+/// A daemon-persistable view of the open turn (AC B2 crash journal). Source is
+/// stringified so the wire form is stable; times are engine ms.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenSnapshot {
+    pub source: String, // "bracket" | "git" | "quiet"
+    pub tool: Option<String>,
+    pub prompt: Option<String>,
+    pub session: Option<String>,
+    pub opened_at: u64,
+    pub last_change_at: u64,
+    pub files: Vec<ChangeObs>,
+}
+
+pub struct TurnEngine {
+    open: Option<OpenTurn>,
+    last_change_at: Option<u64>,
+    git_window_until: u64,
+    /// Bare turns closed since the last rich close, eligible for folding.
+    recent_bare: Vec<ClosedTurn>,
+    last_rich_closed_at: u64,
+    id_gen: fn() -> String,
+}
+
+impl Default for TurnEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TurnEngine {
+    pub fn new() -> Self {
+        TurnEngine {
+            open: None,
+            last_change_at: None,
+            git_window_until: 0,
+            recent_bare: vec![],
+            last_rich_closed_at: 0,
+            id_gen: crate::id::turn_id,
+        }
+    }
+
+    pub fn has_open_turn(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Serializable view of the currently-open turn, for the daemon's crash
+    /// journal (AC B2). None when no turn is open. Times are engine ms; the
+    /// daemon converts them to wall clock before persisting the journal.
+    pub fn snapshot_open(&self) -> Option<OpenSnapshot> {
+        let open = self.open.as_ref()?;
+        Some(OpenSnapshot {
+            source: match open.source {
+                Source::Bracket => "bracket",
+                Source::Git => "git",
+                Source::Quiet => "quiet",
+            }
+            .to_string(),
+            tool: open.tool.clone(),
+            prompt: open.prompt.clone(),
+            session: open.session.clone(),
+            opened_at: open.opened_at,
+            last_change_at: self.last_change_at.unwrap_or(open.opened_at),
+            files: open.files.clone(),
+        })
+    }
+
+    /// Scanner-observed file changes at `now`. Opens a turn when none is open:
+    /// grade depends on whether a git ref-change window is active. Only the
+    /// first observation of a path per turn records its `before`.
+    pub fn observe_changes(&mut self, now: u64, changes: &[ChangeObs]) {
+        if changes.is_empty() {
+            return;
+        }
+        self.last_change_at = Some(now);
+        if self.open.is_none() {
+            // `git_window_until > 0` guards the uninitialized state: without it,
+            // the first change at `now == 0` matches the default window and is
+            // misclassified as a git turn (the monotonic daemon clock starts ~0).
+            let (source, tool) = if self.git_window_until > 0 && now <= self.git_window_until {
+                (Source::Git, Some("git".to_string()))
+            } else {
+                (Source::Quiet, None)
+            };
+            self.open = Some(OpenTurn {
+                source,
+                tool,
+                prompt: None,
+                session: None,
+                opened_at: now,
+                files: vec![],
+            });
+        }
+        let open = self.open.as_mut().expect("just ensured");
+        for change in changes {
+            if open.files.iter().any(|f| f.path == change.path) {
+                continue; // before captured once per turn
+            }
+            open.files.push(change.clone());
+        }
+    }
+
+    /// A `.git/HEAD`/index/ref transition at `now`: classify surrounding
+    /// activity as a git operation, not agent/unknown work. A bracket in
+    /// progress is left alone — an agent running git is agent work.
+    pub fn observe_git_change(&mut self, now: u64) {
+        self.git_window_until = now + GIT_SETTLE_MS;
+        if let Some(open) = self.open.as_mut() {
+            if open.source == Source::Quiet
+                && now.saturating_sub(open.opened_at) <= GIT_SETTLE_MS + QUIET_MS
+            {
+                open.source = Source::Git;
+                open.tool = Some("git".to_string());
+            }
+        }
+    }
+
+    /// Start signal (e.g. Claude Code UserPromptSubmit): opens a bracket.
+    /// Any open non-bracket turn closes first (pre-agent activity); an open
+    /// bracket from any tool closes truncated (one open turn per root, D6).
+    pub fn observe_start(
+        &mut self,
+        now: u64,
+        tool: &str,
+        prompt: Option<String>,
+        session: Option<String>,
+    ) -> Vec<ClosedTurn> {
+        let mut closed = vec![];
+        if let Some(open) = self.open.take() {
+            let turn = match open.source {
+                Source::Quiet => self.finish(open, now, "quiet", "bare", false),
+                Source::Git => self.finish(open, now, "git", "rich", false),
+                Source::Bracket => self.finish(open, now, "timeout", "rich", true),
+            };
+            closed.push(turn);
+        }
+        self.open = Some(OpenTurn {
+            source: Source::Bracket,
+            tool: Some(tool.to_string()),
+            prompt,
+            session,
+            opened_at: now,
+            files: vec![],
+        });
+        closed
+    }
+
+    /// Stop signal. Bracketed: closes the bracket rich, folding any bare turns
+    /// that closed inside it (daemon restarts can produce those). Unbracketed
+    /// (stop-only emitter): converts the open unattributed turn — or recently
+    /// closed bare turns within the fold window — into the rich turn.
+    pub fn observe_stop(
+        &mut self,
+        now: u64,
+        tool: &str,
+        prompt_fallback: Option<String>,
+        session: Option<String>,
+    ) -> Vec<ClosedTurn> {
+        let mut closed = vec![];
+        let open = self.open.take();
+        match open {
+            Some(open) if open.source == Source::Bracket && open.tool.as_deref() == Some(tool) => {
+                let mut turn = self.finish(open, now, "bracket", "rich", false);
+                if turn.prompt.is_none() {
+                    turn.prompt = prompt_fallback;
+                }
+                if turn.session.is_none() {
+                    turn.session = session;
+                }
+                self.fold_recent_bares(&mut turn);
+                self.last_rich_closed_at = now;
+                closed.push(turn);
+            }
+            other => {
+                // Close whatever was open on its own terms first.
+                if let Some(open) = other {
+                    let turn = match open.source {
+                        Source::Git => self.finish(open, now, "git", "rich", false),
+                        Source::Bracket => self.finish(open, now, "timeout", "rich", true),
+                        Source::Quiet => {
+                            // Stop-only emitter: the open unattributed turn IS
+                            // this tool's turn — attribute and close rich.
+                            let mut turn = self.finish(open, now, "stop-only", "rich", false);
+                            turn.tool = Some(tool.to_string());
+                            turn.prompt = prompt_fallback.clone();
+                            turn.session = session.clone();
+                            self.fold_recent_bares(&mut turn);
+                            self.last_rich_closed_at = now;
+                            closed.push(turn);
+                            return closed;
+                        }
+                    };
+                    closed.push(turn);
+                }
+                // No open unattributed work: fold recent bares, or record an
+                // empty rich turn (the agent turn happened; maybe it only read).
+                let mut turn = ClosedTurn {
+                    id: (self.id_gen)(),
+                    grade: "rich",
+                    boundary: "stop-only",
+                    truncated: false,
+                    tool: Some(tool.to_string()),
+                    prompt: prompt_fallback,
+                    session,
+                    opened_at: now,
+                    closed_at: now,
+                    files: vec![],
+                    merges: vec![],
+                };
+                self.fold_recent_bares(&mut turn);
+                self.last_rich_closed_at = now;
+                closed.push(turn);
+            }
+        }
+        closed
+    }
+
+    /// Clock tick: quiet-window close for unattributed turns, settle close for
+    /// git turns, crash-rule timeout for brackets. Brackets are never closed
+    /// by the quiet window (PROTOCOL §4 suppression).
+    pub fn tick(&mut self, now: u64) -> Vec<ClosedTurn> {
+        self.recent_bare
+            .retain(|t| now.saturating_sub(t.closed_at) <= FOLD_WINDOW_MS);
+        let Some(open) = self.open.as_ref() else {
+            return vec![];
+        };
+        let last_change = self.last_change_at.unwrap_or(open.opened_at);
+        let close = match open.source {
+            Source::Quiet => now.saturating_sub(last_change) > QUIET_MS,
+            Source::Git => now.saturating_sub(last_change) > GIT_SETTLE_MS,
+            Source::Bracket => now.saturating_sub(open.opened_at) > MAX_BRACKET_MS,
+        };
+        if !close {
+            return vec![];
+        }
+        let open = self.open.take().expect("checked above");
+        let turn = match open.source {
+            Source::Quiet => {
+                let turn = self.finish(open, now, "quiet", "bare", false);
+                self.recent_bare.push(turn.clone());
+                turn
+            }
+            Source::Git => self.finish(open, now, "git", "rich", false),
+            Source::Bracket => self.finish(open, now, "timeout", "rich", true),
+        };
+        vec![turn]
+    }
+
+    /// Force-close the open turn at `now`, regardless of source — used on clean
+    /// daemon shutdown (an operator stopping mid-turn). Bracket → truncated rich
+    /// (keep attribution), git → rich, quiet → bare. `now` is the real close
+    /// time, so timestamps stay sane (unlike an inflated tick threshold).
+    pub fn force_close(&mut self, now: u64) -> Vec<ClosedTurn> {
+        let Some(open) = self.open.take() else {
+            return vec![];
+        };
+        let turn = match open.source {
+            Source::Quiet => self.finish(open, now, "quiet", "bare", false),
+            Source::Git => self.finish(open, now, "git", "rich", false),
+            Source::Bracket => self.finish(open, now, "timeout", "rich", true),
+        };
+        vec![turn]
+    }
+
+    fn fold_recent_bares(&mut self, turn: &mut ClosedTurn) {
+        let cutoff = turn.closed_at.saturating_sub(FOLD_WINDOW_MS);
+        let eligible: Vec<ClosedTurn> = self
+            .recent_bare
+            .drain(..)
+            .filter(|b| b.closed_at >= cutoff && b.closed_at >= self.last_rich_closed_at)
+            .collect();
+        for bare in eligible {
+            turn.merges.push(bare.id.clone());
+            if bare.opened_at < turn.opened_at {
+                turn.opened_at = bare.opened_at;
+            }
+            for file in bare.files {
+                if !turn.files.iter().any(|f| f.path == file.path) {
+                    turn.files.push(file);
+                }
+            }
+        }
+    }
+
+    fn finish(
+        &mut self,
+        open: OpenTurn,
+        now: u64,
+        boundary: &'static str,
+        grade: &'static str,
+        truncated: bool,
+    ) -> ClosedTurn {
+        self.last_change_at = None;
+        ClosedTurn {
+            id: (self.id_gen)(),
+            grade,
+            boundary,
+            truncated,
+            tool: open.tool,
+            prompt: open.prompt,
+            session: open.session,
+            opened_at: open.opened_at,
+            closed_at: now.max(open.opened_at),
+            files: open.files,
+            merges: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obs(path: &str) -> ChangeObs {
+        ChangeObs {
+            path: path.to_string(),
+            before_hash: Some(format!("sha256:{path}")),
+            snapshotted: true,
+            withheld: false,
+            baseline_unknown: false,
+            deleted: false,
+        }
+    }
+
+    // F1 fix: an open bracket suppresses the quiet window across long pauses
+    // (thinking, test runs), so one agent turn stays one turn.
+    #[test]
+    fn bracket_suppresses_quiet_window() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", Some("fix auth".into()), None);
+        e.observe_changes(1_000, &[obs("a.rs")]);
+        assert!(e.tick(75_000).is_empty()); // 74s of silence: still open
+        e.observe_changes(80_000, &[obs("b.rs")]);
+        let closed = e.observe_stop(90_000, "claude-code", None, None);
+        assert_eq!(closed.len(), 1);
+        let t = &closed[0];
+        assert_eq!(t.grade, "rich");
+        assert_eq!(t.boundary, "bracket");
+        assert_eq!(t.prompt.as_deref(), Some("fix auth"));
+        assert_eq!(t.files.len(), 2);
+        assert!(!t.truncated);
+    }
+
+    // F1 fix: human editor-save bursts outside any bracket close as bare —
+    // unattributed activity windows, never fabricated agent turns.
+    #[test]
+    fn human_burst_outside_bracket_closes_bare() {
+        let mut e = TurnEngine::new();
+        e.observe_changes(0, &[obs("notes.md")]);
+        assert!(e.tick(9_999).is_empty());
+        let closed = e.tick(10_001);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].grade, "bare");
+        assert_eq!(closed[0].tool, None);
+    }
+
+    // Stop-only emitters: the open unattributed turn is attributed on stop,
+    // and recently-closed bare fragments fold in via `merges`.
+    #[test]
+    fn stop_only_attributes_open_turn_and_folds_bares() {
+        let mut e = TurnEngine::new();
+        // fragment 1: closed bare by quiet window (agent paused >10s mid-turn)
+        e.observe_changes(0, &[obs("a.rs")]);
+        let bare = e.tick(11_000);
+        assert_eq!(bare[0].grade, "bare");
+        let bare_id = bare[0].id.clone();
+        // fragment 2: still open when the stop signal lands
+        e.observe_changes(60_000, &[obs("b.rs")]);
+        let closed = e.observe_stop(65_000, "codex", Some("refactor".into()), None);
+        assert_eq!(closed.len(), 1);
+        let t = &closed[0];
+        assert_eq!(t.grade, "rich");
+        assert_eq!(t.tool.as_deref(), Some("codex"));
+        assert_eq!(t.merges, vec![bare_id]);
+        let mut paths: Vec<&str> = t.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.rs", "b.rs"]);
+        assert_eq!(t.opened_at, 0); // started at the earliest folded fragment
+    }
+
+    // F2 fix: a ref-change classifies the surrounding burst as a git turn.
+    #[test]
+    fn git_ref_change_converts_open_burst() {
+        let mut e = TurnEngine::new();
+        e.observe_changes(0, &[obs("x.rs"), obs("y.rs")]);
+        e.observe_git_change(100); // checkout detected just after the burst began
+        let closed = e.tick(100 + GIT_SETTLE_MS + 1);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool.as_deref(), Some("git"));
+        assert_eq!(closed[0].grade, "rich");
+        assert_eq!(closed[0].boundary, "git");
+    }
+
+    #[test]
+    fn changes_inside_git_window_open_git_turn() {
+        let mut e = TurnEngine::new();
+        e.observe_git_change(1_000);
+        e.observe_changes(1_500, &[obs("f1"), obs("f2")]);
+        let closed = e.tick(1_500 + GIT_SETTLE_MS + 1);
+        assert_eq!(closed[0].tool.as_deref(), Some("git"));
+    }
+
+    // Agent-run git stays agent work: brackets are not converted.
+    #[test]
+    fn git_change_leaves_bracket_alone() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None);
+        e.observe_changes(10, &[obs("a.rs")]);
+        e.observe_git_change(20);
+        let closed = e.observe_stop(1_000, "claude-code", None, None);
+        assert_eq!(closed[0].tool.as_deref(), Some("claude-code"));
+    }
+
+    // Pre-agent activity: a start signal closes the open unattributed turn as
+    // bare rather than absorbing pre-prompt human edits into the agent turn.
+    #[test]
+    fn start_closes_prior_quiet_as_bare() {
+        let mut e = TurnEngine::new();
+        e.observe_changes(0, &[obs("human.md")]);
+        let closed = e.observe_start(5_000, "claude-code", Some("go".into()), None);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].grade, "bare");
+        let stop = e.observe_stop(9_000, "claude-code", None, None);
+        assert_eq!(stop[0].files.len(), 0); // human.md not attributed to agent
+        assert!(stop[0].merges.is_empty()); // pre-start bare is not folded
+    }
+
+    // Crash rule: start with no stop closes truncated, keeping attribution.
+    #[test]
+    fn bracket_timeout_closes_truncated_rich() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", Some("long job".into()), None);
+        e.observe_changes(10, &[obs("a.rs")]);
+        assert!(e.tick(MAX_BRACKET_MS).is_empty());
+        let closed = e.tick(MAX_BRACKET_MS + 1);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].truncated);
+        assert_eq!(closed[0].grade, "rich");
+        assert_eq!(closed[0].tool.as_deref(), Some("claude-code"));
+    }
+
+    // D6: one open turn per root — a second start closes the first truncated.
+    #[test]
+    fn second_start_closes_first_bracket_truncated() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None);
+        e.observe_changes(10, &[obs("a.rs")]);
+        let closed = e.observe_start(1_000, "codex", None, None);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].truncated);
+        assert_eq!(closed[0].tool.as_deref(), Some("claude-code"));
+        let stop = e.observe_stop(2_000, "codex", None, None);
+        assert_eq!(stop[0].tool.as_deref(), Some("codex"));
+    }
+
+    // A stop with nothing observed still records the (empty, rich) turn.
+    #[test]
+    fn empty_stop_records_prompt_only_turn() {
+        let mut e = TurnEngine::new();
+        let closed = e.observe_stop(1_000, "claude-code", Some("read the code".into()), None);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].files.is_empty());
+        assert_eq!(closed[0].grade, "rich");
+    }
+
+    #[test]
+    fn before_captured_once_per_turn() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None);
+        let first = ChangeObs {
+            before_hash: Some("sha256:v0".into()),
+            ..obs("a.rs")
+        };
+        let second = ChangeObs {
+            before_hash: Some("sha256:v1".into()),
+            ..obs("a.rs")
+        };
+        e.observe_changes(1, &[first]);
+        e.observe_changes(2, &[second]);
+        let closed = e.observe_stop(3, "claude-code", None, None);
+        assert_eq!(closed[0].files.len(), 1);
+        assert_eq!(closed[0].files[0].before_hash.as_deref(), Some("sha256:v0"));
+    }
+
+    // B2: the open turn is snapshottable for the crash journal, carrying source,
+    // attribution, times, and files; None once nothing is open.
+    #[test]
+    fn snapshot_open_captures_bracket_state() {
+        let mut e = TurnEngine::new();
+        assert!(e.snapshot_open().is_none());
+        e.observe_start(
+            1_000,
+            "claude-code",
+            Some("fix auth".into()),
+            Some("s1".into()),
+        );
+        e.observe_changes(1_500, &[obs("a.rs")]);
+        let snap = e.snapshot_open().expect("turn is open");
+        assert_eq!(snap.source, "bracket");
+        assert_eq!(snap.tool.as_deref(), Some("claude-code"));
+        assert_eq!(snap.prompt.as_deref(), Some("fix auth"));
+        assert_eq!(snap.opened_at, 1_000);
+        assert_eq!(snap.last_change_at, 1_500);
+        assert_eq!(snap.files.len(), 1);
+        // round-trips through the wire form the daemon persists
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: OpenSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.files[0].path, "a.rs");
+        e.observe_stop(2_000, "claude-code", None, None);
+        assert!(e.snapshot_open().is_none());
+    }
+
+    // Bare fragments older than the fold window are not absorbed.
+    #[test]
+    fn stale_bares_not_folded() {
+        let mut e = TurnEngine::new();
+        e.observe_changes(0, &[obs("old.rs")]);
+        e.tick(11_000); // closed bare at 11s
+        let much_later = FOLD_WINDOW_MS + 100_000;
+        let closed = e.observe_stop(much_later, "codex", None, None);
+        assert!(closed[0].merges.is_empty());
+        assert!(closed[0].files.is_empty());
+    }
+}

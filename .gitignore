@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.agentrec/
+.DS_Store
+# Local dev-environment config (machine-specific; keep out of the repo)
+.claude/
+.codex/
+.sutra/
+.mcp.json
+HANDOFF.md

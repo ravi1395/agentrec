@@ -1,0 +1,30 @@
+//! agentrec-core: pure engine + persistence primitives for the agentrec recorder.
+//! Modules: id (ULID), time (RFC 3339), store (content-addressed blobs),
+//! record (protocol types), scrub (secret redaction), engine (turn boundaries),
+//! diff (unified text diff + binary detection for the `diff` verb).
+//! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
+//! disagree, the doc wins and the code is a bug.
+
+pub mod diff;
+pub mod engine;
+pub mod id;
+pub mod perms;
+pub mod record;
+pub mod retention;
+pub mod scrub;
+pub mod store;
+pub mod time;
+
+/// Per-file snapshot cap (PROTOCOL §6).
+pub const MAX_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;
+/// Store-wide size budget (AC I+): once exceeded, the oldest snapshot blobs
+/// (never prompt blobs — those have their own TTL path) are evicted.
+pub const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Quiet window closing unattributed activity (PROTOCOL §4; Sutra-proven).
+pub const QUIET_MS: u64 = 10_000;
+/// Settle window closing a git-classified turn after its last mutation.
+pub const GIT_SETTLE_MS: u64 = 2_000;
+/// Safety net: a bracket with no stop signal closes truncated after this.
+pub const MAX_BRACKET_MS: u64 = 2 * 60 * 60 * 1000;
+/// Stop-only emitters: bare turns closed within this window fold into the rich turn.
+pub const FOLD_WINDOW_MS: u64 = 15 * 60 * 1000;

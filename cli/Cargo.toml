@@ -1,0 +1,23 @@
+[package]
+name = "agentrec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Flight recorder for coding agents: who broke my repo — me or the agent?"
+
+[[bin]]
+name = "agentrec"
+path = "src/main.rs"
+
+[dependencies]
+agentrec-core = { path = "../agentrec-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ignore = "0.4"
+notify = "6"
+libc = "0.2"
+ctrlc = "3"
+
+[dev-dependencies]
+tempfile = "3"

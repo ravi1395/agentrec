@@ -1,0 +1,16 @@
+[package]
+name = "agentrec-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core engine for agentrec: turn boundaries, snapshot store, records, scrub."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+regex = "1"
+similar = "3.1.1"
+
+[dev-dependencies]
+tempfile = "3"
