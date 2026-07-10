@@ -28,9 +28,13 @@ jobs:
             asset: agentrec-darwin-arm64
           - os: macos-15-intel
             asset: agentrec-darwin-x86_64
-          - os: ubuntu-24.04
+          # Built on the oldest supported glibc baseline (22.04) so the
+          # binary runs forward onto 24.04 too — a 24.04-built binary
+          # requires GLIBC_2.39 and refuses to run on 22.04 (caught live by
+          # the verify-install leg below on the first release attempt).
+          - os: ubuntu-22.04
             asset: agentrec-linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             asset: agentrec-linux-arm64
     steps:
       - uses: actions/checkout@v5
