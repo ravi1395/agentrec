@@ -2842,6 +2842,59 @@ fn doctor_json_shape_and_exit_code() {
     }
 }
 
+// AC-Y++2: the inotify-headroom check must actually hit its fail branch when
+// fs.inotify.max_user_watches is too low for the repo's directory count. The
+// normal CI matrix runs with a generous default limit (pass branch only) —
+// this test only makes sense in an environment that deliberately lowered the
+// ceiling first (see the `inotify-low-watches` job in
+// .github/workflows/ci.yml), hence `#[ignore]` so it never runs as part of
+// the default `cargo test --workspace`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires fs.inotify.max_user_watches lowered before running — see .github/workflows/ci.yml's inotify-low-watches job"]
+fn doctor_inotify_low_watches_fails() {
+    let max_watches: u64 = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .expect("read /proc/sys/fs/inotify/max_user_watches")
+        .trim()
+        .parse()
+        .expect("parse max_user_watches");
+    assert!(
+        max_watches < 100,
+        "this test requires an induced-low fs.inotify.max_user_watches \
+         (got {max_watches}) — run: sudo sysctl -w fs.inotify.max_user_watches=1"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let init_out = agentrec(root, &["init", "--no-service"]);
+    assert!(init_out.status.success(), "init failed: {init_out:?}");
+
+    let v = doctor_json_value(root);
+    assert_eq!(
+        v["ok"], false,
+        "expected ok:false with induced-low watches: {v}"
+    );
+    let checks = v["checks"].as_array().unwrap();
+    let inotify = checks
+        .iter()
+        .find(|c| c["name"] == "inotify headroom")
+        .unwrap_or_else(|| panic!("no inotify headroom check in {v}"));
+    assert_eq!(
+        inotify["status"], "fail",
+        "expected inotify headroom to fail: {v}"
+    );
+    assert!(
+        inotify["remedy"]
+            .as_str()
+            .unwrap_or("")
+            .contains("max_user_watches"),
+        "expected remedy to mention max_user_watches: {v}"
+    );
+
+    let out = doctor(root);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+}
+
 // --- AC-Z+2, AC-Z+3, AC-Z+4 (D42/D43): relative-time default / --utc
 // absolute, color gated off when piped or under NO_COLOR, and the
 // `--explain` glossary only ever mentions terms present in this listing.

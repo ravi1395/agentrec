@@ -50,5 +50,25 @@ jobs:
       - name: cargo test --workspace
         # Excludes #[ignore]d torture heavy run; torture_smoke still runs here.
         # On Ubuntu legs this also compiles + runs the Linux-only doctor paths
-        # (inotify headroom, 0700/0600 perms) — AC Y++2 / I++1.
+        # (inotify headroom pass branch, 0700/0600 perms) — AC I++1. The
+        # inotify FAIL branch needs an induced-low ceiling; see the
+        # inotify-low-watches job below (AC Y++2).
         run: cargo test --workspace --all-features
+
+  inotify-low-watches:
+    name: doctor inotify headroom (induced low watches, AC Y++2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: lower fs.inotify.max_user_watches
+        # Ephemeral CI VM — safe to mutate system-wide. 1 is strictly below a
+        # fresh `init`'s dir count (root + .agentrec + .agentrec/objects ≈ 3).
+        run: |
+          sudo sysctl -w fs.inotify.max_user_watches=1
+          sysctl fs.inotify.max_user_watches
+      - name: cargo test doctor_inotify_low_watches_fails
+        run: |
+          cargo test -p agentrec --test integration --all-features \
+            -- --ignored --exact doctor_inotify_low_watches_fails

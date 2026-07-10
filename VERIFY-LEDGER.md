@@ -14,7 +14,7 @@ allowing a "M3 shipped" claim. Each names the exact command/environment that clo
 | Y+1 (Ubuntu leg) | `curl \| sh` installer proven on a **clean Ubuntu container**. macOS leg provable here. | Installer run in an Ubuntu 22.04/24.04 container yields `agentrec` on PATH, checksum-verified. |
 | Y+1 (macOS clean box) | Clean-box guarantee (no prior toolchain) needs a fresh macOS VM/container. | Installer run on a pristine macOS image. |
 | Y+2 | `brew install` via own tap. Formula authored; tap publish + install is a network/launch step. | Formula published to tap and `brew install` succeeds. |
-| Y++2 (inotify mode) | `doctor` Linux-inotify-headroom failure mode. Code path present; only asserts on Linux. | Integration test run on Linux CI induces low `fs.inotify.max_user_watches`. |
+| Y++2 (inotify mode) | `doctor` Linux-inotify-headroom failure mode. `doctor_inotify_low_watches_fails` test (`cli/tests/integration.rs`, `#[ignore]`d) + `inotify-low-watches` CI job (`.github/workflows/ci.yml`, sets `fs.inotify.max_user_watches=1` then runs it `--ignored --exact`) authored; workflow live, awaiting first green run. | `inotify-low-watches` job green on Linux CI. |
 | README blame GIF | The line-level-blame demo GIF leading the README. | GIF recorded from a real session and embedded. |
 
 ## Closed here
