@@ -43,6 +43,12 @@ curl -fsSL https://raw.githubusercontent.com/ravi1395/agentrec/main/install.sh |
 
 This downloads a prebuilt binary for your OS/arch, verifies its sha256 checksum, and installs it to `~/.local/bin/agentrec` — no sudo, ever. If `~/.local/bin` isn't on your `PATH`, the installer tells you exactly what to add.
 
+Or via Homebrew:
+
+```sh
+brew install ravi1395/agentrec/agentrec
+```
+
 Building an already-checked-out binary locally instead of downloading a release:
 
 ```sh
