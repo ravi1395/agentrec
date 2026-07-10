@@ -1,0 +1,99 @@
+name: Release
+
+# Y+1: builds the 4-target binary matrix, publishes a GitHub Release, then
+# proves the README's literal `curl | sh` command on fresh Ubuntu + macOS
+# runners (real network fetch + checksum verify + PATH install — not the
+# AGENTREC_LOCAL_BINARY leg). Triggered by pushing a `v*.*.*` tag.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {} # manual re-run: pick the tag as the ref in the UI
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: agentrec-darwin-arm64
+          - os: macos-15-intel
+            asset: agentrec-darwin-x86_64
+          - os: ubuntu-24.04
+            asset: agentrec-linux-x86_64
+          - os: ubuntu-24.04-arm
+            asset: agentrec-linux-arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release -p agentrec
+      - name: stage asset + checksum
+        run: |
+          mkdir -p dist
+          cp target/release/agentrec "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: tag
+        run: echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" dist/* \
+            --title "agentrec ${{ steps.tag.outputs.tag }}" \
+            --generate-notes
+
+  verify-install:
+    name: verify curl|sh (${{ matrix.os }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-15-intel, macos-14]
+    steps:
+      - name: real network curl | sh (README's literal command)
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/ravi1395/agentrec/${{ needs.publish.outputs.tag }}/install.sh" | sh | tee install.out
+          grep -q "^checksum verified:" install.out
+      - name: verify installed binary reports the released version
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          agentrec --version | tee version.out
+          grep -q "${{ needs.publish.outputs.tag }}" version.out || \
+            grep -q "$(echo '${{ needs.publish.outputs.tag }}' | sed 's/^v//')" version.out

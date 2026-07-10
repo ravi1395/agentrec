@@ -38,7 +38,7 @@ t_01J8…MB · claude-code · "add rate limiting to login" · 14:04 · human-edi
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/agentrec/agentrec/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ravi1395/agentrec/main/install.sh | sh
 ```
 
 This downloads a prebuilt binary for your OS/arch, verifies its sha256 checksum, and installs it to `~/.local/bin/agentrec` — no sudo, ever. If `~/.local/bin` isn't on your `PATH`, the installer tells you exactly what to add.

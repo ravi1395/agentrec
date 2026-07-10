@@ -2,7 +2,7 @@
 # agentrec installer — POSIX sh, curl|sh style.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<org>/agentrec/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ravi1395/agentrec/main/install.sh | sh
 #
 # Env overrides:
 #   AGENTREC_RELEASE_BASE   base URL releases are fetched from (default: GitHub
@@ -25,7 +25,7 @@
 set -eu
 
 bin_name="agentrec"
-release_base="${AGENTREC_RELEASE_BASE:-https://github.com/agentrec/agentrec/releases/latest/download}"
+release_base="${AGENTREC_RELEASE_BASE:-https://github.com/ravi1395/agentrec/releases/latest/download}"
 install_dir="${AGENTREC_INSTALL_DIR:-$HOME/.local/bin}"
 local_binary="${AGENTREC_LOCAL_BINARY:-}"
 expected_sha256=""
