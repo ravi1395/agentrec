@@ -2,6 +2,7 @@
 **/*.rs.bk
 .agentrec/
 .DS_Store
+/docs/fixtures/demo-repo/
 # Local dev-environment config (machine-specific; keep out of the repo)
 .claude/
 .codex/

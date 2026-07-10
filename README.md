@@ -14,7 +14,7 @@ No cloud, no telemetry, no vendor lock — works with any tool that can fire a l
 The headline feature: point at a file and a line, get the turn that wrote it, the tool and prompt behind it, and whether it's been touched since.
 
 ![line-level blame demo](docs/blame-demo.gif)
-*(GIF pending — recorded from a real session; the example below is real CLI output shown as text in the meantime.)*
+*(Recorded from a real daemon session — regenerate with `./docs/generate-blame-fixture.sh && vhs docs/blame-demo.tape`.)*
 
 ```
 $ agentrec blame src/auth.ts:42
