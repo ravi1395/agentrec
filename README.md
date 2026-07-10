@@ -1,5 +1,8 @@
 # agentrec
 
+[![CI](https://github.com/ravi1395/agentrec/actions/workflows/ci.yml/badge.svg)](https://github.com/ravi1395/agentrec/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A local-first, tool-agnostic flight recorder for coding agents. It segments agent activity into *turns*, snapshots every touched file into a content-addressed store, and answers the question that matters after a bad session:
 
 **Who broke my repo — me or the agent?**
