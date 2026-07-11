@@ -362,13 +362,18 @@ fn check_inotify(root: &Path) -> Check {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(8192);
-    let estimate = estimate_watch_count(root);
+    // Pass `max_watches` so the walk can stop as soon as it proves the tree
+    // exceeds the limit — a blind cap could false-PASS when the limit was
+    // raised above it. `estimate` is a lower bound (may stop early), so the
+    // message says "at least".
+    let estimate = estimate_watch_count(root, max_watches);
     if estimate > max_watches {
         Check::fail(
             "inotify headroom",
             format!(
-                "inotify headroom too low ({estimate} watched dirs vs {max_watches} \
-                 max_user_watches) — raise it: sudo sysctl fs.inotify.max_user_watches=524288"
+                "inotify headroom too low (at least {estimate} dirs to watch vs \
+                 {max_watches} max_user_watches) — raise it: sudo sysctl \
+                 fs.inotify.max_user_watches=524288"
             ),
         )
     } else {
@@ -376,21 +381,63 @@ fn check_inotify(root: &Path) -> Check {
     }
 }
 
-/// Rough estimate of directories `notify`'s recursive watcher would register
-/// — one inotify watch per directory, gitignore-aware like the daemon's own
-/// filter (B+/D29), bounded so a huge repo doesn't turn this into a slow scan.
-#[cfg(target_os = "linux")]
-fn estimate_watch_count(root: &Path) -> u64 {
-    const MAX_DIRS: u64 = 100_000;
-    let mut count = 0u64;
-    for entry in ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .build()
-        .flatten()
-    {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+/// Estimate of directories `notify`'s recursive watcher registers — one
+/// inotify watch per directory. The daemon watches the whole root
+/// (`cli/src/daemon.rs`, `RecursiveMode::Recursive`) and filters *events*
+/// afterward via `IgnoreSet`, not which directories are watched — so notify
+/// arms a watch on EVERY directory under `root`, including gitignored trees
+/// (`target`, `node_modules`) and `.git`. This estimate must count all of
+/// them.
+///
+/// The previous implementation used a gitignore-aware `ignore::Walk`, which
+/// silently dropped every gitignored directory (on this repo, `target/` alone
+/// is ~600 dirs). It therefore reported far fewer dirs than the kernel
+/// actually consumed, so `doctor` could PASS while the daemon hit
+/// `max_user_watches` and failed to arm its watch at startup.
+///
+/// This mirrors notify 6's `INotifyWatcher::add_watch` exactly: the same
+/// `walkdir::WalkDir` with `follow_links(true)`, watching every entry whose
+/// metadata is a directory. Following symlinks matters — a pnpm `node_modules`
+/// is almost entirely directory symlinks, and notify arms a watch on each
+/// followed target; a non-following walk would miss them all and under-report
+/// by orders of magnitude. `walkdir` detects symlink loops and yields an error
+/// for the offending entry (skipped here), so cycles cannot hang the walk.
+/// Symlink aliasing may over-count (two links to one dir counted twice while
+/// the kernel dedups by inode) — the safe direction for a headroom check
+/// (over-count risks a false FAIL, never a false PASS).
+///
+/// Returns as soon as the count exceeds `stop_above` (the caller's
+/// `max_user_watches`): the fail verdict is already decided, so the rest of a
+/// huge tree needn't be walked. Unlike a blind fixed cap, this does not
+/// false-PASS for any limit up to `CEILING` — the walk runs until it either
+/// exceeds the limit or exhausts the tree. The returned value is a lower bound
+/// (walk may stop early); callers phrase it as "at least N".
+///
+/// `CEILING` (2M, far above any realistic `max_user_watches`) bounds the walk
+/// so an effectively-unlimited limit can't scan forever. The one residual
+/// blind spot: a limit AND a true dir count both above `CEILING` — the walk
+/// caps at `CEILING` and could report PASS. That needs a >2M-directory tree
+/// and a >2M sysctl simultaneously, neither of which occurs in practice.
+///
+/// Not `#[cfg(target_os = "linux")]`-only: the estimate is pure filesystem
+/// walking and is unit-tested on every platform (`test` cfg below), even
+/// though its sole caller `check_inotify` is Linux-only.
+#[cfg(any(target_os = "linux", test))]
+fn estimate_watch_count(root: &Path, stop_above: u64) -> u64 {
+    // Hard ceiling so an "unlimited" max_user_watches can't make this walk an
+    // enormous tree forever. 2M is orders of magnitude past any real setting.
+    const CEILING: u64 = 2_000_000;
+    let limit = stop_above.saturating_add(1).min(CEILING);
+    let mut count: u64 = 0;
+    // Same traversal notify uses to arm inotify watches (notify-6 inotify.rs).
+    for entry in walkdir::WalkDir::new(root).follow_links(true) {
+        // A walk error (permission denied, symlink loop) means notify could
+        // not watch that entry either — skip it, don't abort the estimate.
+        let Ok(entry) = entry else { continue };
+        // notify's `filter_dir`: metadata (follows symlinks) must be a dir.
+        if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
             count += 1;
-            if count >= MAX_DIRS {
+            if count >= limit {
                 break;
             }
         }
@@ -509,5 +556,99 @@ mod tests {
         let check = check_signal_freshness(root);
         std::env::remove_var("AGENTREC_CLAUDE_PROJECTS_DIR");
         assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    // Regression: `estimate_watch_count` used a gitignore-aware `ignore::Walk`
+    // that dropped every gitignored directory, so it undercounted the inotify
+    // watches the daemon actually arms — notify watches the whole root
+    // recursively, gitignored trees included. doctor could report PASS while
+    // the daemon blew past `max_user_watches` and failed to arm at startup.
+    // Runs on every platform because the estimate is now cross-platform
+    // (`cfg(test)`), even though its production caller is Linux-only.
+    //
+    // A real `git init` is required so the `.gitignore` is honored by a
+    // gitignore-aware walker (the `ignore` crate applies ignore rules only
+    // inside a git repo by default) — otherwise the old code would count
+    // everything too and the regression would be invisible. The count delta
+    // over a whole nested gitignored subtree isolates the fix from `.git` and
+    // other noise (identical in both counts).
+    #[test]
+    fn estimate_watch_count_includes_gitignored_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        // A nested gitignored subtree: 3 directories the old walk skipped
+        // wholesale but notify still watches at every level.
+        std::fs::create_dir_all(root.join("ignored/deep/deeper")).unwrap();
+
+        // `u64::MAX` disables the early-stop so the full (small) tree is walked.
+        let with_subtree = estimate_watch_count(root, u64::MAX);
+        std::fs::remove_dir_all(root.join("ignored")).unwrap();
+        let without_subtree = estimate_watch_count(root, u64::MAX);
+
+        // Every level of the gitignored subtree consumes an inotify watch.
+        // Old gitignore-aware code: delta 0 (whole subtree skipped) -> fails.
+        assert_eq!(
+            with_subtree,
+            without_subtree + 3,
+            "all 3 levels of the gitignored subtree must be counted: \
+             with={with_subtree} without={without_subtree}"
+        );
+    }
+
+    // The walk must stop as soon as it exceeds the caller's limit and report a
+    // value > the limit — so `check_inotify` fails a tree that overflows even a
+    // raised `max_user_watches`, rather than being blindly capped below it (the
+    // false-PASS the fixed-cap version risked).
+    #[test]
+    fn estimate_watch_count_stops_above_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // root + 3 children = 4 dirs, comfortably over a limit of 1.
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::create_dir(root.join("c")).unwrap();
+
+        let est = estimate_watch_count(root, 1);
+        assert!(
+            est > 1,
+            "must return a value exceeding the limit to trigger the fail verdict, got {est}"
+        );
+        // Lower bound only: early-stop means it need not equal the true count (4).
+        assert!(
+            est <= 4,
+            "cannot exceed the true directory count, got {est}"
+        );
+    }
+
+    // notify walks with `follow_links(true)`, so it arms watches on the targets
+    // of directory symlinks (a pnpm `node_modules` is almost all such links).
+    // The estimate must follow them too, or it under-reports the kernel's real
+    // watch consumption. Fails on any non-following walk (delta 0).
+    #[cfg(unix)]
+    #[test]
+    fn estimate_watch_count_follows_directory_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        // root, real, real/sub = 3
+        let before = estimate_watch_count(root, u64::MAX);
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let after = estimate_watch_count(root, u64::MAX);
+        // Following `link` adds the link dir itself and its `sub` child (+2).
+        assert_eq!(
+            after,
+            before + 2,
+            "symlinked dir tree must be followed like notify does: \
+             before={before} after={after}"
+        );
     }
 }
