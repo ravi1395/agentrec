@@ -20,20 +20,42 @@ const DAY_MS: u64 = 86_400_000;
 
 pub fn run(root: &Path, all_prompts: bool, snapshots_before: Option<&str>) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
-    let turns: Vec<&TurnRecord> = records
+    let turns: Vec<&TurnRecord> = owned_turns(&records);
+    let store = BlobStore::new(objects_dir(root));
+
+    purge_prompts(&store, &turns, root, all_prompts);
+    if let Some(date) = snapshots_before {
+        purge_snapshots_before(&store, &turns, date, root)?;
+    }
+    Ok(())
+}
+
+fn owned_turns(records: &[LogRecord]) -> Vec<&TurnRecord> {
+    records
         .iter()
         .filter_map(|r| match r {
             LogRecord::Turn(t) => Some(t),
             LogRecord::Epoch(_) => None,
         })
-        .collect();
-    let store = BlobStore::new(objects_dir(root));
+        .collect()
+}
 
-    purge_prompts(&store, &turns, root, all_prompts);
-    if let Some(date) = snapshots_before {
-        purge_snapshots_before(&store, &turns, date)?;
-    }
-    Ok(())
+/// Every snapshot-blob hash (`before`/`after`) referenced by any of `turns`.
+fn snapshot_hashes<'a>(turns: &[&'a TurnRecord]) -> HashSet<&'a str> {
+    turns
+        .iter()
+        .flat_map(|t| t.files.iter())
+        .flat_map(|f| [f.before.as_deref(), f.after.as_deref()])
+        .flatten()
+        .collect()
+}
+
+/// Every prompt-blob hash (`prompt_ref`) referenced by any of `turns`.
+fn prompt_hashes<'a>(turns: &[&'a TurnRecord]) -> HashSet<&'a str> {
+    turns
+        .iter()
+        .filter_map(|t| t.prompt_ref.as_deref())
+        .collect()
 }
 
 /// Delete prompt-blob objects: all of them (`all_prompts`) or just those
@@ -43,7 +65,7 @@ fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prom
     let ttl_days = read_ttl_days(root);
     let cutoff = ttl_cutoff(ttl_days);
 
-    let keep: HashSet<&str> = if all_prompts {
+    let mut keep: HashSet<&str> = if all_prompts {
         HashSet::new()
     } else {
         turns
@@ -52,6 +74,11 @@ fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prom
             .filter_map(|t| t.prompt_ref.as_deref())
             .collect()
     };
+    // A2: a blob content-shared with any turn's snapshot (before/after) must
+    // never be deleted here, regardless of prompt TTL or `--all-prompts` —
+    // snapshot blobs are only purged via `--snapshots-before`, its own
+    // disjoint retention policy.
+    keep.extend(snapshot_hashes(turns));
 
     let mut candidates: HashSet<&str> = HashSet::new();
     for t in turns {
@@ -63,6 +90,24 @@ fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prom
             candidates.insert(pref);
         }
     }
+
+    // A3(b): re-load the log immediately before the destructive step and
+    // re-union the keep-set, narrowing the TOCTOU window between this
+    // function's initial log read (in `run`) and the delete below — a live
+    // daemon may have appended a turn referencing a candidate in between.
+    let fresh_records = agentrec_core::record::load_log(&log_path(root));
+    let fresh_turns = owned_turns(&fresh_records);
+    let mut fresh_keep: HashSet<&str> = if all_prompts {
+        HashSet::new()
+    } else {
+        fresh_turns
+            .iter()
+            .filter(|t| t.started.as_str() >= cutoff.as_str())
+            .filter_map(|t| t.prompt_ref.as_deref())
+            .collect()
+    };
+    fresh_keep.extend(snapshot_hashes(&fresh_turns));
+    candidates.retain(|h| !fresh_keep.contains(h));
 
     let (count, bytes) = delete_all(store, &candidates);
     if all_prompts {
@@ -85,16 +130,20 @@ fn purge_snapshots_before(
     store: &BlobStore,
     turns: &[&TurnRecord],
     date: &str,
+    root: &Path,
 ) -> Result<(), String> {
     let cutoff = parse_date_cutoff(date)?;
 
-    let keep: HashSet<&str> = turns
+    let mut keep: HashSet<&str> = turns
         .iter()
         .filter(|t| t.started.as_str() >= cutoff.as_str())
         .flat_map(|t| t.files.iter())
         .flat_map(|f| [f.before.as_deref(), f.after.as_deref()])
         .flatten()
         .collect();
+    // A2: a blob content-shared with any turn's prompt must never be
+    // deleted here — prompt blobs are only purged via the default TTL path.
+    keep.extend(prompt_hashes(turns));
 
     let mut candidates: HashSet<&str> = HashSet::new();
     for t in turns {
@@ -112,6 +161,19 @@ fn purge_snapshots_before(
             }
         }
     }
+
+    // A3(b): same reload-before-delete narrowing as `purge_prompts`.
+    let fresh_records = agentrec_core::record::load_log(&log_path(root));
+    let fresh_turns = owned_turns(&fresh_records);
+    let mut fresh_keep: HashSet<&str> = fresh_turns
+        .iter()
+        .filter(|t| t.started.as_str() >= cutoff.as_str())
+        .flat_map(|t| t.files.iter())
+        .flat_map(|f| [f.before.as_deref(), f.after.as_deref()])
+        .flatten()
+        .collect();
+    fresh_keep.extend(prompt_hashes(&fresh_turns));
+    candidates.retain(|h| !fresh_keep.contains(h));
 
     let (count, bytes) = delete_all(store, &candidates);
     println!(

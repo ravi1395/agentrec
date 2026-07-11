@@ -51,15 +51,44 @@ impl BlobStore {
     /// content is written to a per-writer-unique tmp file inside the
     /// object's fan-out dir, fsynced, renamed into place, then the fan-out
     /// dir itself is fsynced so the rename survives a crash. Dedup: an
-    /// existing object is never rewritten, and never re-fsynced.
+    /// existing intact object is never rewritten.
     pub fn put_result(&self, bytes: &[u8]) -> PutResult {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             return PutResult::OverCap;
         }
         let hash = hash_bytes(bytes);
-        let path = self.object_path(&hash);
+        let Some(path) = self.object_path(&hash) else {
+            // hash_bytes always produces a well-formed sha256 hex ref (A1);
+            // this is unreachable in practice, but keeps object_path's
+            // validation load-bearing rather than assumed-away.
+            return PutResult::IoError("invalid object hash".to_string());
+        };
         if path.exists() {
-            return PutResult::Stored(hash);
+            // A4: dedup normally trusts the existing object verbatim — but
+            // if it's silently corrupt, discarding the good bytes we were
+            // just handed (by returning early) would be worse than
+            // rewriting. Verify before trusting.
+            let intact = fs::read(&path).is_ok_and(|existing| hash_bytes(&existing) == hash);
+            if intact {
+                // A3: best-effort mtime touch — narrows the TOCTOU window
+                // where a retention pass snapshots its keep-set from
+                // log.jsonl just before this dedup-hit lands, by giving a
+                // concurrent reader a fresher mtime to notice.
+                if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
+                // A4: dedup previously skipped the dir fsync entirely (a
+                // D34 hole) — fsync it too, since a prior crash could have
+                // lost the directory entry even though this inode survived.
+                if let Some(parent) = path.parent() {
+                    if let Ok(dir) = fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                }
+                return PutResult::Stored(hash);
+            }
+            // Corrupt — fall through and rewrite via the normal tmp+rename
+            // path below instead of trusting it.
         }
         let Some(parent) = path.parent() else {
             return PutResult::IoError("object path has no parent directory".to_string());
@@ -75,20 +104,23 @@ impl BlobStore {
         let tmp = parent.join(format!(".tmp.{}.{}", std::process::id(), seq));
 
         let write = (|| -> std::io::Result<()> {
-            let mut file = fs::File::create(&tmp)?;
+            // A6: create at 0600 directly (unix) — mode is set at the same
+            // syscall that creates the file, so there is no window where
+            // the tmp file sits at the process umask default before a
+            // later chmod locks it down.
+            let mut file = create_tmp_file(&tmp)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            // Lock down before the rename makes it visible under its final
-            // name (D37) — no window where the blob is reachable at 0644.
-            perms::lock_file(&tmp);
             fs::rename(&tmp, &path)?;
-            let dir = fs::File::open(parent)?;
-            dir.sync_all()?;
             Ok(())
         })();
 
         match write {
-            Ok(()) => PutResult::Stored(hash),
+            // A7: the blob is durably at its final name the moment
+            // rename() returns — a dir-fsync failure past this point (e.g.
+            // a read-only remount racing the write) must never be reported
+            // as "no snapshot" when the snapshot plainly exists.
+            Ok(()) => finish_stored(hash, parent),
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 PutResult::IoError(e.to_string())
@@ -99,7 +131,9 @@ impl BlobStore {
     /// Read a blob back; verifies content integrity against its address
     /// (a corrupted object is reported as an error, never silently served).
     pub fn get(&self, hash: &str) -> Result<Vec<u8>, StoreError> {
-        let path = self.object_path(hash);
+        let Some(path) = self.object_path(hash) else {
+            return Err(StoreError::Missing(hash.to_string()));
+        };
         let bytes = fs::read(&path).map_err(|_| StoreError::Missing(hash.to_string()))?;
         if hash_bytes(&bytes) != hash {
             return Err(StoreError::Corrupt(hash.to_string()));
@@ -108,21 +142,33 @@ impl BlobStore {
     }
 
     pub fn contains(&self, hash: &str) -> bool {
-        self.object_path(hash).exists()
+        self.object_path(hash).is_some_and(|p| p.exists())
     }
 
-    /// Size in bytes of the object at `hash`, or `None` if it doesn't exist.
+    /// Size in bytes of the object at `hash`, or `None` if it doesn't exist
+    /// (including when `hash` is malformed — A1).
     pub fn size(&self, hash: &str) -> Option<u64> {
-        fs::metadata(self.object_path(hash)).ok().map(|m| m.len())
+        let path = self.object_path(hash)?;
+        fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// Last-modified time of the object at `hash`, if present (A3) — lets a
+    /// retention pass give a just-touched blob (e.g. a concurrent dedup-hit)
+    /// a grace window before it's eligible for eviction.
+    pub fn mtime(&self, hash: &str) -> Option<std::time::SystemTime> {
+        let path = self.object_path(hash)?;
+        fs::metadata(path).ok().and_then(|m| m.modified().ok())
     }
 
     /// Delete the object at `hash` if present, returning its size (bytes)
     /// beforehand. Used by retention (purge / budget eviction) — never by the
-    /// write/read paths, which must never lose a live blob.
+    /// write/read paths, which must never lose a live blob. A malformed
+    /// `hash` (A1) is treated as missing — never touches disk.
     pub fn remove(&self, hash: &str) -> Option<u64> {
-        let size = self.size(hash);
+        let path = self.object_path(hash)?;
+        let size = fs::metadata(&path).ok().map(|m| m.len());
         if size.is_some() {
-            let _ = fs::remove_file(self.object_path(hash));
+            let _ = fs::remove_file(&path);
         }
         size
     }
@@ -147,12 +193,58 @@ impl BlobStore {
         walk(&self.dir)
     }
 
-    /// `sha256:aabb...` → `<dir>/aa/bb...`
-    fn object_path(&self, hash: &str) -> PathBuf {
-        let hex = hash.strip_prefix("sha256:").unwrap_or(hash);
-        let (fan, rest) = hex.split_at(hex.len().min(2));
-        self.dir.join(fan).join(rest)
+    /// `sha256:aabb...` → `<dir>/aa/bb...`, or `None` if `hash` isn't a
+    /// well-formed `sha256:` ref — exactly 64 lowercase hex chars (A1). A
+    /// crafted hash containing `/`, `..`, or an absolute-path component
+    /// must never be joined onto a store path: `PathBuf::join` silently
+    /// *replaces* the base when the argument is absolute, which would let a
+    /// hash like `"sha256:xx/abs/path"` turn a store operation (including
+    /// `remove`, used by purge/eviction) into an arbitrary-path delete.
+    /// Malformed hashes are treated as missing everywhere — never touched
+    /// on disk.
+    fn object_path(&self, hash: &str) -> Option<PathBuf> {
+        let hex = hash.strip_prefix("sha256:")?;
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        let (fan, rest) = hex.split_at(2);
+        Some(self.dir.join(fan).join(rest))
     }
+}
+
+/// Create the write-tmp file at mode 0600 (unix) in the same syscall that
+/// creates it — set-at-create rather than create-then-chmod, so there is no
+/// window where the tmp file is briefly reachable at the process umask
+/// default (A6).
+#[cfg(unix)]
+fn create_tmp_file(path: &std::path::Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_tmp_file(path: &std::path::Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Best-effort fsync of the fan-out dir after a successful rename, then
+/// unconditionally report `Stored` (A7): the blob already exists at its
+/// final name by the time this runs, so a dir-fsync failure past this point
+/// is a durability warning, never a "no snapshot" report.
+fn finish_stored(hash: String, parent: &std::path::Path) -> PutResult {
+    if let Ok(dir) = fs::File::open(parent) {
+        if let Err(e) = dir.sync_all() {
+            eprintln!("agentrec: snapshot {hash} stored but parent-dir fsync failed: {e}");
+        }
+    }
+    PutResult::Stored(hash)
 }
 
 /// Typed outcome of a write (D35) — replaces the lossy `Option<String>`
@@ -366,5 +458,122 @@ mod tests {
             matches!(result, PutResult::IoError(_)),
             "expected IoError, got {result:?}"
         );
+    }
+
+    // A1: a crafted hash with an embedded absolute-path component must never
+    // reach disk. `PathBuf::join` silently *replaces* the base when its
+    // argument is absolute, so pre-fix `object_path` for
+    // `"sha256:xx" + "/abs/path"` returned the victim path verbatim once
+    // split at 2 hex chars — every store op (crucially `remove`, used by
+    // purge/eviction) would then touch a file completely outside the store.
+    #[test]
+    fn malformed_hash_never_touches_disk_outside_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+
+        // Plant a victim file outside the store dir entirely.
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("planted-file.txt");
+        fs::write(&victim, b"do not delete me").unwrap();
+
+        // `strip_prefix("sha256:")` leaves an absolute path once the first
+        // two hex-fan chars are split off.
+        let evil_hash = format!("sha256:xx{}", victim.display());
+
+        assert!(!store.contains(&evil_hash), "malformed hash must not exist");
+        assert_eq!(store.size(&evil_hash), None);
+        assert_eq!(
+            store.get(&evil_hash),
+            Err(StoreError::Missing(evil_hash.clone()))
+        );
+        assert_eq!(
+            store.remove(&evil_hash),
+            None,
+            "remove on a malformed hash must be a no-op"
+        );
+
+        assert!(
+            victim.exists(),
+            "victim file outside the store must survive"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"do not delete me");
+    }
+
+    // A1: a relative `..` traversal component must also be rejected, not
+    // just an absolute path.
+    #[test]
+    fn malformed_hash_rejects_traversal_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let evil_hash = "sha256:aa/../../../../etc/hosts";
+        assert!(!store.contains(evil_hash));
+        assert_eq!(store.remove(evil_hash), None);
+    }
+
+    // A4: a dedup-hit on a silently-corrupted existing object must heal it
+    // (rewrite with the good bytes just handed in) rather than discarding
+    // the good bytes and reporting success over corrupt content.
+    #[test]
+    fn dedup_hit_heals_corrupt_existing_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let h = store.put(b"good content").unwrap();
+        let hex = h.strip_prefix("sha256:").unwrap();
+        let path = tmp.path().join(&hex[..2]).join(&hex[2..]);
+        fs::write(&path, b"corrupted!!!").unwrap();
+        assert_eq!(store.get(&h), Err(StoreError::Corrupt(h.clone())));
+
+        // Re-put the same content: pre-fix, `path.exists()` short-circuited
+        // to `Stored(hash)` without checking the bytes on disk, leaving the
+        // corruption in place forever.
+        let result = store.put_result(b"good content");
+        assert_eq!(result, PutResult::Stored(h.clone()));
+        assert_eq!(store.get(&h).unwrap(), b"good content", "corruption healed");
+    }
+
+    // A3: a dedup-hit touches the existing object's mtime — a retention pass
+    // consulting mtime can use it to detect "this blob was just referenced
+    // again," narrowing the TOCTOU window against a keep-set computed from a
+    // slightly-stale log.jsonl read.
+    #[test]
+    fn dedup_hit_touches_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let h = store.put(b"touch-me").unwrap();
+        let before = store.mtime(&h).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(store.put(b"touch-me").unwrap(), h, "dedup hit");
+        let after = store.mtime(&h).unwrap();
+
+        assert!(after > before, "dedup hit must bump mtime forward");
+    }
+
+    // A6: the tmp file must land at 0600 as part of its creation call, not
+    // via a later chmod — there is no window at any other mode.
+    #[cfg(unix)]
+    #[test]
+    fn create_tmp_file_is_0600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".tmp.probe");
+        let file = create_tmp_file(&path).unwrap();
+        let mode = file.metadata().unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "must be 0600 at the create() syscall itself"
+        );
+    }
+
+    // A7: once rename() has landed the blob at its final name, a parent-dir
+    // fsync failure (dir vanished, read-only remount, etc.) must never
+    // downgrade an already-durable write to IoError / "no snapshot".
+    #[test]
+    fn finish_stored_never_downgrades_a_landed_blob() {
+        let bogus_parent = std::path::Path::new("/nonexistent/agentrec-a7-probe-dir");
+        let result = finish_stored("sha256:deadbeef".to_string(), bogus_parent);
+        assert_eq!(result, PutResult::Stored("sha256:deadbeef".to_string()));
     }
 }

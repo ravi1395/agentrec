@@ -58,10 +58,15 @@ fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
     })?;
 
     let mut changed = false;
+    // E4: only the specific `UserPromptSubmit`/`Stop` keys that OUR OWN
+    // removal just emptied are candidates for deletion — a pre-existing
+    // empty array under some other key (or one that was already empty
+    // before we touched it) is the user's own placeholder and must survive.
+    let mut emptied_by_us: Vec<&str> = Vec::new();
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for event in ["UserPromptSubmit", "Stop"] {
             if let Some(arr) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
-                let before = arr.len();
+                let mut event_changed = false;
                 // Command-granular: strip only the agentrec command(s) out of
                 // each entry's inner `hooks[]`, preserving any other commands
                 // in the same group (e.g. a mixed entry with `prettier`).
@@ -76,12 +81,13 @@ fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
                                 .unwrap_or(false)
                         });
                         if inner.len() != inner_before {
-                            changed = true;
+                            event_changed = true;
                         }
                     }
                 }
                 // Drop an entry only once its inner `hooks[]` is empty;
                 // malformed entries with no `hooks[]` array are left as-is.
+                let before = arr.len();
                 arr.retain(|entry| {
                     entry
                         .get("hooks")
@@ -90,11 +96,23 @@ fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
                         .unwrap_or(true)
                 });
                 if arr.len() != before {
+                    event_changed = true;
+                }
+                if event_changed {
                     changed = true;
+                    // Only queue this key for removal if OUR edit is what
+                    // left it empty — an array that was already empty before
+                    // we touched it never sets `event_changed`, so it's
+                    // never queued here.
+                    if arr.is_empty() {
+                        emptied_by_us.push(event);
+                    }
                 }
             }
         }
-        hooks.retain(|_, v| !v.as_array().map(|a| a.is_empty()).unwrap_or(false));
+        for event in &emptied_by_us {
+            hooks.remove(*event);
+        }
     }
     if settings
         .get("hooks")
@@ -108,6 +126,9 @@ fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
     }
 
     if changed {
+        // Mirror init: back up the pre-rewrite file before overwriting it.
+        let backup = path.with_extension("local.json.bak");
+        fs::copy(&path, &backup).map_err(|e| e.to_string())?;
         let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
         fs::write(&path, text).map_err(|e| e.to_string())?;
     }
@@ -231,6 +252,70 @@ mod tests {
     fn no_settings_file_is_a_noop() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!remove_claude_hooks(tmp.path()).unwrap());
+    }
+
+    // E4: a pre-existing empty array under an UNRELATED hook key (never
+    // touched by agentrec, and not one we emptied) must survive uninstall —
+    // the old code dropped ANY empty-array hook key, agentrec's own or not.
+    #[test]
+    fn pre_existing_empty_hook_key_survives_uninstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [],
+                "Stop": [ { "hooks": [ { "type": "command", "command": "agentrec hook claude" } ] } ]
+            }
+        });
+        fs::write(
+            root.join(".claude/settings.local.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(remove_claude_hooks(root).unwrap());
+
+        let text = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // Our own Stop entry (which we emptied) is gone...
+        assert!(after["hooks"].get("Stop").is_none());
+        // ...but the user's own pre-existing empty placeholder survives.
+        assert_eq!(
+            after["hooks"]["PreToolUse"],
+            serde_json::json!([]),
+            "pre-existing empty hook key must not be dropped: {after}"
+        );
+    }
+
+    // E4: uninstall takes a .bak of settings.local.json before rewriting it,
+    // mirroring init's own backup-before-merge behavior.
+    #[test]
+    fn uninstall_backs_up_settings_before_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        let settings = serde_json::json!({
+            "hooks": {
+                "Stop": [ { "hooks": [ { "type": "command", "command": "agentrec hook claude" } ] } ]
+            }
+        });
+        let original = serde_json::to_string_pretty(&settings).unwrap();
+        fs::write(root.join(".claude/settings.local.json"), &original).unwrap();
+
+        assert!(remove_claude_hooks(root).unwrap());
+
+        // Mirrors initcmd's own `path.with_extension("local.json.bak")`
+        // pattern byte-for-byte (including its known "double .local" naming
+        // oddity — CLAUDE.md tracks that as deferred, not this round's job).
+        let backup_path = root.join(".claude/settings.local.local.json.bak");
+        assert!(
+            backup_path.exists(),
+            "expected a .bak of the pre-rewrite file at {}",
+            backup_path.display()
+        );
+        let backup = fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(backup, original, "backup must be the pre-rewrite content");
     }
 
     #[test]

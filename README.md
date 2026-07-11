@@ -3,7 +3,9 @@
 [![CI](https://github.com/ravi1395/agentrec/actions/workflows/ci.yml/badge.svg)](https://github.com/ravi1395/agentrec/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A local-first, tool-agnostic flight recorder for coding agents. It segments agent activity into *turns*, snapshots every touched file into a content-addressed store, and answers the question that matters after a bad session:
+Agentrec is the first local, tool-agnostic flight recorder for coding agents: it captures each agent turn, snapshots every touched file, and lets developers answer "what changed, who changed it, and can I safely undo it?" across tools such as Codex and Claude Code. Unlike vendor-specific transcripts or Git—which records only committed outcomes—agentrec preserves the otherwise-missing layer between an agent's intent and the repository's final state, addressing weak attribution, unsafe rollback, silent failures, and lost context. In the broader agent ecosystem, it is the independent observability and recovery layer: agents act, Git versions, and agentrec makes their work inspectable, attributable, and reversible.
+
+It segments agent activity into *turns*, snapshots every touched file into a content-addressed store, and answers the question that matters after a bad session:
 
 **Who broke my repo — me or the agent?**
 

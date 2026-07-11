@@ -21,10 +21,13 @@ use agentrec_core::time::rfc3339;
 use agentrec_core::MAX_SNAPSHOT_BYTES;
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::io::{Read as _, Seek, SeekFrom};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,13 +46,17 @@ pub fn run(root: &Path) -> Result<(), String> {
     if !objects_dir(&root).exists() {
         return Err("not initialized — run `agentrec init` first".into());
     }
-    acquire_lock(&root)?;
+    // D2: a real OS-level advisory lock, held for the daemon's entire
+    // lifetime via this binding. Must be a NAMED local, never `let _ =` — the
+    // latter drops the `File` immediately, closing the fd and releasing the
+    // flock right away, silently destroying mutual exclusion.
+    let _lock = acquire_lock(&root)?;
 
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
     recover_orphan(&root)?;
 
-    let clock = Clock::start();
+    let mut clock = Clock::start();
     let store = BlobStore::new(objects_dir(&root));
     let mut engine = TurnEngine::new();
     let mut recorder = Recorder::scan(&root, store);
@@ -85,26 +92,29 @@ pub fn run(root: &Path) -> Result<(), String> {
     let mut git_hit = false;
 
     loop {
-        match rx.recv_timeout(POLL) {
-            Ok(Ok(event)) => {
-                for path in event.paths {
-                    match classify(&root, &path, &ignore_set) {
-                        Class::GitRef => git_hit = true,
-                        Class::Watch => {
-                            pending.insert(path);
-                            let at = Instant::now();
-                            first_event.get_or_insert(at);
-                            last_event = Some(at);
-                        }
-                        Class::Ignore => {}
-                    }
-                }
-            }
-            Ok(Err(_)) => {} // watcher-level error on one event; keep going
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        // D9: block for the first message, then drain everything already
+        // queued via `try_recv` before moving on to flush logic. The old
+        // one-event-per-250ms-tick shape let a large burst dribble in over
+        // many ticks, which both delays debounce settlement and (worse) can
+        // make MAX_DEBOUNCE fire before the burst has actually finished
+        // arriving.
+        if drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+        ) {
+            break; // channel disconnected — the watcher thread is gone
         }
 
+        // D4: re-anchor the wall-clock offset once per loop iteration so a
+        // system sleep/wake (which halts the monotonic clock's elapsed()
+        // progress relative to wall time) can't leave every subsequent
+        // record timestamped hours early.
+        clock.reanchor();
         let now = clock.now_ms();
 
         // A ref transition classifies the surrounding burst as a git turn.
@@ -187,24 +197,52 @@ pub fn run(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Monotonic engine clock with a fixed wall-clock offset for record stamps.
+/// D4: a system sleep/wake halts `Instant::now()`'s progress relative to wall
+/// time (the monotonic clock doesn't tick while asleep, the wall clock keeps
+/// going) — beyond this much disagreement between the predicted and the live
+/// wall clock, the offset is stale enough to re-anchor.
+const DRIFT_REANCHOR_MS: u64 = 2_000;
+
+/// Monotonic engine clock with a wall-clock offset for record stamps. The
+/// offset is re-anchored on drift (D4) so a laptop sleep doesn't leave every
+/// record after it misdated by the sleep duration; `max_wall_ms` is a floor
+/// so a correction can never make a derived timestamp go backwards relative
+/// to one already handed out.
 struct Clock {
     start_mono: Instant,
     start_wall_ms: u64,
+    max_wall_ms: Cell<u64>,
 }
 
 impl Clock {
     fn start() -> Self {
+        let start_wall_ms = wall_now_ms();
         Clock {
             start_mono: Instant::now(),
-            start_wall_ms: wall_now_ms(),
+            start_wall_ms,
+            max_wall_ms: Cell::new(start_wall_ms),
         }
     }
     fn now_ms(&self) -> u64 {
         self.start_mono.elapsed().as_millis() as u64
     }
+    /// Compare the live wall clock against what the current offset predicts;
+    /// beyond `DRIFT_REANCHOR_MS` disagreement, recompute the offset so
+    /// forthcoming `wall_ms` calls track real time again. Cheap (one
+    /// `SystemTime::now()`), safe to call every loop iteration.
+    fn reanchor(&mut self) {
+        let elapsed = self.now_ms();
+        let predicted = self.start_wall_ms + elapsed;
+        let actual = wall_now_ms();
+        if actual.abs_diff(predicted) > DRIFT_REANCHOR_MS {
+            self.start_wall_ms = actual.saturating_sub(elapsed);
+        }
+    }
     fn wall_ms(&self, mono_ms: u64) -> u64 {
-        self.start_wall_ms + mono_ms
+        let derived = self.start_wall_ms + mono_ms;
+        let clamped = derived.max(self.max_wall_ms.get());
+        self.max_wall_ms.set(clamped);
+        clamped
     }
 }
 
@@ -213,6 +251,100 @@ fn wall_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ---- watch event draining (D9) ----------------------------------------------
+
+/// Blocks up to `POLL` for the first watcher message, then drains everything
+/// already queued behind it via non-blocking `try_recv` — a burst of many
+/// `notify` events (or a genuine watcher error) is applied in full within one
+/// loop iteration instead of trickling in one message per 250ms tick.
+/// Returns `true` if the channel is confirmed disconnected (the watcher
+/// thread is gone; the caller should stop recording).
+#[allow(clippy::too_many_arguments)]
+fn drain_watch_events(
+    rx: &Receiver<Result<notify::Event, notify::Error>>,
+    root: &Path,
+    ignore_set: &IgnoreSet,
+    pending: &mut HashSet<PathBuf>,
+    last_event: &mut Option<Instant>,
+    first_event: &mut Option<Instant>,
+    git_hit: &mut bool,
+) -> bool {
+    match rx.recv_timeout(POLL) {
+        Ok(res) => apply_watch_result(
+            res,
+            root,
+            ignore_set,
+            pending,
+            last_event,
+            first_event,
+            git_hit,
+        ),
+        Err(RecvTimeoutError::Timeout) => {}
+        Err(RecvTimeoutError::Disconnected) => return true,
+    }
+    loop {
+        match rx.try_recv() {
+            Ok(res) => apply_watch_result(
+                res,
+                root,
+                ignore_set,
+                pending,
+                last_event,
+                first_event,
+                git_hit,
+            ),
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_watch_result(
+    res: Result<notify::Event, notify::Error>,
+    root: &Path,
+    ignore_set: &IgnoreSet,
+    pending: &mut HashSet<PathBuf>,
+    last_event: &mut Option<Instant>,
+    first_event: &mut Option<Instant>,
+    git_hit: &mut bool,
+) {
+    match res {
+        Ok(event) => {
+            for path in event.paths {
+                match classify(root, &path, ignore_set) {
+                    Class::GitRef => *git_hit = true,
+                    Class::Watch => {
+                        pending.insert(path);
+                        let at = Instant::now();
+                        first_event.get_or_insert(at);
+                        *last_event = Some(at);
+                    }
+                    Class::Ignore => {}
+                }
+            }
+        }
+        // D3: was `Ok(Err(_)) => {}` — a mid-run watcher error (inotify queue
+        // overflow, watch-limit exhaustion on a newly created directory) was
+        // silently dropped, leaving `doctor` reporting healthy through a real
+        // recording gap. Route it through the same persisted-counter/DEGRADED
+        // banner the snapshot-I/O taxonomy (D35) already surfaces.
+        Err(e) => record_watch_error(root, &e.to_string()),
+    }
+}
+
+/// Persist a watcher-level error into the DEGRADED taxonomy (D3) and warn
+/// loudly on stderr. Reuses `record_io_failure`'s counter/path-list rather
+/// than inventing a parallel one — `status`/`doctor` already surface it.
+fn record_watch_error(root: &Path, cause: &str) {
+    eprintln!("agentrec: watcher error: {cause}");
+    let mut state = read_state(root);
+    record_io_failure(&mut state, "<watcher>");
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist watcher-error state: {e}");
+    }
 }
 
 // ---- change classification --------------------------------------------------
@@ -270,6 +402,19 @@ struct IgnoreSet {
     matchers: Vec<(PathBuf, ignore::gitignore::Gitignore)>,
 }
 
+/// D9: both `IgnoreSet::build`'s and `Recorder::scan`'s walks previously
+/// descended into `.git` and `.agentrec` (`.hidden(false)` with no override
+/// left them unpruned) — on a repo with real history / a grown object store
+/// that's a full walk of every loose git/agentrec blob for no reason, and for
+/// `Recorder::scan` it meant agentrec's own object files ended up in `known`
+/// as if they were ordinary repo content. `filter_entry` returns `false` to
+/// prune a subtree before the walker descends into it (event-time denylisting
+/// in `classify` already excludes them from *watched* changes; this excludes
+/// them from these one-shot scans too).
+fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
+    !matches!(entry.file_name().to_str(), Some(".git") | Some(".agentrec"))
+}
+
 impl IgnoreSet {
     fn build(root: &Path) -> Self {
         let mut matchers = vec![];
@@ -278,6 +423,7 @@ impl IgnoreSet {
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .parents(false)
+            .filter_entry(prune_git_and_agentrec)
             .build()
             .flatten()
         {
@@ -358,6 +504,7 @@ impl Recorder {
         let mut known = HashSet::new();
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
+            .filter_entry(prune_git_and_agentrec)
             .build()
             .flatten()
         {
@@ -519,7 +666,9 @@ fn drain_io_failures(root: &Path, recorder: &mut Recorder) {
         record_io_failure(&mut state, &path);
         eprintln!("agentrec: snapshot write failed for {path}: {cause}");
     }
-    write_state(root, &state);
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist snapshot-failure state: {e}");
+    }
 }
 
 // ---- signals ----------------------------------------------------------------
@@ -542,15 +691,49 @@ impl SignalTailer {
         Ok(SignalTailer { offset })
     }
 
+    /// D7: seek to the persisted offset and read only the fresh tail, instead
+    /// of re-reading the whole inbox every ~250ms (O(file) per poll, on a
+    /// file that only grows). Also detects external truncation (`len <
+    /// offset` — someone rewrote or corrupted signal.jsonl out from under
+    /// us): the old code sliced `text[offset..]` on a file shorter than
+    /// `offset`, which panics; resuming from a reset offset=0 would instead
+    /// *replay* already-consumed signals as duplicate turns. Neither is
+    /// acceptable — we resync to the new end, log loudly, and count it as an
+    /// I/O failure (DEGRADED-visible), accepting that whatever was written
+    /// during the truncated window is lost.
     fn poll(&mut self, root: &Path) -> Vec<SignalEvent> {
-        let text = match std::fs::read(signal_path(root)) {
-            Ok(bytes) => bytes,
-            Err(_) => return vec![],
+        let path = signal_path(root);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return vec![];
         };
-        if (text.len() as u64) <= self.offset {
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return vec![];
+        };
+        if len < self.offset {
+            eprintln!(
+                "agentrec: signal.jsonl truncated externally (was {} bytes, now {len}) — \
+                 resuming from the new end; any signals written during the gap are lost",
+                self.offset
+            );
+            self.offset = len;
+            let mut state = read_state(root);
+            state.signal_offset = self.offset;
+            record_io_failure(&mut state, "signal.jsonl (truncated)");
+            if let Err(e) = write_state(root, &state) {
+                eprintln!("agentrec: warning: failed to persist signal offset: {e}");
+            }
             return vec![];
         }
-        let fresh = &text[self.offset as usize..];
+        if len == self.offset {
+            return vec![];
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return vec![];
+        }
+        let mut fresh = Vec::new();
+        if file.read_to_end(&mut fresh).is_err() {
+            return vec![];
+        }
         // Only consume up to the last complete line.
         let Some(nl) = fresh.iter().rposition(|b| *b == b'\n') else {
             return vec![]; // no complete line yet
@@ -560,7 +743,9 @@ impl SignalTailer {
         self.offset += (nl + 1) as u64;
         let mut state = read_state(root);
         state.signal_offset = self.offset;
-        write_state(root, &state);
+        if let Err(e) = write_state(root, &state) {
+            eprintln!("agentrec: warning: failed to persist signal offset: {e}");
+        }
         events
     }
 }
@@ -787,6 +972,26 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         _ => ("bare", false), // unattributed window → honest bare
     };
 
+    let ended_ms = journal.last_change_wall_ms.max(journal.opened_wall_ms);
+    let started = rfc3339(journal.opened_wall_ms);
+    let ended = rfc3339(ended_ms);
+
+    // D8: a kill-9 landing between this function's own `append_log` and its
+    // `remove_file(&path)` a few lines down (or the equivalent window in the
+    // steady-state journal-close path) leaves the journal on disk describing
+    // a turn that's ALREADY in log.jsonl. Recovering it again on the next
+    // startup would double-log the same turn. Idempotent by construction:
+    // before appending, check whether the tail of the log already has a turn
+    // for this root with this exact start/end and file set — if so, this is
+    // a replay of a recovery that already landed; just clean up the journal.
+    if already_logged(root, &journal.root, &started, &ended, &journal.files) {
+        let _ = std::fs::remove_file(&path);
+        eprintln!(
+            "agentrec: crash journal matches an already-logged turn — skipping duplicate recovery"
+        );
+        return Ok(());
+    }
+
     // A bare recovery carries no attribution; a rich one keeps tool + prompt.
     let (tool, session, prompt_ref, prompt_excerpt) = if grade == "bare" {
         (None, None, None, None)
@@ -807,14 +1012,13 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         )
     };
 
-    let ended = journal.last_change_wall_ms.max(journal.opened_wall_ms);
     let record = TurnRecord {
         v: 1,
         id: turn_id(),
         grade: grade.to_string(),
         truncated,
-        started: rfc3339(journal.opened_wall_ms),
-        ended: rfc3339(ended),
+        started,
+        ended,
         tool,
         model: None,
         session,
@@ -833,6 +1037,41 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// D8: does the log tail already contain a turn matching this journal's
+/// root + both wall-clock endpoints + exact file set? Bounded to the most
+/// recent 50 records — a duplicate-recovery replay is always near the tail
+/// (it can only happen across back-to-back crashes), so there's no reason to
+/// scan the whole history.
+fn already_logged(
+    root: &Path,
+    journal_root: &str,
+    started: &str,
+    ended: &str,
+    files: &[FileEntry],
+) -> bool {
+    let records = agentrec_core::record::load_log(&log_path(root));
+    records.iter().rev().take(50).any(|r| match r {
+        LogRecord::Turn(t) => {
+            t.root == journal_root
+                && t.started == started
+                && t.ended == ended
+                && files_match(&t.files, files)
+        }
+        LogRecord::Epoch(_) => false,
+    })
+}
+
+/// Same set of paths, order-independent (the journal's file order need not
+/// match the logged turn's).
+fn files_match(a: &[FileEntry], b: &[FileEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let set_a: HashSet<&str> = a.iter().map(|f| f.path.as_str()).collect();
+    let set_b: HashSet<&str> = b.iter().map(|f| f.path.as_str()).collect();
+    set_a == set_b
+}
+
 fn append_epoch(root: &Path, event: &str, wall_ms: u64) -> Result<(), String> {
     append_log(
         &log_path(root),
@@ -846,43 +1085,106 @@ fn append_epoch(root: &Path, event: &str, wall_ms: u64) -> Result<(), String> {
 
 // ---- lock -------------------------------------------------------------------
 
-/// Acquire the per-root recorder lock (AC B1). A live PID blocks with exit 1;
-/// a stale PID (dead process) is broken with a logged notice.
-fn acquire_lock(root: &Path) -> Result<(), String> {
-    let mut state = read_state(root);
-    if state.pid != 0 && pid_alive(state.pid) {
+/// Per-root advisory lock file (D2): `flock(LOCK_EX | LOCK_NB)` on this path
+/// is the actual mutual-exclusion mechanism, replacing the old
+/// check-state-then-write-state pid dance — which raced two daemons starting
+/// concurrently (both could observe "no live pid" before either wrote its
+/// own) and, separately, treated a *recycled* pid (a new, unrelated process
+/// that happened to reuse a dead daemon's pid) as "still alive". The OS
+/// arbitrates `flock` atomically; there is no window for two winners.
+fn lock_path(root: &Path) -> PathBuf {
+    crate::agentrec_dir(root).join("daemon.lock")
+}
+
+/// Acquire the per-root recorder lock (AC B1, hardened D2). Returns the open
+/// `File` — the caller MUST bind it to a named local held for the daemon's
+/// entire lifetime (`let _lock = acquire_lock(...)?;`); dropping it early
+/// closes the fd and releases the flock immediately. `state.json`'s `pid`
+/// field is still set here, but purely for the refusal message and `status`
+/// display — it is never consulted to decide whether the lock is held.
+fn acquire_lock(root: &Path) -> Result<std::fs::File, String> {
+    let path = lock_path(root);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        // Never truncate: this file's only role is to be `flock`'d — clearing
+        // its (currently unused) content on every open has no benefit and
+        // needlessly risks racing a concurrent reader of it.
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open lock file {}: {e}", path.display()))?;
+    agentrec_core::perms::lock_file(&path);
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let pid = read_state(root).pid;
+        let who = if pid != 0 {
+            format!(" (pid {pid})")
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "already recording {} (pid {}) — stop it first",
-            root.display(),
-            state.pid
+            "already recording {}{who} — stop it first",
+            root.display()
         ));
     }
-    if state.pid != 0 {
-        eprintln!("agentrec: breaking stale lock (pid {} is gone)", state.pid);
-    }
+    let mut state = read_state(root);
     state.pid = std::process::id();
-    write_state(root, &state);
-    Ok(())
+    // D2: persistence failure here is fatal — an "acquired" lock the daemon
+    // can't record its own pid into would still function (the flock IS the
+    // gate), but silently leaving a stale/wrong pid on disk would mislead
+    // every later refusal message and `doctor`/`status` display.
+    write_state(root, &state)
+        .map_err(|e| format!("acquired recorder lock but failed to write state.json: {e}"))?;
+    Ok(file)
 }
 
 fn release_lock(root: &Path) {
     let mut state = read_state(root);
     if state.pid == std::process::id() {
         state.pid = 0;
-        write_state(root, &state);
+        if let Err(e) = write_state(root, &state) {
+            eprintln!("agentrec: warning: failed to clear pid in state.json: {e}");
+        }
     }
+    // The flock itself releases when `_lock`'s `File` drops at the end of
+    // `run()` (fd close) — nothing to do here for the actual mutex.
 }
 
-/// `kill(pid, 0)`: true if the process exists (or we lack permission to signal
-/// it — still "alive" for lock purposes).
-pub(crate) fn pid_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+/// Non-blocking liveness probe (D2) for `doctor`: if we can acquire the lock
+/// ourselves, nothing else holds it, so no daemon is recording. Used instead
+/// of the old pid-liveness check, which false-passed when a *different*,
+/// unrelated process recycled a dead daemon's pid. Fails safe in every
+/// can't-determine case (missing/unopenable lock file, syscall error) by
+/// reporting "not running" — a false healthy pass is the direction that
+/// actually hides a problem from the user; a false failure is merely
+/// annoying.
+pub(crate) fn daemon_is_running(root: &Path) -> bool {
+    let path = lock_path(root);
+    // No `.create(true)`: a lock file that was never written means the
+    // daemon has never run here — nothing to probe, and `doctor` must not
+    // mutate disk as a side effect of a liveness check.
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+        return false;
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // We just took the lock ourselves — release it immediately; we're
+        // only probing, not claiming it.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else {
+        true
+    }
 }
 
 fn watch_error(e: &notify::Error) -> String {
     let msg = e.to_string();
-    if msg.contains("inotify") || msg.contains("watch") && msg.contains("limit") {
+    // D10: was `a || b && c`, which — `&&` binding tighter than `||` — parses
+    // as `a || (b && c)`: any message merely mentioning "inotify" (with no
+    // "limit" in sight, e.g. a permission error) wrongly got the raise-the-
+    // limit remedy. Intent is `(a || b) && c`: only messages that actually
+    // mention a limit get that specific remedy.
+    if (msg.contains("inotify") || msg.contains("watch")) && msg.contains("limit") {
         return format!(
             "watch failed ({msg}) — raise the inotify limit: \
              sudo sysctl fs.inotify.max_user_watches=524288"
@@ -1015,5 +1317,451 @@ mod tests {
         let entry = rec.resolve(&change("c.rs", None, true, false));
         assert_eq!(entry.op, "create");
         assert_eq!(entry.after.as_deref(), Some("sha256:new"));
+    }
+
+    // ---- D2: flock-based lock -----------------------------------------------
+
+    #[test]
+    fn acquire_lock_refuses_a_second_holder_via_flock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let _first = acquire_lock(root).expect("first acquire succeeds");
+        let second = acquire_lock(root);
+        assert!(
+            second.is_err(),
+            "a second acquire must be refused while the first holds the lock"
+        );
+        assert!(second.unwrap_err().contains("already recording"));
+    }
+
+    #[test]
+    fn acquire_lock_succeeds_again_after_the_first_holder_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        {
+            let _first = acquire_lock(root).expect("first acquire succeeds");
+        } // `_first` drops here — the flock is released with the fd close.
+        let second = acquire_lock(root);
+        assert!(
+            second.is_ok(),
+            "a fresh acquire after the holder released must succeed"
+        );
+    }
+
+    #[test]
+    fn daemon_is_running_false_when_lock_never_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        assert!(!daemon_is_running(root));
+    }
+
+    #[test]
+    fn daemon_is_running_true_while_held_false_after_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let held = acquire_lock(root).unwrap();
+        assert!(
+            daemon_is_running(root),
+            "lock is held — must report running"
+        );
+        drop(held);
+        assert!(
+            !daemon_is_running(root),
+            "lock released — must report not running"
+        );
+    }
+
+    // D2/D6: the old check was `state.pid != 0 && pid_alive(state.pid)` — a
+    // *recycled* pid (an unrelated, live process that happens to reuse a dead
+    // daemon's pid number) would false-pass. The flock probe must not be
+    // fooled by a live-but-unrelated pid sitting in state.json.
+    #[test]
+    fn daemon_is_running_false_despite_a_live_recycled_pid_in_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let mut state = read_state(root);
+        state.pid = std::process::id(); // this test process is definitely alive
+        write_state(root, &state).unwrap();
+
+        assert!(
+            !daemon_is_running(root),
+            "a live-but-unrelated pid in state.json must not fake liveness"
+        );
+    }
+
+    // ---- D4: wall-clock re-anchor on drift -----------------------------------
+
+    #[test]
+    fn reanchor_corrects_large_stale_offset() {
+        // Simulate a Clock whose offset is wildly stale (as if the process had
+        // slept for years) — `reanchor` must snap it back close to real wall
+        // time instead of leaving every subsequent record misdated.
+        let mut clock = Clock {
+            start_mono: Instant::now(),
+            start_wall_ms: 1_000, // ~1970, absurdly far in the past
+            max_wall_ms: Cell::new(1_000),
+        };
+        let before = clock.wall_ms(0);
+        clock.reanchor();
+        let after = clock.wall_ms(0);
+        assert!(
+            after > before + 1_000,
+            "reanchor should have corrected a multi-decade drift: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn wall_ms_never_regresses_even_after_a_backward_correction() {
+        let mut clock = Clock::start();
+        let high = clock.wall_ms(10_000);
+        // Simulate a backward-jumped reanchor (e.g. NTP correction) by
+        // directly rewinding the offset, as `reanchor` itself would on a
+        // backward system-clock jump.
+        clock.start_wall_ms = clock.start_wall_ms.saturating_sub(50_000);
+        let low = clock.wall_ms(10_000);
+        assert_eq!(
+            low, high,
+            "a derived wall time must never regress below one already handed out"
+        );
+    }
+
+    // ---- D10: watch_error precedence -----------------------------------------
+
+    #[test]
+    fn watch_error_requires_limit_keyword_not_just_inotify_mention() {
+        let e = notify::Error::generic("inotify_add_watch failed: Permission denied");
+        let msg = watch_error(&e);
+        assert!(
+            !msg.contains("raise the inotify limit"),
+            "message has no 'limit' — must not claim a limit fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn watch_error_flags_true_limit_exhaustion() {
+        let e = notify::Error::generic("inotify_add_watch failed: limit reached");
+        let msg = watch_error(&e);
+        assert!(
+            msg.contains("raise the inotify limit"),
+            "message mentions both inotify and limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn watch_error_flags_watch_plus_limit_without_inotify_word() {
+        let e = notify::Error::generic("could not add watch: limit exceeded");
+        let msg = watch_error(&e);
+        assert!(msg.contains("raise the inotify limit"), "message: {msg}");
+    }
+
+    // ---- D3: watcher errors feed the persisted DEGRADED counter -------------
+
+    #[test]
+    fn record_watch_error_bumps_the_persisted_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let before = read_state(root).snapshot_failures;
+        record_watch_error(root, "inotify queue overflow");
+        let after = read_state(root);
+        assert_eq!(after.snapshot_failures, before + 1);
+        assert!(after.io_failed.iter().any(|p| p == "<watcher>"));
+    }
+
+    // ---- D7: seek-based signal tail + truncation recovery --------------------
+
+    #[test]
+    fn signal_tailer_consumes_appended_signals_via_seek() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(signal_path(root), b"").unwrap();
+
+        let mut tailer = SignalTailer::open(root).unwrap();
+        assert_eq!(tailer.offset, 0);
+
+        std::fs::write(
+            signal_path(root),
+            b"{\"v\":1,\"ts\":1,\"tool\":\"claude\",\"event\":\"start\"}\n",
+        )
+        .unwrap();
+        let events = tailer.poll(root);
+        assert_eq!(events.len(), 1);
+        assert!(tailer.offset > 0);
+    }
+
+    // D7: external truncation must never replay from offset 0 (that would
+    // double-log already-applied signals) — it resyncs to the new EOF,
+    // warns loudly, and bumps the I/O-failure counter so
+    // `doctor`/`status` surface it.
+    #[test]
+    fn signal_tailer_recovers_from_external_truncation_without_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(signal_path(root), b"012345678901234567890").unwrap(); // 21 bytes
+
+        let mut tailer = SignalTailer { offset: 21 };
+        std::fs::write(signal_path(root), b"tiny\n").unwrap(); // 5 bytes — truncated
+
+        let events = tailer.poll(root);
+        assert!(
+            events.is_empty(),
+            "the truncation batch itself yields no events"
+        );
+        assert_eq!(tailer.offset, 5, "offset resets to the new EOF, never to 0");
+        assert!(
+            read_state(root).snapshot_failures >= 1,
+            "truncation must bump the I/O-failure counter"
+        );
+
+        // A signal appended after the truncation is consumed cleanly from the
+        // reset offset — recovery, not just detection.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(signal_path(root))
+            .unwrap();
+        writeln!(
+            f,
+            "{{\"v\":1,\"ts\":2,\"tool\":\"claude\",\"event\":\"start\"}}"
+        )
+        .unwrap();
+        let events2 = tailer.poll(root);
+        assert_eq!(events2.len(), 1);
+    }
+
+    // ---- D9: event-channel draining + walk exclusion -------------------------
+
+    #[test]
+    fn drain_watch_events_applies_every_queued_message_in_one_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+
+        let p1 = root.join("a.rs");
+        let p2 = root.join("b.rs");
+        let p3 = root.join("c.rs");
+        tx.send(Ok(notify::Event::default().add_path(p1.clone())))
+            .unwrap();
+        tx.send(Ok(notify::Event::default().add_path(p2.clone())))
+            .unwrap();
+        tx.send(Ok(notify::Event::default().add_path(p3.clone())))
+            .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let disconnected = drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+        );
+
+        assert!(!disconnected);
+        assert_eq!(
+            pending.len(),
+            3,
+            "one call must drain every already-queued event, not just the first"
+        );
+        assert!(pending.contains(&p1));
+        assert!(pending.contains(&p2));
+        assert!(pending.contains(&p3));
+    }
+
+    #[test]
+    fn drain_watch_events_reports_disconnected_when_sender_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        drop(tx);
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let disconnected = drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+        );
+        assert!(disconnected);
+    }
+
+    #[test]
+    fn recorder_scan_excludes_git_and_agentrec_subtrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/objects/ab")).unwrap();
+        std::fs::write(root.join(".git/objects/ab/deadbeef"), b"x").unwrap();
+        std::fs::create_dir_all(root.join(".agentrec/objects/cd")).unwrap();
+        std::fs::write(root.join(".agentrec/objects/cd/feedface"), b"x").unwrap();
+        std::fs::write(root.join("real.rs"), b"fn main(){}").unwrap();
+
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let recorder = Recorder::scan(root, store);
+        assert!(recorder.known.contains(Path::new("real.rs")));
+        assert!(
+            !recorder.known.iter().any(|p| p.starts_with(".git")),
+            "known set: {:?}",
+            recorder.known
+        );
+        assert!(
+            !recorder.known.iter().any(|p| p.starts_with(".agentrec")),
+            "known set: {:?}",
+            recorder.known
+        );
+    }
+
+    #[test]
+    fn ignoreset_build_does_not_descend_into_git_or_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // A `.gitignore` buried inside `.git`/`.agentrec` must never be
+        // collected as a real ignore rule for the repo.
+        std::fs::write(root.join(".git/.gitignore"), "*.rs\n").unwrap();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(root.join(".agentrec/.gitignore"), "*.rs\n").unwrap();
+
+        let set = IgnoreSet::build(root);
+        assert!(
+            !set.is_ignored(&root.join("real.rs"), false),
+            "a buried .gitignore under .git/.agentrec must not leak into real rules"
+        );
+    }
+
+    // ---- D8: idempotent orphan recovery ---------------------------------------
+
+    // A kill-9 landing between `append_log` and the journal's `remove_file`
+    // leaves the journal describing a turn that's already logged. Recovering
+    // it again on the next startup must not double-log it.
+    #[test]
+    fn recover_orphan_skips_duplicate_when_already_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let files = vec![FileEntry {
+            path: "a.rs".into(),
+            before: None,
+            after: Some("sha256:aaa".into()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }];
+
+        let existing = TurnRecord {
+            v: 1,
+            id: turn_id(),
+            grade: "bare".to_string(),
+            truncated: false,
+            started: rfc3339(1_000),
+            ended: rfc3339(2_000),
+            tool: None,
+            model: None,
+            session: None,
+            root: root.to_string_lossy().to_string(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            files: files.clone(),
+        };
+        append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
+
+        // A journal describing the SAME turn, as if a prior recovery already
+        // appended it and crashed before removing the journal file.
+        let journal = OrphanJournal {
+            source: "quiet".to_string(),
+            tool: None,
+            prompt: None,
+            session: None,
+            opened_wall_ms: 1_000,
+            last_change_wall_ms: 2_000,
+            root: root.to_string_lossy().to_string(),
+            files,
+        };
+        std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
+
+        recover_orphan(root).unwrap();
+
+        let turns: Vec<_> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter(|r| matches!(r, LogRecord::Turn(_)))
+            .collect();
+        assert_eq!(
+            turns.len(),
+            1,
+            "must not double-log the same recovered turn"
+        );
+        assert!(
+            !open_path(root).exists(),
+            "the stale journal is still cleaned up on the duplicate path"
+        );
+    }
+
+    // A genuinely new orphaned turn (different times/files than anything
+    // logged) must still be recovered normally — the idempotency check must
+    // not swallow real recoveries.
+    #[test]
+    fn recover_orphan_still_recovers_a_genuinely_new_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let journal = OrphanJournal {
+            source: "quiet".to_string(),
+            tool: None,
+            prompt: None,
+            session: None,
+            opened_wall_ms: 5_000,
+            last_change_wall_ms: 6_000,
+            root: root.to_string_lossy().to_string(),
+            files: vec![FileEntry {
+                path: "b.rs".into(),
+                before: None,
+                after: Some("sha256:bbb".into()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+            }],
+        };
+        std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
+
+        recover_orphan(root).unwrap();
+
+        let turns: Vec<_> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter(|r| matches!(r, LogRecord::Turn(_)))
+            .collect();
+        assert_eq!(
+            turns.len(),
+            1,
+            "a genuinely new orphan must still be recovered"
+        );
+        assert!(!open_path(root).exists());
     }
 }

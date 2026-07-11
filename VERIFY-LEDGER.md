@@ -11,6 +11,7 @@ allowing a "M3 shipped" claim. Each names the exact command/environment that clo
 | AC | Gate | Closes when |
 |---|---|---|
 | H++ / D36 | 7-consecutive-green-nights torture run is a **launch gate**. Harness built + one local ≥1000-op run proven here; the multi-night streak cannot be produced tonight. | Nightly CI runs the harness 7 nights with 0 invariant violations. |
+| D11 (service reload on re-init) | `service.rs`'s `install`/`uninstall`/`load`/`unload` shell out to real `launchctl`/`systemctl` and are, by this file's own long-standing design (see its module doc comment), deliberately never invoked from the automated suite — only `--no-service` paths are. The fix (launchd: `unload` best-effort then `load -w`; systemd: `daemon-reload` before `enable --now`) is implemented and reads correctly, but "re-`init` on an already-loaded service actually restarts it with the new unit content" needs a real macOS box with a previously-loaded `com.agentrec.<slug>` label, and a real Linux box with a previously-loaded `agentrec-<slug>.service`, to prove `launchctl load` no longer silently no-ops and `systemctl` actually re-reads the rewritten unit. | A manual run on both a macOS box and a Linux box: `agentrec init` twice in a row against a real (non-`--no-service`) repo, second run — confirm via `launchctl list \| grep com.agentrec` / `systemctl --user status agentrec-<slug>` that the service is loaded and its `ExecStart` matches the freshly written unit content. |
 
 ## Closed here
 

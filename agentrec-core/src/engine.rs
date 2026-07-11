@@ -6,6 +6,7 @@
 
 use crate::{FOLD_WINDOW_MS, GIT_SETTLE_MS, MAX_BRACKET_MS, QUIET_MS};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// One observed file change, fingerprinted by the scanner (hashes, not bytes).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +76,13 @@ pub struct TurnEngine {
     /// Bare turns closed since the last rich close, eligible for folding.
     recent_bare: Vec<ClosedTurn>,
     last_rich_closed_at: u64,
+    /// Turns closed out-of-band from the normal `tick`/`observe_*` return
+    /// path (currently only C2's git-transition close of a long-open Quiet
+    /// turn). Drained by the very next `tick` call, which every caller
+    /// already persists — this keeps every close returned through the one
+    /// path callers already handle, instead of adding a second one they'd
+    /// have to remember to wire up.
+    pending_closed: Vec<ClosedTurn>,
     id_gen: fn() -> String,
 }
 
@@ -92,6 +100,7 @@ impl TurnEngine {
             git_window_until: 0,
             recent_bare: vec![],
             last_rich_closed_at: 0,
+            pending_closed: vec![],
             id_gen: crate::id::turn_id,
         }
     }
@@ -149,24 +158,53 @@ impl TurnEngine {
         }
         let open = self.open.as_mut().expect("just ensured");
         for change in changes {
-            if open.files.iter().any(|f| f.path == change.path) {
-                continue; // before captured once per turn
+            match open.files.iter_mut().find(|f| f.path == change.path) {
+                None => open.files.push(change.clone()),
+                Some(existing) => {
+                    // `before_hash`/`baseline_unknown` describe the turn's
+                    // true original state — captured once, from the first
+                    // observation (C4). Every other field is terminal state
+                    // (does the file exist now? was content captured?) and
+                    // must track the LATEST observation, or a
+                    // delete-then-recreate freezes `deleted:true` on a file
+                    // that exists again (and modify-then-delete freezes
+                    // `deleted:false` on a file that's gone).
+                    existing.deleted = change.deleted;
+                    existing.snapshotted = change.snapshotted;
+                    existing.withheld = change.withheld;
+                }
             }
-            open.files.push(change.clone());
         }
     }
 
     /// A `.git/HEAD`/index/ref transition at `now`: classify surrounding
     /// activity as a git operation, not agent/unknown work. A bracket in
     /// progress is left alone — an agent running git is agent work.
+    ///
+    /// A long-running open Quiet turn (continuous human saves keep the quiet
+    /// window from ever elapsing, C2) is NOT converted wholesale into a git
+    /// turn — that would fabricate attribution in the other direction (a
+    /// 400-file checkout logged as a human bare turn, or a genuinely
+    /// long-running human turn logged as `tool:"git"`). Instead it closes as
+    /// bare at its last real mutation, and the git burst that follows opens
+    /// its own fresh `tool:"git"` turn via the usual git-window check. The
+    /// closed bare turn is queued in `pending_closed` and surfaces through
+    /// the very next `tick` call rather than this function's own return
+    /// value — every caller already persists whatever `tick` returns, so
+    /// this can't be forgotten the way a new return value could be.
     pub fn observe_git_change(&mut self, now: u64) {
         self.git_window_until = now + GIT_SETTLE_MS;
-        if let Some(open) = self.open.as_mut() {
-            if open.source == Source::Quiet
-                && now.saturating_sub(open.opened_at) <= GIT_SETTLE_MS + QUIET_MS
-            {
+        if matches!(&self.open, Some(o) if o.source == Source::Quiet) {
+            let mut open = self.open.take().expect("checked above");
+            if now.saturating_sub(open.opened_at) <= GIT_SETTLE_MS + QUIET_MS {
                 open.source = Source::Git;
                 open.tool = Some("git".to_string());
+                self.open = Some(open);
+            } else {
+                let close_at = self.last_change_at.unwrap_or(open.opened_at);
+                let turn = self.finish(open, close_at, "quiet", "bare", false);
+                self.recent_bare.push(turn.clone());
+                self.pending_closed.push(turn);
             }
         }
     }
@@ -273,12 +311,15 @@ impl TurnEngine {
 
     /// Clock tick: quiet-window close for unattributed turns, settle close for
     /// git turns, crash-rule timeout for brackets. Brackets are never closed
-    /// by the quiet window (PROTOCOL §4 suppression).
+    /// by the quiet window (PROTOCOL §4 suppression). Also drains any turn
+    /// closed out-of-band since the last tick (C2's git-transition close),
+    /// so callers persist it through the same path as everything else.
     pub fn tick(&mut self, now: u64) -> Vec<ClosedTurn> {
         self.recent_bare
             .retain(|t| now.saturating_sub(t.closed_at) <= FOLD_WINDOW_MS);
+        let mut out: Vec<ClosedTurn> = std::mem::take(&mut self.pending_closed);
         let Some(open) = self.open.as_ref() else {
-            return vec![];
+            return out;
         };
         let last_change = self.last_change_at.unwrap_or(open.opened_at);
         let close = match open.source {
@@ -287,7 +328,7 @@ impl TurnEngine {
             Source::Bracket => now.saturating_sub(open.opened_at) > MAX_BRACKET_MS,
         };
         if !close {
-            return vec![];
+            return out;
         }
         let open = self.open.take().expect("checked above");
         let turn = match open.source {
@@ -297,9 +338,15 @@ impl TurnEngine {
                 turn
             }
             Source::Git => self.finish(open, now, "git", "rich", false),
-            Source::Bracket => self.finish(open, now, "timeout", "rich", true),
+            // C5: close at the last real mutation, not the tick's `now` — a
+            // crash-rule timeout fires long after the bracket went quiet
+            // (MAX_BRACKET_MS+), and using `now` here would glue that entire
+            // dead gap onto the turn's displayed span. `truncated: true`
+            // already marks this as a synthetic, not-a-real-stop close.
+            Source::Bracket => self.finish(open, last_change, "timeout", "rich", true),
         };
-        vec![turn]
+        out.push(turn);
+        out
     }
 
     /// Force-close the open turn at `now`, regardless of source — used on clean
@@ -320,19 +367,45 @@ impl TurnEngine {
 
     fn fold_recent_bares(&mut self, turn: &mut ClosedTurn) {
         let cutoff = turn.closed_at.saturating_sub(FOLD_WINDOW_MS);
-        let eligible: Vec<ClosedTurn> = self
+        let opened_at = turn.opened_at;
+        // A bracket's `opened_at` comes from a real start signal, so activity
+        // that closed bare BEFORE it is provably pre-agent and must never be
+        // folded in (C1) — otherwise a pre-bracket human save gets fabricated
+        // attribution and undo would revert the human's file. Stop-only turns
+        // have no such boundary (their `opened_at` is just where the
+        // fragment chain happened to break), so every bare within the fold
+        // window stays eligible there, matching the retroactive-merge design.
+        let is_bracket = turn.boundary == "bracket";
+        let mut eligible: Vec<ClosedTurn> = self
             .recent_bare
             .drain(..)
-            .filter(|b| b.closed_at >= cutoff && b.closed_at >= self.last_rich_closed_at)
+            .filter(|b| {
+                b.closed_at >= cutoff
+                    && b.closed_at >= self.last_rich_closed_at
+                    && (!is_bracket || b.closed_at >= opened_at)
+            })
             .collect();
+        // Fold oldest fragment first: for a path touched by more than one
+        // fragment, the earliest fragment's before_hash is the true original
+        // (C3) — a later occurrence of the same path (a later bare, or the
+        // rich turn's own already-populated entry) must never clobber it.
+        eligible.sort_by_key(|b| b.opened_at);
+        let mut before_claimed: HashSet<String> = HashSet::new();
         for bare in eligible {
             turn.merges.push(bare.id.clone());
             if bare.opened_at < turn.opened_at {
                 turn.opened_at = bare.opened_at;
             }
             for file in bare.files {
-                if !turn.files.iter().any(|f| f.path == file.path) {
-                    turn.files.push(file);
+                if !before_claimed.insert(file.path.clone()) {
+                    continue; // an earlier fragment already fixed this before
+                }
+                match turn.files.iter_mut().find(|f| f.path == file.path) {
+                    None => turn.files.push(file),
+                    Some(existing) => {
+                        existing.before_hash = file.before_hash;
+                        existing.baseline_unknown = file.baseline_unknown;
+                    }
                 }
             }
         }
@@ -576,5 +649,203 @@ mod tests {
         let closed = e.observe_stop(much_later, "codex", None, None);
         assert!(closed[0].merges.is_empty());
         assert!(closed[0].files.is_empty());
+    }
+
+    // C1: a bare turn that closed BEFORE a bracket ever opened is provably
+    // pre-agent activity (the bracket's `opened_at` comes from a real start
+    // signal) and must never fold into the bracket's rich turn.
+    #[test]
+    fn fold_excludes_bare_closed_before_bracket_opened() {
+        let mut e = TurnEngine::new();
+        // human vim save at t=10s, closes bare via quiet window at t=21s
+        e.observe_changes(10_000, &[obs("human-notes.md")]);
+        let bare = e.tick(21_000);
+        assert_eq!(bare[0].grade, "bare");
+        // agent bracket starts well after the bare closed
+        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None);
+        e.observe_changes(70_000, &[obs("b.rs")]);
+        let closed = e.observe_stop(120_000, "claude-code", None, None);
+        let t = &closed[0];
+        assert!(t.merges.is_empty());
+        assert_eq!(
+            t.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["b.rs"]
+        );
+        assert_eq!(t.opened_at, 60_000); // not pulled earlier by the pre-bracket bare
+    }
+
+    // C1: a bare fragment that closed INSIDE the bracket's own span (e.g. a
+    // daemon-restart artifact recovered mid-bracket) still folds in.
+    #[test]
+    fn fold_includes_bare_closed_inside_bracket_span() {
+        let mut e = TurnEngine::new();
+        // bare closes at t=75_000 — inside what becomes the bracket's
+        // [60_000, 80_000] span (simulating a restart-recovered fragment).
+        e.observe_changes(64_000, &[obs("interim.rs")]);
+        let bare = e.tick(75_000); // 75_000 - 64_000 = 11s > QUIET_MS
+        assert_eq!(bare[0].grade, "bare");
+        assert_eq!(bare[0].closed_at, 75_000);
+        let bare_id = bare[0].id.clone();
+        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None);
+        e.observe_changes(70_500, &[obs("b.rs")]);
+        let closed = e.observe_stop(80_000, "claude-code", None, None);
+        let t = &closed[0];
+        assert_eq!(t.merges, vec![bare_id]);
+        let mut paths: Vec<&str> = t.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["b.rs", "interim.rs"]);
+    }
+
+    // C2: a Quiet turn open well past the young-turn window must not absorb
+    // a subsequent git checkout burst — it closes bare at its last real
+    // mutation, and the burst opens its own fresh git turn.
+    #[test]
+    fn long_open_quiet_turn_closes_bare_before_git_burst() {
+        let mut e = TurnEngine::new();
+        // human editing continuously: saves every 5s keep the quiet turn open
+        for i in 0..7u64 {
+            e.observe_changes(i * 5_000, &[obs(&format!("edit{i}.md"))]);
+        }
+        // Closes the long-open quiet turn into the engine's internal pending
+        // queue — NOT returned directly (observe_git_change returns `()`),
+        // so it can only surface through the next `tick` call, same as
+        // every other close the daemon already knows to persist.
+        e.observe_git_change(31_000);
+
+        let burst: Vec<ChangeObs> = (0..400).map(|i| obs(&format!("src/f{i}.rs"))).collect();
+        e.observe_changes(31_500, &burst);
+        let closed = e.tick(31_500 + QUIET_MS + GIT_SETTLE_MS + 1);
+        // Both the pending pre-git bare AND the settled git turn surface
+        // from this single tick call.
+        assert_eq!(closed.len(), 2);
+        let bare = closed
+            .iter()
+            .find(|t| t.grade == "bare")
+            .expect("bare turn");
+        assert_eq!(bare.files.len(), 7);
+        assert_eq!(bare.closed_at, 30_000); // last real mutation, not 31_000
+        let git = closed
+            .iter()
+            .find(|t| t.tool.as_deref() == Some("git"))
+            .expect("git turn");
+        assert_eq!(git.grade, "rich");
+        assert_eq!(git.boundary, "git");
+        assert_eq!(git.files.len(), 400);
+    }
+
+    // C2: a pending git-transition close surfaces on the very next tick even
+    // when nothing else closes in that tick — the daemon calls tick() every
+    // loop iteration and persists whatever it returns, so this is the only
+    // guarantee the closed bare turn actually gets written.
+    #[test]
+    fn pending_git_close_surfaces_on_next_tick_even_when_nothing_else_closes() {
+        let mut e = TurnEngine::new();
+        for i in 0..7u64 {
+            e.observe_changes(i * 5_000, &[obs(&format!("edit{i}.md"))]);
+        }
+        e.observe_git_change(31_000);
+        let closed = e.tick(31_100); // far too soon for anything else to close
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].grade, "bare");
+        assert_eq!(closed[0].files.len(), 7);
+    }
+
+    // C2: a young open Quiet turn still converts in place (existing
+    // behavior preserved) — no bare turn is produced.
+    #[test]
+    fn young_open_quiet_turn_still_converts_to_git() {
+        let mut e = TurnEngine::new();
+        e.observe_changes(0, &[obs("x.rs")]);
+        e.observe_git_change(1_000);
+        let closed = e.tick(1_000 + GIT_SETTLE_MS + 1);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool.as_deref(), Some("git"));
+    }
+
+    // C3: a path touched by both an earlier bare fragment and the rich
+    // turn's own (later) capture keeps the fragment's earliest before_hash —
+    // the true original — not the later mid-turn state.
+    #[test]
+    fn fold_keeps_earliest_before_hash_for_shared_path() {
+        let mut e = TurnEngine::new();
+        // fragment 1: true original a.rs = v0, closes bare
+        e.observe_changes(
+            0,
+            &[ChangeObs {
+                before_hash: Some("sha256:v0".into()),
+                ..obs("a.rs")
+            }],
+        );
+        let bare = e.tick(11_000);
+        assert_eq!(bare[0].grade, "bare");
+        // fragment 2: agent re-edits a.rs; its own before is mid-turn state
+        e.observe_changes(
+            60_000,
+            &[ChangeObs {
+                before_hash: Some("sha256:v1".into()),
+                ..obs("a.rs")
+            }],
+        );
+        let closed = e.observe_stop(65_000, "codex", Some("refactor".into()), None);
+        let t = &closed[0];
+        assert_eq!(t.merges.len(), 1);
+        let before = t
+            .files
+            .iter()
+            .find(|f| f.path == "a.rs")
+            .unwrap()
+            .before_hash
+            .clone();
+        assert_eq!(before.as_deref(), Some("sha256:v0"));
+    }
+
+    // C4: a later observation's terminal flags (deleted/snapshotted/withheld)
+    // must win over an earlier one, while before_hash/baseline_unknown stay
+    // pinned to the first observation.
+    #[test]
+    fn dedup_updates_terminal_flags_from_latest_observation() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None);
+        let del = ChangeObs {
+            path: "a.rs".into(),
+            before_hash: Some("sha256:v0".into()),
+            snapshotted: true,
+            withheld: false,
+            baseline_unknown: false,
+            deleted: true,
+        };
+        e.observe_changes(1_000, &[del]);
+        let recreate = ChangeObs {
+            path: "a.rs".into(),
+            before_hash: Some("sha256:different".into()), // must be ignored
+            snapshotted: true,
+            withheld: false,
+            baseline_unknown: false,
+            deleted: false,
+        };
+        e.observe_changes(2_000, &[recreate]);
+        let closed = e.observe_stop(3_000, "claude-code", None, None);
+        let f = &closed[0].files[0];
+        assert!(!f.deleted); // latest observation wins
+        assert_eq!(f.before_hash.as_deref(), Some("sha256:v0")); // first observation wins
+    }
+
+    // C5: a bracket-timeout close lands at the last real mutation, not the
+    // tick's `now` — the crash rule fires MAX_BRACKET_MS+ after the bracket
+    // went quiet, and gluing that whole dead gap onto the turn would report
+    // hours of silence as agent activity.
+    #[test]
+    fn bracket_timeout_closes_at_last_mutation_not_tick_time() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", Some("long job".into()), None);
+        e.observe_changes(500, &[obs("a.rs")]); // last real mutation at t=500
+        assert!(e.tick(MAX_BRACKET_MS).is_empty());
+        let closed = e.tick(MAX_BRACKET_MS + 1);
+        assert_eq!(closed.len(), 1);
+        let t = &closed[0];
+        assert!(t.truncated);
+        assert_eq!(t.grade, "rich");
+        assert_eq!(t.boundary, "timeout");
+        assert_eq!(t.closed_at, 500);
     }
 }

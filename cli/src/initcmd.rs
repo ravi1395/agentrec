@@ -51,7 +51,11 @@ pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Resul
 
     changed = ensure_gitignore(root)? || changed;
 
-    apply_permissions(root)?;
+    // E9: a perms repair (e.g. a file drifted looser since the last init) is
+    // a real disk mutation and must flip `changed`, or the summary line
+    // below fabricates "nothing changed" while a chmod just ran.
+    let perms_changed = apply_permissions(root)?;
+    changed = changed || perms_changed;
     if cfg!(unix) {
         actions.push("set .agentrec/ to 0700 (files 0600)".to_string());
     }
@@ -129,21 +133,25 @@ fn current_exe() -> Result<std::path::PathBuf, String> {
 /// Lock down `.agentrec/` (D37): the dir and its subdirs to 0700, files
 /// (config.toml, signal.jsonl, log.jsonl, state.json, objects/*) to 0600.
 /// Applied after creation; only touches what already exists at init time.
+/// Returns whether any mode actually changed (E9) — a re-run that finds
+/// everything already locked down correctly must report no mutation, but a
+/// genuine repair (something drifted looser) must be counted as real work.
 #[cfg(unix)]
-fn apply_permissions(root: &Path) -> Result<(), String> {
+fn apply_permissions(root: &Path) -> Result<bool, String> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
     let dir_mode = Permissions::from_mode(0o700);
     let file_mode = Permissions::from_mode(0o600);
+    let mut changed = false;
 
     let dir = agentrec_dir(root);
-    fs::set_permissions(&dir, dir_mode.clone()).map_err(|e| e.to_string())?;
+    changed |= chmod_if_needed(&dir, &dir_mode)?;
 
     let obj_dir = objects_dir(root);
     if obj_dir.exists() {
-        fs::set_permissions(&obj_dir, dir_mode.clone()).map_err(|e| e.to_string())?;
-        chmod_tree(&obj_dir, &dir_mode, &file_mode)?;
+        changed |= chmod_if_needed(&obj_dir, &dir_mode)?;
+        changed |= chmod_tree(&obj_dir, &dir_mode, &file_mode)?;
     }
 
     for path in [
@@ -153,10 +161,23 @@ fn apply_permissions(root: &Path) -> Result<(), String> {
         state_path(root),
     ] {
         if path.exists() {
-            fs::set_permissions(&path, file_mode.clone()).map_err(|e| e.to_string())?;
+            changed |= chmod_if_needed(&path, &file_mode)?;
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// Sets `mode` on `path` only when its current mode differs — returns
+/// whether it actually changed anything.
+#[cfg(unix)]
+fn chmod_if_needed(path: &Path, mode: &std::fs::Permissions) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    if current.mode() & 0o777 == mode.mode() & 0o777 {
+        return Ok(false);
+    }
+    fs::set_permissions(path, mode.clone()).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -164,23 +185,24 @@ fn chmod_tree(
     dir: &Path,
     dir_mode: &std::fs::Permissions,
     file_mode: &std::fs::Permissions,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut changed = false;
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if path.is_dir() {
-            fs::set_permissions(&path, dir_mode.clone()).map_err(|e| e.to_string())?;
-            chmod_tree(&path, dir_mode, file_mode)?;
+            changed |= chmod_if_needed(&path, dir_mode)?;
+            changed |= chmod_tree(&path, dir_mode, file_mode)?;
         } else {
-            fs::set_permissions(&path, file_mode.clone()).map_err(|e| e.to_string())?;
+            changed |= chmod_if_needed(&path, file_mode)?;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(not(unix))]
-fn apply_permissions(_root: &Path) -> Result<(), String> {
-    Ok(())
+fn apply_permissions(_root: &Path) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Append `.agentrec/` to .gitignore when this is a git repo; idempotent.
@@ -219,7 +241,17 @@ fn install_claude_hooks(root: &Path) -> Result<bool, String> {
                 path.display()
             )
         })?,
-        Err(_) => serde_json::json!({}),
+        // E5: only a genuinely absent file means "nothing to merge with" —
+        // ANY other read error (permissions, invalid UTF-8, ...) must abort
+        // untouched with a clear message, never silently treated as an empty
+        // settings object (which would drop the user's live hooks on write).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
     };
     let mut settings = current.clone();
     let mut changed = false;
@@ -316,6 +348,34 @@ mod tests {
         assert!(merge_hook(serde_json::json!([]), "Stop").is_err());
         assert!(merge_hook(serde_json::json!({"hooks": []}), "Stop").is_err());
         assert!(merge_hook(serde_json::json!({"hooks": {"Stop": "x"}}), "Stop").is_err());
+    }
+
+    // E5: a settings.local.json that exists but fails to READ as UTF-8 text
+    // must abort `init` untouched (byte-identical) with a clear error — the
+    // old code treated ANY read error (not just NotFound) as "file absent",
+    // which would go on to write a fresh settings object and drop the
+    // user's live hooks.
+    #[test]
+    fn init_aborts_untouched_on_unreadable_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let settings_dir = root.join(".claude");
+        fs::create_dir_all(&settings_dir).unwrap();
+        let settings_path = settings_dir.join("settings.local.json");
+        // Invalid UTF-8 bytes — fs::read_to_string fails with InvalidData,
+        // not NotFound.
+        fs::write(&settings_path, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+        let before = fs::read(&settings_path).unwrap();
+
+        let err = run(root, false, true, false).unwrap_err();
+        assert!(
+            err.contains("settings.local.json"),
+            "error should name the file: {err}"
+        );
+
+        let after = fs::read(&settings_path).unwrap();
+        assert_eq!(before, after, "unreadable settings file must be untouched");
     }
 
     #[test]

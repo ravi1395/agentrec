@@ -1,9 +1,9 @@
 //! `agentrec doctor`: one-shot diagnosis of the whole recording chain (D41 /
 //! AC-Y++). A SETUP command alongside `init`/`uninstall`, not a query verb —
 //! it never mutates anything, only reads state and reports. Reuses the same
-//! liveness (`daemon::pid_alive`), hook-marker (`initcmd::event_has_marker`),
-//! and state (`state::read_state`) logic as `status`/`record`/`init` rather
-//! than re-deriving it.
+//! liveness (`daemon::daemon_is_running` — a non-blocking flock probe, D2),
+//! hook-marker (`initcmd::event_has_marker`), and state (`state::read_state`)
+//! logic as `status`/`record`/`init` rather than re-deriving it.
 
 use crate::state::read_state;
 use crate::{agentrec_dir, log_path, objects_dir, signal_path};
@@ -149,9 +149,12 @@ fn check_initialized(root: &Path) -> Check {
 // ---- daemon liveness --------------------------------------------------------
 
 fn check_daemon(root: &Path) -> Check {
-    let state = read_state(root);
-    let alive = state.pid != 0 && crate::daemon::pid_alive(state.pid);
-    if alive {
+    // D2: a pid-liveness check false-passes when an unrelated process
+    // recycles a dead daemon's pid (state.json still names it, `kill(pid,0)`
+    // succeeds against the new occupant). The flock probe asks the only
+    // question that actually matters — does something hold the recorder
+    // lock right now — so pid recycling can't fool it.
+    if crate::daemon::daemon_is_running(root) {
         Check::pass("daemon liveness")
     } else {
         Check::fail(
@@ -467,6 +470,30 @@ mod tests {
         let check = check_degraded(root);
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.remedy.unwrap().contains("2 snapshot"));
+    }
+
+    // D2/D6: `check_daemon` used to trust `state.pid` liveness alone, which
+    // false-passes when an unrelated live process recycles a dead daemon's
+    // pid. It's now a non-blocking flock probe on `.agentrec/daemon.lock` —
+    // a live pid sitting in state.json with no lock actually held must still
+    // fail. Calls `check_daemon` directly (not `diagnose`) so this doesn't
+    // also depend on `check_signal_freshness`'s real-`$HOME` transcript scan.
+    #[test]
+    fn check_daemon_fails_on_recycled_pid_with_no_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        std::fs::write(
+            crate::state_path(root),
+            format!(
+                r#"{{"pid":{},"signal_offset":0,"snapshot_failures":0,"io_failed":[]}}"#,
+                std::process::id() // this test process is definitely alive
+            ),
+        )
+        .unwrap();
+
+        let check = check_daemon(root);
+        assert_eq!(check.status, CheckStatus::Fail);
     }
 
     #[test]

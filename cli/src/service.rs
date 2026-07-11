@@ -34,6 +34,26 @@ pub fn slug(root: &Path) -> String {
     hex.chars().take(12).collect()
 }
 
+/// D5: XML-escape a value before it's interpolated into a `<string>…</string>`
+/// element. An unescaped `&`, `<`, `>`, `"`, or `'` in the repo path (an `&`
+/// is not exotic — plenty of real directory names have one) produces an
+/// invalid plist; `launchctl load` then fails with no useful diagnostic while
+/// `init` had already reported success.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// macOS launchd plist: runs `record --root <root>` at load and on crash.
 pub fn launchd_plist(exec: &Path, root: &Path) -> String {
     format!(
@@ -57,9 +77,38 @@ pub fn launchd_plist(exec: &Path, root: &Path) -> String {
 </dict>\n\
 </plist>\n",
         slug = slug(root),
-        exec = exec.display(),
-        root = root.display(),
+        exec = xml_escape(&exec.display().to_string()),
+        root = xml_escape(&root.display().to_string()),
     )
+}
+
+/// D5: quote+escape a value for embedding as one `ExecStart=` command-line
+/// token. Systemd's unit-file argument syntax (not a shell): a literal `%`
+/// always starts a specifier expansion (`%h`, `%n`, …) unless doubled, so an
+/// unescaped `%` in a path silently mangles it into something else entirely;
+/// a value containing whitespace splits into extra argv entries unless
+/// double-quoted, with embedded `"`/`\` backslash-escaped inside the quotes.
+/// Plain values (the overwhelmingly common case — no space/quote/backslash)
+/// are left byte-identical, only `%` doubled, so ordinary paths don't grow a
+/// cosmetic pair of quotes they never needed.
+fn systemd_escape(s: &str) -> String {
+    let percent_escaped = s.replace('%', "%%");
+    let needs_quoting = s
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\\'));
+    if !needs_quoting {
+        return percent_escaped;
+    }
+    let mut out = String::with_capacity(percent_escaped.len() + 2);
+    out.push('"');
+    for c in percent_escaped.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Linux systemd user unit: same exec; `Restart=always` mirrors `KeepAlive`.
@@ -69,13 +118,14 @@ pub fn systemd_unit(exec: &Path, root: &Path) -> String {
 Description=agentrec recorder for {root}\n\
 \n\
 [Service]\n\
-ExecStart={exec} record --root {root}\n\
+ExecStart={exec} record --root {root_q}\n\
 Restart=always\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        exec = exec.display(),
         root = root.display(),
+        exec = systemd_escape(&exec.display().to_string()),
+        root_q = systemd_escape(&root.display().to_string()),
     )
 }
 
@@ -170,13 +220,27 @@ pub fn uninstall(root: &Path) -> Vec<String> {
     actions
 }
 
+/// D11: re-`init` on an already-loaded service previously failed silently —
+/// `launchctl load` on a label that's already loaded refuses (needs an
+/// explicit `unload` first), and a rewritten unit file on Linux was never
+/// picked up because nothing told systemd to re-read it off disk. Both
+/// failures were swallowed by `load`'s existing "could not auto-load, run
+/// manually" fallback, so `init` still reported success while the OLD unit
+/// content kept running.
 fn load(path: &Path) -> Result<(), ()> {
     let status = if cfg!(target_os = "macos") {
+        // Best-effort: fails harmlessly if nothing was loaded yet.
+        let _ = Command::new("launchctl").arg("unload").arg(path).status();
         Command::new("launchctl")
             .args(["load", "-w"])
             .arg(path)
             .status()
     } else {
+        // Best-effort: makes systemd re-read the unit file we may have just
+        // rewritten, before `enable --now` acts on it.
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
         Command::new("systemctl")
             .args(["--user", "enable", "--now"])
             .arg(path)
@@ -271,6 +335,107 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/agentrec record --root /repo"));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("[Install]"));
+    }
+
+    // D5: a root containing a space must not split into extra ExecStart argv
+    // entries — the whole value is double-quoted.
+    #[test]
+    fn systemd_unit_quotes_a_root_containing_a_space() {
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo with space"),
+        );
+        assert!(
+            unit.contains(r#"ExecStart=/usr/local/bin/agentrec record --root "/repo with space""#),
+            "unit: {unit}"
+        );
+    }
+
+    // D5: `%` starts a systemd specifier expansion (`%h`, `%n`, …) unless
+    // doubled — an unescaped `%` in a path would silently mangle it.
+    #[test]
+    fn systemd_unit_doubles_a_literal_percent() {
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo/100%done"),
+        );
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/agentrec record --root /repo/100%%done"),
+            "unit: {unit}"
+        );
+    }
+
+    // D5: `&` has no special meaning in systemd unit-file argument syntax
+    // (it is not passed through a shell) — it must survive unquoted and
+    // unescaped, unlike the launchd XML case below. No whitespace here
+    // deliberately, to isolate `&` handling from the separate quote-on-space
+    // rule proven by `systemd_unit_quotes_a_root_containing_a_space`.
+    #[test]
+    fn systemd_unit_leaves_ampersand_untouched() {
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo/AT&T"),
+        );
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/agentrec record --root /repo/AT&T"),
+            "unit: {unit}"
+        );
+    }
+
+    // D5: an embedded quote/backslash inside a space-triggered quoted value
+    // must itself be backslash-escaped, or the generated unit is unparsable.
+    #[test]
+    fn systemd_unit_escapes_embedded_quote_when_quoting() {
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo \"weird\" dir"),
+        );
+        assert!(unit.contains(r#""/repo \"weird\" dir""#), "unit: {unit}");
+    }
+
+    // D5: XML special characters in the repo path must be entity-escaped, or
+    // the generated plist is not well-formed XML and `launchctl load` fails
+    // with no useful diagnostic while `init` already reported success.
+    #[test]
+    fn launchd_plist_escapes_ampersand_and_quotes() {
+        let plist = launchd_plist(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo & co"),
+        );
+        assert!(
+            plist.contains("<string>/repo &amp; co</string>"),
+            "plist: {plist}"
+        );
+        assert!(!plist.contains("<string>/repo & co</string>"));
+    }
+
+    // D5: launchd plists have no `%`-specifier concept (that's systemd-only)
+    // — a literal `%` must pass through untouched, unlike `systemd_escape`.
+    #[test]
+    fn launchd_plist_leaves_percent_untouched() {
+        let plist = launchd_plist(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo/100%done"),
+        );
+        assert!(
+            plist.contains("<string>/repo/100%done</string>"),
+            "plist: {plist}"
+        );
+    }
+
+    // D5: a space needs no XML escaping (only the five XML special chars
+    // do) — must survive verbatim, no spurious quoting either (this is XML,
+    // not a systemd command line).
+    #[test]
+    fn launchd_plist_space_survives_unescaped() {
+        let plist = launchd_plist(
+            Path::new("/usr/local/bin/agentrec"),
+            Path::new("/repo with space"),
+        );
+        assert!(
+            plist.contains("<string>/repo with space</string>"),
+            "plist: {plist}"
+        );
     }
 
     #[test]

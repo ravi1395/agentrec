@@ -160,8 +160,20 @@ pub fn load_log(path: &Path) -> Vec<LogRecord> {
             out.push(rec);
             continue;
         }
-        if let Ok(turn) = serde_json::from_str::<TurnRecord>(trimmed) {
-            out.push(LogRecord::Turn(turn));
+        // The bare-TurnRecord fallback exists only for legacy lines that
+        // predate the `type` tag entirely (C6). A line that DOES have a
+        // `type` field — just one `LogRecord` doesn't recognize, e.g. a
+        // future additive record kind — must never be coerced into a turn:
+        // serde ignores unknown fields by default, so a `type:"future_thing"`
+        // line with turn-shaped fields would otherwise silently misparse.
+        let has_type_field = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|v| v.as_object().map(|o| o.contains_key("type")))
+            .unwrap_or(false);
+        if !has_type_field {
+            if let Ok(turn) = serde_json::from_str::<TurnRecord>(trimmed) {
+                out.push(LogRecord::Turn(turn));
+            }
         }
     }
     out
@@ -332,6 +344,34 @@ mod tests {
         for path in [&log_path, &signal_path] {
             let mode = fs::metadata(path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "{}: expected 0600", path.display());
+        }
+    }
+
+    // C6: a line with an unrecognized non-empty `type` (a future additive
+    // record kind) must never be coerced into a turn via the legacy
+    // bare-TurnRecord fallback, even when its other fields are turn-shaped.
+    // A genuinely type-less legacy line (pre-epoch) still parses.
+    #[test]
+    fn unknown_type_line_not_coerced_into_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let future_line = concat!(
+            "{\"type\":\"future_thing\",\"id\":\"t_FUTURE\",\"grade\":\"rich\",",
+            "\"started\":\"2026-07-05T00:00:00.000Z\",\"ended\":\"2026-07-05T00:00:01.000Z\",",
+            "\"root\":\"/repo\",\"files\":[]}"
+        );
+        let legacy_line = concat!(
+            "{\"v\":1,\"id\":\"t_LEGACY\",\"grade\":\"rich\",",
+            "\"started\":\"2026-07-05T00:00:00.000Z\",\"ended\":\"2026-07-05T00:00:01.000Z\",",
+            "\"root\":\"/repo\",\"files\":[]}"
+        );
+        fs::write(&path, format!("{future_line}\n{legacy_line}\n")).unwrap();
+
+        let records = load_log(&path);
+        assert_eq!(records.len(), 1); // only the type-less legacy line parses
+        match &records[0] {
+            LogRecord::Turn(t) => assert_eq!(t.id, "t_LEGACY"),
+            LogRecord::Epoch(_) => panic!("expected turn record"),
         }
     }
 }

@@ -4,7 +4,7 @@
 //! to the worktree but not to the daemon's internal state.
 
 use crate::state::State;
-use crate::{log_path, objects_dir, undo_guard_path, UndoGuard};
+use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
 use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
@@ -232,7 +232,11 @@ pub fn blame(root: &Path, target: &str) -> Result<(), String> {
     let (file, line_no) = parse_target(target);
 
     let records = agentrec_core::record::load_log(&log_path(root));
-    let has_gap = has_recording_gap(&records);
+    // Global fallback for the "no touching turn at all" case, where there is
+    // no turn to bound an interval-aware check against (unchanged semantics —
+    // AC blame_untouched_file_exit0 depends on a balanced start/stop NOT
+    // counting as a gap here).
+    let no_turn_gap = has_recording_gap(&records);
 
     let turns: Vec<&TurnRecord> = records
         .iter()
@@ -252,17 +256,18 @@ pub fn blame(root: &Path, target: &str) -> Result<(), String> {
     let current_hash = disk_bytes.as_deref().map(hash_bytes);
 
     match line_no {
-        None => blame_file(&touching, &file, &current_hash, has_gap),
+        None => blame_file(&touching, &records, &file, &current_hash, no_turn_gap),
         Some(n) => {
             let store = BlobStore::new(objects_dir(root));
             blame_line(
                 &store,
                 &touching,
+                &records,
                 &file,
                 n,
                 &current_hash,
                 disk_bytes.as_deref(),
-                has_gap,
+                no_turn_gap,
             )
         }
     }
@@ -327,7 +332,11 @@ fn render_turn(t: &TurnRecord) -> String {
     let when = hhmm(&t.started);
     if t.grade == "rich" {
         let tool = t.tool.as_deref().unwrap_or("—");
-        let prompt = t.prompt_excerpt.as_deref().unwrap_or("—");
+        let prompt = t
+            .prompt_excerpt
+            .as_deref()
+            .map(fmt::sanitize_terminal)
+            .unwrap_or_else(|| "—".to_string());
         format!("{id} · {tool} · \"{prompt}\" · {when}")
     } else {
         format!("{id} · bare turn · {when}")
@@ -339,12 +348,13 @@ fn render_turn(t: &TurnRecord) -> String {
 /// makes the answer uncertain.
 fn blame_file(
     touching: &[&TurnRecord],
+    records: &[LogRecord],
     file: &str,
     current_hash: &Option<String>,
-    has_gap: bool,
+    no_turn_gap: bool,
 ) -> Result<(), String> {
     let Some(t) = touching.last() else {
-        if has_gap {
+        if no_turn_gap {
             // A gap may hide the turn that actually touched this file.
             println!("attribution stale — recording gap");
         } else {
@@ -360,7 +370,10 @@ fn blame_file(
         .map(|f| f.op.as_str())
         == Some("delete");
     let modified = modified_since(t, file, current_hash);
-    let gap_stale = has_gap && modified;
+    // E2: interval-aware — a gap only makes THIS turn's attribution stale
+    // when it occurs after the turn ended (a gap entirely before it is
+    // irrelevant to whether the current on-disk state is explained).
+    let gap_stale = has_gap_after(records, &t.ended) && modified;
 
     let mut line = render_turn(t);
     if deleted {
@@ -382,20 +395,24 @@ fn blame_file(
 /// Known v1 limitation: matching is by exact line text, not a tracked
 /// identity — a line duplicated verbatim elsewhere in the file cannot be
 /// told apart from its duplicate by this heuristic.
+#[allow(clippy::too_many_arguments)]
 fn blame_line(
     store: &BlobStore,
     touching: &[&TurnRecord],
+    records: &[LogRecord],
     file: &str,
     line_no: usize,
     current_hash: &Option<String>,
     disk_bytes: Option<&[u8]>,
-    has_gap: bool,
+    no_turn_gap: bool,
 ) -> Result<(), String> {
     let last = touching.last().copied();
 
+    // E2: interval-aware, bounded to the last touching turn's end — mirrors
+    // blame_file's gap_stale check.
     let gap_stale = match last {
-        Some(t) => has_gap && modified_since(t, file, current_hash),
-        None => has_gap,
+        Some(t) => has_gap_after(records, &t.ended) && modified_since(t, file, current_hash),
+        None => no_turn_gap,
     };
     if gap_stale {
         println!("attribution stale — recording gap");
@@ -446,6 +463,15 @@ fn blame_line(
 
     match responsible {
         Some(t) => println!("{file}:{line_no}: {}", render_turn(t)),
+        // E3: no turn's recorded diff introduces this exact line text. That
+        // is only honestly "before recording began" when the whole history
+        // is actually gap-free — a line that was silently added during an
+        // uncovered interval (then folded into a later turn's unchanged
+        // `before`) would otherwise be misreported as predating all
+        // recording, when really its origin is just unknown.
+        None if has_gap_after(records, "") => {
+            println!("{file}:{line_no}: attribution stale — recording gap");
+        }
         None => println!("{file}:{line_no}: before recording began"),
     }
     Ok(())
@@ -496,6 +522,25 @@ pub fn undo(
     // always succeeds; the fallback is only a defensive belt-and-braces.
     let target_idx = turns.iter().position(|t| t.id == target.id).unwrap_or(0);
 
+    // E6: `--files` naming a path not in this turn is a user error, not a
+    // silent no-op — refuse (no preview, no mutation) and name the typo(s)
+    // rather than quietly printing "nothing to revert".
+    if !files.is_empty() {
+        let target_paths: HashSet<&str> = target.files.iter().map(|f| f.path.as_str()).collect();
+        let unmatched: Vec<&str> = files
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|p| !target_paths.contains(p))
+            .collect();
+        if !unmatched.is_empty() {
+            return Err(format!(
+                "--files names path(s) not in turn {}: {}",
+                short_id(&target.id),
+                unmatched.join(", ")
+            ));
+        }
+    }
+
     let store = BlobStore::new(objects_dir(root));
     let state = crate::state::read_state(root);
     let plans = build_plan(
@@ -526,25 +571,65 @@ pub fn undo(
         return Ok(());
     }
 
+    // E8: refuse to START a concurrent undo while another one's guard is
+    // still live — two undos racing on the same paths would otherwise
+    // clobber each other's guard and mint a bogus bare turn for the loser's
+    // in-flight writes. An expired (or absent/malformed) guard is not live.
+    if let Some(reason) = live_undo_guard_reason(root) {
+        return Err(reason);
+    }
+
     let guarded_paths: Vec<String> = revertible.iter().map(|p| p.entry.path.clone()).collect();
     write_undo_guard(root, &guarded_paths)?;
 
+    let short_target = short_id(&target.id);
     let mut inverse_entries = Vec::with_capacity(revertible.len());
+    let mut mutation_err: Option<String> = None;
     for plan in &revertible {
         match execute_revert(root, &store, &plan.entry) {
             Ok(inverse) => inverse_entries.push(inverse),
             Err(e) => {
-                // Any entries already reverted are real writes a concurrent
-                // daemon must still not misattribute, so this waits out the
-                // same linger as the success path before cleaning up.
-                finish_undo_guard(root);
-                return Err(e);
+                mutation_err = Some(e);
+                break;
             }
         }
     }
 
+    if let Some(e) = mutation_err {
+        // E1 belt-and-braces: any entries already reverted before the
+        // failure are real writes — they must not go unrecorded (invisible
+        // mutations), so append a partial, honestly-truncated undo turn
+        // covering them before surfacing the error.
+        if !inverse_entries.is_empty() {
+            let now = wall_now_ms();
+            let partial = TurnRecord {
+                v: 1,
+                id: agentrec_core::id::turn_id(),
+                grade: "rich".to_string(),
+                truncated: true,
+                started: agentrec_core::time::rfc3339(now),
+                ended: agentrec_core::time::rfc3339(now),
+                tool: Some("agentrec".to_string()),
+                model: None,
+                session: None,
+                root: root.to_string_lossy().to_string(),
+                prompt_ref: None,
+                prompt_excerpt: Some(format!(
+                    "undo of {short_target} (partial — aborted mid-revert)"
+                )),
+                merges: vec![],
+                files: inverse_entries,
+            };
+            let _ = agentrec_core::record::append_log(&log_path(root), &LogRecord::Turn(partial));
+        }
+        // Any entries already reverted are real writes a concurrent daemon
+        // must still not misattribute, so this waits out the same linger as
+        // the success path before cleaning up.
+        finish_undo_guard(root);
+        return Err(e);
+    }
+
     let now = wall_now_ms();
-    let short_target = short_id(&target.id);
     let undo_record = TurnRecord {
         v: 1,
         id: agentrec_core::id::turn_id(),
@@ -661,16 +746,24 @@ fn build_plan(
             continue;
         }
         if entry.op == "modify" || entry.op == "delete" {
-            let missing_before = match entry.before.as_deref() {
-                None => true,
-                Some(h) => !store.contains(h),
+            // E1: an integrity READ (store.get), not a bare existence check —
+            // build_plan runs entirely before any file mutation, so a corrupt
+            // (hash-mismatched) before-blob is caught and refused here, never
+            // discovered mid-revert after other files have already changed.
+            let refuse_reason = match entry.before.as_deref() {
+                None => Some("no prior snapshot to restore".to_string()),
+                Some(h) => match store.get(h) {
+                    Ok(_) => None,
+                    Err(StoreError::Missing(_)) => Some("no prior snapshot to restore".to_string()),
+                    Err(StoreError::Corrupt(_)) => Some(
+                        "prior snapshot corrupt (hash mismatch) — refusing to restore".to_string(),
+                    ),
+                },
             };
-            if missing_before {
+            if let Some(reason) = refuse_reason {
                 plans.push(Plan {
                     entry: entry.clone(),
-                    kind: PlanKind::Refused {
-                        reason: "no prior snapshot to restore".to_string(),
-                    },
+                    kind: PlanKind::Refused { reason },
                 });
                 continue;
             }
@@ -730,22 +823,45 @@ fn modified_cause(
     "human or external edit".to_string()
 }
 
-/// True when an unbalanced `start` epoch (no intervening `stop`) occurs after
-/// `since` (RFC 3339 strings compare lexically in time order at fixed width).
+/// True when the daemon was NOT recording for some interval that falls after
+/// `since` (RFC 3339 strings compare lexically in time order at fixed
+/// width). Three shapes, all uncovered intervals (E2):
+///   - crash-shaped: an unbalanced `start` (no intervening `stop`) — the
+///     interval from the first `start` to the second is unaccounted for.
+///   - clean restart: a `stop` followed later by a `start` — the daemon was
+///     deliberately off for that interval, however short.
+///   - trailing stop: the last epoch is a `stop` with nothing after it — the
+///     daemon is (or was, as of the log) simply not running.
+///
+/// Only the *start* of the uncovered interval needs to be after `since` —
+/// once recording has stopped, everything from there on is uncovered.
 fn has_gap_after(records: &[LogRecord], since: &str) -> bool {
     let mut open = false;
+    let mut pending_stop: Option<&str> = None;
     for r in records {
         if let LogRecord::Epoch(e) = r {
             match e.event.as_str() {
                 "start" => {
                     if open && e.ts.as_str() > since {
-                        return true;
+                        return true; // crash-shaped
+                    }
+                    if pending_stop.is_some() && e.ts.as_str() > since {
+                        return true; // clean restart: stop -> (later) start
                     }
                     open = true;
+                    pending_stop = None;
                 }
-                "stop" => open = false,
+                "stop" => {
+                    open = false;
+                    pending_stop = Some(e.ts.as_str());
+                }
                 _ => {}
             }
+        }
+    }
+    if let Some(stop_ts) = pending_stop {
+        if stop_ts > since {
+            return true; // trailing stop: daemon currently not running
         }
     }
     false
@@ -805,8 +921,14 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
 
     let (new_after, inverse_op) = match entry.op.as_str() {
         "create" => {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("{}: failed to delete: {e}", entry.path))?;
+            // E1: idempotent — a file already absent (deleted by something
+            // else since the turn) means the goal state ("file gone") is
+            // already reached; NotFound is success, not an error.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: failed to delete: {e}", entry.path)),
+            }
             if path.exists() {
                 return Err(format!(
                     "{}: still present after delete (revert of create)",
@@ -866,6 +988,24 @@ fn restore_from_before(
         ));
     }
     Ok(before_hash.to_string())
+}
+
+/// E8: `Some(reason)` when an unexpired H7 coordination guard already exists
+/// — a second concurrent `undo --confirm` must refuse rather than clobber
+/// it (clobbering would let the first undo's in-flight writes be mistaken
+/// for a bare turn, and the two guards would delete each other on cleanup).
+/// An absent, malformed, or expired guard is not live: `None`.
+fn live_undo_guard_reason(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(undo_guard_path(root)).ok()?;
+    let guard: UndoGuard = serde_json::from_str(&text).ok()?;
+    if guard.until_ms > wall_now_ms() {
+        Some(format!(
+            "another undo is already in progress ({} file(s) guarded) — refusing to start a concurrent undo; retry once it finishes",
+            guard.paths.len()
+        ))
+    } else {
+        None
+    }
 }
 
 /// Write the H7 coordination guard before any file mutation begins.

@@ -159,6 +159,23 @@ fn contains_word(text: &str, word: &str) -> bool {
         .any(|tok| tok.eq_ignore_ascii_case(word))
 }
 
+/// Strip terminal control characters (C0 controls `0x00`-`0x1F` and DEL
+/// `0x7F`) from text about to be printed to a real terminal (E7): a prompt
+/// excerpt is user-authored text that reaches stdout verbatim, so an
+/// embedded escape sequence (e.g. an OSC "set terminal title" or a cursor
+/// move) must never survive to the terminal. Printable text — including
+/// non-ASCII UTF-8 — passes through unchanged; this is display-only and
+/// never touches what's persisted (the scrub/excerpt pipeline in
+/// `agentrec_core::scrub` already ran before this text ever reaches here).
+pub fn sanitize_terminal(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            cp >= 0x20 && cp != 0x7f
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +246,22 @@ mod tests {
     fn glossary_git_word_boundary_ignores_substring() {
         assert!(glossary_for("a digit changed").is_empty());
         assert!(!glossary_for("tool git 1 file").is_empty());
+    }
+
+    // E7: an ESC/BEL-laden prompt (e.g. an OSC "set terminal title" payload)
+    // must never survive sanitize_terminal — the plain text around it does.
+    #[test]
+    fn sanitize_terminal_strips_c0_and_del_keeps_text() {
+        let evil = "hello \x1b]0;evil\x07 world\x7f!";
+        let clean = sanitize_terminal(evil);
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\x07'));
+        assert!(!clean.contains('\x7f'));
+        assert_eq!(clean, "hello ]0;evil world!");
+    }
+
+    #[test]
+    fn sanitize_terminal_noop_on_plain_text() {
+        assert_eq!(sanitize_terminal("write g.rs — done"), "write g.rs — done");
     }
 }

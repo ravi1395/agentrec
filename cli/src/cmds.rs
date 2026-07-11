@@ -101,7 +101,7 @@ fn format_turn(t: &TurnRecord, now_ms: u64, utc: bool, color: bool) -> String {
     let excerpt = t
         .prompt_excerpt
         .as_deref()
-        .map(|e| format!("  \"{e}\""))
+        .map(|e| format!("  \"{}\"", fmt::sanitize_terminal(e)))
         .unwrap_or_default();
     let trunc = if t.truncated { " (truncated)" } else { "" };
     format!(
@@ -118,7 +118,12 @@ pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
         let mut state = read_state(root);
         state.snapshot_failures = 0;
         state.io_failed.clear();
-        write_state(root, &state);
+        // D2: state.json is a real persistence path now (its tmp file can
+        // fail to write/rename, e.g. disk full) — a swallowed error here
+        // would print "cleared" while the DEGRADED counter is still on disk.
+        if let Err(e) = write_state(root, &state) {
+            return Err(format!("could not clear DEGRADED state: {e}"));
+        }
         println!("acknowledged — DEGRADED cleared");
         return Ok(());
     }

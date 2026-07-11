@@ -29,19 +29,24 @@ pub fn read_state(root: &Path) -> State {
         .unwrap_or_default()
 }
 
-pub fn write_state(root: &Path, state: &State) {
-    if let Ok(text) = serde_json::to_string(state) {
-        // Atomic tmp+rename: a crash mid-write must not leave a torn state.json
-        // that parses as default (pid 0 → lost lock; offset 0 → replayed inbox).
-        let path = state_path(root);
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &text).is_ok() {
-            // Lock down before the rename makes it visible under its final
-            // name (D37) — no window where state.json is reachable at 0644.
-            agentrec_core::perms::lock_file(&tmp);
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+/// Persist `state` atomically (tmp+rename): a crash mid-write must not leave
+/// a torn state.json that parses as default (pid 0 → lost lock; offset 0 →
+/// replayed inbox). D2: the tmp name is unique per writing process
+/// (`state.json.tmp.<pid>`) — the daemon and a concurrent `status
+/// --ack-degraded` (or two racing writers) must never share one tmp path and
+/// clobber each other's in-flight write. Returns the write/rename error
+/// instead of swallowing it, so a caller for whom persistence is load-bearing
+/// (the lock-acquire path) can treat failure as fatal.
+pub fn write_state(root: &Path, state: &State) -> std::io::Result<()> {
+    let text = serde_json::to_string(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = state_path(root);
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &text)?;
+    // Lock down before the rename makes it visible under its final name
+    // (D37) — no window where state.json is reachable at 0644.
+    agentrec_core::perms::lock_file(&tmp);
+    std::fs::rename(&tmp, &path)
 }
 
 /// Record a genuine snapshot I/O failure: bumps the counter and tracks the
