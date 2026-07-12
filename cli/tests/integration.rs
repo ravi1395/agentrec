@@ -3657,6 +3657,76 @@ fn verify_and_forget_lifecycle() {
     );
 }
 
+// F1: fact rendering must strip terminal-escape bytes (ESC 0x1b / BEL 0x07)
+// before they reach stdout — same posture prompt excerpts already get via
+// `fmt::sanitize_terminal` (cmds.rs/readcmds.rs). Seeds a memory whose fact
+// carries an OSC "set terminal title" payload plus an SGR color escape
+// directly via `memory::append_memory` (bypasses the CLI's scrub call sites
+// entirely — the escape bytes are not secrets, so `scrub()` at persist time
+// leaves them untouched; asserted below) and checks every render path:
+// `recall`, `memories`, `verify <id>`, and the `--for-hook` block.
+#[test]
+fn memory_fact_render_sanitizes_terminal_escapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/evil.rs"), b"fn evil() {}").unwrap();
+    // Fillers give the "nightly seed" query terms a low document frequency
+    // so BM25 clears SCORE_FLOOR — same pattern as `seed_filler_memories`'s
+    // other callers (e.g. `verify_and_forget_lifecycle`).
+    seed_filler_memories(root, 8);
+
+    let evil_fact = "nightly seed \x1b]0;pwn\x07 rotation \x1b[31mdanger\x1b[0m zone";
+    let hash = memory::hash_pin(root, "src/evil.rs").unwrap();
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: evil_fact.to_string(),
+        pins: vec![Pin {
+            path: "src/evil.rs".to_string(),
+            hash,
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    // Fixture sanity: prove the escape bytes actually survived scrub at
+    // persist time — otherwise this test would pass for the wrong reason.
+    let stored = memory_records(root)
+        .into_iter()
+        .find(|r| r.get("id").and_then(|i| i.as_str()) == Some(rec.id.as_str()))
+        .expect("seeded memory not found on disk");
+    let stored_fact = stored.get("fact").and_then(|f| f.as_str()).unwrap();
+    assert!(
+        stored_fact.contains('\u{1b}') && stored_fact.contains('\u{7}'),
+        "fixture invalid — scrub already stripped the escape bytes at persist time: {stored_fact:?}"
+    );
+
+    let assert_clean = |out: &Output, label: &str| {
+        assert!(out.status.success(), "{label} failed: {out:?}");
+        let leaked = out.stdout.iter().any(|&b| b == 0x1b || 0x07 == b);
+        assert!(
+            !leaked,
+            "{label} leaked a raw ESC/BEL byte: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    };
+
+    assert_clean(&agentrec(root, &["recall", "nightly seed"]), "recall");
+    assert_clean(&agentrec(root, &["memories"]), "memories");
+    assert_clean(&agentrec(root, &["verify", &rec.id]), "verify");
+    assert_clean(
+        &agentrec(root, &["recall", "nightly seed", "--for-hook"]),
+        "recall --for-hook",
+    );
+}
+
 #[test]
 fn log_explain_glossary_matches_only_present_terms() {
     let tmp = tempfile::tempdir().unwrap();

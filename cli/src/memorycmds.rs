@@ -181,27 +181,28 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
         ));
     }
 
-    println!("{}", m.fact);
+    println!("{}", fmt::sanitize_terminal(&m.fact));
     let mut orphaned: Vec<String> = Vec::new();
     let mut fresh_pins: Vec<Pin> = Vec::new();
     for pin in &m.pins {
+        let path = fmt::sanitize_terminal(&pin.path);
         match memory::hash_pin(root, &pin.path) {
             Ok(current) if current != pin.hash => {
-                println!("  {}: old {} -> new {current}", pin.path, pin.hash);
+                println!("  {path}: old {} -> new {current}", pin.hash);
                 fresh_pins.push(Pin {
                     path: pin.path.clone(),
                     hash: current,
                 });
             }
             Ok(current) => {
-                println!("  {}: unchanged", pin.path);
+                println!("  {path}: unchanged");
                 fresh_pins.push(Pin {
                     path: pin.path.clone(),
                     hash: current,
                 });
             }
             Err(_) => {
-                println!("  {}: deleted", pin.path);
+                println!("  {path}: deleted");
                 orphaned.push(pin.path.clone());
             }
         }
@@ -578,8 +579,16 @@ fn build_hook_block(hits: &[EffectiveMemory], max_facts: usize) -> String {
         .iter()
         .take(max_facts)
         .map(|m| {
-            let pins: Vec<&str> = m.pins.iter().map(|p| p.path.as_str()).collect();
-            format!("- {}  [pins: {}]", m.fact, pins.join(", "))
+            let pins: Vec<String> = m
+                .pins
+                .iter()
+                .map(|p| fmt::sanitize_terminal(&p.path))
+                .collect();
+            format!(
+                "- {}  [pins: {}]",
+                fmt::sanitize_terminal(&m.fact),
+                pins.join(", ")
+            )
         })
         .collect();
 
@@ -617,14 +626,18 @@ fn format_memory_line(
         freshness_str(freshness)
     };
     let when = fmt::relative_time(&agentrec_core::time::rfc3339(m.ts), now_ms);
-    let pins: Vec<&str> = m.pins.iter().map(|p| p.path.as_str()).collect();
+    let pins: Vec<String> = m
+        .pins
+        .iter()
+        .map(|p| fmt::sanitize_terminal(&p.path))
+        .collect();
     let mut line = format!(
         "{id}  {label:8}  {when}  {}  [pins: {}]",
-        m.fact,
+        fmt::sanitize_terminal(&m.fact),
         pins.join(", ")
     );
     if let Some(r) = reason {
-        line.push_str(&format!("  reason: {r}"));
+        line.push_str(&format!("  reason: {}", fmt::sanitize_terminal(r)));
     }
     line
 }
