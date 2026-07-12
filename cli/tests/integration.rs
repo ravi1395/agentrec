@@ -2976,6 +2976,140 @@ fn log_no_color_env_suppresses_escapes() {
     );
 }
 
+// --- Task 4: `agentrec remember` — manual pinned memories.
+
+#[test]
+fn remember_writes_pinned_scrubbed_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "build needs cargo nightly",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let path = root.join(".agentrec/memory.jsonl");
+    assert!(path.exists(), "memory.jsonl must exist");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "memory.jsonl must be 0600");
+    }
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "expected exactly one record: {text}");
+    let rec: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(rec.get("origin").and_then(|v| v.as_str()), Some("human"));
+    assert_eq!(rec.get("op").and_then(|v| v.as_str()), Some("assert"));
+    let pins = rec.get("pins").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(pins.len(), 1, "expected one pin: {pins:?}");
+    assert_eq!(
+        pins[0].get("path").and_then(|v| v.as_str()),
+        Some("src/a.rs")
+    );
+    let hash = pins[0].get("hash").and_then(|v| v.as_str()).unwrap();
+    assert!(hash.starts_with("sha256:"), "hash: {hash}");
+    let hex = &hash["sha256:".len()..];
+    assert_eq!(hex.len(), 64, "hash hex len: {hex}");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "hash not hex: {hash}"
+    );
+}
+
+#[test]
+fn remember_refuses_bad_pins_and_secret_facts() {
+    // Traversal escape: --from ../escape -> exit 1, stderr names the path,
+    // memory.jsonl absent.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let out = agentrec(root, &["remember", "some fact", "--from", "../escape"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("../escape"), "stderr: {stderr}");
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created on a rejected pin"
+        );
+    }
+
+    // Secret-file pin: --from .env -> exit 1, stderr mentions secret.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        let out = agentrec(root, &["remember", "some fact", "--from", ".env"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("secret"), "stderr: {stderr}");
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created on a secret-path pin"
+        );
+    }
+
+    // A fact containing a secret (but not only a secret), with a valid pin,
+    // is persisted with the secret redacted (INV-M3 half 1) — same
+    // AWS-key-shaped fixture as secret_prompt_never_reaches_disk_in_cleartext.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let fact = format!("deploy with key {secret} now");
+        let out = agentrec(root, &["remember", &fact, "--from", "src/a.rs"]);
+        assert!(out.status.success(), "remember failed: {out:?}");
+        let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+        assert!(
+            text.contains("[redacted:"),
+            "expected a redaction marker: {text}"
+        );
+        assert!(!text.contains(secret), "raw key leaked to disk: {text}");
+    }
+
+    // A fact that scrubs to nothing is refused, nothing written. scrub()
+    // never deletes matched content (it substitutes a `[redacted:...]`
+    // marker), so the only input that can trim-empty after scrubbing is one
+    // that was already blank — same fixture shape as
+    // agentrec_core::memory::append_memory_rejects_oversize_and_empty's
+    // blank_fact case.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+        let out = agentrec(root, &["remember", "   \n\t  ", "--from", "src/a.rs"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("scrub") || stderr.contains("empty"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created for a fact that scrubs to nothing"
+        );
+    }
+}
+
 #[test]
 fn log_explain_glossary_matches_only_present_terms() {
     let tmp = tempfile::tempdir().unwrap();

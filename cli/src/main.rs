@@ -6,6 +6,7 @@ mod daemon;
 mod doctorcmd;
 mod fmt;
 mod initcmd;
+mod memorycmds;
 mod purgecmd;
 mod readcmds;
 mod service;
@@ -135,6 +136,14 @@ enum Command {
         #[arg(long = "snapshots-before", value_name = "DATE")]
         snapshots_before: Option<String>,
     },
+    /// Record a manual, human-authored pinned memory.
+    Remember {
+        /// The fact to remember (scrubbed of secrets before storage).
+        fact: String,
+        /// Comma-separated repo-relative paths this fact is pinned to.
+        #[arg(long)]
+        from: String,
+    },
 }
 
 fn main() {
@@ -181,6 +190,7 @@ fn main() {
             all_prompts,
             snapshots_before,
         } => purgecmd::run(&root, all_prompts, snapshots_before.as_deref()),
+        Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
