@@ -159,8 +159,11 @@ counterweight. Tighten only on dogfood evidence.
 
 ## Read path
 
-Core: `recall(query, k)` in `agentrec-core` — load → fold → pin-verify → BM25 over
-`fact` text + pin path segments, **fresh memories only** → top-k. Cold read; no
+Core: `recall(query, k)` in `agentrec-core` — load → fold → BM25 over `fact` text +
+pin path segments → **rank-then-verify**: pin-verify candidates in rank order until
+k fresh results found (verification cost scales with k, not corpus size — this is
+what keeps INV-M4's 10k-record/50 ms budget honest). Stale/orphaned candidates are
+skipped, never served. Cold read; no
 daemon. Tokenization: lowercase, split non-alphanumeric, path segments are terms.
 Empty query → recency-ordered fresh list.
 
@@ -223,6 +226,22 @@ Invariants (each maps to ≥1 automated test; add to IMPLEMENTATION.md AC regist
 Success gate: all invariants green + 1-week dogfood in this repo with counters in
 `status` (injections / rejects / stale-quarantined). Token A/B harness = later eval
 round.
+
+## Performance envelope (low-end target: 8 GB laptop)
+
+Baseline measured on the live v0.1.0 daemon (29 h run): 9.8 MB idle RSS, 0.018 %
+idle CPU, ~100 ms per 50-file mutation burst, sha256 at 555 MB/s. Budgets this
+feature must hold:
+
+- Daemon idle RSS ≤ 25 MB including the live dedup set (facts are ≤ 500 chars;
+  10k facts ≈ 3 MB — nothing resident scales with repo size).
+- No new timers, no polling: ingestion is signal-tailer-driven; recall is a
+  transient process (~5–10 MB RSS, exits).
+- Recall hook: 50 ms hard self-budget via rank-then-verify (§Read path).
+  Optional `(path, mtime, size)` hash cache is an advisory fast-path only —
+  mtime can lie; any cache miss or doubt falls back to full hashing.
+- `memory.jsonl` disk growth is KB–low-MB; CAS remains the only large store and
+  keeps its existing 2 GiB eviction cap.
 
 ## Phasing (independently mergeable)
 
