@@ -226,12 +226,25 @@ pub fn append_memory(root: &Path, rec: &MemoryRecord) -> Result<(), String> {
     append_line_synced(&memory_path(root), &line)
 }
 
+/// Tie-break precedence for `load_effective`'s fold when two records share
+/// the exact same `ts`: retract > reverify > assert. Returned value is the
+/// sort rank (higher sorts later, i.e. wins the "latest op" fold) — do not
+/// reorder these without also re-reading `load_effective`'s fold loop.
+fn op_rank(op: &MemoryOp) -> u8 {
+    match op {
+        MemoryOp::Assert => 0,
+        MemoryOp::Reverify => 1,
+        MemoryOp::Retract => 2,
+    }
+}
+
 /// Load every parseable record, fold per id (latest op wins, ordered by
-/// `ts` — ties broken by file order), and return one `EffectiveMemory` per
-/// id. Absent file = empty vec (never an error — a repo with no memories
-/// yet is a normal state, not a failure). Malformed lines (bad JSON, or an
-/// `op` string this build doesn't recognize) are skipped, never fatal —
-/// mirrors `record::load_log`'s tolerance.
+/// `ts` ascending; equal `ts` broken by op precedence, see `op_rank` —
+/// never by file order), and return one `EffectiveMemory` per id. Absent
+/// file = empty vec (never an error — a repo with no memories yet is a
+/// normal state, not a failure). Malformed lines (bad JSON, or an `op`
+/// string this build doesn't recognize) are skipped, never fatal — mirrors
+/// `record::load_log`'s tolerance.
 pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
     let path = memory_path(root);
     let records = match fs::File::open(&path) {
@@ -256,8 +269,10 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
         Err(_) => return Ok(vec![]),
     };
 
-    // Group by id, preserving file (insertion) order within each group —
-    // the tie-break for equal `ts` values.
+    // Group by id. File (insertion) order within each group is irrelevant
+    // to the fold — `group.sort_by_key` below reorders by (ts, op_rank), so
+    // equal-ts ties are broken by op precedence, not by this insertion
+    // order.
     let mut by_id: HashMap<String, Vec<MemoryRecord>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for rec in records {
@@ -270,8 +285,13 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
     let mut out = Vec::with_capacity(order.len());
     for id in order {
         let mut group = by_id.remove(&id).unwrap_or_default();
-        // Stable sort: equal `ts` values keep their original (file) order.
-        group.sort_by_key(|r| r.ts);
+        // Primary key `ts` ascending; secondary key breaks exact-ts ties by
+        // op precedence (retract > reverify > assert) so the fold below
+        // (which takes the *last* element of the sorted group as the
+        // effective state) is deterministic regardless of file order —
+        // INV-M5. A retraction is never lost to a same-ms assert/reverify,
+        // and a reverify's fresh pins are never lost to a same-ms assert.
+        group.sort_by_key(|r| (r.ts, op_rank(&r.op)));
 
         let mut fact = String::new();
         let mut pins = Vec::new();
@@ -544,6 +564,95 @@ mod tests {
             );
             assert!(m.retracted, "perm {perm:?}: must be retracted");
             assert_eq!(m.ts, 3_000, "perm {perm:?}: ts of latest op");
+        }
+    }
+
+    // INV-M5, equal-ts case: two records for the same id sharing the exact
+    // same `ts` must still fold deterministically regardless of file order.
+    // Tie-break rule: retract > reverify > assert — a retraction at the same
+    // ts as an assert is never lost to file order.
+    #[test]
+    fn fold_equal_ts_retract_wins_any_order() {
+        let assert_rec = rec(
+            "A",
+            MemoryOp::Assert,
+            "F1",
+            vec![pin("src/a.rs", "aaaa")],
+            1_000,
+        );
+        let retract_rec = rec(
+            "A",
+            MemoryOp::Retract,
+            "F1",
+            vec![pin("src/a.rs", "aaaa")],
+            1_000,
+        );
+
+        // Ordering 1: assert then retract (file order matches ts-tie winner).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            append_memory(root, &assert_rec).unwrap();
+            append_memory(root, &retract_rec).unwrap();
+            let effective = load_effective(root).unwrap();
+            assert_eq!(effective.len(), 1);
+            assert!(
+                effective[0].retracted,
+                "assert-then-retract at equal ts must retract"
+            );
+        }
+
+        // Ordering 2: retract then assert (file order opposes ts-tie winner
+        // — this is the case a stable sort on ts alone gets wrong).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            append_memory(root, &retract_rec).unwrap();
+            append_memory(root, &assert_rec).unwrap();
+            let effective = load_effective(root).unwrap();
+            assert_eq!(effective.len(), 1);
+            assert!(
+                effective[0].retracted,
+                "retract-then-assert at equal ts must still retract (retract wins ties)"
+            );
+        }
+    }
+
+    // Equal-ts tie between reverify and assert: reverify's pins must win
+    // over a same-ts assert regardless of file order (reverify outranks
+    // assert in the tie-break precedence).
+    #[test]
+    fn fold_equal_ts_reverify_wins_over_assert_any_order() {
+        let assert_rec = rec(
+            "A",
+            MemoryOp::Assert,
+            "F1",
+            vec![pin("src/a.rs", "aaaa")],
+            1_000,
+        );
+        let reverify_rec = rec(
+            "A",
+            MemoryOp::Reverify,
+            "F1",
+            vec![pin("src/a.rs", "bbbb")],
+            1_000,
+        );
+
+        for (first, second) in [
+            (assert_rec.clone(), reverify_rec.clone()),
+            (reverify_rec.clone(), assert_rec.clone()),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            append_memory(root, &first).unwrap();
+            append_memory(root, &second).unwrap();
+            let effective = load_effective(root).unwrap();
+            assert_eq!(effective.len(), 1);
+            assert_eq!(
+                effective[0].pins,
+                vec![pin("src/a.rs", "bbbb")],
+                "reverify's pins must win over a same-ts assert regardless of file order"
+            );
         }
     }
 
