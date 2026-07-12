@@ -160,16 +160,26 @@ pub fn validate_pin_path(root: &Path, path: &str) -> Result<String, String> {
 /// (stalled network volume, special file) that the outer hook wall-deadline
 /// test (`cli/tests/integration.rs::hook_recall_hard_wall_deadline`) uses to
 /// prove a single slow read cannot push the hook's observable wall time past
-/// its budget. Runtime env read, not `cfg(test)`-gated — the integration
-/// test drives the real compiled `agentrec` binary as a subprocess, which
-/// never builds with `cfg(test)`. A no-op unless a caller's process
-/// environment explicitly sets the var (never true in production; the CLI
-/// never sets it).
+/// its budget. The env read is compiled out entirely in release builds
+/// (`#[cfg(not(debug_assertions))]` arm always returns `None` without
+/// touching the environment) — fail-safe: a release/production binary can
+/// never have arbitrary sleep injected into `hash_pin`, which every
+/// `remember`/`verify`/hook recall path calls, not just the hook's. It stays
+/// active under `cfg(debug_assertions)`, which `cargo test` sets and which
+/// the integration test's spawned `CARGO_BIN_EXE_agentrec` (always a debug
+/// build) inherits, so the seam still bites in the test suite.
 fn test_slow_pin_read_delay() -> Option<Duration> {
-    std::env::var("AGENTREC_TEST_SLOW_PIN_READ_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AGENTREC_TEST_SLOW_PIN_READ_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 /// Hash the file at `root/rel` right now, as `"sha256:<hex>"` via
@@ -794,6 +804,24 @@ fn recall_impl(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// AC-F8.1: in a release build (`debug_assertions` off), the test-only
+    /// slow-pin-read seam must return `None` even when the env var IS set —
+    /// proves the `#[cfg(not(debug_assertions))]` arm actually compiles out
+    /// the env read rather than merely being unreachable dead code. Only
+    /// runs under `cargo test --release` (the `debug_assertions`-on debug
+    /// test build never exercises this arm at all).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn slow_pin_read_delay_is_none_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_TEST_SLOW_PIN_READ_MS", "5000");
+        assert_eq!(
+            test_slow_pin_read_delay(),
+            None,
+            "release builds must never honor AGENTREC_TEST_SLOW_PIN_READ_MS"
+        );
+        std::env::remove_var("AGENTREC_TEST_SLOW_PIN_READ_MS");
+    }
 
     fn pin(path: &str, hash: &str) -> Pin {
         Pin {

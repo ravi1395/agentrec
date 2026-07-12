@@ -364,15 +364,21 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
 /// doing so would just reintroduce the exact runner-speed coupling commit
 /// 76a716d removed), so this substitutes a deadline that has already
 /// expired *before any recall work starts*, regardless of how fast or slow
-/// the machine is. A single env var read (no-op) when unset; no effect on
-/// production behavior.
+/// the machine is. Compiled out of release builds entirely (same
+/// `#[cfg(debug_assertions)]` fail-safe class as
+/// `memory::test_slow_pin_read_delay`) — the const declaration itself is
+/// also gated, otherwise it would be dead code once its only reader's env
+/// read is compiled away in release.
+#[cfg(debug_assertions)]
 const TEST_FORCE_BUDGET_EXCEEDED_VAR: &str = "AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED";
 
 /// The cooperative deadline (F2) `inject_memory` passes into
 /// `recall_for_hook_with_deadline`: `started + RECALL_BUDGET_MS`, unless
 /// [`TEST_FORCE_BUDGET_EXCEEDED_VAR`] is set, in which case it is a fixed
-/// point already 1s in the past.
+/// point already 1s in the past. The override is a no-op — the env is never
+/// read — in release builds.
 fn recall_deadline(started: Instant) -> Instant {
+    #[cfg(debug_assertions)]
     if std::env::var_os(TEST_FORCE_BUDGET_EXCEEDED_VAR).is_some() {
         return started
             .checked_sub(Duration::from_secs(1))

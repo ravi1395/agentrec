@@ -4256,6 +4256,16 @@ fn verify_replace_pin_rejections_append_nothing() {
             lines_before,
             "{msg}: refusal must append nothing"
         );
+        // AC-F9.4: a --replace-pin refusal must be atomic on stdout too, not
+        // just on the memory.jsonl append — every validation error is
+        // returned BEFORE the fact is printed (memorycmds.rs::verify), so a
+        // rejected call must produce zero stdout bytes. Guards against a
+        // future regression that moves the print earlier than validation.
+        assert!(
+            out.stdout.is_empty(),
+            "{msg}: refusal must print nothing to stdout, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     };
 
     // nonexistent old pin (not on this memory)
@@ -5708,5 +5718,177 @@ fn hook_corrupt_store_safe_under_concurrent_append() {
         failures as u64, iterations,
         "expected one failure stat per hook attempt against the permanently corrupt \
          store: {stats:?}"
+    );
+}
+
+/// RAII guard for a single spawned `agentrec record` daemon: `Drop` SIGKILLs
+/// and reaps it, so a test panic mid-assertion never leaks an orphan daemon
+/// (mirrors `torture.rs`'s `DaemonGuard`, scoped down to the single-daemon
+/// case this test needs). `kill()` tears the daemon down explicitly, before
+/// end of scope, so a caller can assert "after teardown" invariants right
+/// away; `Drop` then finds nothing left to do.
+struct SingleDaemonGuard(Option<Child>);
+
+impl SingleDaemonGuard {
+    fn spawn(root: &Path) -> Self {
+        let child = spawn_record(root);
+        std::thread::sleep(Duration::from_millis(800));
+        SingleDaemonGuard(Some(child))
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            sigkill(&c);
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for SingleDaemonGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+// AC-F10.6: the sibling test above only races an IN-PROCESS `append_memory`
+// writer against the hook — it never starts a real `agentrec record` daemon
+// and never validates `state.json`, so it doesn't actually prove the stated
+// guarantee (a concurrent DAEMON + a permanently corrupt memory.jsonl cannot
+// corrupt state.json / memory-stats.jsonl / signal.jsonl, and the hook still
+// appends its start signal). This test drives a REAL daemon subprocess and a
+// REAL `agentrec hook claude` subprocess per iteration, with concurrent fs
+// mutations so the daemon is genuinely active (writing log.jsonl/state.json)
+// while the hook reads the corrupt store. Assertions are deliberately
+// file-parseability + count based (never FSEvents-timing-dependent turn
+// observations) so the test is robust rather than flaky.
+#[test]
+fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    // Seeded corruption, `\n`-terminated so it stays its own line no matter
+    // what the daemon (memory-candidate ingestion) might ever append after
+    // it — the store stays corrupt (and thus failure-counted) for the whole
+    // test.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"{not valid json at all}\n",
+    )
+    .unwrap();
+
+    let mut guard = SingleDaemonGuard::spawn(&root);
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"real-daemon-corrupt","prompt":"real daemon corrupt store probe"}"#;
+    let iterations = 12u64;
+    for iter in 0..iterations {
+        // Concurrent fs mutation: the daemon's watcher observes this while
+        // the hook subprocess concurrently reads the corrupt memory store —
+        // genuine concurrent daemon activity, not just a live process.
+        std::fs::write(
+            root.join("daemon_corrupt.rs"),
+            format!("fn daemon_corrupt_{iter}() {{}}\n").as_bytes(),
+        )
+        .unwrap();
+
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under a real concurrent daemon against a corrupt \
+             memory.jsonl at iter {iter}: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a corrupt store must never inject, even against a real concurrent \
+             daemon, at iter {iter}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite a real concurrent \
+             daemon and a corrupt memory.jsonl (before={before}, after={})",
+            after.len()
+        );
+    }
+
+    // Teardown the daemon now, before validating on-disk state — the daemon
+    // must actually have been alive and racing the hook calls above; killing
+    // it here (rather than only at end-of-scope via Drop) lets the
+    // "after teardown" file-parseability checks below run immediately after
+    // the real interleaving window closes.
+    guard.kill();
+
+    // signal.jsonl and memory-stats.jsonl must never be left torn by the
+    // interleaving between the real daemon and the hook subprocesses — every
+    // line still parses as JSON.
+    for name in [".agentrec/signal.jsonl", ".agentrec/memory-stats.jsonl"] {
+        let text = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{name} line {n} failed to parse after concurrent real-daemon activity \
+                 against a corrupt memory.jsonl: {line}"
+            );
+        }
+    }
+
+    // state.json is written by the daemon itself (pid/signal-offset/etc) and
+    // must survive the same interleaving — the daemon's writer uses tmp+
+    // rename, so a torn read here would indicate a real atomicity bug, not
+    // just a JSONL-append issue. `cli::state` isn't reachable from this
+    // black-box integration test (the `agentrec` crate has no lib target),
+    // so this parses the raw file the same way the CLI's own tests would via
+    // `serde_json::Value` rather than the (error-tolerant) `read_state`
+    // helper, which would silently mask a genuinely corrupt file.
+    let state_text = std::fs::read_to_string(root.join(".agentrec/state.json"))
+        .expect("state.json must exist after a real daemon ran");
+    let state_json: serde_json::Value = serde_json::from_str(&state_text).unwrap_or_else(|e| {
+        panic!(
+            "state.json failed to parse cleanly after concurrent real-daemon activity \
+             against a corrupt memory.jsonl: {e}: {state_text}"
+        )
+    });
+    // Liveness/concurrency proof, not just "a daemon process existed": every
+    // hook call above appends a start signal to signal.jsonl, and only the
+    // daemon's own signal-tailer advances `signal_offset` (the hook never
+    // touches state.json). A nonzero offset after 12 real hook subprocesses
+    // and an 800ms startup window means the daemon genuinely consumed
+    // signals emitted while it was racing the hook against the corrupt
+    // store — not merely a live PID that never did any work. Signal-tailer
+    // based, not FSEvents-based, so it isn't timing-flaky the way a turn
+    // observation would be.
+    let signal_offset = state_json
+        .get("signal_offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        signal_offset > 0,
+        "state.json's signal_offset is 0 — the daemon never consumed any of the \
+         {iterations} hooks' start signals, so this test didn't prove a genuinely \
+         concurrent/active daemon: {state_text}"
+    );
+
+    // Every hook attempt against the still-corrupt store recorded exactly
+    // one failure stat — the corrupt line was seeded once and never healed,
+    // so `iterations` calls means `iterations` failure lines.
+    let stats = memory_stats_lines(&root);
+    let failures = stats
+        .iter()
+        .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+        .count();
+    assert_eq!(
+        failures as u64, iterations,
+        "expected one failure stat per hook attempt against the permanently corrupt \
+         store under a real concurrent daemon: {stats:?}"
+    );
+    let store_corrupt = stats
+        .iter()
+        .filter(|s| s.get("reason").and_then(|r| r.as_str()) == Some("store_corrupt"))
+        .count();
+    assert_eq!(
+        store_corrupt as u64, iterations,
+        "expected every failure stat to be tagged reason:store_corrupt: {stats:?}"
     );
 }
