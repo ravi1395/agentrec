@@ -183,6 +183,28 @@ enum Command {
         #[arg(long, default_value = "agent")]
         tool: String,
     },
+    /// Re-pin a drifted memory. Without --confirm, previews the per-pin
+    /// drift and changes nothing.
+    Verify {
+        /// Memory id, full or an unambiguous prefix.
+        id: String,
+        /// Apply the reverify. Without this flag, verify only previews.
+        #[arg(long)]
+        confirm: bool,
+        /// Explicitly drop an orphaned (deleted) pin; repeatable. Required
+        /// for every orphaned pin, or --confirm refuses.
+        #[arg(long = "drop-pin")]
+        drop_pin: Vec<String>,
+    },
+    /// Retract a memory — quarantine is recoverable, but forgetting is
+    /// explicit and reasoned.
+    Forget {
+        /// Memory id, full or an unambiguous prefix.
+        id: String,
+        /// Why this memory is being retracted (scrubbed of secrets).
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 fn main() {
@@ -240,6 +262,12 @@ fn main() {
         Command::Candidate { fact, from, tool } => {
             memorycmds::candidate(&root, &fact, &from, &tool)
         }
+        Command::Verify {
+            id,
+            confirm,
+            drop_pin,
+        } => memorycmds::verify(&root, &id, confirm, &drop_pin),
+        Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");

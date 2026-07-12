@@ -3298,6 +3298,281 @@ fn recall_for_hook_emits_block_or_nothing() {
     );
 }
 
+// --- Task 10: `verify` + `forget` — quarantine is recoverable.
+
+#[test]
+fn verify_and_forget_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed rotation keeps torture runs reproducible";
+    let out = agentrec(root, &["remember", fact, "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("newly remembered id not found");
+
+    // Mutate the pinned file -> stale; `memories --stale` surfaces it.
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }").unwrap();
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "stale listing must show the drifted pin: {stdout}"
+    );
+
+    // `verify <id>` (no --confirm): prints drift, changes nothing.
+    let lines_before = memory_records(root).len();
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify (preview) failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("old sha256:") && stdout.contains("-> new sha256:"),
+        "expected a drift line: {stdout}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "preview verify must not append"
+    );
+
+    // `verify <id> --confirm`: fresh again, exactly one new record appended.
+    let out = agentrec(root, &["verify", &id, "--confirm"]);
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before + 1,
+        "reverify must append exactly one record"
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert!(
+        arr.iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "recall must serve the reverified (fresh again) memory: {stdout}"
+    );
+
+    // `forget <id> --reason "wrong"` -> excluded from recall AND hook
+    // injection; `memories --all` shows it retracted with the reason.
+    let out = agentrec(root, &["forget", &id, "--reason", "wrong"]);
+    assert!(out.status.success(), "forget failed: {out:?}");
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert!(
+        !arr.iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "forgotten memory must not appear in recall: {stdout}"
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed", "--for-hook"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "forgotten memory must not be injected: {stdout}"
+    );
+
+    let out = agentrec(root, &["memories", "--all"]);
+    assert!(out.status.success(), "memories --all failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("retracted"),
+        "memories --all must show the retracted state: {stdout}"
+    );
+    assert!(
+        stdout.contains("wrong"),
+        "memories --all must show the retract reason: {stdout}"
+    );
+
+    // `forget <id>` again -> exit 1 (already retracted).
+    let out = agentrec(root, &["forget", &id, "--reason", "again"]);
+    assert!(!out.status.success(), "double forget must fail: {out:?}");
+
+    // Orphan variant: a fresh memory with two pins, one of which is deleted.
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+    std::fs::write(root.join("src/c.rs"), b"fn c() {}").unwrap();
+    let orphan_fact = "orphan variant fact about kraken batching";
+    let out = agentrec(
+        root,
+        &["remember", orphan_fact, "--from", "src/b.rs,src/c.rs"],
+    );
+    assert!(
+        out.status.success(),
+        "remember (orphan fixture) failed: {out:?}"
+    );
+    let orphan_id = memory_records(root)
+        .iter()
+        .rev()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(orphan_fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("orphan id not found");
+
+    std::fs::remove_file(root.join("src/b.rs")).unwrap();
+
+    let lines_before = memory_records(root).len();
+    let out = agentrec(root, &["verify", &orphan_id, "--confirm"]);
+    assert!(
+        !out.status.success(),
+        "verify --confirm without --drop-pin must refuse on an orphaned pin: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("src/b.rs"),
+        "stderr must name the orphaned path: {stderr}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "a refused verify must not append"
+    );
+
+    let out = agentrec(
+        root,
+        &["verify", &orphan_id, "--confirm", "--drop-pin", "src/b.rs"],
+    );
+    assert!(
+        out.status.success(),
+        "verify --confirm --drop-pin failed: {out:?}"
+    );
+    assert_eq!(memory_records(root).len(), lines_before + 1);
+
+    let out = agentrec(root, &["memories", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    let orphan_entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(orphan_id.as_str()))
+        .expect("orphan entry not found in memories --json");
+    let pins = orphan_entry
+        .get("pins")
+        .and_then(|p| p.as_array())
+        .expect("pins array");
+    assert_eq!(pins.len(), 1, "dropped pin must be gone: {pins:?}");
+    assert_eq!(
+        pins[0].get("path").and_then(|p| p.as_str()),
+        Some("src/c.rs")
+    );
+
+    // Dropping the only remaining pin must be refused — a memory must
+    // retain at least one pin.
+    std::fs::remove_file(root.join("src/c.rs")).unwrap();
+    let lines_before = memory_records(root).len();
+    let out = agentrec(
+        root,
+        &["verify", &orphan_id, "--confirm", "--drop-pin", "src/c.rs"],
+    );
+    assert!(
+        !out.status.success(),
+        "dropping the only remaining pin must be refused: {out:?}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "a refused verify must not append"
+    );
+
+    // Origin provenance (design spec, §Quality gate: "origin + source_turns
+    // give provenance"): verify/forget are human-run CLI commands, but they
+    // must not silently reassign an *agent-authored* memory's origin to
+    // "human" — the fold takes `origin` from whichever op is latest
+    // (`agentrec_core::memory::load_effective`), so `verify`/`forget` must
+    // restate the original origin, not the actor running the command.
+    std::fs::write(root.join("src/d.rs"), b"fn d() {}").unwrap();
+    let agent_fact = "agent authored fact about kraken retry batching";
+    let out = agentrec(root, &["remember", agent_fact, "--from", "src/d.rs"]);
+    assert!(
+        out.status.success(),
+        "remember (agent fixture) failed: {out:?}"
+    );
+
+    // Hand-edit that record's `origin` to "agent" — `remember` always
+    // stamps "human"; simulating an agent-authored memory without a live
+    // daemon means rewriting the field directly (same posture as this
+    // file's other direct-JSONL fixtures, e.g. the memory.jsonl scale test
+    // near `hook_...recall_budget`).
+    let memory_path = root.join(".agentrec/memory.jsonl");
+    let text = std::fs::read_to_string(&memory_path).unwrap();
+    let mut agent_id = String::new();
+    let rewritten: String = text
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v.get("fact").and_then(|f| f.as_str()) == Some(agent_fact) {
+                v["origin"] = serde_json::Value::String("agent".to_string());
+                agent_id = v["id"].as_str().unwrap().to_string();
+            }
+            v.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&memory_path, rewritten).unwrap();
+    assert!(!agent_id.is_empty(), "agent fixture id not found");
+
+    let out = agentrec(root, &["verify", &agent_id, "--confirm"]);
+    assert!(
+        out.status.success(),
+        "verify --confirm on agent-origin memory failed: {out:?}"
+    );
+    let out = agentrec(root, &["memories", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().unwrap();
+    let entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(agent_id.as_str()))
+        .expect("agent-origin entry not found after verify");
+    assert_eq!(
+        entry.get("origin").and_then(|o| o.as_str()),
+        Some("agent"),
+        "verify must not reassign an agent-authored memory's origin to human: {entry}"
+    );
+
+    let out = agentrec(root, &["forget", &agent_id, "--reason", "still agent"]);
+    assert!(
+        out.status.success(),
+        "forget (agent fixture) failed: {out:?}"
+    );
+    let out = agentrec(root, &["memories", "--all", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().unwrap();
+    let entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(agent_id.as_str()))
+        .expect("agent-origin entry not found after forget");
+    assert_eq!(
+        entry.get("origin").and_then(|o| o.as_str()),
+        Some("agent"),
+        "forget must not reassign an agent-authored memory's origin to human: {entry}"
+    );
+    assert_eq!(entry.get("retracted").and_then(|r| r.as_bool()), Some(true));
+    assert_eq!(
+        entry.get("reason").and_then(|r| r.as_str()),
+        Some("still agent")
+    );
+}
+
 #[test]
 fn log_explain_glossary_matches_only_present_terms() {
     let tmp = tempfile::tempdir().unwrap();

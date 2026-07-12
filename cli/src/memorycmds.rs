@@ -11,6 +11,7 @@ use agentrec_core::memory::{self, EffectiveMemory, Freshness, MemoryOp, MemoryRe
 use agentrec_core::record::{append_log_line, SignalEvent};
 use agentrec_core::{id, scrub};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,6 +126,176 @@ pub fn candidate(root: &Path, fact: &str, from: &str, tool: &str) -> Result<(), 
     append_log_line(&crate::signal_path(root), &line)
 }
 
+/// Match `id_ref` against effective memory ids, exact or unambiguous prefix
+/// — mirrors `readcmds::resolve_turn`'s resolution style, adapted to
+/// `EffectiveMemory` (already deduped by id via `load_effective`'s fold, so
+/// no group-by is needed here). Zero or multiple matches is an error naming
+/// the candidates.
+fn resolve_memory<'a>(
+    effective: &'a [EffectiveMemory],
+    id_ref: &str,
+) -> Result<&'a EffectiveMemory, String> {
+    if effective.is_empty() {
+        return Err("no memories recorded".to_string());
+    }
+    let matches: Vec<&EffectiveMemory> = effective
+        .iter()
+        .filter(|m| m.id == id_ref || m.id.starts_with(id_ref))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(format!("unknown memory id '{id_ref}'")),
+        n => {
+            let ids: Vec<String> = matches.iter().map(|m| short_id(&m.id)).collect();
+            Err(format!(
+                "ambiguous memory id '{id_ref}' — matches {n} memories: {}",
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
+/// `verify <id> [--confirm] [--drop-pin <path>]...` (Task 10): re-pins a
+/// drifted memory. Without `--confirm`, prints the fact and per-pin drift
+/// against the current working tree and touches nothing on disk. With
+/// `--confirm`, appends a `reverify` record (same id, per the design spec —
+/// `reverify`/`retract` never mint a new id) carrying a fresh hash for every
+/// still-present pin.
+///
+/// An orphaned pin (pinned path no longer exists) is never silently dropped:
+/// `--confirm` refuses — naming the orphaned path, nothing appended — unless
+/// the caller also names that exact path via one or more `--drop-pin`
+/// flags. Dropping every pin (leaving the memory with zero pins) is refused
+/// outright; a memory must retain at least one pin at all times, the same
+/// invariant `append_memory` enforces on every other write path.
+pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Result<(), String> {
+    if !crate::agentrec_dir(root).is_dir() {
+        return Err("not initialized — run `agentrec init`".to_string());
+    }
+    let effective = memory::load_effective(root)?;
+    let m = resolve_memory(&effective, id)?;
+    if m.retracted {
+        return Err(format!(
+            "memory {} is already retracted — nothing to verify",
+            short_id(&m.id)
+        ));
+    }
+
+    println!("{}", m.fact);
+    let mut orphaned: Vec<String> = Vec::new();
+    let mut fresh_pins: Vec<Pin> = Vec::new();
+    for pin in &m.pins {
+        match memory::hash_pin(root, &pin.path) {
+            Ok(current) if current != pin.hash => {
+                println!("  {}: old {} -> new {current}", pin.path, pin.hash);
+                fresh_pins.push(Pin {
+                    path: pin.path.clone(),
+                    hash: current,
+                });
+            }
+            Ok(current) => {
+                println!("  {}: unchanged", pin.path);
+                fresh_pins.push(Pin {
+                    path: pin.path.clone(),
+                    hash: current,
+                });
+            }
+            Err(_) => {
+                println!("  {}: deleted", pin.path);
+                orphaned.push(pin.path.clone());
+            }
+        }
+    }
+
+    if !confirm {
+        return Ok(());
+    }
+
+    for path in &orphaned {
+        if !drop_pins.iter().any(|d| d == path) {
+            return Err(format!(
+                "pin '{path}' no longer exists — reverify refuses to silently drop it; pass --drop-pin {path} to confirm dropping it"
+            ));
+        }
+    }
+    if fresh_pins.is_empty() {
+        return Err(
+            "dropping every orphaned pin would leave this memory with zero pins — refusing"
+                .to_string(),
+        );
+    }
+
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: m.id.clone(),
+        op: MemoryOp::Reverify,
+        fact: m.fact.clone(),
+        pins: fresh_pins,
+        source_turns: vec![],
+        // Carry the fact's original authorship forward (design spec
+        // §Quality gate: "origin + source_turns give provenance") — a
+        // human re-pinning an agent-authored memory does not make the
+        // agent stop having asserted the fact. `load_effective`'s fold
+        // takes `origin` from whichever op is latest, so this record must
+        // restate it explicitly or an agent memory would silently flip to
+        // "human" on its first reverify.
+        origin: m.origin.clone(),
+        ts: wall_now_ms(),
+        reason: None,
+    };
+    memory::append_memory(root, &rec)
+}
+
+/// `forget <id> [--reason <text>]` (Task 10): retracts a memory. Refuses
+/// (honest error, exit 1) if `id` is already retracted. The retract record
+/// carries the memory's current fact and pins forward unchanged — never
+/// empty, since `append_memory` rejects an empty fact or a zero-pin record
+/// and both are already guaranteed non-empty on every live memory — so the
+/// appended line is self-describing without a reader needing to look up the
+/// original assert. `reason`, if given, is scrubbed the same as `remember`'s
+/// fact (defence in depth — a pasted secret in a retraction reason must
+/// never reach disk); a reason that scrubs to nothing is treated as absent
+/// rather than stored as an empty husk.
+pub fn forget(root: &Path, id: &str, reason: Option<&str>) -> Result<(), String> {
+    if !crate::agentrec_dir(root).is_dir() {
+        return Err("not initialized — run `agentrec init`".to_string());
+    }
+    let effective = memory::load_effective(root)?;
+    let m = resolve_memory(&effective, id)?;
+    if m.retracted {
+        return Err(format!("memory {} is already retracted", short_id(&m.id)));
+    }
+
+    let scrubbed_reason = reason.and_then(|r| {
+        let s = scrub::scrub(r);
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    });
+
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: m.id.clone(),
+        op: MemoryOp::Retract,
+        fact: m.fact.clone(),
+        pins: m.pins.clone(),
+        source_turns: vec![],
+        // Same provenance-preservation rationale as `verify`: `forget` is
+        // "the human counterweight" (design spec) to a bad assertion, but
+        // retracting an agent's memory doesn't retroactively make it
+        // human-authored — the fold takes `origin` from the retract record
+        // itself, so it must restate the original.
+        origin: m.origin.clone(),
+        ts: wall_now_ms(),
+        reason: scrubbed_reason,
+    };
+    memory::append_memory(root, &rec)
+}
+
 /// Mirrors the same one-line helper repeated across `cmds.rs`/`purgecmd.rs`/
 /// `daemon.rs`/`readcmds.rs` — a 3-line `SystemTime` call, not worth sharing.
 fn wall_now_ms() -> u64 {
@@ -228,9 +399,11 @@ pub fn recall_cmd(
     let hits = memory::recall(root, query, k)?;
 
     if json {
+        // `recall` only ever returns Fresh, non-retracted memories (INV-M2),
+        // so there is never a retract reason to surface here.
         let arr: Vec<EffectiveJson> = hits
             .iter()
-            .map(|m| effective_json(m, Freshness::Fresh))
+            .map(|m| effective_json(m, Freshness::Fresh, None))
             .collect();
         println!(
             "{}",
@@ -255,7 +428,10 @@ pub fn recall_cmd(
         std::env::var_os("NO_COLOR").is_some(),
     );
     for m in &hits {
-        println!("{}", format_memory_line(m, Freshness::Fresh, now_ms, color));
+        println!(
+            "{}",
+            format_memory_line(m, Freshness::Fresh, now_ms, color, None)
+        );
     }
     Ok(())
 }
@@ -264,7 +440,12 @@ pub fn recall_cmd(
 /// non-retracted memory unless `all`, which also includes retracted ones;
 /// `stale` then narrows that set to only non-`Fresh` (Stale or Orphaned)
 /// entries. Freshness is derived per row (`memory::pin_freshness`), never
-/// cached. Newest (`ts`) first.
+/// cached. Newest (`ts`) first. When `all` surfaces retracted entries, each
+/// row's `forget --reason` (if any) is looked up via
+/// [`latest_retract_reasons`] and shown alongside — `EffectiveMemory` itself
+/// deliberately doesn't carry `reason` (design comment on
+/// `memory::load_effective`'s fold), so this is a small parallel scan purely
+/// for display.
 pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), String> {
     if !crate::agentrec_dir(root).is_dir() {
         return Err("not initialized — run `agentrec init`".to_string());
@@ -279,8 +460,17 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
         .collect();
     rows.sort_by_key(|(m, _)| std::cmp::Reverse(m.ts));
 
+    let reasons: HashMap<String, String> = if all {
+        latest_retract_reasons(root)
+    } else {
+        HashMap::new()
+    };
+
     if json {
-        let arr: Vec<EffectiveJson> = rows.iter().map(|(m, f)| effective_json(m, *f)).collect();
+        let arr: Vec<EffectiveJson> = rows
+            .iter()
+            .map(|(m, f)| effective_json(m, *f, reasons.get(&m.id).map(String::as_str)))
+            .collect();
         println!(
             "{}",
             serde_json::to_string(&arr).map_err(|e| e.to_string())?
@@ -299,9 +489,54 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
         std::env::var_os("NO_COLOR").is_some(),
     );
     for (m, freshness) in rows {
-        println!("{}", format_memory_line(m, freshness, now_ms, color));
+        println!(
+            "{}",
+            format_memory_line(
+                m,
+                freshness,
+                now_ms,
+                color,
+                reasons.get(&m.id).map(String::as_str)
+            )
+        );
     }
     Ok(())
+}
+
+/// Scan raw `memory.jsonl` for the latest (highest `ts`) `retract` record's
+/// `reason` per memory id. See [`memories`]'s doc comment for why this lives
+/// here rather than on `EffectiveMemory`. Malformed lines are skipped, same
+/// tolerance as `memory::load_effective`; a retract with no `reason` simply
+/// has no entry.
+fn latest_retract_reasons(root: &Path) -> HashMap<String, String> {
+    let mut out: HashMap<String, (u64, String)> = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(memory::memory_path(root)) else {
+        return HashMap::new();
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<MemoryRecord>(line) else {
+            continue;
+        };
+        if rec.op != MemoryOp::Retract {
+            continue;
+        }
+        let Some(reason) = rec.reason else {
+            continue;
+        };
+        match out.get(&rec.id) {
+            Some((ts, _)) if *ts >= rec.ts => {}
+            _ => {
+                out.insert(rec.id, (rec.ts, reason));
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(id, (_, reason))| (id, reason))
+        .collect()
 }
 
 /// Task 9: the recall-for-hook logic, shared IN-PROCESS by `agentrec recall
@@ -365,21 +600,33 @@ fn build_hook_block(hits: &[EffectiveMemory], max_facts: usize) -> String {
 /// is epoch ms, converted through `agentrec_core::time::rfc3339` the same
 /// way `agentrec_core::time` and `fmt` already agree on), the fact, and pin
 /// paths (paths only — no hashes, this is the human view, not the hook one).
+/// A retracted memory (only ever reached via `memories --all`) shows
+/// "retracted" in place of the freshness label, plus its `forget --reason`
+/// (if any) trailing the line.
 fn format_memory_line(
     m: &EffectiveMemory,
     freshness: Freshness,
     now_ms: u64,
     color: bool,
+    reason: Option<&str>,
 ) -> String {
     let id = fmt::paint(&short_id(&m.id), "36", color);
-    let label = freshness_str(freshness);
+    let label = if m.retracted {
+        "retracted"
+    } else {
+        freshness_str(freshness)
+    };
     let when = fmt::relative_time(&agentrec_core::time::rfc3339(m.ts), now_ms);
     let pins: Vec<&str> = m.pins.iter().map(|p| p.path.as_str()).collect();
-    format!(
+    let mut line = format!(
         "{id}  {label:8}  {when}  {}  [pins: {}]",
         m.fact,
         pins.join(", ")
-    )
+    );
+    if let Some(r) = reason {
+        line.push_str(&format!("  reason: {r}"));
+    }
+    line
 }
 
 fn short_id(id: &str) -> String {
@@ -402,6 +649,9 @@ fn freshness_str(f: Freshness) -> &'static str {
 /// record plus the derived freshness label. Unlike the `--for-hook` block,
 /// this is a machine format — id and pin hashes are included in full, same
 /// posture as every other `--json` output in this CLI (e.g. `log --json`).
+/// `reason` (the latest `forget --reason`, via [`latest_retract_reasons`])
+/// is omitted entirely when absent — never emitted as `null` clutter on the
+/// overwhelming majority of (non-retracted) rows.
 #[derive(Serialize)]
 struct EffectiveJson<'a> {
     id: &'a str,
@@ -411,9 +661,15 @@ struct EffectiveJson<'a> {
     ts: u64,
     retracted: bool,
     freshness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
 }
 
-fn effective_json(m: &EffectiveMemory, freshness: Freshness) -> EffectiveJson<'_> {
+fn effective_json<'a>(
+    m: &'a EffectiveMemory,
+    freshness: Freshness,
+    reason: Option<&'a str>,
+) -> EffectiveJson<'a> {
     EffectiveJson {
         id: &m.id,
         fact: &m.fact,
@@ -422,6 +678,7 @@ fn effective_json(m: &EffectiveMemory, freshness: Freshness) -> EffectiveJson<'_
         ts: m.ts,
         retracted: m.retracted,
         freshness: freshness_str(freshness),
+        reason,
     }
 }
 
