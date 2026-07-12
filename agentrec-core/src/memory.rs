@@ -238,6 +238,33 @@ fn op_rank(op: &MemoryOp) -> u8 {
     }
 }
 
+/// Final tie-break key for `load_effective`'s fold sort, used only when two
+/// records share the exact same `(ts, op_rank)` — e.g. two `reverify`
+/// records for the same id at the same millisecond, with different pins
+/// (INV-M5). `(ts, op_rank)` alone is not a total order over such records,
+/// and `Vec::sort_by_key` is stable, so without a content tiebreak the
+/// winner would silently fall back to file (append) order — exactly the
+/// non-determinism INV-M5 forbids ("same records in any order produce the
+/// same effective state").
+///
+/// Built from the record's distinguishing fields — pins (sorted by
+/// `(path, hash)` so pin *order* within the record doesn't matter), then
+/// `fact`, then `origin` — so:
+/// - two records with the same id/ts/op but different content always sort
+///   into the same relative order regardless of file order (deterministic
+///   winner), and
+/// - two byte-identical records (any internal field order) map to the same
+///   key, so permuting them is a no-op — idempotency is preserved.
+fn content_key(rec: &MemoryRecord) -> (Vec<(String, String)>, String, String) {
+    let mut pins: Vec<(String, String)> = rec
+        .pins
+        .iter()
+        .map(|p| (p.path.clone(), p.hash.clone()))
+        .collect();
+    pins.sort();
+    (pins, rec.fact.clone(), rec.origin.clone())
+}
+
 /// Load every parseable record, fold per id (latest op wins, ordered by
 /// `ts` ascending; equal `ts` broken by op precedence, see `op_rank` —
 /// never by file order), and return one `EffectiveMemory` per id. Absent
@@ -285,13 +312,19 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
     let mut out = Vec::with_capacity(order.len());
     for id in order {
         let mut group = by_id.remove(&id).unwrap_or_default();
-        // Primary key `ts` ascending; secondary key breaks exact-ts ties by
-        // op precedence (retract > reverify > assert) so the fold below
-        // (which takes the *last* element of the sorted group as the
-        // effective state) is deterministic regardless of file order —
-        // INV-M5. A retraction is never lost to a same-ms assert/reverify,
-        // and a reverify's fresh pins are never lost to a same-ms assert.
-        group.sort_by_key(|r| (r.ts, op_rank(&r.op)));
+        // Total order: `ts` ascending, then op precedence (retract >
+        // reverify > assert), then `content_key` as a final deterministic
+        // tiebreak. The fold below takes the *last* element of the sorted
+        // group as the effective state, so this must be a genuine total
+        // order — `(ts, op_rank)` alone ties whenever two same-op records
+        // for the same id share a `ts` (e.g. two `reverify`s with
+        // different pins), and `sort_by_key`'s stability would then leak
+        // file order into the fold, violating INV-M5. A retraction is
+        // never lost to a same-ms assert/reverify, a reverify's fresh pins
+        // are never lost to a same-ms assert, and two same-(ts, op)
+        // records with different content always resolve to the same
+        // winner regardless of file order.
+        group.sort_by_key(|r| (r.ts, op_rank(&r.op), content_key(r)));
 
         let mut fact = String::new();
         let mut pins = Vec::new();
@@ -443,17 +476,35 @@ pub fn bm25_rank(corpus: &[EffectiveMemory], query: &str) -> Vec<(usize, f64)> {
     results
 }
 
+/// Hard cap on how many ranked candidates a single `recall` call will
+/// freshness-verify (`pin_freshness`, which reads + hashes every pinned
+/// file), regardless of `k`. On a corpus where many high-ranked candidates
+/// are stale/orphaned, rank-then-verify without a cap would hash an
+/// unbounded number of files — unbounded filesystem I/O in the
+/// `UserPromptSubmit` injection path, which has a tight (50ms) budget.
+///
+/// 128 comfortably exceeds any reasonable `k` (recall is used to fill a
+/// handful of injected-memory slots, not to page through the corpus) while
+/// keeping worst-case verification work bounded and constant regardless of
+/// corpus size. Capping out means recall may return *fewer than `k`*
+/// results on a mostly-stale corpus — it never weakens INV-M2 (fresh-only):
+/// a stale or orphaned candidate is still never returned, it is just never
+/// reached.
+pub const RECALL_VERIFY_CAP: usize = 128;
+
 /// Rank-then-verify recall (INV-M2, load-bearing): rank candidates by BM25
 /// relevance, then walk the ranking in order verifying each candidate's pin
 /// freshness against the current working tree, keeping only `Fresh`
 /// memories until `k` are collected. Stale and Orphaned candidates are
 /// skipped, never returned, and never block later (lower-ranked)
 /// candidates from being checked. Verification is lazy — candidates past
-/// the k-th Fresh one are never touched.
+/// the k-th Fresh one are never touched, and the walk never verifies more
+/// than `RECALL_VERIFY_CAP` candidates total, even if fewer than `k` Fresh
+/// results have been found by then (bounded worst-case I/O).
 ///
 /// Empty query -> no ranking signal, so falls back to the `k` freshest
 /// (by `ts`, most-recent-first) non-retracted memories that are Fresh,
-/// walked in the same lazy-verify style.
+/// walked in the same lazy-verify, cap-bounded style.
 pub fn recall(root: &Path, query: &str, k: usize) -> Result<Vec<EffectiveMemory>, String> {
     let all = load_effective(root)?;
 
@@ -469,8 +520,8 @@ pub fn recall(root: &Path, query: &str, k: usize) -> Result<Vec<EffectiveMemory>
     };
 
     let mut out = Vec::new();
-    for m in ordered_candidates {
-        if out.len() >= k {
+    for (verified, m) in ordered_candidates.into_iter().enumerate() {
+        if out.len() >= k || verified >= RECALL_VERIFY_CAP {
             break;
         }
         if pin_freshness(root, &m.pins) == Freshness::Fresh {
@@ -654,6 +705,52 @@ mod tests {
                 "reverify's pins must win over a same-ts assert regardless of file order"
             );
         }
+    }
+
+    // INV-M5 literal: `(ts, op_rank)` is not a total order by itself. Two
+    // `reverify` records for the *same* id, at the *same* ts, with
+    // *different* pins tie on both `ts` and `op_rank` — a sort keyed only
+    // on those (Vec::sort_by_key is stable) falls back to file/append
+    // order for the tie, so reversing the write order flips which pins
+    // win. INV-M5 says "same records in ANY order produce the same
+    // effective state" — that is a literal violation. The `content_key`
+    // tiebreak must make the fold pick the same winner regardless of which
+    // record was written first.
+    #[test]
+    fn fold_equal_ts_same_op_reverify_deterministic_any_order() {
+        let rev_a = rec(
+            "A",
+            MemoryOp::Reverify,
+            "F1",
+            vec![pin("src/a.rs", "aaaa")],
+            1_000,
+        );
+        let rev_b = rec(
+            "A",
+            MemoryOp::Reverify,
+            "F1",
+            vec![pin("src/b.rs", "bbbb")],
+            1_000,
+        );
+
+        let mut winners = Vec::new();
+        for (first, second) in [
+            (rev_a.clone(), rev_b.clone()),
+            (rev_b.clone(), rev_a.clone()),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            append_memory(root, &first).unwrap();
+            append_memory(root, &second).unwrap();
+            let effective = load_effective(root).unwrap();
+            assert_eq!(effective.len(), 1);
+            winners.push(effective[0].pins.clone());
+        }
+        assert_eq!(
+            winners[0], winners[1],
+            "same id/ts/op reverify records with different pins must fold \
+             to the identical winner regardless of file order: {winners:?}"
+        );
     }
 
     // Bad-line tolerance: a line with unknown extra fields still parses; a
@@ -1030,5 +1127,120 @@ mod tests {
         let mut ids: Vec<&str> = found.iter().map(|m| m.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["relevant0", "relevant1", "relevant2"]);
+    }
+
+    // FIX B: rank-then-verify's I/O must be bounded by RECALL_VERIFY_CAP,
+    // not by k or corpus size. Corpus is built so the orphaned block and
+    // the fresh block get an *identical* BM25 score (same 2-token fact
+    // "kraken telemetry", same doc length, so tf/dl normalization is
+    // identical) — `bm25_rank`'s idx-ascending tiebreak then makes
+    // insertion order decide rank order, letting this test place a large,
+    // deterministically-ordered orphaned block strictly ahead of the fresh
+    // one. Filler docs (disjoint vocabulary) pad total corpus size N so
+    // idf doesn't collapse toward zero when hundreds of docs share the
+    // query vocabulary (BM25 idf ~ ln((N-df+0.5)/(df+0.5)+1) — needs N
+    // meaningfully larger than df to clear SCORE_FLOOR).
+    //
+    // Scenario 1 (orphaned count << cap): sanity check on the construction
+    // itself — with nothing to exhaust the cap, recall must still find all
+    // 3 fresh memories. This isolates the cap (not some scoring artifact
+    // of the identical-fact construction) as the cause of scenario 2.
+    //
+    // Scenario 2 (orphaned count > RECALL_VERIFY_CAP, all ranked strictly
+    // ahead of the 3 fresh ones): recall's verification walk exhausts its
+    // cap entirely inside the orphaned block and never reaches the fresh
+    // one, so it returns *zero* results — even though 3 genuinely fresh,
+    // on-topic memories exist in the corpus. Before the Fix B cap, this
+    // exact construction returns all 3 (an unbounded walk eventually skips
+    // past every orphaned candidate and reaches them); this test fails
+    // against the pre-fix code with `found.len() == 3`, not empty. INV-M2
+    // (fresh-only) holds in both scenarios — capping only ever removes
+    // results, it never returns a stale/orphaned one.
+    //
+    // What this test does NOT prove: it doesn't instrument `pin_freshness`
+    // call counts directly, so it's an outcome-level (not an
+    // instrumentation-level) proof of the cap. The deterministic
+    // score-tie + insertion-order construction makes that outcome-level
+    // proof exact rather than probabilistic, which is why no
+    // instrumentation was added.
+    #[test]
+    fn recall_bounds_verification_on_stale_heavy_corpus() {
+        fn seed_orphaned(root: &Path, id: &str, rel: &str, ts: u64) {
+            seed_memory(root, id, "kraken telemetry", rel, b"x", ts);
+            fs::remove_file(root.join(rel)).unwrap();
+        }
+        fn seed_filler(root: &Path, id: &str, rel: &str, ts: u64) {
+            seed_memory(root, id, "unrelated housekeeping", rel, b"y", ts);
+        }
+
+        // Scenario 1: orphaned block comfortably below the cap.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            for i in 0..5 {
+                seed_orphaned(root, &format!("orph{i}"), &format!("orph{i}.rs"), 1_000 + i);
+            }
+            for i in 0..3 {
+                seed_memory(
+                    root,
+                    &format!("fresh{i}"),
+                    "kraken telemetry",
+                    &format!("fresh{i}.rs"),
+                    b"z",
+                    2_000 + i,
+                );
+            }
+            for i in 0..20 {
+                seed_filler(
+                    root,
+                    &format!("filler{i}"),
+                    &format!("filler{i}.rs"),
+                    3_000 + i,
+                );
+            }
+
+            let found = recall(root, "kraken telemetry", 3).unwrap();
+            assert_eq!(
+                found.len(),
+                3,
+                "below-cap sanity check: nothing but the cap should keep these 3 from being found"
+            );
+        }
+
+        // Scenario 2: orphaned block exceeds RECALL_VERIFY_CAP, ranked
+        // strictly ahead of the 3 fresh candidates.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let orphaned_count = RECALL_VERIFY_CAP as u64 + 12;
+            for i in 0..orphaned_count {
+                seed_orphaned(root, &format!("orph{i}"), &format!("orph{i}.rs"), 1_000 + i);
+            }
+            for i in 0..3 {
+                seed_memory(
+                    root,
+                    &format!("fresh{i}"),
+                    "kraken telemetry",
+                    &format!("fresh{i}.rs"),
+                    b"z",
+                    2_000 + i,
+                );
+            }
+            for i in 0..100 {
+                seed_filler(
+                    root,
+                    &format!("filler{i}"),
+                    &format!("filler{i}.rs"),
+                    3_000 + i,
+                );
+            }
+
+            let found = recall(root, "kraken telemetry", 3).unwrap();
+            assert!(
+                found.is_empty(),
+                "verification cap must be exhausted inside the orphaned \
+                 block before ever reaching the fresh one: {found:?}"
+            );
+        }
     }
 }
