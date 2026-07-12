@@ -102,7 +102,7 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec recall <query>` | Rank-then-verify search over pinned memories — only returns Fresh matches. `-k <n>`, `--json`. Verification is capped at 128 candidates per call; if the cap is hit, a notice prints to stderr ("results may be incomplete") since fresh matches could exist beyond it |
 | `agentrec memories` | List recorded memories (audit view, not a query). `--stale` (non-fresh only), `--all` (include retracted), `--json` |
 | `agentrec candidate <fact> --from <paths>` | Emit an agent-authored memory candidate for the daemon to validate, hash, and ingest. `--tool <name>` |
-| `agentrec verify <id>` | Preview a memory's per-pin drift against the working tree; touches nothing without `--confirm`. `--confirm` re-pins, `--drop-pin <path>` (repeatable) explicitly drops an orphaned pin |
+| `agentrec verify <id>` | Preview a memory's per-pin drift against the working tree; touches nothing without `--confirm`. `--confirm` re-pins, `--drop-pin <path>` (repeatable) explicitly drops an orphaned pin, `--replace-pin <old>=<new>` (repeatable) re-points an existing pin to an explicit successor path |
 | `agentrec forget <id>` | Retract a memory — recoverable (quarantined, not deleted) until `purge --memories-retracted` archives it past TTL. `--reason <text>` |
 
 Run `agentrec <command> --help` for the full flag reference.
@@ -112,6 +112,14 @@ Run `agentrec <command> --help` for the full flag reference.
 Beyond turns, agentrec can hold small, durable facts about a repo — "this endpoint requires an API key", "this test is flaky under load" — and hand the relevant ones back to the agent at the start of its next turn.
 
 Every memory is **pinned**: it's tied to the content hash of the file(s) it was true about, not just the file's path. When a pinned file changes, the pin drifts — the memory is still recorded, but `recall` stops returning it until someone re-verifies it (`agentrec verify <id> --confirm`) or explicitly retracts it (`agentrec forget <id>`). This is the staleness guarantee: **recall only ever returns memories whose pins are still Fresh right now** — a memory about code that's since changed underneath it is never silently handed back as if it were still true.
+
+A pinned file can also be *renamed* rather than edited — the old path is gone, so the pin looks orphaned even though the fact is still true of the file at its new location. `verify --replace-pin <old>=<new>` re-points that one pin to the successor path instead of dropping it:
+
+```
+agentrec verify a1b2c3d4 --confirm --replace-pin src/old_name.rs=src/new_name.rs
+```
+
+`new` is validated exactly like `remember --from`: it must resolve inside the repo root, contain no `..` traversal or symlink escape, actually exist on disk, and not match a secret-file pattern — any violation refuses with nothing appended. There is deliberately **no automatic rename detection**: `agentrec` never guesses that a deleted path and a new path are "the same file," since a wrong guess would silently re-ground a fact against the wrong source. You always name the successor explicitly.
 
 Two write paths: `agentrec remember` for a human asserting a fact directly, and `agentrec candidate` for an agent proposing one (routed through the daemon, which validates, hashes, and scrubs it before it ever reaches disk — same as prompt persistence). Facts are always scrubbed of secrets before they touch `.agentrec/memory.jsonl`, matching the discipline the rest of the store already applies to prompts and snapshots.
 
