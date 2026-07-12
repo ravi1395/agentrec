@@ -1,13 +1,15 @@
 //! agentrec-core: pure engine + persistence primitives for the agentrec recorder.
 //! Modules: id (ULID), time (RFC 3339), store (content-addressed blobs),
 //! record (protocol types), scrub (secret redaction), engine (turn boundaries),
-//! diff (unified text diff + binary detection for the `diff` verb).
+//! diff (unified text diff + binary detection for the `diff` verb), memory
+//! (hash-pinned semantic memory records, fold, fsynced append).
 //! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
 //! disagree, the doc wins and the code is a bug.
 
 pub mod diff;
 pub mod engine;
 pub mod id;
+pub mod memory;
 pub mod perms;
 pub mod record;
 pub mod retention;

@@ -103,7 +103,15 @@ pub struct EpochRecord {
 /// kill-9 immediately after this call returns Ok.
 pub fn append_log(path: &Path, record: &LogRecord) -> Result<(), String> {
     let line = serde_json::to_string(record).map_err(|e| e.to_string())?;
-    let file = open_append(path, &line)?;
+    append_line_synced(path, &line)
+}
+
+/// Append a pre-serialized, `\n`-terminated JSON line and fsync before
+/// returning. Shared durability primitive (D34) for any append-only store in
+/// the workspace that needs kill-9-safe closes — `append_log` is one caller;
+/// `memory.rs`'s `append_memory` is another.
+pub fn append_line_synced(path: &Path, line: &str) -> Result<(), String> {
+    let file = open_append(path, line)?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }

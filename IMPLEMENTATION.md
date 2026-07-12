@@ -228,6 +228,26 @@ Every call that could have been an open question, resolved. Renegotiable, but th
 2. The npm package version is locked one-to-one to the binary release version; publishing is a CI step of the release workflow, not a manual action.
 3. The mise/asdf plugin installs and pins versions; the README install matrix documents all five paths (installer script, brew, npm, mise, cargo) with one-line commands.
 
+### Memory (v1)
+
+Hash-pinned semantic memory (see `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`).
+Every invariant below maps to ≥1 automated test, filled in as the memory tasks land
+(Tasks 1–12); a name still reading "pending" has no test yet and must not be
+treated as verified.
+
+1. **INV-M1** — no memory record exists without ≥1 valid in-root pin: fuzz malformed
+   candidates (traversal, absolute paths, symlink escape, empty pins). Maps to test:
+   pending.
+2. **INV-M2** — stale/orphaned memories are never emitted by the injection path:
+   mutate a pinned file, recall again, memory gone. Maps to test: pending.
+3. **INV-M3** — planted secret never lands in `memory.jsonl` via either write path.
+   Maps to test: pending.
+4. **INV-M4** — hook path exits 0 and within budget under: corrupt store, missing
+   store, 10k-record store, concurrent append. Maps to test: pending.
+5. **INV-M5** — fold determinism: same records ingested in any order produce the
+   same effective state (property test). Maps to test:
+   `agentrec-core::memory::tests::fold_latest_op_wins_any_order` (Task 1).
+
 ## 5. v2 — The integration release (Codex, MCP, VS Code)
 
 ### O. Codex CLI capture
