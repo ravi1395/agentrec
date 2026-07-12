@@ -931,3 +931,131 @@ fn purge_memories_retracted_refuses_while_daemon_running() {
         "no archive file may be created on refusal"
     );
 }
+
+// ---- PR #2 curative: read-side dedup of orphan-recovery same-id duplicates --
+//
+// The engine fix (cb5dcd1) is PREVENTIVE: it stops a post-fix daemon writing a
+// duplicate turn id. A log.jsonl written by a PRE-fix daemon can still hold two
+// TurnRecords under one id (the kill-9 window between persist and journal
+// clear), which broke `undo <full_ulid>` with "ambiguous turn id — matches 2
+// turns". `resolve_turn` must now be curative: collapse an exact re-emit while
+// still surfacing a genuine id collision.
+
+#[test]
+fn undo_collapses_orphan_recovery_duplicate_same_id() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"BEFORE\n").unwrap();
+    let after = store.put(b"AFTER\n").unwrap();
+    std::fs::write(root.join("d.rs"), b"AFTER\n").unwrap();
+
+    let id = "t_DUP00000000000000000000001";
+    let mut turn = base_turn(
+        id,
+        vec![FileEntry {
+            path: "d.rs".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    // The steady `persist` close of a bracket turn carries an attributed model
+    // and (here) an untruncated close.
+    turn.model = Some("claude-opus-4".into());
+    turn.truncated = false;
+    seed_turn(root, &turn);
+    // Pre-fix orphan recovery re-appended the SAME turn under the SAME id from
+    // the crash journal. Recovery drifts on MORE than the timestamp: it
+    // recomputes `ended` from last-change, forces `model: None`, and forces
+    // `truncated: true` for a bracket turn (see daemon::recover_orphan). The
+    // file set — path + before/after hashes — is byte-identical, which is the
+    // only thing the collapse may key on.
+    turn.ended = "2026-07-06T00:00:09.000Z".into();
+    turn.model = None;
+    turn.truncated = true;
+    seed_turn(root, &turn);
+
+    // Pre-fix this errored "ambiguous turn id — matches 2 turns". The read side
+    // must collapse the double-emit and revert cleanly to a single turn.
+    let out = agentrec(root, &["undo", id, "--confirm"]);
+    assert!(out.status.success(), "undo should succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("reverted 1 file"),
+        "expected a clean revert, got: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("d.rs")).unwrap(),
+        b"BEFORE\n",
+        "file must be reverted to its pre-turn content"
+    );
+    assert_eq!(
+        agentrec_turns(root).len(),
+        1,
+        "the collapsed double-emit reverts as exactly one undo turn"
+    );
+}
+
+#[test]
+fn undo_still_errors_on_distinct_turns_sharing_id() {
+    use agentrec_core::record::FileEntry;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let id = "t_COLLIDE0000000000000000001";
+    // Two DIFFERENT turns (disjoint file sets) minted under the SAME id — a
+    // genuine id-gen collision, NOT a recovery double-emit. Collapsing these
+    // would silently undo one arbitrary turn, so resolution must still error.
+    let a = base_turn(
+        id,
+        vec![FileEntry {
+            path: "one.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    let b = base_turn(
+        id,
+        vec![FileEntry {
+            path: "two.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &a);
+    seed_turn(root, &b);
+
+    let out = agentrec(root, &["undo", id]);
+    assert!(
+        !out.status.success(),
+        "two distinct turns sharing an id must not resolve: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous turn id"),
+        "must still surface the genuine collision: {stderr}"
+    );
+}

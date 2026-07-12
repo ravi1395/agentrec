@@ -53,7 +53,12 @@ jobs:
         # (inotify headroom pass branch, 0700/0600 perms) — AC I++1. The
         # inotify FAIL branch needs an induced-low ceiling; see the
         # inotify-low-watches job below (AC Y++2).
-        run: cargo test --workspace --all-features
+        #
+        # --no-fail-fast: run EVERY test binary even after one fails. Without it
+        # cargo stops at the first failing binary, so a failure in `integration`
+        # masks one in `torture` entirely (torture_smoke never runs) — every
+        # such collision costs a CI round-trip. See CLAUDE.md "PR #2 CI-red fix".
+        run: cargo test --workspace --all-features --no-fail-fast
 
   inotify-low-watches:
     name: doctor inotify headroom (induced low watches, AC Y++2)
