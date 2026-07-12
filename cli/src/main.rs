@@ -192,7 +192,9 @@ enum Command {
         tool: String,
     },
     /// Re-pin a drifted memory. Without --confirm, previews the per-pin
-    /// drift and changes nothing.
+    /// drift and changes nothing. Re-pinning a renamed/moved file to its
+    /// successor is explicit only (--replace-pin) — there is no automatic
+    /// rename detection.
     Verify {
         /// Memory id, full or an unambiguous prefix.
         id: String,
@@ -200,9 +202,18 @@ enum Command {
         #[arg(long)]
         confirm: bool,
         /// Explicitly drop an orphaned (deleted) pin; repeatable. Required
-        /// for every orphaned pin, or --confirm refuses.
+        /// for every orphaned pin (unless it's named by --replace-pin
+        /// instead), or --confirm refuses.
         #[arg(long = "drop-pin")]
         drop_pin: Vec<String>,
+        /// Re-point an existing pin (`old`, already on this memory) to a
+        /// validated successor path (`new`) — repeatable as
+        /// `--replace-pin old=new`. `new` must pass the same validation as
+        /// `remember --from`: in-root, exists, not a secret path. No
+        /// automatic rename/successor discovery — the mapping is always
+        /// explicit.
+        #[arg(long = "replace-pin", value_name = "OLD=NEW")]
+        replace_pin: Vec<String>,
     },
     /// Retract a memory — quarantine is recoverable, but forgetting is
     /// explicit and reasoned.
@@ -280,7 +291,8 @@ fn main() {
             id,
             confirm,
             drop_pin,
-        } => memorycmds::verify(&root, &id, confirm, &drop_pin),
+            replace_pin,
+        } => memorycmds::verify(&root, &id, confirm, &drop_pin, &replace_pin),
         Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
     };
     if let Err(message) = result {

@@ -129,6 +129,23 @@ pub fn candidate(root: &Path, fact: &str, from: &str, tool: &str) -> Result<(), 
     append_log_line(&crate::signal_path(root), &line)
 }
 
+/// Parse one `--replace-pin` value as `OLD=NEW`, splitting on the FIRST `=`
+/// (a path could legitimately contain `=` on the right-hand side, though not
+/// the left — `old` is always matched verbatim against an existing pin
+/// path). Rejects a missing `=` or either side being empty after the split;
+/// neither side is trimmed of whitespace — mirrors `remember`'s from-path
+/// handling, no implicit normalization that could mask a typo.
+fn parse_replace_pin(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((old, new)) if !old.is_empty() && !new.is_empty() => {
+            Ok((old.to_string(), new.to_string()))
+        }
+        _ => Err(format!(
+            "--replace-pin '{raw}' must be OLD=NEW with both sides non-empty"
+        )),
+    }
+}
+
 /// Match `id_ref` against effective memory ids, exact or unambiguous prefix
 /// — mirrors `readcmds::resolve_turn`'s resolution style, adapted to
 /// `EffectiveMemory` (already deduped by id via `load_effective`'s fold, so
@@ -158,12 +175,13 @@ fn resolve_memory<'a>(
     }
 }
 
-/// `verify <id> [--confirm] [--drop-pin <path>]...` (Task 10, CAS diff added
-/// F7 part B): re-pins a drifted memory. Without `--confirm`, prints the
-/// fact and per-pin drift against the current working tree and touches
-/// nothing on disk. With `--confirm`, appends a `reverify` record (same id,
-/// per the design spec — `reverify`/`retract` never mint a new id) carrying
-/// a fresh hash for every still-present pin.
+/// `verify <id> [--confirm] [--drop-pin <path>]... [--replace-pin
+/// <old>=<new>]...` (Task 10, CAS diff added F7 part B, explicit re-pin
+/// added F9): re-pins a drifted memory. Without `--confirm`, prints the fact
+/// and per-pin drift against the current working tree and touches nothing on
+/// disk. With `--confirm`, appends a `reverify` record (same id, per the
+/// design spec — `reverify`/`retract` never mint a new id) carrying a fresh
+/// hash for every still-present or replaced pin.
 ///
 /// On a hash-drifted (not orphaned) pin, also renders a diff summary via the
 /// CAS (design spec §Lifecycle: "diff summary via CAS where snapshots
@@ -171,11 +189,36 @@ fn resolve_memory<'a>(
 ///
 /// An orphaned pin (pinned path no longer exists) is never silently dropped:
 /// `--confirm` refuses — naming the orphaned path, nothing appended — unless
-/// the caller also names that exact path via one or more `--drop-pin`
-/// flags. Dropping every pin (leaving the memory with zero pins) is refused
-/// outright; a memory must retain at least one pin at all times, the same
-/// invariant `append_memory` enforces on every other write path.
-pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Result<(), String> {
+/// the caller also names that exact path via one or more `--drop-pin` flags,
+/// or replaces it via `--replace-pin`. Dropping every pin (leaving the
+/// memory with zero pins) is refused outright; a memory must retain at least
+/// one pin at all times, the same invariant `append_memory` enforces on
+/// every other write path (INV-M1).
+///
+/// `--replace-pin old=new` (F9) re-points an EXISTING pin of this memory
+/// (`old` must already be one of `m.pins` — fresh, stale, or orphaned) to a
+/// validated successor path `new`. `new` passes the exact same validation as
+/// `remember --from` (`memory::validate_pin_path`: in-root, no `..`
+/// traversal, no symlink escape, must exist, not a secret path), reusing
+/// that validator rather than re-implementing it. This is the ONLY way to
+/// recover a memory whose sole pinned file was renamed — there is
+/// deliberately no automatic rename/successor guessing (design spec's
+/// rejected-approaches: an ambiguous rename could silently re-ground a fact
+/// against the wrong source).
+///
+/// Every `--replace-pin` is validated up front, atomically, before anything
+/// is printed: malformed `OLD=NEW` syntax, a duplicate `old` across multiple
+/// flags, an `old` also named by `--drop-pin` (contradictory), an `old` not
+/// currently a pin on this memory, or an invalid `new` all abort with
+/// nothing appended and nothing printed — same fail-fast posture as
+/// `remember`'s pin validation.
+pub fn verify(
+    root: &Path,
+    id: &str,
+    confirm: bool,
+    drop_pins: &[String],
+    replace_pins: &[String],
+) -> Result<(), String> {
     if !crate::agentrec_dir(root).is_dir() {
         return Err("not initialized — run `agentrec init`".to_string());
     }
@@ -188,27 +231,58 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
         ));
     }
 
+    // F9: parse + fully validate every --replace-pin before printing or
+    // touching anything else — an atomic all-or-nothing gate.
+    let mut replace_map: HashMap<String, (String, String)> = HashMap::new();
+    for raw in replace_pins {
+        let (old, new) = parse_replace_pin(raw)?;
+        if replace_map.contains_key(&old) {
+            return Err(format!(
+                "--replace-pin names '{old}' as the old path more than once"
+            ));
+        }
+        if drop_pins.iter().any(|d| d == &old) {
+            return Err(format!(
+                "'{old}' is named by both --drop-pin and --replace-pin — contradictory"
+            ));
+        }
+        if !m.pins.iter().any(|p| p.path == old) {
+            return Err(format!(
+                "'{old}' is not a pin on memory {}",
+                short_id(&m.id)
+            ));
+        }
+        let validated_new = memory::validate_pin_path(root, &new)?;
+        let new_hash = memory::hash_pin(root, &validated_new)?;
+        replace_map.insert(old, (validated_new, new_hash));
+    }
+
     let store = BlobStore::new(crate::objects_dir(root));
     println!("{}", fmt::sanitize_terminal(&m.fact));
     let mut orphaned: Vec<String> = Vec::new();
     let mut fresh_pins: Vec<Pin> = Vec::new();
     for pin in &m.pins {
         let path = fmt::sanitize_terminal(&pin.path);
+        let being_replaced = replace_map.contains_key(&pin.path);
         match memory::hash_pin(root, &pin.path) {
             Ok(current) if current != pin.hash => {
                 println!("  {path}: old {} -> new {current}", pin.hash);
                 print_pin_diff(&store, pin, root);
-                fresh_pins.push(Pin {
-                    path: pin.path.clone(),
-                    hash: current,
-                });
+                if !being_replaced {
+                    fresh_pins.push(Pin {
+                        path: pin.path.clone(),
+                        hash: current,
+                    });
+                }
             }
             Ok(current) => {
                 println!("  {path}: unchanged");
-                fresh_pins.push(Pin {
-                    path: pin.path.clone(),
-                    hash: current,
-                });
+                if !being_replaced {
+                    fresh_pins.push(Pin {
+                        path: pin.path.clone(),
+                        hash: current,
+                    });
+                }
             }
             Err(_) => {
                 println!("  {path}: deleted");
@@ -216,17 +290,34 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
             }
         }
     }
+    for (old, (new_path, _)) in &replace_map {
+        println!(
+            "  {} -> {}",
+            fmt::sanitize_terminal(old),
+            fmt::sanitize_terminal(new_path)
+        );
+    }
 
     if !confirm {
         return Ok(());
     }
 
     for path in &orphaned {
+        if replace_map.contains_key(path) {
+            // Being re-pointed via --replace-pin, not dropped.
+            continue;
+        }
         if !drop_pins.iter().any(|d| d == path) {
             return Err(format!(
-                "pin '{path}' no longer exists — reverify refuses to silently drop it; pass --drop-pin {path} to confirm dropping it"
+                "pin '{path}' no longer exists — reverify refuses to silently drop it; pass --drop-pin {path} to confirm dropping it, or --replace-pin {path}=<successor> to re-point it"
             ));
         }
+    }
+    for (new_path, new_hash) in replace_map.values() {
+        fresh_pins.push(Pin {
+            path: new_path.clone(),
+            hash: new_hash.clone(),
+        });
     }
     if fresh_pins.is_empty() {
         return Err(

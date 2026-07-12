@@ -3999,6 +3999,416 @@ fn verify_falls_back_when_blob_purged() {
     );
 }
 
+// F9: renaming the sole pinned file of a memory orphans it forever with only
+// the pre-F9 verb set (`--confirm` refuses without a matching `--drop-pin`,
+// and dropping the only pin is refused outright — a hard dead end). This
+// test proves the gap using ONLY `--replace-pin` (the fix under test); before
+// F9 lands, `--replace-pin` is an unrecognized clap argument, so the CLI
+// invocation itself fails — that failure IS the RED signal for AC-F9.1.
+#[test]
+fn verify_replace_pin_preserves_renamed_sole_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/old_name.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed rotation lives in old_name for now";
+    let out = agentrec(root, &["remember", fact, "--from", "src/old_name.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("newly remembered id not found");
+
+    // Rename: old path gone, new path holds the same content under a new
+    // name — the pin is now orphaned with zero automatic recovery.
+    std::fs::rename(root.join("src/old_name.rs"), root.join("src/new_name.rs")).unwrap();
+
+    // AC-F9.1 (RED before implementation): recall no longer serves the
+    // memory (orphaned pin => never Fresh), and there is no re-pin path
+    // using only the pre-F9 verbs.
+    let out = agentrec(root, &["recall", "nightly seed rotation", "--json"]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        !parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "orphaned-by-rename memory must not recall before re-pinning"
+    );
+
+    // AC-F9.2: preview (no --confirm) shows the orphaned old pin AND the
+    // proposed old -> new mapping; nothing is appended.
+    let lines_before = memory_records(root).len();
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--replace-pin",
+            "src/old_name.rs=src/new_name.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify preview failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/old_name.rs") && stdout.contains("deleted"),
+        "preview must show the orphaned old pin: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/old_name.rs") && stdout.contains("src/new_name.rs"),
+        "preview must show the proposed old -> new mapping: {stdout}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "preview must not append"
+    );
+
+    // AC-F9.3: confirmed replacement preserves id + fact, replaces the pin,
+    // and `recall` serves the memory again.
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/old_name.rs=src/new_name.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before + 1,
+        "replacement must append exactly one record"
+    );
+
+    let effective_pins = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .expect("appended record")
+        .get("pins")
+        .cloned()
+        .expect("pins");
+    let pins_arr = effective_pins.as_array().unwrap();
+    assert_eq!(
+        pins_arr.len(),
+        1,
+        "sole pin replaced, not added to: {pins_arr:?}"
+    );
+    assert_eq!(
+        pins_arr[0].get("path").and_then(|p| p.as_str()),
+        Some("src/new_name.rs")
+    );
+    let last_rec = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .unwrap();
+    assert_eq!(last_rec.get("fact").and_then(|f| f.as_str()), Some(fact));
+    assert_eq!(
+        last_rec.get("op").and_then(|o| o.as_str()),
+        Some("reverify")
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed rotation", "--json"]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "recall must serve the memory again after replacement: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "replaced memory must be fresh again, not stale: {stdout}"
+    );
+}
+
+// AC-F9.5: replacing ONE orphaned pin while another pin on the same memory
+// is retained (re-hashed, not dropped) yields a single valid, non-empty pin
+// set — INV-M1 (a memory always carries >=1 valid pin) holds.
+#[test]
+fn verify_replace_pin_keeps_other_pins_on_multi_pin_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/renamed.rs"), b"fn r() {}").unwrap();
+    std::fs::write(root.join("src/kept.rs"), b"fn k() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed kraken batching spans two files";
+    let out = agentrec(
+        root,
+        &["remember", fact, "--from", "src/renamed.rs,src/kept.rs"],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("id not found");
+
+    std::fs::rename(root.join("src/renamed.rs"), root.join("src/renamed2.rs")).unwrap();
+    // Also drift (not orphan) the kept pin, to prove it gets re-hashed, not
+    // just carried forward stale.
+    std::fs::write(root.join("src/kept.rs"), b"fn k() { changed(); }").unwrap();
+    let new_kept_hash = memory::hash_pin(root, "src/kept.rs").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/renamed.rs=src/renamed2.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+
+    let last_rec = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .unwrap();
+    let pins_arr = last_rec.get("pins").unwrap().as_array().unwrap();
+    assert_eq!(pins_arr.len(), 2, "both pins present: {pins_arr:?}");
+    let paths: Vec<&str> = pins_arr
+        .iter()
+        .map(|p| p.get("path").and_then(|x| x.as_str()).unwrap())
+        .collect();
+    assert!(paths.contains(&"src/renamed2.rs"));
+    assert!(paths.contains(&"src/kept.rs"));
+    let kept_entry = pins_arr
+        .iter()
+        .find(|p| p.get("path").and_then(|x| x.as_str()) == Some("src/kept.rs"))
+        .unwrap();
+    assert_eq!(
+        kept_entry.get("hash").and_then(|h| h.as_str()),
+        Some(new_kept_hash.as_str()),
+        "kept pin must be re-hashed fresh, not left stale"
+    );
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "memory must be fully fresh: {stdout}"
+    );
+}
+
+// AC-F9.4: every atomic-refusal case for --replace-pin. Each sub-case
+// re-derives a fresh id off a fresh remember (the prior case's own refusal
+// already proves nothing was appended, so state carries forward safely) and
+// asserts append count is unchanged.
+#[test]
+fn verify_replace_pin_rejections_append_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("outside_root")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+    std::fs::write(root.join("src/c.rs"), b"fn c() {}").unwrap();
+    std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+
+    let fact = "kraken batching rejection fixture fact";
+    let out = agentrec(root, &["remember", fact, "--from", "src/a.rs,src/b.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("id not found");
+
+    let assert_refused = |args: &[&str], must_contain: &str, msg: &str| {
+        let lines_before = memory_records(root).len();
+        let out = agentrec(root, args);
+        assert!(
+            !out.status.success(),
+            "{msg}: expected failure, got {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(must_contain),
+            "{msg}: stderr {stderr} must mention '{must_contain}'"
+        );
+        assert_eq!(
+            memory_records(root).len(),
+            lines_before,
+            "{msg}: refusal must append nothing"
+        );
+    };
+
+    // nonexistent old pin (not on this memory)
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/not_a_pin.rs=src/c.rs",
+        ],
+        "not a pin",
+        "nonexistent old pin",
+    );
+
+    // nonexistent new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=src/does_not_exist.rs",
+        ],
+        "does_not_exist",
+        "nonexistent new path",
+    );
+
+    // absolute new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=/etc/passwd",
+        ],
+        "absolute",
+        "absolute new path",
+    );
+
+    // ..-traversal new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=../outside_root",
+        ],
+        "..",
+        "traversal new path",
+    );
+
+    // secret-pattern new path
+    assert_refused(
+        &["verify", &id, "--confirm", "--replace-pin", "src/a.rs=.env"],
+        "secret",
+        "secret new path",
+    );
+
+    // duplicate old mappings across multiple --replace-pin flags
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=src/c.rs",
+            "--replace-pin",
+            "src/a.rs=src/b.rs",
+        ],
+        "more than once",
+        "duplicate old mapping",
+    );
+
+    // contradictory --drop-pin old + --replace-pin old=new for the same old
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--drop-pin",
+            "src/a.rs",
+            "--replace-pin",
+            "src/a.rs=src/c.rs",
+        ],
+        "contradictory",
+        "contradictory drop-pin + replace-pin",
+    );
+
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("src/escape.rs"))
+            .unwrap();
+        assert_refused(
+            &[
+                "verify",
+                &id,
+                "--confirm",
+                "--replace-pin",
+                "src/a.rs=src/escape.rs",
+            ],
+            "escape",
+            "symlink-escape new path",
+        );
+    }
+
+    // Sanity: the memory is still intact and unresolved by any of the above.
+    let effective = agentrec(root, &["memories", "--json"]);
+    assert!(effective.status.success());
+}
+
+// AC-F9.6: `verify --help` documents the explicit `--replace-pin` mechanism
+// and does not claim any automatic rename/successor discovery.
+#[test]
+fn verify_help_documents_replace_pin_no_auto_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["verify", "--help"]);
+    assert!(out.status.success(), "verify --help failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--replace-pin"),
+        "--help must document --replace-pin: {stdout}"
+    );
+    let lower = stdout.to_lowercase();
+    // Must not claim the tool discovers/detects a rename on its own — but
+    // an explicit *denial* of that ("no automatic rename detection") is
+    // exactly what AC-F9.6 wants, so only phrases that assert auto-discovery
+    // as a real capability are forbidden.
+    for forbidden in [
+        "automatically detects",
+        "automatically finds",
+        "automatically re-pins",
+        "auto-detects",
+        "auto-detect a rename",
+        "guesses the rename",
+        "guesses the successor",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "--help must not claim automatic rename discovery (found '{forbidden}'): {stdout}"
+        );
+    }
+    assert!(
+        lower.contains("no automatic") || lower.contains("explicit"),
+        "--help should state the mapping is explicit / not automatic: {stdout}"
+    );
+}
+
 // F1: fact rendering must strip terminal-escape bytes (ESC 0x1b / BEL 0x07)
 // before they reach stdout — same posture prompt excerpts already get via
 // `fmt::sanitize_terminal` (cmds.rs/readcmds.rs). Seeds a memory whose fact
