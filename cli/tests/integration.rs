@@ -3859,6 +3859,146 @@ fn verify_and_forget_lifecycle() {
     );
 }
 
+// F7 part B: design spec §Read path promises `memories --stale` shows WHICH
+// pin drifted and WHEN (a join against the turn log), not just a bare
+// "stale" label. Pre-fix, the listing only prints the fact + freshness
+// label + all pin paths — the drifted pin isn't distinguished from any
+// other pin on the memory, and there is no turn/time reference at all.
+#[test]
+fn memories_stale_shows_drifted_pin_and_when() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Mutate the pinned file and seed a turn recording exactly that drift
+    // (base_turn/seed_turn — same direct-log fixture pattern as the
+    // diff/blame tests above; no daemon needed, only the read-side join is
+    // under test).
+    let new_bytes = b"fn a() { changed(); }\n";
+    std::fs::write(root.join("src/a.rs"), new_bytes).unwrap();
+    let after_hash = agentrec_core::store::hash_bytes(new_bytes);
+    let turn_id = "t_DRIFTJOIN0000000000000A1";
+    let turn = base_turn(
+        turn_id,
+        vec![agentrec_core::record::FileEntry {
+            path: "src/a.rs".into(),
+            before: None,
+            after: Some(after_hash),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "must name the drifted pin path: {stdout}"
+    );
+    assert!(
+        stdout.contains(turn_id),
+        "must reference the turn that produced the drift: {stdout}"
+    );
+    assert!(
+        stdout.lines().count() > 1,
+        "must be more than a bare one-line 'stale' label: {stdout}"
+    );
+}
+
+// F7 part B: design spec §Lifecycle promises `verify <id>` shows a "diff
+// summary via CAS" on drift, not only two hashes. Pre-fix, `verify` prints
+// exactly `old <hash> -> new <hash>` and nothing else.
+#[test]
+fn verify_renders_cas_diff_on_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let original = b"fn a() {}\n";
+    std::fs::write(root.join("src/a.rs"), original).unwrap();
+
+    // Seed the CAS with the pinned content itself — a pin's hash is computed
+    // directly from file bytes (`memory::hash_pin`), it is never written to
+    // the object store by `remember`, so a diff needs this seeded explicitly
+    // (mirrors how `diff`/`undo`'s own tests seed blobs via BlobStore::put).
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+    store.put(original).expect("seed pinned blob");
+
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }\n").unwrap();
+
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("+1/-1"),
+        "expected a diff summary line: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with('+') && l.contains("changed")),
+        "expected an actual added diff line: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with('-') && !l.trim_start().starts_with("---")),
+        "expected an actual removed diff line: {stdout}"
+    );
+}
+
+// F7 part B: the pinned-hash blob is the common case for being unavailable
+// (a pin's hash is computed straight from file bytes; it's only IN the CAS
+// if some turn happened to snapshot identical content) — the diff summary
+// must fall back honestly rather than silently show nothing, mirroring
+// `show --prompt`'s corrupt/purged-blob honesty.
+#[test]
+fn verify_falls_back_when_blob_purged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+
+    // No CAS seeding — the pinned hash was never written as a blob.
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }\n").unwrap();
+
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("blob unavailable"),
+        "expected the honest fallback note: {stdout}"
+    );
+    assert!(
+        stdout.contains("old sha256:") && stdout.contains("-> new sha256:"),
+        "hash line must still be present: {stdout}"
+    );
+}
+
 // F1: fact rendering must strip terminal-escape bytes (ESC 0x1b / BEL 0x07)
 // before they reach stdout — same posture prompt excerpts already get via
 // `fmt::sanitize_terminal` (cmds.rs/readcmds.rs). Seeds a memory whose fact

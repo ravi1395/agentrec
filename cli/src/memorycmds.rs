@@ -8,8 +8,10 @@
 
 use crate::cmds::wall_now_ms;
 use crate::fmt;
+use agentrec_core::diff;
 use agentrec_core::memory::{self, EffectiveMemory, Freshness, MemoryOp, MemoryRecord, Pin};
-use agentrec_core::record::{append_log_line, SignalEvent};
+use agentrec_core::record::{append_log_line, LogRecord, SignalEvent, TurnRecord};
+use agentrec_core::store::{BlobStore, StoreError};
 use agentrec_core::{id, scrub};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -156,12 +158,16 @@ fn resolve_memory<'a>(
     }
 }
 
-/// `verify <id> [--confirm] [--drop-pin <path>]...` (Task 10): re-pins a
-/// drifted memory. Without `--confirm`, prints the fact and per-pin drift
-/// against the current working tree and touches nothing on disk. With
-/// `--confirm`, appends a `reverify` record (same id, per the design spec —
-/// `reverify`/`retract` never mint a new id) carrying a fresh hash for every
-/// still-present pin.
+/// `verify <id> [--confirm] [--drop-pin <path>]...` (Task 10, CAS diff added
+/// F7 part B): re-pins a drifted memory. Without `--confirm`, prints the
+/// fact and per-pin drift against the current working tree and touches
+/// nothing on disk. With `--confirm`, appends a `reverify` record (same id,
+/// per the design spec — `reverify`/`retract` never mint a new id) carrying
+/// a fresh hash for every still-present pin.
+///
+/// On a hash-drifted (not orphaned) pin, also renders a diff summary via the
+/// CAS (design spec §Lifecycle: "diff summary via CAS where snapshots
+/// exist") — see [`print_pin_diff`].
 ///
 /// An orphaned pin (pinned path no longer exists) is never silently dropped:
 /// `--confirm` refuses — naming the orphaned path, nothing appended — unless
@@ -182,6 +188,7 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
         ));
     }
 
+    let store = BlobStore::new(crate::objects_dir(root));
     println!("{}", fmt::sanitize_terminal(&m.fact));
     let mut orphaned: Vec<String> = Vec::new();
     let mut fresh_pins: Vec<Pin> = Vec::new();
@@ -190,6 +197,7 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
         match memory::hash_pin(root, &pin.path) {
             Ok(current) if current != pin.hash => {
                 println!("  {path}: old {} -> new {current}", pin.hash);
+                print_pin_diff(&store, pin, root);
                 fresh_pins.push(Pin {
                     path: pin.path.clone(),
                     hash: current,
@@ -296,6 +304,78 @@ pub fn forget(root: &Path, id: &str, reason: Option<&str>) -> Result<(), String>
         reason: scrubbed_reason,
     };
     crate::memlock::append_memory_locked(root, &rec)
+}
+
+/// F7 part B: render a diff summary for one drifted (hash-mismatched, not
+/// orphaned — caller already confirmed the path is still readable) pin, via
+/// the CAS — reuses `diff::is_binary`/`diff::unified` (agentrec-core),
+/// never a hand-rolled diff.
+///
+/// A pin's hash is computed directly from file bytes at pin/reverify time
+/// (`memory::hash_pin`) — `remember`/`verify` never call `BlobStore::put`,
+/// so the pinned content is only IN the CAS by coincidence (some turn
+/// happened to snapshot identical bytes). A missing or corrupt blob is
+/// therefore the common case, not an edge case, and is reported honestly —
+/// same posture as `readcmds::show --prompt`'s corrupt/purged-blob handling
+/// — rather than silently producing no diff. All rendered text is routed
+/// through `fmt::sanitize_terminal` (fact/pin/path/diff-line convention).
+fn print_pin_diff(store: &BlobStore, pin: &Pin, root: &Path) {
+    let path = fmt::sanitize_terminal(&pin.path);
+    let old = match store.get(&pin.hash) {
+        Ok(bytes) => bytes,
+        Err(StoreError::Missing(_)) => {
+            println!("    {path}: blob unavailable (never captured or purged) — hash only");
+            return;
+        }
+        Err(StoreError::Corrupt(_)) => {
+            println!("    {path}: blob unavailable (corrupt — hash mismatch) — hash only");
+            return;
+        }
+    };
+    // The caller only reaches here after `memory::hash_pin` succeeded on
+    // this same path, so this read should also succeed; a race (deleted
+    // between the two reads) degrades to silently skipping the diff rather
+    // than erroring — the hash-drift line above already told the caller
+    // enough to act on.
+    let Ok(current) = std::fs::read(root.join(&pin.path)) else {
+        return;
+    };
+
+    if diff::is_binary(&old) || diff::is_binary(&current) {
+        println!(
+            "    {path}: binary content changed ({} -> {} bytes)",
+            old.len(),
+            current.len()
+        );
+        return;
+    }
+
+    let old_str = std::str::from_utf8(&old).unwrap_or("");
+    let cur_str = std::str::from_utf8(&current).unwrap_or("");
+    let text = diff::unified(old_str, cur_str, &pin.path);
+    let (added, removed) = count_diff_lines(&text);
+    println!("    {path}: +{added}/-{removed} lines");
+    for line in text.lines() {
+        println!("    {}", fmt::sanitize_terminal(line));
+    }
+}
+
+/// Count added/removed content lines in a `diff::unified` output — skips
+/// the `+++`/`---` file-header lines so only real hunk lines count.
+fn count_diff_lines(unified_text: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in unified_text.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => added += 1,
+            Some('-') => removed += 1,
+            _ => {}
+        }
+    }
+    (added, removed)
 }
 
 /// Read `memory_enabled` from `.agentrec/config.toml` via the shared
@@ -492,8 +572,121 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
                 reasons.get(&m.id).map(String::as_str)
             )
         );
+        // F7 part B, design spec §Read path: "stale rows show which pin
+        // drifted and when (join against turn log)" — a bare freshness
+        // label alone doesn't say WHICH of a memory's (up to 8) pins
+        // drifted, or when. Fresh rows have nothing to show here.
+        if freshness != Freshness::Fresh {
+            for drift in pin_drifts(root, m) {
+                println!("{}", format_drift_line(&drift, now_ms));
+            }
+        }
     }
     Ok(())
+}
+
+/// One drifted pin's turn-log join (design spec §Read path). `current` is
+/// `None` for an orphaned pin (path no longer readable); `turn` is `None`
+/// when neither join strategy in [`find_drift_turn`] finds a candidate — an
+/// honest "drift time unknown", never a guess.
+struct PinDrift {
+    path: String,
+    pinned_hash: String,
+    current: Option<String>,
+    turn: Option<(String, String)>, // (turn id, turn `ended` RFC3339)
+}
+
+/// Every non-fresh pin on `m`, each joined against the turn log via
+/// [`find_drift_turn`]. A memory's freshness is the worst case across its
+/// pins (`memory::pin_freshness`), so a Stale/Orphaned memory can still have
+/// some individually-fresh pins — those are skipped here, only the pins that
+/// actually drifted are returned.
+fn pin_drifts(root: &Path, m: &EffectiveMemory) -> Vec<PinDrift> {
+    let mut out = Vec::new();
+    for pin in &m.pins {
+        match memory::hash_pin(root, &pin.path) {
+            Ok(current) if current == pin.hash => continue,
+            Ok(current) => {
+                let turn = find_drift_turn(root, &pin.path, Some(&current), m.ts);
+                out.push(PinDrift {
+                    path: pin.path.clone(),
+                    pinned_hash: pin.hash.clone(),
+                    current: Some(current),
+                    turn,
+                });
+            }
+            Err(_) => {
+                let turn = find_drift_turn(root, &pin.path, None, m.ts);
+                out.push(PinDrift {
+                    path: pin.path.clone(),
+                    pinned_hash: pin.hash.clone(),
+                    current: None,
+                    turn,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Join a drifted pin against `log.jsonl`. Preferred: the turn whose
+/// recorded `after` hash for `pin_path` equals the file's current content —
+/// the turn that produced the drift, scanned newest-first so the most
+/// recent producer wins if content ever repeats. Fallback (no exact-hash
+/// match — e.g. an edit the watcher hasn't recorded yet, or an orphaned
+/// pin, which has no current hash to match at all): the most recent turn
+/// that touched `pin_path` at or after the memory's own `ts` (the pin
+/// couldn't have drifted before it was pinned). `None` when neither
+/// strategy finds a candidate.
+fn find_drift_turn(
+    root: &Path,
+    pin_path: &str,
+    current_hash: Option<&str>,
+    pinned_ts_ms: u64,
+) -> Option<(String, String)> {
+    let records = agentrec_core::record::load_log(&crate::log_path(root));
+    let turns: Vec<&TurnRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            LogRecord::Turn(t) => Some(t),
+            LogRecord::Epoch(_) => None,
+        })
+        .collect();
+
+    if let Some(cur) = current_hash {
+        if let Some(t) = turns.iter().rev().find(|t| {
+            t.files
+                .iter()
+                .any(|f| f.path == pin_path && f.after.as_deref() == Some(cur))
+        }) {
+            return Some((t.id.clone(), t.ended.clone()));
+        }
+    }
+
+    let since = agentrec_core::time::rfc3339(pinned_ts_ms);
+    turns
+        .iter()
+        .rev()
+        .find(|t| t.ended.as_str() >= since.as_str() && t.files.iter().any(|f| f.path == pin_path))
+        .map(|t| (t.id.clone(), t.ended.clone()))
+}
+
+/// Render one [`PinDrift`] detail line under a `memories` row.
+fn format_drift_line(d: &PinDrift, now_ms: u64) -> String {
+    let path = fmt::sanitize_terminal(&d.path);
+    let current_disp = d.current.as_deref().unwrap_or("missing");
+    let when = match &d.turn {
+        Some((turn_id, ended)) => format!(
+            "drifted in turn {} at {}",
+            fmt::sanitize_terminal(turn_id),
+            fmt::relative_time(ended, now_ms)
+        ),
+        None => "drift time unknown".to_string(),
+    };
+    format!(
+        "    {path}: pinned {} -> now {current_disp}  ({when})",
+        d.pinned_hash
+    )
 }
 
 /// Scan raw `memory.jsonl` for the latest (highest `ts`) `retract` record's
