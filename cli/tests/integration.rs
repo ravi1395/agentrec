@@ -3320,3 +3320,165 @@ fn log_explain_glossary_matches_only_present_terms() {
         "expected a bare glossary entry once a bare turn is present: {both_stdout}"
     );
 }
+
+// --- Task 8: `agentrec candidate` — agent-emitted memory candidates (the
+// memory WRITE path's CLI emitter half; the daemon-side ingestion is
+// Task 7's `daemon::ingest_candidate`, covered end-to-end here too).
+
+/// Every parsed line of `.agentrec/memory.jsonl`. Absent file = empty vec.
+fn memory_records(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+#[test]
+fn candidate_cli_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(
+        root.join(".github/workflows/nightly.yml"),
+        "name: nightly\n",
+    )
+    .unwrap();
+
+    let mut daemon = spawn_record(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    let out = agentrec(
+        root,
+        &[
+            "candidate",
+            "fact about nightly",
+            "--from",
+            ".github/workflows/nightly.yml",
+        ],
+    );
+    assert!(out.status.success(), "candidate failed: {out:?}");
+
+    // The emitted signal line: type memory-candidate, pins are PATHS ONLY —
+    // no "sha256:" hash anywhere in the line. Hashing is the daemon's job,
+    // done against the live tree at ingestion, never trusted from the
+    // emitter (design spec, "Rejected approaches — emitter-side hashing").
+    let signal_text = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap();
+    let candidate_line = signal_text
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            (v.get("type").and_then(|t| t.as_str()) == Some("memory-candidate")).then_some(v)
+        })
+        .expect("no memory-candidate line appended to signal.jsonl");
+    assert_eq!(
+        candidate_line.get("fact").and_then(|f| f.as_str()),
+        Some("fact about nightly")
+    );
+    let pins = candidate_line
+        .get("pins")
+        .and_then(|p| p.as_array())
+        .expect("pins must be an array");
+    assert_eq!(pins.len(), 1, "expected exactly one pin: {pins:?}");
+    let pin0 = pins[0]
+        .as_str()
+        .expect("pins must be plain path strings, not hash objects");
+    assert_eq!(pin0, ".github/workflows/nightly.yml");
+    assert!(
+        !signal_text.contains("sha256:"),
+        "the emitted signal line must never carry a hash: {signal_text}"
+    );
+
+    // End-to-end through Task 7 ingestion: the daemon tails the inbox and
+    // lands the fact in memory.jsonl, attributed to the agent.
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let recs = memory_records(root);
+        (!recs.is_empty()).then_some(recs)
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let recs = recorded.expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    assert_eq!(
+        recs[0].get("origin").and_then(|v| v.as_str()),
+        Some("agent")
+    );
+    assert_eq!(
+        recs[0].get("fact").and_then(|v| v.as_str()),
+        Some("fact about nightly")
+    );
+}
+
+// Daemon-DOWN replay + D7-preservation pair. A candidate emitted while NO
+// daemon is running must be ingested on the NEXT daemon start (candidate-only
+// startup replay, daemon.rs `replay_pending_candidates`). In the SAME
+// pre-daemon gap, a stale start/stop bracket must NOT be replayed — it would
+// mint a phantom turn misdated to boot (the exact hazard D7's EOF-skip
+// prevents). This is the pair that proves the startup replay is
+// candidate-only and D7 still holds: memory record lands, zero turns appear.
+#[test]
+fn candidate_startup_replay_is_candidate_only_and_preserves_d7() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    // No daemon running yet. Emit a candidate via the real CLI...
+    let out = agentrec(
+        root,
+        &["candidate", "a fact learned offline", "--from", "notes.txt"],
+    );
+    assert!(out.status.success(), "candidate failed: {out:?}");
+    assert!(
+        !root.join(".agentrec/memory.jsonl").exists(),
+        "no daemon was running — nothing should be ingested yet"
+    );
+
+    // ...and, in the SAME gap, plant a stale bracket (start+stop). If replayed
+    // as live, this pair would fabricate an empty turn misdated to boot.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_stale"}"#,
+    );
+    send_hook(root, r#"{"hook_event_name":"Stop","session_id":"s_stale"}"#);
+
+    // Now start the daemon: the candidate is replayed on startup...
+    let mut daemon = spawn_record(root);
+    let recorded = poll_until(Duration::from_secs(6), || {
+        let recs = memory_records(root);
+        (!recs.is_empty()).then_some(recs)
+    });
+
+    // Give the daemon a beat past the replay to confirm no phantom turn lands.
+    std::thread::sleep(Duration::from_secs(1));
+    let phantom = turns(root);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let recs = recorded.expect("candidate emitted while daemon down was never replayed on startup");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    assert_eq!(
+        recs[0].get("fact").and_then(|v| v.as_str()),
+        Some("a fact learned offline")
+    );
+    assert_eq!(
+        recs[0].get("origin").and_then(|v| v.as_str()),
+        Some("agent")
+    );
+
+    assert!(
+        phantom.is_empty(),
+        "a stale start/stop bracket in the pre-daemon gap was replayed and \
+         minted a phantom turn — D7's EOF-skip must still drop start/stop: {phantom:?}"
+    );
+}

@@ -170,6 +170,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Emit an agent-authored memory candidate (write path): appends a
+    /// memory-candidate signal for the daemon to validate, hash, and
+    /// ingest. See the companion `agentrec-memory` skill for usage guidance.
+    Candidate {
+        /// The candidate fact (scrubbed of secrets before it reaches disk).
+        fact: String,
+        /// Comma-separated repo-relative paths this fact is grounded in.
+        #[arg(long)]
+        from: String,
+        /// Emitting tool identity.
+        #[arg(long, default_value = "agent")]
+        tool: String,
+    },
 }
 
 fn main() {
@@ -224,6 +237,9 @@ fn main() {
             for_hook,
         } => memorycmds::recall_cmd(&root, &query, k, json, for_hook),
         Command::Memories { stale, all, json } => memorycmds::memories(&root, stale, all, json),
+        Command::Candidate { fact, from, tool } => {
+            memorycmds::candidate(&root, &fact, &from, &tool)
+        }
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");

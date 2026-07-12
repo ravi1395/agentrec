@@ -60,7 +60,11 @@ pub fn run(root: &Path) -> Result<(), String> {
     let store = BlobStore::new(objects_dir(&root));
     let mut engine = TurnEngine::new();
     let mut recorder = Recorder::scan(&root, store);
-    let mut tailer = SignalTailer::open(&root)?;
+    // Candidate-only startup replay: memory-candidate lines that landed in the
+    // inbox while no daemon was running are ingested now, and the live tailer
+    // starts exactly where this scan stopped so nothing is read twice.
+    let replay_to = replay_pending_candidates(&root, engine.open_turn_id());
+    let mut tailer = SignalTailer { offset: replay_to };
     let mut ignore_set = IgnoreSet::build(&root);
     let mut journal_cache: Option<String> = None;
 
@@ -690,17 +694,6 @@ struct SignalTailer {
 }
 
 impl SignalTailer {
-    fn open(root: &Path) -> Result<Self, String> {
-        // Start at the current end of the inbox, not the persisted offset. A
-        // signal that landed while no daemon was recording refers to fs changes
-        // we never observed; replaying it would mint an empty turn misdated to
-        // daemon-boot (reviewer #5). The pre-recording interval is an honest gap.
-        let offset = std::fs::metadata(signal_path(root))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        Ok(SignalTailer { offset })
-    }
-
     /// D7: seek to the persisted offset and read only the fresh tail, instead
     /// of re-reading the whole inbox every ~250ms (O(file) per poll, on a
     /// file that only grows). Also detects external truncation (`len <
@@ -781,6 +774,70 @@ impl SignalTailer {
 /// re-scrubs before writing (idempotent on already-scrubbed text, matching
 /// the prompt-persistence discipline elsewhere in this file); any of its
 /// refusals also counts as a reject here.
+/// Candidate-only startup replay. Scans `signal.jsonl` from the persisted
+/// `signal_offset` (end of what the previous daemon session consumed) up to the
+/// current EOF — the window of signals that arrived while no daemon was running
+/// — and routes ONLY memory-candidate lines through `ingest_candidate`. Every
+/// start/stop signal in that same pre-daemon window is intentionally dropped.
+///
+/// This is the one narrow relaxation of D7 (`SignalTailer::open`'s blanket
+/// EOF-skip), and it is safe precisely where D7's rationale does not apply:
+/// D7 skips the gap because replaying a stale start/stop "would mint an empty
+/// turn misdated to daemon-boot". A memory-candidate mints no turn at all —
+/// `ingest_candidate` never opens/closes a turn, stamps the record with the
+/// signal's own `ts` (not boot time), and dedups an already-ingested fact to a
+/// silent no-op — so replaying candidates is turn-neutral and idempotent across
+/// restarts, while start/stop lines here still never reach the engine.
+///
+/// Returns the offset consumed up to (the last complete line). The live tailer
+/// adopts this as its starting offset, so within a single boot the startup scan
+/// and the live tailer never read the same line twice. The advanced offset is
+/// also persisted, so an immediate restart doesn't re-scan the same window
+/// (dedup would no-op it, but advancing avoids the repeated work).
+fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
+    let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
+        // No inbox yet — same starting point as the historical open() path.
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let mut state = read_state(root);
+    let start = state.signal_offset;
+    if len <= start {
+        // Nothing appended since the last consumed offset. (len < start is an
+        // external shrink we can't recover — sit at the new EOF, matching the
+        // historical open() behaviour of starting at the current end.)
+        return len;
+    }
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return len;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return len;
+    }
+    // Only replay complete lines; a torn final line is left for the live tailer
+    // to complete and process (it re-reads from `start` in that case).
+    let Some(nl) = buf.iter().rposition(|b| *b == b'\n') else {
+        return start;
+    };
+    for sig in parse_signals(&String::from_utf8_lossy(&buf[..=nl])) {
+        // D7 preserved: ONLY candidate lines are acted on; start/stop (and any
+        // other) signals in the pre-daemon gap are dropped, never fed to the
+        // engine, so no phantom turn can be minted here.
+        if sig.is_memory_candidate() {
+            ingest_candidate(root, &mut state, &sig, current_turn);
+        }
+    }
+    let consumed = start + (nl as u64) + 1;
+    state.signal_offset = consumed;
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist replayed signal offset: {e}");
+    }
+    consumed
+}
+
 fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_turn: Option<&str>) {
     let raw_pins: &[String] = sig.pins.as_deref().unwrap_or(&[]);
     let mut pins = Vec::with_capacity(raw_pins.len());
@@ -1604,8 +1661,7 @@ mod tests {
         std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
         std::fs::write(signal_path(root), b"").unwrap();
 
-        let mut tailer = SignalTailer::open(root).unwrap();
-        assert_eq!(tailer.offset, 0);
+        let mut tailer = SignalTailer { offset: 0 };
 
         std::fs::write(
             signal_path(root),
@@ -1656,6 +1712,69 @@ mod tests {
         .unwrap();
         let events2 = tailer.poll(root);
         assert_eq!(events2.len(), 1);
+    }
+
+    // Candidate-only startup replay: the scan ingests ONLY memory-candidate
+    // lines from the pre-daemon gap (start/stop are skipped — D7 preserved for
+    // turn boundaries), reconciles the offset to the scanned EOF so the live
+    // tailer never re-reads within one boot, persists that offset, and is
+    // idempotent across restarts (a re-scanned candidate dedups to a no-op).
+    #[test]
+    fn replay_pending_candidates_is_candidate_only_and_offset_reconciled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+
+        let start_line = r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#;
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        let contents = format!("{start_line}\n{candidate}\n{stop_line}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let eof = contents.len() as u64;
+
+        // No state.json -> persisted offset 0: the whole file is the gap.
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(
+            consumed, eof,
+            "scan consumes up to the last complete line (EOF)"
+        );
+        assert_eq!(
+            read_state(root).signal_offset,
+            eof,
+            "advanced offset persisted so the live tailer resumes at EOF"
+        );
+
+        let mems = agentrec_core::memory::load_effective(root).unwrap();
+        assert_eq!(
+            mems.len(),
+            1,
+            "only the candidate is ingested; start/stop are skipped: {mems:?}"
+        );
+        assert_eq!(mems[0].fact, "a gap fact");
+        assert_eq!(mems[0].origin, "agent");
+
+        // Restart idempotency: force a full re-scan of a gap that now holds the
+        // same candidate twice — dedup keeps memory.jsonl at one record.
+        std::fs::write(
+            signal_path(root),
+            format!("{contents}{candidate}\n").as_bytes(),
+        )
+        .unwrap();
+        let mut st = read_state(root);
+        st.signal_offset = 0;
+        write_state(root, &st).unwrap();
+        replay_pending_candidates(root, None);
+        let mems2 = agentrec_core::memory::load_effective(root).unwrap();
+        assert_eq!(
+            mems2.len(),
+            1,
+            "a re-scanned/duplicate candidate dedups to a no-op: {mems2:?}"
+        );
     }
 
     // ---- D9: event-channel draining + walk exclusion -------------------------

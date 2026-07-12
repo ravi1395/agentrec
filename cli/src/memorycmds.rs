@@ -8,6 +8,7 @@
 
 use crate::fmt;
 use agentrec_core::memory::{self, EffectiveMemory, Freshness, MemoryOp, MemoryRecord, Pin};
+use agentrec_core::record::{append_log_line, SignalEvent};
 use agentrec_core::{id, scrub};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -51,6 +52,77 @@ pub fn remember(root: &Path, fact: &str, from: &str) -> Result<(), String> {
         reason: None,
     };
     memory::append_memory(root, &rec)
+}
+
+/// `agentrec candidate` (Task 8): the memory WRITE path's agent-facing
+/// emitter. Appends one memory-candidate `SignalEvent` line to the signal
+/// inbox via `record::append_log_line` — unsynced, same D34 inbox exemption
+/// `cmds::hook` relies on for start/stop lines. The daemon
+/// (`daemon::ingest_candidate`, Task 7) does the real work: hashing pins
+/// against the live tree, deduping, and persisting to `memory.jsonl`. This
+/// layer never hashes or checks path existence (design spec, "Rejected
+/// approaches — emitter-side hashing": a hash computed here could be stale
+/// by the time the daemon reads it) — it only scrubs and light-validates.
+///
+/// Order: scrub the fact FIRST (defence in depth — a secret must never
+/// enter even the unsynced inbox, not even transiently; this is the layer
+/// Task 7's own tests explicitly deferred to Task 8) -> refuse if the
+/// scrubbed fact is empty or over `memory::FACT_MAX_CHARS` -> split `from`
+/// on `,` (mirrors `remember`), trim, strip a leading `./` (closes the
+/// dedup gap Task 7 noted: `./a.rs` and `a.rs` naming the same file must
+/// normalize to one pin) -> refuse on zero paths or more than
+/// `memory::PINS_MAX`. Nothing heavier: full validation (existence,
+/// traversal, secret-path, hashing) is the daemon's job at ingestion.
+pub fn candidate(root: &Path, fact: &str, from: &str, tool: &str) -> Result<(), String> {
+    let scrubbed_fact = scrub::scrub(fact);
+    if scrubbed_fact.trim().is_empty() {
+        return Err("fact scrubbed to empty — refusing to store an empty husk".to_string());
+    }
+    let fact_len = scrubbed_fact.chars().count();
+    if fact_len > memory::FACT_MAX_CHARS {
+        return Err(format!(
+            "fact exceeds {}-char cap ({fact_len} chars)",
+            memory::FACT_MAX_CHARS
+        ));
+    }
+
+    let mut pins = Vec::new();
+    for raw in from.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = raw.strip_prefix("./").unwrap_or(raw);
+        if normalized.is_empty() {
+            continue;
+        }
+        pins.push(normalized.to_string());
+    }
+    if pins.is_empty() {
+        return Err("--from must name at least one path".to_string());
+    }
+    if pins.len() > memory::PINS_MAX {
+        return Err(format!(
+            "--from names more than the {}-path cap ({} paths)",
+            memory::PINS_MAX,
+            pins.len()
+        ));
+    }
+
+    let signal = SignalEvent {
+        v: 1,
+        ts: wall_now_ms(),
+        tool: tool.to_string(),
+        event: None,
+        session: None,
+        transcript: None,
+        prompt: None,
+        kind: Some("memory-candidate".to_string()),
+        fact: Some(scrubbed_fact),
+        pins: Some(pins),
+    };
+    let line = serde_json::to_string(&signal).map_err(|e| e.to_string())?;
+    append_log_line(&crate::signal_path(root), &line)
 }
 
 /// Mirrors the same one-line helper repeated across `cmds.rs`/`purgecmd.rs`/
