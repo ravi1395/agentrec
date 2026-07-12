@@ -3310,6 +3310,207 @@ fn recall_cli_fresh_only_and_json() {
     );
 }
 
+/// Seeds `memory.jsonl` directly (no daemon, no subprocess-per-record) with
+/// a stale-heavy corpus shaped exactly like `agentrec-core::memory::tests::
+/// recall_bounds_verification_on_stale_heavy_corpus`'s scenario 2: an
+/// orphaned block strictly larger than `RECALL_VERIFY_CAP`, sharing the same
+/// fact text (and therefore an identical BM25 score) as `fresh_count`
+/// genuinely fresh, real-pinned records that rank strictly BEHIND it via the
+/// idx-ascending tiebreak (insertion order). A filler block pads corpus size
+/// so idf doesn't collapse toward zero. Returns the paths of the fresh
+/// records (already written + hashed) so callers can assert on their facts.
+fn seed_capped_stale_heavy_corpus(root: &Path, fresh_count: u64) {
+    let mut lines = String::new();
+    let orphaned_count = agentrec_core::memory::RECALL_VERIFY_CAP as u64 + 12;
+    for i in 0..orphaned_count {
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("orph{i}"),
+            "op": "assert",
+            "fact": "kraken telemetry batching",
+            "pins": [{
+                "path": format!("missing{i}.rs"),
+                "hash": format!("sha256:{i:064}"),
+            }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 1_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    for i in 0..fresh_count {
+        let rel = format!("fresh{i}.rs");
+        std::fs::write(root.join(&rel), b"fn fresh() {}\n").unwrap();
+        let hash = memory::hash_pin(root, &rel).expect("hash fresh file");
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("fresh{i}"),
+            "op": "assert",
+            "fact": "kraken telemetry batching",
+            "pins": [{ "path": rel, "hash": hash }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 2_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    for i in 0..100 {
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("filler{i}"),
+            "op": "assert",
+            "fact": "unrelated housekeeping chore",
+            "pins": [{
+                "path": format!("filler_missing{i}.rs"),
+                "hash": format!("sha256:{i:064}"),
+            }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 3_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    std::fs::write(root.join(".agentrec/memory.jsonl"), lines).unwrap();
+}
+
+/// F3 (RECALL_VERIFY_CAP truncation is silent): on a corpus where the
+/// verify walk exhausts `RECALL_VERIFY_CAP` entirely inside an orphaned
+/// block, `agentrec recall` must print a one-line capped notice to STDERR
+/// (never stdout, keeping stdout parseable/pipeable) so "no fresh matches"
+/// is never indistinguishable from "no fresh matches AND more exist beyond
+/// the cap". Pre-fix, this fails on a plain string-absence assertion
+/// (compiles fine against pre-fix code — no `capped` field existed to
+/// gate a notice on, so none was ever printed).
+#[test]
+fn recall_notice_appears_when_verification_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    seed_capped_stale_heavy_corpus(root, 3);
+
+    let out = agentrec(root, &["recall", "kraken telemetry batching"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("verification capped at 128 candidates — results may be incomplete"),
+        "expected the capped notice on stderr: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("verification capped"),
+        "capped notice must never land on stdout: stdout={stdout}"
+    );
+
+    // `--json` is out of scope for the F3 notice (see recall_cmd's doc
+    // comment) — assert it stays a clean, notice-free array either way.
+    let out = agentrec(root, &["recall", "kraken telemetry batching", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "recall --json stdout must stay valid JSON: {stdout}"
+    );
+}
+
+/// F3 counterpart: a corpus comfortably under `RECALL_VERIFY_CAP` must
+/// never print the capped notice — it is not a generic "results might be
+/// incomplete for some other reason" disclaimer, it fires only when the cap
+/// was actually the reason the walk stopped early.
+#[test]
+fn recall_no_cap_notice_under_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed rotation"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("verification capped"),
+        "under-cap corpus must never print the capped notice: stderr={stderr}"
+    );
+
+    // A genuinely empty result set (no fresh match) under the cap also
+    // must not print the notice — the two "empty" cases (capped vs
+    // genuinely-nothing) must render differently.
+    let out = agentrec(root, &["recall", "zebra quantum flux"]);
+    assert!(out.status.success(), "recall (no match) failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("verification capped"),
+        "genuinely-empty-under-cap must not print the capped notice: stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("no fresh memories match"),
+        "expected the plain no-match message: stdout={stdout}"
+    );
+}
+
+/// F3, hook path: the capped signal must be recorded in
+/// `memory-stats.jsonl` ONLY — the `--for-hook`/hook stdout contract
+/// (fenced block or nothing, exit 0 always) is unconditional and must never
+/// carry the capped notice text. Uses the same stale-heavy construction as
+/// `recall_notice_appears_when_verification_capped`, sized well under the
+/// hook's 50ms self-budget (no `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED`
+/// involved — this proves the capped stat lands on a real, in-budget walk).
+#[test]
+fn hook_records_capped_stat_never_stdout_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // No fresh matches at all — the exact silent-truncation scenario F3
+    // exists for: zero hits AND fresh matches existed beyond the cap.
+    seed_capped_stale_heavy_corpus(root, 0);
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_capped","prompt":"kraken telemetry batching"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "no fresh hits -> hook stdout must be empty, capped or not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("capped"),
+        "capped must never appear in hook stdout: {stdout}"
+    );
+
+    let stats = poll_until(Duration::from_secs(5), || {
+        let lines = memory_stats_lines(root);
+        lines
+            .iter()
+            .any(|l| l.get("capped").and_then(|v| v.as_bool()) == Some(true))
+            .then_some(lines)
+    })
+    .expect("expected a capped:true line in memory-stats.jsonl");
+    assert!(
+        stats
+            .iter()
+            .any(|l| l.get("capped").and_then(|v| v.as_bool()) == Some(true)),
+        "expected capped:true in memory-stats.jsonl: {stats:?}"
+    );
+}
+
 #[test]
 fn recall_for_hook_emits_block_or_nothing() {
     let tmp = tempfile::tempdir().unwrap();

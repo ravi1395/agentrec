@@ -99,7 +99,7 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec purge` | Delete blob objects: expired prompts by default (TTL from `config.toml`). `--all-prompts`, `--snapshots-before <DATE>`, `--memories-retracted` (archives expired retracted memory chains, never deletes) |
 | `agentrec uninstall` | Remove hooks + service unit, archive `.agentrec/` to a sibling directory. Nothing is ever deleted. `--no-service` |
 | `agentrec remember <fact> --from <paths>` | Record a manual, human-authored pinned memory. `--from` is a comma-separated list of repo-relative paths |
-| `agentrec recall <query>` | Rank-then-verify search over pinned memories — only returns Fresh matches. `-k <n>`, `--json` |
+| `agentrec recall <query>` | Rank-then-verify search over pinned memories — only returns Fresh matches. `-k <n>`, `--json`. Verification is capped at 128 candidates per call; if the cap is hit, a notice prints to stderr ("results may be incomplete") since fresh matches could exist beyond it |
 | `agentrec memories` | List recorded memories (audit view, not a query). `--stale` (non-fresh only), `--all` (include retracted), `--json` |
 | `agentrec candidate <fact> --from <paths>` | Emit an agent-authored memory candidate for the daemon to validate, hash, and ingest. `--tool <name>` |
 | `agentrec verify <id>` | Preview a memory's per-pin drift against the working tree; touches nothing without `--confirm`. `--confirm` re-pins, `--drop-pin <path>` (repeatable) explicitly drops an orphaned pin |

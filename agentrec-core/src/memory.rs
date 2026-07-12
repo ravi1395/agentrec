@@ -540,6 +540,12 @@ fn deadline_exceeded(deadline: Option<Instant>) -> bool {
 /// results on a mostly-stale corpus — it never weakens INV-M2 (fresh-only):
 /// a stale or orphaned candidate is still never returned, it is just never
 /// reached.
+///
+/// F3: hitting this cap while still short of `k` is silent by construction
+/// (INV-M2 forbids ever surfacing what's beyond it) — `RecallOutcome::capped`
+/// is the load-bearing signal that lets callers say so instead of an
+/// indistinguishable "no fresh matches". See `recall_outcome` /
+/// `recall_with_deadline`.
 pub const RECALL_VERIFY_CAP: usize = 128;
 
 /// Rank-then-verify recall (INV-M2, load-bearing): rank candidates by BM25
@@ -559,14 +565,38 @@ pub fn recall(root: &Path, query: &str, k: usize) -> Result<Vec<EffectiveMemory>
     Ok(recall_impl(root, query, k, None)?.hits)
 }
 
-/// Result of a deadline-bounded [`recall_with_deadline`] call (F2).
+/// Non-deadline twin of [`recall`] that surfaces the full [`RecallOutcome`]
+/// (F3) — specifically `capped`, so a caller (the CLI `recall`/`memories`
+/// commands, the `--for-hook` deadline path) can tell "the verify walk
+/// examined the whole ranking" apart from "it stopped at
+/// [`RECALL_VERIFY_CAP`] with candidates left unchecked", and warn rather
+/// than silently presenting a possibly-incomplete result set as if it were
+/// exhaustive. `budget_exceeded` is always `false` here (no deadline is
+/// passed) — kept on the shared struct only so `recall_with_deadline` and
+/// this function can return the same type.
+pub fn recall_outcome(root: &Path, query: &str, k: usize) -> Result<RecallOutcome, String> {
+    recall_impl(root, query, k, None)
+}
+
+/// Result of a deadline-bounded [`recall_with_deadline`] call (F2), also
+/// returned by the non-deadline [`recall_outcome`] (F3).
 /// `budget_exceeded` is set iff the cooperative deadline tripped before the
 /// walk completed — when it is `true`, `hits` is always empty (a hard
 /// bail, never a partial result, so a caller can't confuse "budget blown"
 /// with "genuinely no matches").
+///
+/// `capped` (F3) is set iff the verify walk hit [`RECALL_VERIFY_CAP`] with
+/// at least one candidate still unexamined — i.e. `hits` may be missing
+/// Fresh matches that exist beyond the cap. It is only ever `true` when
+/// `hits.len() < k` (a caller who already got their `k` results was not
+/// truncated, regardless of what lies further down the ranking) and is
+/// always `false` on a `budget_exceeded` outcome (a deadline bail never
+/// walked far enough to distinguish "capped" from any other reason it
+/// stopped early). See `recall_impl`'s loop for the exact boundary.
 pub struct RecallOutcome {
     pub hits: Vec<EffectiveMemory>,
     pub budget_exceeded: bool,
+    pub capped: bool,
 }
 
 /// Deadline-bounded [`recall`] (F2, founder-decided option (a) — a hard
@@ -599,6 +629,7 @@ fn recall_impl(
         return Ok(RecallOutcome {
             hits: Vec::new(),
             budget_exceeded: true,
+            capped: false,
         });
     }
 
@@ -607,6 +638,7 @@ fn recall_impl(
         return Ok(RecallOutcome {
             hits: Vec::new(),
             budget_exceeded: true,
+            capped: false,
         });
     }
 
@@ -620,20 +652,36 @@ fn recall_impl(
             return Ok(RecallOutcome {
                 hits: Vec::new(),
                 budget_exceeded: true,
+                capped: false,
             });
         }
         ranked.into_iter().map(|(idx, _score)| &all[idx]).collect()
     };
 
+    // F3: `capped` must record WHY the walk stopped, not just THAT it
+    // stopped — `out.len() >= k` ("caller got everything they asked for")
+    // is checked first and is never a truncation; only reaching index
+    // `RECALL_VERIFY_CAP` while still hungry (`i >= RECALL_VERIFY_CAP` is
+    // only reachable when the prior check didn't already break) proves an
+    // unexamined candidate exists beyond the cap. A combined `||` condition
+    // (the pre-F3 shape) can't distinguish the two, which is exactly how
+    // "zero fresh matches" and "zero fresh matches AND more exist beyond
+    // the cap" became indistinguishable to callers.
     let mut out = Vec::new();
-    for (verified, m) in ordered_candidates.into_iter().enumerate() {
-        if out.len() >= k || verified >= RECALL_VERIFY_CAP {
+    let mut capped = false;
+    for (i, m) in ordered_candidates.into_iter().enumerate() {
+        if out.len() >= k {
+            break;
+        }
+        if i >= RECALL_VERIFY_CAP {
+            capped = true;
             break;
         }
         if deadline_exceeded(deadline) {
             return Ok(RecallOutcome {
                 hits: Vec::new(),
                 budget_exceeded: true,
+                capped: false,
             });
         }
         if pin_freshness(root, &m.pins) == Freshness::Fresh {
@@ -643,6 +691,7 @@ fn recall_impl(
     Ok(RecallOutcome {
         hits: out,
         budget_exceeded: false,
+        capped,
     })
 }
 
@@ -1279,6 +1328,20 @@ mod tests {
     // score-tie + insertion-order construction makes that outcome-level
     // proof exact rather than probabilistic, which is why no
     // instrumentation was added.
+    //
+    // F3 extension: both scenarios now also assert `RecallOutcome::capped`
+    // via `recall_outcome` — scenario 1 (nothing exhausts the cap) must
+    // report `capped: false`; scenario 2 (the cap is exhausted entirely
+    // inside the orphaned block, 3 genuinely fresh matches left unreached)
+    // must report `capped: true`, so a caller can distinguish "verified
+    // everything, genuinely nothing fresh" from "stopped early, may have
+    // missed fresh matches" instead of both collapsing into an identical
+    // empty `Vec`. Pre-F3 this doesn't compile (`RecallOutcome`/
+    // `recall_outcome` didn't exist) — the closest RED equivalent is the
+    // CLI-level `recall_notice_appears_when_verification_capped`
+    // (`cli/tests/integration.rs`), which drives the same construction
+    // through the real binary and fails on a plain string-absence
+    // assertion against pre-fix code.
     #[test]
     fn recall_bounds_verification_on_stale_heavy_corpus() {
         fn seed_orphaned(root: &Path, id: &str, rel: &str, ts: u64) {
@@ -1321,6 +1384,13 @@ mod tests {
                 3,
                 "below-cap sanity check: nothing but the cap should keep these 3 from being found"
             );
+
+            let outcome = recall_outcome(root, "kraken telemetry", 3).unwrap();
+            assert_eq!(outcome.hits.len(), 3);
+            assert!(
+                !outcome.capped,
+                "walk never reached RECALL_VERIFY_CAP — must not report capped"
+            );
         }
 
         // Scenario 2: orphaned block exceeds RECALL_VERIFY_CAP, ranked
@@ -1356,6 +1426,14 @@ mod tests {
                 found.is_empty(),
                 "verification cap must be exhausted inside the orphaned \
                  block before ever reaching the fresh one: {found:?}"
+            );
+
+            let outcome = recall_outcome(root, "kraken telemetry", 3).unwrap();
+            assert!(outcome.hits.is_empty());
+            assert!(
+                outcome.capped,
+                "walk exhausted RECALL_VERIFY_CAP with the 3 fresh matches \
+                 still unreached — must report capped: true"
             );
         }
     }

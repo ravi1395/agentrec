@@ -397,11 +397,16 @@ pub fn recall_cmd(
         return Err("not initialized — run `agentrec init`".to_string());
     }
 
-    let hits = memory::recall(root, query, k)?;
+    let outcome = memory::recall_outcome(root, query, k)?;
+    let hits = outcome.hits;
 
     if json {
         // `recall` only ever returns Fresh, non-retracted memories (INV-M2),
-        // so there is never a retract reason to surface here.
+        // so there is never a retract reason to surface here. `--json` is
+        // deliberately out of scope for the F3 capped notice below — a
+        // machine consumer parses a fixed array shape; a human-readable
+        // warning line has no well-defined place in it without a schema
+        // bump, and no caller has asked for one yet.
         let arr: Vec<EffectiveJson> = hits
             .iter()
             .map(|m| effective_json(m, Freshness::Fresh, None))
@@ -411,6 +416,19 @@ pub fn recall_cmd(
             serde_json::to_string(&arr).map_err(|e| e.to_string())?
         );
         return Ok(());
+    }
+
+    // F3: the verify walk may have stopped at RECALL_VERIFY_CAP with fresh
+    // matches still unreached — `hits` alone can't distinguish that from
+    // "genuinely nothing fresh matched", so surface it explicitly. STDERR
+    // (not stdout) keeps `recall`'s stdout parseable/pipeable; this is the
+    // interactive human path only (see the `json` branch above and
+    // `recall_for_hook`, which never prints this).
+    if outcome.capped {
+        eprintln!(
+            "verification capped at {} candidates — results may be incomplete",
+            memory::RECALL_VERIFY_CAP
+        );
     }
 
     if hits.is_empty() {
@@ -575,9 +593,17 @@ pub fn recall_for_hook(root: &Path, query: &str, max_facts: usize) -> String {
 /// genuinely found nothing" (empty `block`, `budget_exceeded: false`, no
 /// stat line — the existing INV-M4 fail-open contract). When
 /// `budget_exceeded` is `true`, `block` is always empty.
+///
+/// `capped` (F3) mirrors `memory::RecallOutcome::capped` — set when the
+/// verify walk hit `RECALL_VERIFY_CAP` with fresh matches possibly still
+/// unreached. The caller (`cmds::inject_memory`) records it in
+/// `memory-stats.jsonl` ONLY — this struct's `block` never carries the
+/// capped notice text; the `--for-hook`/hook stdout contract (block or
+/// nothing, exit 0 always) is unconditional and F3 does not touch it.
 pub struct HookRecallOutcome {
     pub block: String,
     pub budget_exceeded: bool,
+    pub capped: bool,
 }
 
 /// F2 (founder decision, option (a)): the hard-deadline twin of
@@ -600,20 +626,24 @@ pub fn recall_for_hook_with_deadline(
         return HookRecallOutcome {
             block: String::new(),
             budget_exceeded: false,
+            capped: false,
         };
     }
     match memory::recall_with_deadline(root, query, max_facts, deadline) {
         Ok(outcome) if outcome.budget_exceeded => HookRecallOutcome {
             block: String::new(),
             budget_exceeded: true,
+            capped: false,
         },
         Ok(outcome) => HookRecallOutcome {
             block: build_hook_block(&outcome.hits, max_facts),
             budget_exceeded: false,
+            capped: outcome.capped,
         },
         Err(_) => HookRecallOutcome {
             block: String::new(),
             budget_exceeded: false,
+            capped: false,
         },
     }
 }

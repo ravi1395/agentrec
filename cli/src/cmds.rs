@@ -218,10 +218,12 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // I = memory-stats.jsonl lines that recorded a real injection (carry
     // `n`) — the hook-owned injection log (Task 9); this is the only
     // visible evidence recall actually fired into a prompt, so status
-    // surfaces it verbatim. F2 also appends `budget_exceeded` lines to the
-    // same file (a bailed-out recall, never an injection) — those must NOT
-    // inflate this count, so the filter is content-aware, not a raw line
-    // count.
+    // surfaces it verbatim. F2 also appends `budget_exceeded` lines, and F3
+    // a bare `{"ts","capped":true}` line for a capped-and-empty recall, to
+    // the same file (neither is an injection) — those must NOT inflate this
+    // count, so the filter is content-aware (keys on `n`), not a raw line
+    // count. A capped injection still carries `n` (plus `capped`), so it IS
+    // counted here, correctly — it really did inject something.
     let injections = std::fs::read_to_string(crate::memory_stats_path(root))
         .map(|text| {
             text.lines()
@@ -366,8 +368,15 @@ fn recall_deadline(started: Instant) -> Instant {
 /// appends a `{"ts","budget_exceeded":true}` line to `memory-stats.jsonl` —
 /// visible evidence the budget was actually hit, not silent degradation. On
 /// an actual injection (non-empty block, within budget) appends
-/// `{"ts","n"}` instead. Never `state.json`, which only the daemon writes
-/// (the hazard this task is explicitly gated against).
+/// `{"ts","n"}` instead, plus `"capped":true` (F3) when the verify walk hit
+/// `RECALL_VERIFY_CAP` — recorded as a stat only, NEVER stdout noise; the
+/// `--for-hook`/hook stdout contract (block or nothing, exit 0 always) is
+/// unconditional. F3 also covers the case a plain `n`-vs-nothing split would
+/// miss: a capped walk that found ZERO fresh hits (`outcome.block.is_empty()`)
+/// is exactly the silent-truncation scenario this fix exists for, so it gets
+/// its own `{"ts","capped":true}` line rather than returning with no stat at
+/// all. Never `state.json`, which only the daemon writes (the hazard this
+/// task is explicitly gated against).
 fn inject_memory(root: &Path, query: &str) {
     let max_facts = memorycmds::read_memory_inject_max(root);
     let started = Instant::now();
@@ -383,6 +392,14 @@ fn inject_memory(root: &Path, query: &str) {
         return;
     }
     if outcome.block.is_empty() {
+        // F3: a capped walk that surfaced no fresh hits is the exact
+        // silent-truncation case — record it even though there's no
+        // injection to report. Best-effort, same fail-open posture as
+        // everywhere else in this function.
+        if outcome.capped {
+            let stats_line = serde_json::json!({ "ts": wall_now_ms(), "capped": true }).to_string();
+            let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
+        }
         return;
     }
     print!("{}", outcome.block);
@@ -391,7 +408,11 @@ fn inject_memory(root: &Path, query: &str) {
         .lines()
         .filter(|l| l.starts_with("- "))
         .count();
-    let stats_line = serde_json::json!({ "ts": wall_now_ms(), "n": n }).to_string();
+    let mut stats = serde_json::json!({ "ts": wall_now_ms(), "n": n });
+    if outcome.capped {
+        stats["capped"] = serde_json::json!(true);
+    }
+    let stats_line = stats.to_string();
     // Best-effort: a memory-stats write failure must not turn a successful
     // injection into a hook failure (same fail-open posture as the recall
     // itself).

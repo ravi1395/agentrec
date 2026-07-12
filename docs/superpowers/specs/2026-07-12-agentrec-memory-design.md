@@ -167,6 +167,23 @@ skipped, never served. Cold read; no
 daemon. Tokenization: lowercase, split non-alphanumeric, path segments are terms.
 Empty query → recency-ordered fresh list.
 
+**Verify cap (F3, `RECALL_VERIFY_CAP = 128`):** the rank-then-verify walk never
+freshness-verifies more than 128 ranked candidates per call, regardless of `k` —
+without this, a stale/orphaned-heavy corpus would hash an unbounded number of files
+on every recall (unbounded I/O inside the hook's 50 ms budget). On a corpus where
+the 128 highest-ranked candidates are all stale/orphaned, recall can return fewer
+than `k` (even zero) results while genuinely Fresh, on-topic memories exist further
+down the ranking — capping never serves a stale/orphaned candidate (INV-M2 intact),
+it only ever means some Fresh ones past the cap are never reached. This is silent by
+construction, so the read path surfaces it explicitly: `recall_outcome`/
+`recall_with_deadline` return `capped: bool` (`RecallOutcome`), and `agentrec
+recall`'s human output prints a one-line `verification capped at 128 candidates —
+results may be incomplete` notice to **stderr** (never stdout — keeps stdout
+parseable/pipeable) when it fires. `--json` output and `agentrec memories` (which
+never verify-caps — it walks every record via `pin_freshness`, not `recall`) are
+unaffected. The hook injection path (below) records `capped` as a
+`memory-stats.jsonl` stat only, never as injected text.
+
 1. **CLI:** `agentrec recall "<query>" [-k N] [--json]`;
    `agentrec memories [--stale|--all]` — stale rows show which pin drifted and when
    (join against turn log), pointing at the verify-or-forget decision.
@@ -178,6 +195,11 @@ Empty query → recency-ordered fresh list.
      Failures increment a counter, never break the prompt.
    - Format: fenced `agentrec memory` block, one fact per line + pin paths; no
      ids/hashes in injected text.
+   - Verify cap (F3): a capped walk (see above) records `capped: true` in the
+     `memory-stats.jsonl` line it appends — including the zero-hit case, where
+     a bare `{"ts","capped":true}` line lands even though no block is
+     injected. Never appears in stdout; the block-or-nothing/exit-0 contract
+     is unconditional.
 3. **MCP:** `agentrec_recall`, read tier — added to PROTOCOL.md §8 table + schema
    now (frozen), implemented when the v2 MCP server lands.
 
