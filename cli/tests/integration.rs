@@ -5732,7 +5732,12 @@ struct SingleDaemonGuard(Option<Child>);
 impl SingleDaemonGuard {
     fn spawn(root: &Path) -> Self {
         let child = spawn_record(root);
-        std::thread::sleep(Duration::from_millis(800));
+        // Bounded-poll for the daemon to actually be up (holding the flock,
+        // pid written to state.json) rather than a fixed sleep — proves the
+        // daemon genuinely launched instead of assuming 800ms was enough,
+        // and fails loudly (via `wait_for_live_daemon`'s own assert) if it
+        // never comes up at all.
+        wait_for_live_daemon(root);
         SingleDaemonGuard(Some(child))
     }
 
@@ -5813,9 +5818,33 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
         );
     }
 
-    // Teardown the daemon now, before validating on-disk state — the daemon
-    // must actually have been alive and racing the hook calls above; killing
-    // it here (rather than only at end-of-scope via Drop) lets the
+    // Liveness/concurrency proof, not just "a daemon process existed": every
+    // hook call above appends a start signal to signal.jsonl, and only the
+    // daemon's own signal-tailer advances `signal_offset` in state.json (the
+    // hook process never touches state.json). Bounded-poll for it to advance
+    // past 0 WHILE THE DAEMON IS STILL ALIVE — this must run before
+    // `guard.kill()`, not after: a one-shot post-kill sample races the
+    // guard's SIGKILL against the tailer's own poll loop and can read 0 even
+    // though the daemon genuinely consumed signals throughout the test
+    // (observed twice under adversarial review). Polling here instead proves
+    // the daemon was actively processing the concurrently-appended hook
+    // signals — the exact AC-F10.6 guarantee — without being coupled to
+    // teardown timing.
+    let signal_offset_seen = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let offset = v.get("signal_offset")?.as_u64()?;
+        (offset > 0).then_some(offset)
+    });
+    assert!(
+        signal_offset_seen.is_some(),
+        "state.json's signal_offset never advanced past 0 within 5s while the daemon \
+         was alive — the daemon never consumed any of the {iterations} hooks' start \
+         signals, so this test didn't prove a genuinely concurrent/active daemon"
+    );
+
+    // Teardown the daemon now, after the liveness proof above — killing it
+    // here (rather than only at end-of-scope via Drop) lets the
     // "after teardown" file-parseability checks below run immediately after
     // the real interleaving window closes.
     guard.kill();
@@ -5844,31 +5873,12 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
     // helper, which would silently mask a genuinely corrupt file.
     let state_text = std::fs::read_to_string(root.join(".agentrec/state.json"))
         .expect("state.json must exist after a real daemon ran");
-    let state_json: serde_json::Value = serde_json::from_str(&state_text).unwrap_or_else(|e| {
+    let _state_json: serde_json::Value = serde_json::from_str(&state_text).unwrap_or_else(|e| {
         panic!(
             "state.json failed to parse cleanly after concurrent real-daemon activity \
              against a corrupt memory.jsonl: {e}: {state_text}"
         )
     });
-    // Liveness/concurrency proof, not just "a daemon process existed": every
-    // hook call above appends a start signal to signal.jsonl, and only the
-    // daemon's own signal-tailer advances `signal_offset` (the hook never
-    // touches state.json). A nonzero offset after 12 real hook subprocesses
-    // and an 800ms startup window means the daemon genuinely consumed
-    // signals emitted while it was racing the hook against the corrupt
-    // store — not merely a live PID that never did any work. Signal-tailer
-    // based, not FSEvents-based, so it isn't timing-flaky the way a turn
-    // observation would be.
-    let signal_offset = state_json
-        .get("signal_offset")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    assert!(
-        signal_offset > 0,
-        "state.json's signal_offset is 0 — the daemon never consumed any of the \
-         {iterations} hooks' start signals, so this test didn't prove a genuinely \
-         concurrent/active daemon: {state_text}"
-    );
 
     // Every hook attempt against the still-corrupt store recorded exactly
     // one failure stat — the corrupt line was seeded once and never healed,
