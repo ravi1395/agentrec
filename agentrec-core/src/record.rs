@@ -24,6 +24,20 @@ pub struct SignalEvent {
     /// Post-scrub prompt text, when the emitting hook has it (UserPromptSubmit).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Signal variant discriminator (PROTOCOL §4, additive). Absent/`None` on
+    /// every existing turn-boundary signal (`start`/`stop`, keyed by `event`
+    /// instead). Currently the only non-`None` value is `"memory-candidate"`
+    /// (memory v1) — a fact-extraction hint that is NOT a turn boundary and
+    /// MUST be routed away from `apply_signal`'s start/stop arms.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Memory-candidate payload: the extracted fact text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact: Option<String>,
+    /// Memory-candidate payload: paths the fact should be pinned to. Paths
+    /// only — the recorder hashes them at ingestion (PROTOCOL §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins: Option<Vec<String>>,
 }
 
 fn one() -> u32 {
@@ -33,6 +47,14 @@ fn one() -> u32 {
 impl SignalEvent {
     pub fn is_start(&self) -> bool {
         self.event.as_deref() == Some("start")
+    }
+
+    /// True for a memory-candidate signal (PROTOCOL §4 additive). These carry
+    /// no `event`, so callers MUST check this BEFORE treating a missing/non-
+    /// "start" `event` as an implicit stop — a memory-candidate line is not a
+    /// turn boundary at all and must never reach the stop arm.
+    pub fn is_memory_candidate(&self) -> bool {
+        self.kind.as_deref() == Some("memory-candidate")
     }
 }
 
@@ -103,7 +125,15 @@ pub struct EpochRecord {
 /// kill-9 immediately after this call returns Ok.
 pub fn append_log(path: &Path, record: &LogRecord) -> Result<(), String> {
     let line = serde_json::to_string(record).map_err(|e| e.to_string())?;
-    let file = open_append(path, &line)?;
+    append_line_synced(path, &line)
+}
+
+/// Append a pre-serialized, `\n`-terminated JSON line and fsync before
+/// returning. Shared durability primitive (D34) for any append-only store in
+/// the workspace that needs kill-9-safe closes — `append_log` is one caller;
+/// `memory.rs`'s `append_memory` is another.
+pub fn append_line_synced(path: &Path, line: &str) -> Result<(), String> {
+    let file = open_append(path, line)?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }

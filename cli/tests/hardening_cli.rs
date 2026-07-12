@@ -5,8 +5,8 @@
 //! (kept separate per file-ownership rules for this hardening round).
 
 use std::path::Path;
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
@@ -591,5 +591,781 @@ fn e9_second_rerun_with_no_drift_is_still_a_real_noop() {
     assert!(
         stdout.contains("already initialized — nothing changed"),
         "a genuine no-op re-run must still say so: {stdout}"
+    );
+}
+
+// ---- Task 11: purge --memories-retracted (archive-never-delete) ----------
+
+fn mem_rec(
+    id: &str,
+    op: agentrec_core::memory::MemoryOp,
+    fact: &str,
+    ts: u64,
+) -> agentrec_core::memory::MemoryRecord {
+    agentrec_core::memory::MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: id.to_string(),
+        op,
+        fact: fact.to_string(),
+        pins: vec![agentrec_core::memory::Pin {
+            path: "src/a.rs".to_string(),
+            hash: format!("sha256:{}", "a".repeat(64)),
+        }],
+        source_turns: vec![],
+        origin: "human".to_string(),
+        ts,
+        reason: None,
+    }
+}
+
+fn mem_line_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+}
+
+// Task 11 acceptance test: a LIVE fact, a STALE-but-unretracted fact (old
+// assert, never retracted), a fact retracted YESTERDAY (inside the default
+// 90-day TTL), and a fact retracted 100 DAYS AGO (past TTL) — only the
+// 100-day chain's records (assert + retract) move to
+// memory.archived.*.jsonl; the other three chains' lines survive in
+// memory.jsonl byte-for-byte. A second run is a genuine no-op (no new
+// archive file, memory.jsonl unchanged). Finally, the archive+survivor union
+// covers exactly the original line set — the crash-safety property that a
+// kill-9 between the archive fsync and the source rewrite can only ever
+// leave memory.jsonl a superset, never drop a record.
+#[test]
+fn purge_archives_only_expired_retracted_chains() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "the daemon uses signal-tailer offsets",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "stale1",
+            MemoryOp::Assert,
+            "legacy config path moved to config toml",
+            now_ms - 200 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_recent",
+            MemoryOp::Assert,
+            "old build script used make",
+            now_ms - 5 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_recent",
+            MemoryOp::Retract,
+            "old build script used make",
+            now_ms - DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mem_path = root.join(".agentrec/memory.jsonl");
+    let before_lines: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(before_lines.len(), 6, "6 records seeded");
+
+    let out = agentrec(root, &["purge", "--memories-retracted"]);
+    assert!(out.status.success(), "purge failed: {out:?}");
+
+    let archive_files: Vec<_> = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .collect();
+    assert_eq!(
+        archive_files.len(),
+        1,
+        "expected exactly one archive file: {archive_files:?}"
+    );
+    let archive_text = std::fs::read_to_string(archive_files[0].path()).unwrap();
+    let archive_lines: Vec<&str> = archive_text.lines().collect();
+    assert_eq!(archive_lines.len(), 2, "only retracted_old's 2 records");
+    for line in &archive_lines {
+        assert_eq!(mem_line_id(line).as_deref(), Some("retracted_old"));
+    }
+
+    // Archived lines are byte-identical to the originals (no reserialization).
+    let orig_old_lines: Vec<&String> = before_lines
+        .iter()
+        .filter(|l| mem_line_id(l).as_deref() == Some("retracted_old"))
+        .collect();
+    assert_eq!(
+        archive_lines,
+        orig_old_lines
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        "archived lines must be byte-for-byte the originals"
+    );
+
+    // memory.jsonl retains the other 4 lines byte-for-byte, original order.
+    let after_lines: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let expected_survivors: Vec<&String> = before_lines
+        .iter()
+        .filter(|l| mem_line_id(l).as_deref() != Some("retracted_old"))
+        .collect();
+    assert_eq!(
+        after_lines.iter().collect::<Vec<_>>(),
+        expected_survivors,
+        "surviving lines must be byte-for-byte, in original order"
+    );
+
+    // Second run -> genuine no-op: no new archive file, memory.jsonl unchanged.
+    let out2 = agentrec(root, &["purge", "--memories-retracted"]);
+    assert!(out2.status.success(), "second purge failed: {out2:?}");
+    let archive_files_2: Vec<_> = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .collect();
+    assert_eq!(
+        archive_files_2.len(),
+        1,
+        "second run must not create a new archive file"
+    );
+    let after_lines_2: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        after_lines_2, after_lines,
+        "second run must not change memory.jsonl"
+    );
+
+    // Crash-safety proxy: the archive+source union equals the original full
+    // set — no record is ever lost (worst case, a kill-9 mid-way leaves a
+    // record in both places, never in neither).
+    let mut union: Vec<String> = after_lines.clone();
+    union.extend(archive_lines.iter().map(|s| s.to_string()));
+    let mut union_sorted = union.clone();
+    union_sorted.sort();
+    let mut before_sorted = before_lines.clone();
+    before_sorted.sort();
+    assert_eq!(
+        union_sorted, before_sorted,
+        "archive+source union must equal the original full set"
+    );
+}
+
+fn spawn_record(root: &Path) -> Child {
+    Command::new(bin())
+        .args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn record")
+}
+
+/// Like `agentrec`/`spawn_record`, but with extra env vars set on the child —
+/// used by the F4 tests below to drive `AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS`.
+fn spawn_agentrec_with_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .args(["--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn agentrec")
+}
+
+fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The `record` daemon appends memory.jsonl concurrently (Task 7); the ONLY
+/// sanctioned rewrite (`purge --memories-retracted`) would otherwise clobber
+/// an append that lands between its read and its rename. So while the daemon
+/// holds its flock, purge must refuse and touch nothing — exit 1, a
+/// running-daemon reason on stderr, memory.jsonl byte-for-byte unchanged, and
+/// no archive file created.
+#[test]
+fn purge_memories_retracted_refuses_while_daemon_running() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // An expired-retracted chain that WOULD be archived if the guard weren't
+    // there — so a passing test proves the refusal, not an empty candidate set.
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mem_path = root.join(".agentrec/memory.jsonl");
+    let before = std::fs::read(&mem_path).unwrap();
+
+    let mut daemon = spawn_record(root);
+    // Wait until the daemon has actually taken its flock (start epoch appended).
+    let up = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).ok()?;
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("epoch")
+                    && v.get("event").and_then(|e| e.as_str()) == Some("start")
+            })
+            .then_some(())
+    });
+    assert!(up.is_some(), "daemon never came up");
+
+    let out = agentrec(root, &["purge", "--memories-retracted"]);
+
+    // Tear the daemon down before any assertion can early-return and leak it.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge must exit non-zero while the daemon is recording: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("recording") || stderr.contains("running"),
+        "stderr must name the running-daemon reason: {stderr}"
+    );
+
+    // memory.jsonl untouched byte-for-byte (nothing rewritten).
+    let after = std::fs::read(&mem_path).unwrap();
+    assert_eq!(before, after, "memory.jsonl must be untouched on refusal");
+
+    // No archive file created.
+    let archive_count = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .count();
+    assert_eq!(
+        archive_count, 0,
+        "no archive file may be created on refusal"
+    );
+}
+
+// ---- F4: dedicated memory.lock closes the purge/append probe->act race ----
+//
+// The daemon-liveness refusal above only ever protects against the daemon.
+// It does nothing for a MANUAL writer (`remember`/`verify`/`forget`) racing a
+// concurrent `purge --memories-retracted`: purge reads memory.jsonl, computes
+// its survivor set, then (pre-F4) rewrites the file with no lock held at all
+// — a manual append landing in that window was silently clobbered by the
+// rewrite. F4 adds a dedicated `.agentrec/memory.lock` that purge holds
+// (non-blocking) across its whole read->archive->rewrite->rename sequence,
+// and every writer now blocks on that same lock rather than racing it.
+//
+// `AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS` (purgecmd.rs) widens the
+// window between purge's archive-fsync and its atomic rewrite long enough for
+// these tests to land a concurrent writer deterministically inside it, using
+// the archive file's appearance on disk as the observable "purge has read
+// and archived, is now paused right before the rewrite" marker — no sleeps
+// guessing at timing.
+
+/// Core F4 acceptance test: a `remember` that starts while purge is paused
+/// mid-rewrite must still have its record survive the rewrite.
+///
+/// RED (pre-F4, no `memory.lock`): `remember`'s unlocked `append_memory`
+/// call succeeds immediately, appending its line to `memory.jsonl` on disk
+/// while purge is paused — but purge already captured `survivor_lines` from
+/// its EARLIER read, before that append happened. When purge's pause ends
+/// and its atomic rewrite lands, it overwrites `memory.jsonl` with only the
+/// old survivors, silently erasing the concurrent `remember`. Confirmed by
+/// running this exact test against the code as it stood before this commit
+/// (writers calling `agentrec_core::memory::append_memory` directly, no
+/// lock anywhere): it fails — the new fact is absent from the post-purge
+/// store, and `remember` returns near-instantly (it was never blocked).
+/// GREEN (post-F4): `remember` blocks on `memory.lock` for (most of) the
+/// pause — proven by wall-clock elapsed time, not just eventual presence —
+/// and only appends after purge's rename has landed, so the final store has
+/// BOTH the rewritten survivors AND the new fact, and the archive is
+/// untouched.
+#[test]
+fn purge_rewrite_never_loses_concurrent_append() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // A live memory that must survive the rewrite untouched — part of the
+    // "old survivors" set purge captures before it pauses.
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "the daemon uses signal-tailer offsets",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    // A retracted-and-expired chain, so purge actually reaches the
+    // archive+rewrite (an empty candidate set would take the fast "0
+    // chains" path and never pause at all).
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--memories-retracted"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS", "3000")],
+    );
+
+    // Observable proof purge has read + archived and is now paused
+    // immediately before the rewrite that would otherwise clobber a
+    // concurrent append.
+    let archive_path = poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("memory.archived.")
+            })
+            .map(|e| e.path())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // While purge is paused, a concurrent writer appends a brand-new fact.
+    let write_started = Instant::now();
+    let out = agentrec(
+        root,
+        &["remember", "a fresh fact pinned to a.rs", "--from", "a.rs"],
+    );
+    let write_elapsed = write_started.elapsed();
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let purge_status = purge.wait().expect("purge exited");
+    assert!(purge_status.success(), "purge itself must succeed");
+
+    // Proof the writer genuinely BLOCKED on memory.lock for (most of) the
+    // pause, rather than racing in and getting lucky.
+    assert!(
+        write_elapsed >= Duration::from_millis(1500),
+        "remember returned in {write_elapsed:?} — too fast to have waited \
+         for purge's lock; the writer is not actually blocking on memory.lock"
+    );
+
+    let effective = agentrec_core::memory::load_effective(root).unwrap();
+    assert!(
+        effective.iter().any(|m| m.fact.contains("fresh fact")),
+        "the concurrent remember's fact must survive purge's rewrite: {effective:?}"
+    );
+    assert!(
+        effective.iter().any(|m| m.id == "live1"),
+        "pre-existing live memory must also survive: {effective:?}"
+    );
+    assert!(
+        !effective.iter().any(|m| m.id == "retracted_old"),
+        "retracted_old was archived by this same purge and must be gone \
+         from memory.jsonl: {effective:?}"
+    );
+
+    // Archive is intact and correct — the concurrent append never touched
+    // it (archive-then-rewrite ordering, and the lock, are both undisturbed
+    // by a writer that landed after the rewrite).
+    let archive_text = std::fs::read_to_string(&archive_path).unwrap();
+    let archive_ids: Vec<Option<String>> = archive_text.lines().map(mem_line_id).collect();
+    assert_eq!(
+        archive_ids.len(),
+        2,
+        "archive must still hold exactly retracted_old's 2 records: {archive_ids:?}"
+    );
+    assert!(
+        archive_ids
+            .iter()
+            .all(|id| id.as_deref() == Some("retracted_old")),
+        "archive must contain only retracted_old's records: {archive_ids:?}"
+    );
+}
+
+/// Companion to the above: `verify --confirm` and `forget` (not just
+/// `remember`) also route through `memory.lock`. Two DIFFERENT manual
+/// writers, both started while purge is paused mid-rewrite, must both
+/// eventually land — serialized by the lock, neither silently dropped —
+/// rather than either racing purge's rewrite or failing outright on
+/// contention.
+///
+/// RED (pre-F4): both `verify --confirm` and `forget` call unlocked
+/// `append_memory` directly; whichever of them (or purge's rewrite) lands
+/// last during the pause wins, silently discarding the others' appends —
+/// this test's presence/absence assertions fail non-deterministically
+/// depending on interleaving, and reliably fail under the widened pause
+/// window used here.
+/// GREEN (post-F4): both block on `memory.lock`, are serialized by the OS
+/// (one after the other, after purge's rename), and both end up recorded.
+#[test]
+fn remember_waits_or_fails_cleanly_during_purge() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("c.rs"), b"fn c() {}").unwrap();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // `live1` will be retracted (via `forget`) by one of the two concurrent
+    // writers below — its pin path doesn't need to exist on disk since
+    // `forget` never re-hashes pins, only carries them forward.
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "old build script used make",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--memories-retracted"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS", "3000")],
+    );
+
+    poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("memory.archived.")
+            })
+            .map(|_| ())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // Two independent writers, spawned concurrently (both real, separate
+    // processes), both attempting to touch memory.jsonl while purge holds
+    // the lock paused.
+    let spawn_started = Instant::now();
+    let mut forget_child = spawn_agentrec_with_env(root, &["forget", "live1"], &[]);
+    let mut remember_child = spawn_agentrec_with_env(
+        root,
+        &["remember", "a second concurrent fact", "--from", "c.rs"],
+        &[],
+    );
+
+    let forget_status = forget_child.wait().expect("forget exited");
+    let remember_status = remember_child.wait().expect("remember exited");
+    let spawn_elapsed = spawn_started.elapsed();
+
+    let purge_status = purge.wait().expect("purge exited");
+    assert!(purge_status.success(), "purge itself must succeed");
+
+    // Both concurrent writers must land cleanly — waiting, never a silent
+    // drop or a contention error.
+    assert!(
+        forget_status.success(),
+        "forget must succeed (wait, not fail)"
+    );
+    assert!(
+        remember_status.success(),
+        "remember must succeed (wait, not fail)"
+    );
+    assert!(
+        spawn_elapsed >= Duration::from_millis(1500),
+        "both writers returned in {spawn_elapsed:?} combined — too fast to \
+         have waited for purge's lock"
+    );
+
+    let effective = agentrec_core::memory::load_effective(root).unwrap();
+    let live1 = effective
+        .iter()
+        .find(|m| m.id == "live1")
+        .expect("live1 must still be present (retracted, not deleted)");
+    assert!(
+        live1.retracted,
+        "forget's retraction must have landed: {live1:?}"
+    );
+    assert!(
+        effective
+            .iter()
+            .any(|m| m.fact.contains("second concurrent fact")),
+        "remember's fact must have landed: {effective:?}"
+    );
+}
+
+// ---- PR #2 curative: read-side dedup of orphan-recovery same-id duplicates --
+//
+// The engine fix (cb5dcd1) is PREVENTIVE: it stops a post-fix daemon writing a
+// duplicate turn id. A log.jsonl written by a PRE-fix daemon can still hold two
+// TurnRecords under one id (the kill-9 window between persist and journal
+// clear), which broke `undo <full_ulid>` with "ambiguous turn id — matches 2
+// turns". `resolve_turn` must now be curative: collapse an exact re-emit while
+// still surfacing a genuine id collision.
+
+#[test]
+fn undo_collapses_orphan_recovery_duplicate_same_id() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"BEFORE\n").unwrap();
+    let after = store.put(b"AFTER\n").unwrap();
+    std::fs::write(root.join("d.rs"), b"AFTER\n").unwrap();
+
+    let id = "t_DUP00000000000000000000001";
+    let mut turn = base_turn(
+        id,
+        vec![FileEntry {
+            path: "d.rs".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    // The steady `persist` close of a bracket turn carries an attributed model
+    // and (here) an untruncated close.
+    turn.model = Some("claude-opus-4".into());
+    turn.truncated = false;
+    seed_turn(root, &turn);
+    // Pre-fix orphan recovery re-appended the SAME turn under the SAME id from
+    // the crash journal. Recovery drifts on MORE than the timestamp: it
+    // recomputes `ended` from last-change, forces `model: None`, and forces
+    // `truncated: true` for a bracket turn (see daemon::recover_orphan). The
+    // file set — path + before/after hashes — is byte-identical, which is the
+    // only thing the collapse may key on.
+    turn.ended = "2026-07-06T00:00:09.000Z".into();
+    turn.model = None;
+    turn.truncated = true;
+    seed_turn(root, &turn);
+
+    // Pre-fix this errored "ambiguous turn id — matches 2 turns". The read side
+    // must collapse the double-emit and revert cleanly to a single turn.
+    let out = agentrec(root, &["undo", id, "--confirm"]);
+    assert!(out.status.success(), "undo should succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("reverted 1 file"),
+        "expected a clean revert, got: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("d.rs")).unwrap(),
+        b"BEFORE\n",
+        "file must be reverted to its pre-turn content"
+    );
+    assert_eq!(
+        agentrec_turns(root).len(),
+        1,
+        "the collapsed double-emit reverts as exactly one undo turn"
+    );
+}
+
+#[test]
+fn undo_still_errors_on_distinct_turns_sharing_id() {
+    use agentrec_core::record::FileEntry;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let id = "t_COLLIDE0000000000000000001";
+    // Two DIFFERENT turns (disjoint file sets) minted under the SAME id — a
+    // genuine id-gen collision, NOT a recovery double-emit. Collapsing these
+    // would silently undo one arbitrary turn, so resolution must still error.
+    let a = base_turn(
+        id,
+        vec![FileEntry {
+            path: "one.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    let b = base_turn(
+        id,
+        vec![FileEntry {
+            path: "two.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &a);
+    seed_turn(root, &b);
+
+    let out = agentrec(root, &["undo", id]);
+    assert!(
+        !out.status.success(),
+        "two distinct turns sharing an id must not resolve: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous turn id"),
+        "must still surface the genuine collision: {stderr}"
     );
 }

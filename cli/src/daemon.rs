@@ -8,8 +8,9 @@
 //! record timestamps are derived by adding a fixed startup offset, keeping them
 //! sane (end >= start) regardless of clock changes.
 
-use crate::state::{read_state, record_io_failure, write_state};
-use crate::{log_path, objects_dir, open_path, signal_path};
+use crate::cmds::wall_now_ms;
+use crate::state::{read_state, record_io_failure, write_state, State};
+use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
 use agentrec_core::record::{
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Debounce window before a mutation burst is staged (SPEC.md: 1.5 s).
 const DEBOUNCE: Duration = Duration::from_millis(1_500);
@@ -60,7 +61,11 @@ pub fn run(root: &Path) -> Result<(), String> {
     let store = BlobStore::new(objects_dir(&root));
     let mut engine = TurnEngine::new();
     let mut recorder = Recorder::scan(&root, store);
-    let mut tailer = SignalTailer::open(&root)?;
+    // Candidate-only startup replay: memory-candidate lines that landed in the
+    // inbox while no daemon was running are ingested now, and the live tailer
+    // starts exactly where this scan stopped so nothing is read twice.
+    let replay_to = replay_pending_candidates(&root, engine.open_turn_id());
+    let mut tailer = SignalTailer { offset: replay_to };
     let mut ignore_set = IgnoreSet::build(&root);
     let mut journal_cache: Option<String> = None;
 
@@ -158,12 +163,52 @@ pub fn run(root: &Path) -> Result<(), String> {
 
         // Consume any new hook signals (start/stop brackets). Fill missing
         // prompt/model from the transcript (Q+) before feeding the engine.
+        // Kill-switch (design spec line 184, binding): `memory_enabled =
+        // false` disables injection AND candidate ingestion. Read once per
+        // poll batch rather than per-candidate — candidates are rare
+        // (occasional agent signals, not a hot loop) so a per-batch disk
+        // read is cheap, and it still picks up a runtime config edit within
+        // one POLL tick (250ms).
+        let memory_enabled = memorycmds::read_memory_enabled(&root);
         for sig in tailer.poll(&root) {
+            // Memory-candidate lines (PROTOCOL §4, additive) carry no `event`
+            // field, so `is_start()` is false — routed here BEFORE
+            // `apply_signal` ever sees them, or they'd fall through to the
+            // stop arm and fabricate a turn closure (the hazard this guard
+            // exists to close; see cli/tests/hardening_daemon.rs).
+            if sig.is_memory_candidate() {
+                if !memory_enabled {
+                    // Disabled feature, not an invalid candidate: the line is
+                    // still consumed from the inbox (offset already advanced
+                    // by `tailer.poll` above) but nothing is ingested and
+                    // nothing is counted as a reject.
+                    continue;
+                }
+                let mut state = read_state(&root);
+                // D-M6: if a turn is open, its id was only RESERVED in
+                // memory (`TurnEngine::open_turn_id`) — the crash journal
+                // that makes it recoverable after a kill-9 is normally
+                // written once per loop iteration, AFTER this whole `for
+                // sig` loop finishes. When a `start` and a `memory-candidate`
+                // land in the SAME polled batch, `ingest_candidate` below
+                // fsyncs a memory record whose `source_turns` names that
+                // reserved id BEFORE the post-loop `sync_journal` call ever
+                // runs. A kill-9 in that window leaves the id durably
+                // referenced in memory.jsonl but recoverable nowhere — the
+                // reference dangles. Force the journal write here, before
+                // the candidate is persisted, so the open turn is always
+                // recoverable before anything references its id.
+                if engine.open_turn_id().is_some() {
+                    sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
+                }
+                ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
+                continue;
+            }
             let (prompt, model) = signal_context(&sig);
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
             }
-            let closed = apply_signal(&mut engine, &sig, prompt, now);
+            let closed = apply_signal(&root, &mut engine, &sig, prompt, now);
             persist(&root, &recorder, &clock, closed)?;
         }
 
@@ -244,13 +289,6 @@ impl Clock {
         self.max_wall_ms.set(clamped);
         clamped
     }
-}
-
-fn wall_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---- watch event draining (D9) ----------------------------------------------
@@ -680,17 +718,6 @@ struct SignalTailer {
 }
 
 impl SignalTailer {
-    fn open(root: &Path) -> Result<Self, String> {
-        // Start at the current end of the inbox, not the persisted offset. A
-        // signal that landed while no daemon was recording refers to fs changes
-        // we never observed; replaying it would mint an empty turn misdated to
-        // daemon-boot (reviewer #5). The pre-recording interval is an honest gap.
-        let offset = std::fs::metadata(signal_path(root))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        Ok(SignalTailer { offset })
-    }
-
     /// D7: seek to the persisted offset and read only the fresh tail, instead
     /// of re-reading the whole inbox every ~250ms (O(file) per poll, on a
     /// file that only grows). Also detects external truncation (`len <
@@ -750,7 +777,198 @@ impl SignalTailer {
     }
 }
 
+/// Memory-candidate ingestion (design spec §Write path/Agent-emitted;
+/// PROTOCOL §4). Runs on the daemon thread — the only writer of both
+/// `memory.jsonl` (via `append_memory`) and `state.json`'s `memory_rejects`
+/// counter, so no lock/TOCTOU concerns beyond what already applies elsewhere
+/// in this file.
+///
+/// Trust boundary (design spec, "Rejected approaches — emitter-side
+/// hashing"): the candidate carries pin PATHS only; hashing happens HERE,
+/// now, against the current working tree — never trust a hash the emitter
+/// computed, since the file may have changed between emit and ingest.
+///
+/// Order: validate + hash every pin (any failure -> reject, nothing
+/// persisted, INV-M1) -> scrub the fact (scrub-empty -> reject) -> dedup
+/// against live (non-retracted) memories (an exact normalized-fact +
+/// pin-path-set match is dropped silently — neither persisted nor counted
+/// as a reject, a duplicate is not an error) -> append with `source_turns`
+/// pointing at the enclosing open turn, if any. `append_memory` is the final
+/// gate for the length/pins-count bounds (PINS_MAX, FACT_MAX_CHARS) and
+/// re-scrubs before writing (idempotent on already-scrubbed text, matching
+/// the prompt-persistence discipline elsewhere in this file); any of its
+/// refusals also counts as a reject here.
+/// Candidate-only startup replay. Scans `signal.jsonl` from the persisted
+/// `signal_offset` (end of what the previous daemon session consumed) up to the
+/// current EOF — the window of signals that arrived while no daemon was running
+/// — and routes ONLY memory-candidate lines through `ingest_candidate`. Every
+/// start/stop signal in that same pre-daemon window is intentionally dropped.
+///
+/// This is the one narrow relaxation of D7 (`SignalTailer::open`'s blanket
+/// EOF-skip), and it is safe precisely where D7's rationale does not apply:
+/// D7 skips the gap because replaying a stale start/stop "would mint an empty
+/// turn misdated to daemon-boot". A memory-candidate mints no turn at all —
+/// `ingest_candidate` never opens/closes a turn, stamps the record with the
+/// signal's own `ts` (not boot time), and dedups an already-ingested fact to a
+/// silent no-op — so replaying candidates is turn-neutral and idempotent across
+/// restarts, while start/stop lines here still never reach the engine.
+///
+/// Returns the offset consumed up to (the last complete line). The live tailer
+/// adopts this as its starting offset, so within a single boot the startup scan
+/// and the live tailer never read the same line twice. The advanced offset is
+/// also persisted, so an immediate restart doesn't re-scan the same window
+/// (dedup would no-op it, but advancing avoids the repeated work).
+fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
+    let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
+        // No inbox yet — same starting point as the historical open() path.
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let mut state = read_state(root);
+    let start = state.signal_offset;
+    if len <= start {
+        // Nothing appended since the last consumed offset. (len < start is an
+        // external shrink we can't recover — sit at the new EOF, matching the
+        // historical open() behaviour of starting at the current end.)
+        return len;
+    }
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return len;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return len;
+    }
+    // Only replay complete lines; a torn final line is left for the live tailer
+    // to complete and process (it re-reads from `start` in that case).
+    let Some(nl) = buf.iter().rposition(|b| *b == b'\n') else {
+        return start;
+    };
+    // Kill-switch (design spec line 184, binding): `memory_enabled = false`
+    // disables injection AND candidate ingestion, including this pre-daemon
+    // replay window. One read for the whole replay batch — same rationale as
+    // the live loop above.
+    let memory_enabled = memorycmds::read_memory_enabled(root);
+    for sig in parse_signals(&String::from_utf8_lossy(&buf[..=nl])) {
+        // D7 preserved: ONLY candidate lines are acted on; start/stop (and any
+        // other) signals in the pre-daemon gap are dropped, never fed to the
+        // engine, so no phantom turn can be minted here.
+        if sig.is_memory_candidate() && memory_enabled {
+            ingest_candidate(root, &mut state, &sig, current_turn);
+        }
+    }
+    let consumed = start + (nl as u64) + 1;
+    state.signal_offset = consumed;
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist replayed signal offset: {e}");
+    }
+    consumed
+}
+
+fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_turn: Option<&str>) {
+    let raw_pins: &[String] = sig.pins.as_deref().unwrap_or(&[]);
+    let mut pins = Vec::with_capacity(raw_pins.len());
+    for raw in raw_pins {
+        let validated = match agentrec_core::memory::validate_pin_path(root, raw) {
+            Ok(v) => v,
+            Err(_) => return reject_candidate(root, state),
+        };
+        let hash = match agentrec_core::memory::hash_pin(root, &validated) {
+            Ok(h) => h,
+            Err(_) => return reject_candidate(root, state),
+        };
+        pins.push(agentrec_core::memory::Pin {
+            path: validated,
+            hash,
+        });
+    }
+
+    let fact = sig.fact.clone().unwrap_or_default();
+    let scrubbed = scrub::scrub(&fact);
+    if scrubbed.trim().is_empty() {
+        return reject_candidate(root, state);
+    }
+
+    let norm_fact = normalize_fact(&scrubbed);
+    let pin_set: HashSet<&str> = pins.iter().map(|p| p.path.as_str()).collect();
+    if let Ok(existing) = agentrec_core::memory::load_effective(root) {
+        let is_dup = existing.iter().any(|m| {
+            !m.retracted
+                && normalize_fact(&m.fact) == norm_fact
+                && m.pins
+                    .iter()
+                    .map(|p| p.path.as_str())
+                    .collect::<HashSet<_>>()
+                    == pin_set
+        });
+        if is_dup {
+            return; // silent drop — a duplicate is not an error (not a reject)
+        }
+    }
+
+    let rec = agentrec_core::memory::MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: agentrec_core::memory::MemoryOp::Assert,
+        fact,
+        pins,
+        source_turns: current_turn
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+        origin: "agent".to_string(),
+        ts: sig.ts,
+        reason: None,
+    };
+
+    // F4: route through the shared memory.lock choke point like every other
+    // writer — the daemon holds `daemon.lock` for its whole lifetime, so
+    // reusing it here would deadlock this call against a live `purge
+    // --memories-retracted` forever instead of just making it wait.
+    match crate::memlock::append_memory_locked(root, &rec) {
+        Ok(()) => test_pause_after_candidate_persist(),
+        Err(_) => reject_candidate(root, state),
+    }
+}
+
+/// Test-only crash-window widener (`cli/tests/hardening_daemon.rs`,
+/// `dangling_source_turns_closed_by_pre_persist_journal_sync`). The real
+/// D-M6 race — a candidate's `source_turns` fsynced before the open turn it
+/// names is journaled — is a same-iteration, sub-millisecond window; no
+/// external test process can land a SIGKILL inside it reliably. When
+/// `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS` is set (only ever done by that
+/// test), this sleeps for the given duration immediately after a candidate
+/// is durably persisted, holding the daemon inside the exact window the fix
+/// closes long enough for a deterministic external kill. A single env var
+/// read (no-op) when unset — no effect on production behavior or perf.
+fn test_pause_after_candidate_persist() {
+    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+}
+
+/// Lowercase + whitespace-collapse, for order-independent-of-spacing dedup
+/// key comparison (design spec's dedup normalization).
+fn normalize_fact(fact: &str) -> String {
+    fact.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn reject_candidate(root: &Path, state: &mut State) {
+    state.memory_rejects += 1;
+    if let Err(e) = write_state(root, state) {
+        eprintln!("agentrec: warning: failed to persist memory-reject state: {e}");
+    }
+}
+
 fn apply_signal(
+    root: &Path,
     engine: &mut TurnEngine,
     sig: &SignalEvent,
     prompt: Option<String>,
@@ -759,9 +977,39 @@ fn apply_signal(
     // `prompt` is already resolved (hook-provided or transcript-extracted);
     // persist() scrubs before anything reaches disk (idempotent, AC I4).
     if sig.is_start() {
-        engine.observe_start(now, &sig.tool, prompt, sig.session.clone())
-    } else {
-        engine.observe_stop(now, &sig.tool, prompt, sig.session.clone())
+        return engine.observe_start(now, &sig.tool, prompt, sig.session.clone());
+    }
+    // F5 / PROTOCOL §10 additive-versioning: a signal carrying a `type` this
+    // consumer doesn't recognize MUST be tolerated, never reinterpreted as a
+    // stop. `memory-candidate` is already routed away before this function is
+    // ever called (see the poll loop above), so any `kind` still present here
+    // is, by construction, unknown — but this check does not lean on that
+    // routing: it re-derives "unknown" locally (`Some(kind)` where
+    // `kind != "memory-candidate"`) so `apply_signal` stays correct even if a
+    // future caller stops pre-filtering. A signal with NO `type` at all
+    // (every legacy start/stop producer, and the real Stop hook payload) is
+    // the only shape that may fall through to the stop arm — that path is
+    // unchanged.
+    if let Some(kind) = sig.kind.as_deref() {
+        if kind != "memory-candidate" {
+            record_unknown_signal(root);
+            return Vec::new();
+        }
+    }
+    engine.observe_stop(now, &sig.tool, prompt, sig.session.clone())
+}
+
+/// Persist a forward-compat "unknown signal type" drop (F5, PROTOCOL §10
+/// additive-versioning). Mirrors `reject_candidate`'s counter mechanism — a
+/// dropped signal leaves no trace in `log.jsonl`/`memory.jsonl`, so this
+/// counter is the only visible evidence it happened. Not a DEGRADED
+/// condition: an unrecognized-but-tolerated signal is expected forward
+/// compatibility, not a daemon health problem.
+fn record_unknown_signal(root: &Path) {
+    let mut state = read_state(root);
+    state.unknown_signal_ignored += 1;
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist unknown-signal state: {e}");
     }
 }
 
@@ -899,6 +1147,14 @@ struct OrphanJournal {
     last_change_wall_ms: u64,
     root: String,
     files: Vec<FileEntry>,
+    /// The id this turn was reserved under at open (`TurnEngine::open_turn_id`)
+    /// — recovery must reuse it, not mint a fresh one, or an in-flight
+    /// memory-candidate ingested against this turn (`source_turns`) would be
+    /// left pointing at an id that never appears in `log.jsonl`.
+    /// `#[serde(default = "turn_id")]` keeps a journal from a pre-this-change
+    /// daemon binary still parseable across an upgrade.
+    #[serde(default = "turn_id")]
+    id: String,
 }
 
 /// Write the open-turn journal (atomic tmp+rename), or remove it when idle.
@@ -922,6 +1178,7 @@ fn sync_journal(
                 last_change_wall_ms: clock.wall_ms(snap.last_change_at),
                 root: root.to_string_lossy().to_string(),
                 files,
+                id: snap.id,
             };
             let Ok(text) = serde_json::to_string(&journal) else {
                 return;
@@ -980,11 +1237,14 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     // `remove_file(&path)` a few lines down (or the equivalent window in the
     // steady-state journal-close path) leaves the journal on disk describing
     // a turn that's ALREADY in log.jsonl. Recovering it again on the next
-    // startup would double-log the same turn. Idempotent by construction:
-    // before appending, check whether the tail of the log already has a turn
-    // for this root with this exact start/end and file set — if so, this is
-    // a replay of a recovery that already landed; just clean up the journal.
-    if already_logged(root, &journal.root, &started, &ended, &journal.files) {
+    // startup would double-log the same turn — and since the id was reserved
+    // at OPEN, that duplicate carries the SAME id, breaking `undo` with an
+    // "ambiguous turn id". Idempotent by construction: skip if a turn with
+    // this reserved id (or, for legacy pre-reserved-id journals, this exact
+    // root/start/end/file set) already sits in the log tail. See
+    // `already_logged` for why the id key is load-bearing (`ended` drifts
+    // between the persist path and recovery).
+    if already_logged(root, &journal, &started, &ended) {
         let _ = std::fs::remove_file(&path);
         eprintln!(
             "agentrec: crash journal matches an already-logged turn — skipping duplicate recovery"
@@ -1014,7 +1274,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
 
     let record = TurnRecord {
         v: 1,
-        id: turn_id(),
+        id: journal.id.clone(),
         grade: grade.to_string(),
         truncated,
         started,
@@ -1037,25 +1297,30 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// D8: does the log tail already contain a turn matching this journal's
-/// root + both wall-clock endpoints + exact file set? Bounded to the most
-/// recent 50 records — a duplicate-recovery replay is always near the tail
-/// (it can only happen across back-to-back crashes), so there's no reason to
-/// scan the whole history.
-fn already_logged(
-    root: &Path,
-    journal_root: &str,
-    started: &str,
-    ended: &str,
-    files: &[FileEntry],
-) -> bool {
+/// D8: does the log tail already contain the turn this journal describes?
+/// Bounded to the most recent 50 records — a duplicate-recovery replay is
+/// always near the tail (it can only happen across back-to-back crashes),
+/// so there's no reason to scan the whole history.
+///
+/// Idempotent by turn `id` first (the canonical unique key, stable across
+/// open -> journal -> recovery now that ids are RESERVED AT OPEN): if a turn
+/// with this reserved id is already logged, this journal is a replay of a
+/// close/recovery that already landed — even when the logged turn's `ended`
+/// drifted from the journal's recomputed one (a turn closed by an incoming
+/// start signal is logged at the start time, not `last_change`). The
+/// root+times+files match is retained as a fallback for journals written by
+/// a pre-reserved-id daemon binary across an upgrade: their `id` deserializes
+/// to a fresh ULID (`#[serde(default)]`) that can't match anything logged, so
+/// the original content-based D8 guarantee still holds for them.
+fn already_logged(root: &Path, journal: &OrphanJournal, started: &str, ended: &str) -> bool {
     let records = agentrec_core::record::load_log(&log_path(root));
     records.iter().rev().take(50).any(|r| match r {
         LogRecord::Turn(t) => {
-            t.root == journal_root
-                && t.started == started
-                && t.ended == ended
-                && files_match(&t.files, files)
+            t.id == journal.id
+                || (t.root == journal.root
+                    && t.started == started
+                    && t.ended == ended
+                    && files_match(&t.files, &journal.files))
         }
         LogRecord::Epoch(_) => false,
     })
@@ -1487,8 +1752,7 @@ mod tests {
         std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
         std::fs::write(signal_path(root), b"").unwrap();
 
-        let mut tailer = SignalTailer::open(root).unwrap();
-        assert_eq!(tailer.offset, 0);
+        let mut tailer = SignalTailer { offset: 0 };
 
         std::fs::write(
             signal_path(root),
@@ -1539,6 +1803,69 @@ mod tests {
         .unwrap();
         let events2 = tailer.poll(root);
         assert_eq!(events2.len(), 1);
+    }
+
+    // Candidate-only startup replay: the scan ingests ONLY memory-candidate
+    // lines from the pre-daemon gap (start/stop are skipped — D7 preserved for
+    // turn boundaries), reconciles the offset to the scanned EOF so the live
+    // tailer never re-reads within one boot, persists that offset, and is
+    // idempotent across restarts (a re-scanned candidate dedups to a no-op).
+    #[test]
+    fn replay_pending_candidates_is_candidate_only_and_offset_reconciled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+
+        let start_line = r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#;
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        let contents = format!("{start_line}\n{candidate}\n{stop_line}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let eof = contents.len() as u64;
+
+        // No state.json -> persisted offset 0: the whole file is the gap.
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(
+            consumed, eof,
+            "scan consumes up to the last complete line (EOF)"
+        );
+        assert_eq!(
+            read_state(root).signal_offset,
+            eof,
+            "advanced offset persisted so the live tailer resumes at EOF"
+        );
+
+        let mems = agentrec_core::memory::load_effective(root).unwrap();
+        assert_eq!(
+            mems.len(),
+            1,
+            "only the candidate is ingested; start/stop are skipped: {mems:?}"
+        );
+        assert_eq!(mems[0].fact, "a gap fact");
+        assert_eq!(mems[0].origin, "agent");
+
+        // Restart idempotency: force a full re-scan of a gap that now holds the
+        // same candidate twice — dedup keeps memory.jsonl at one record.
+        std::fs::write(
+            signal_path(root),
+            format!("{contents}{candidate}\n").as_bytes(),
+        )
+        .unwrap();
+        let mut st = read_state(root);
+        st.signal_offset = 0;
+        write_state(root, &st).unwrap();
+        replay_pending_candidates(root, None);
+        let mems2 = agentrec_core::memory::load_effective(root).unwrap();
+        assert_eq!(
+            mems2.len(),
+            1,
+            "a re-scanned/duplicate candidate dedups to a no-op: {mems2:?}"
+        );
     }
 
     // ---- D9: event-channel draining + walk exclusion -------------------------
@@ -1702,6 +2029,7 @@ mod tests {
             last_change_wall_ms: 2_000,
             root: root.to_string_lossy().to_string(),
             files,
+            id: turn_id(),
         };
         std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
 
@@ -1720,6 +2048,88 @@ mod tests {
             !open_path(root).exists(),
             "the stale journal is still cleaned up on the duplicate path"
         );
+    }
+
+    // Regression: a turn closed by an incoming *start* signal is logged with
+    // `ended` = the start time (engine `observe_start` closes at `now`, not
+    // `last_change_at`), but its crash journal was written earlier carrying
+    // `last_change_wall_ms` < that. A kill-9 in the persist->sync_journal
+    // window leaves that stale journal; on restart `recover_orphan`
+    // recomputes `ended` from `last_change` and it no longer matches the
+    // logged turn. Because turn ids are now RESERVED AT OPEN, the journal and
+    // the already-logged turn share the SAME id — a content-only idempotency
+    // check misses the drift and re-appends that id, producing an "ambiguous
+    // turn id" that breaks `undo`. Dedup must key on the (unique, stable)
+    // turn id, not just root+times+files.
+    #[test]
+    fn recover_orphan_skips_duplicate_by_id_even_when_ended_drifted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let files = vec![FileEntry {
+            path: "a.rs".into(),
+            before: None,
+            after: Some("sha256:aaa".into()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }];
+
+        let id = turn_id();
+        // Logged turn: closed at now=3_000 (a later start signal), NOT at
+        // last_change=2_000.
+        let existing = TurnRecord {
+            v: 1,
+            id: id.clone(),
+            grade: "bare".to_string(),
+            truncated: false,
+            started: rfc3339(1_000),
+            ended: rfc3339(3_000),
+            tool: None,
+            model: None,
+            session: None,
+            root: root.to_string_lossy().to_string(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            files: files.clone(),
+        };
+        append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
+
+        // Journal written before the close, same reserved id, last_change
+        // 2_000 -> recover_orphan recomputes ended = rfc3339(2_000) != 3_000.
+        let journal = OrphanJournal {
+            source: "quiet".to_string(),
+            tool: None,
+            prompt: None,
+            session: None,
+            opened_wall_ms: 1_000,
+            last_change_wall_ms: 2_000,
+            root: root.to_string_lossy().to_string(),
+            files,
+            id: id.clone(),
+        };
+        std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
+
+        recover_orphan(root).unwrap();
+
+        let turns: Vec<_> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let with_id = turns.iter().filter(|t| t.id == id).count();
+        assert_eq!(
+            with_id, 1,
+            "the reserved id must appear exactly once — a drifted `ended` must \
+             not defeat idempotency and re-log the same id (ambiguous `undo`)"
+        );
+        assert_eq!(turns.len(), 1, "no duplicate turn appended");
+        assert!(!open_path(root).exists(), "stale journal cleaned up");
     }
 
     // A genuinely new orphaned turn (different times/files than anything
@@ -1748,6 +2158,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
             }],
+            id: turn_id(),
         };
         std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
 

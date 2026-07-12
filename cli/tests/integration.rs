@@ -7,7 +7,11 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use agentrec_core::memory::{self, MemoryOp, MemoryRecord, Pin};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
@@ -44,6 +48,25 @@ fn send_hook(root: &Path, payload: &str) {
         .write_all(payload.as_bytes())
         .unwrap();
     child.wait().unwrap();
+}
+
+/// Like [`send_hook`] but captures stdout/status instead of discarding it —
+/// Task 9's memory-injection block is written to stdout.
+fn send_hook_capture(root: &Path, payload: &str) -> Output {
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 /// Turn records currently in the log (epoch lines skipped).
@@ -2415,6 +2438,58 @@ fn secret_prompt_never_reaches_disk_in_cleartext() {
     })
     .expect("turn with secret-bearing prompt recorded");
 
+    // INV-M3 (memory locations 3 and 4, Task 12): drive the SAME planted
+    // secret through both memory write paths — `remember` (direct,
+    // daemon-independent write) and `candidate` (async, daemon-ingested
+    // write) — then a matching `UserPromptSubmit` hook so a
+    // `memory-stats.jsonl` line actually exists. All three must land on
+    // disk with the raw key nowhere. The daemon must still be alive for
+    // `candidate` to be ingested, so this all happens BEFORE the
+    // `sigkill` below.
+    seed_filler_memories(root, 8);
+    let remember_fact = format!("deploy with key {secret} now");
+    let out = agentrec(root, &["remember", &remember_fact, "--from", "touched.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let candidate_fact = format!("the deploy key {secret} rotates every staging release cycle");
+    let out = agentrec(
+        root,
+        &[
+            "candidate",
+            &candidate_fact,
+            "--from",
+            "touched.rs",
+            "--tool",
+            "test-candidate",
+        ],
+    );
+    assert!(out.status.success(), "candidate emit failed: {out:?}");
+
+    let memories_after_candidate = poll_until(Duration::from_secs(10), || {
+        let recs = memory_records(root);
+        (recs.len() >= 10).then_some(recs) // 8 filler + remember + candidate
+    })
+    .expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        memories_after_candidate.len(),
+        10,
+        "expected exactly 10 memory records: {memories_after_candidate:?}"
+    );
+
+    // Matching UserPromptSubmit -> a real memory-stats.jsonl line (not just
+    // an absent-file vacuous pass).
+    let hook_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_secret_hook","prompt":"deploy key rotation"}"#;
+    send_hook(root, hook_payload);
+    let stats_after_hook = poll_until(Duration::from_secs(5), || {
+        let lines = memory_stats_lines(root);
+        (!lines.is_empty()).then_some(lines)
+    })
+    .expect("expected a memory-stats.jsonl line after a matching hook prompt");
+    assert!(
+        !stats_after_hook.is_empty(),
+        "expected at least one memory-stats.jsonl line"
+    );
+
     sigkill(&daemon);
     let _ = daemon.wait();
 
@@ -2473,6 +2548,35 @@ fn secret_prompt_never_reaches_disk_in_cleartext() {
         }
     }
     assert!(checked_any, "expected at least one blob object to check");
+
+    // INV-M3 complete (locations 3 and 4): `memory.jsonl` carries the
+    // scrubbed fact (redaction marker present, raw key absent) for BOTH the
+    // `remember` and `candidate` write paths.
+    let memory_jsonl = std::fs::read(root.join(".agentrec/memory.jsonl")).unwrap_or_default();
+    assert!(
+        !contains_bytes(&memory_jsonl, secret.as_bytes()),
+        "raw secret leaked into memory.jsonl"
+    );
+    assert!(
+        contains_bytes(&memory_jsonl, b"[redacted:"),
+        "expected a redaction marker in memory.jsonl"
+    );
+
+    // `memory-stats.jsonl` only ever holds `{"ts","n"}` injection counts or
+    // (F2) `{"ts","budget_exceeded"}` bail markers — no fact text in either
+    // shape — so it should trivially never carry the secret. Asserted
+    // anyway for completeness (INV-M3, 4th and final location) against the
+    // real line the matching hook above produced, not an absent file.
+    let memory_stats_jsonl =
+        std::fs::read(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    assert!(
+        !memory_stats_jsonl.is_empty(),
+        "expected a real memory-stats.jsonl to check, not an absent file"
+    );
+    assert!(
+        !contains_bytes(&memory_stats_jsonl, secret.as_bytes()),
+        "raw secret leaked into memory-stats.jsonl"
+    );
 }
 
 // ---- `agentrec doctor` (D41 / AC-Y++) ---------------------------------------
@@ -2976,6 +3080,1415 @@ fn log_no_color_env_suppresses_escapes() {
     );
 }
 
+// --- Task 4: `agentrec remember` — manual pinned memories.
+
+#[test]
+fn remember_writes_pinned_scrubbed_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "build needs cargo nightly",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let path = root.join(".agentrec/memory.jsonl");
+    assert!(path.exists(), "memory.jsonl must exist");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "memory.jsonl must be 0600");
+    }
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "expected exactly one record: {text}");
+    let rec: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(rec.get("origin").and_then(|v| v.as_str()), Some("human"));
+    assert_eq!(rec.get("op").and_then(|v| v.as_str()), Some("assert"));
+    let pins = rec.get("pins").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(pins.len(), 1, "expected one pin: {pins:?}");
+    assert_eq!(
+        pins[0].get("path").and_then(|v| v.as_str()),
+        Some("src/a.rs")
+    );
+    let hash = pins[0].get("hash").and_then(|v| v.as_str()).unwrap();
+    assert!(hash.starts_with("sha256:"), "hash: {hash}");
+    let hex = &hash["sha256:".len()..];
+    assert_eq!(hex.len(), 64, "hash hex len: {hex}");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "hash not hex: {hash}"
+    );
+}
+
+#[test]
+fn remember_refuses_bad_pins_and_secret_facts() {
+    // Traversal escape: --from ../escape -> exit 1, stderr names the path,
+    // memory.jsonl absent.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let out = agentrec(root, &["remember", "some fact", "--from", "../escape"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("../escape"), "stderr: {stderr}");
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created on a rejected pin"
+        );
+    }
+
+    // Secret-file pin: --from .env -> exit 1, stderr mentions secret.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        let out = agentrec(root, &["remember", "some fact", "--from", ".env"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("secret"), "stderr: {stderr}");
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created on a secret-path pin"
+        );
+    }
+
+    // A fact containing a secret (but not only a secret), with a valid pin,
+    // is persisted with the secret redacted (INV-M3 half 1) — same
+    // AWS-key-shaped fixture as secret_prompt_never_reaches_disk_in_cleartext.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let fact = format!("deploy with key {secret} now");
+        let out = agentrec(root, &["remember", &fact, "--from", "src/a.rs"]);
+        assert!(out.status.success(), "remember failed: {out:?}");
+        let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+        assert!(
+            text.contains("[redacted:"),
+            "expected a redaction marker: {text}"
+        );
+        assert!(!text.contains(secret), "raw key leaked to disk: {text}");
+    }
+
+    // A fact that scrubs to nothing is refused, nothing written. scrub()
+    // never deletes matched content (it substitutes a `[redacted:...]`
+    // marker), so the only input that can trim-empty after scrubbing is one
+    // that was already blank — same fixture shape as
+    // agentrec_core::memory::append_memory_rejects_oversize_and_empty's
+    // blank_fact case.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+        let out = agentrec(root, &["remember", "   \n\t  ", "--from", "src/a.rs"]);
+        assert!(!out.status.success(), "expected failure: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("scrub") || stderr.contains("empty"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            !root.join(".agentrec/memory.jsonl").exists(),
+            "memory.jsonl must not be created for a fact that scrubs to nothing"
+        );
+    }
+}
+
+// --- Task 5: `agentrec recall` + `agentrec memories`.
+
+/// Seeds `count` off-topic filler memories, each pinned to its own file —
+/// mirrors `agentrec_core::memory::recall_never_returns_stale`'s fixture:
+/// with only 1-2 on-topic memories in a tiny corpus, idf(shared terms)
+/// doesn't clear SCORE_FLOOR on its own, so tests that exercise real BM25
+/// ranking need the corpus padded to N ~10.
+fn seed_filler_memories(root: &Path, count: usize) {
+    for i in 0..count {
+        let rel = format!("filler{i}.rs");
+        std::fs::write(root.join(&rel), b"fn filler() {}").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                "unrelated documentation cleanup housekeeping chore",
+                "--from",
+                &rel,
+            ],
+        );
+        assert!(out.status.success(), "remember filler{i} failed: {out:?}");
+    }
+}
+
+#[test]
+fn recall_cli_fresh_only_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember A failed: {out:?}");
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed also drives the fuzz corpus replay",
+            "--from",
+            "src/b.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember B failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid json: {e}: {stdout}"));
+    let arr = parsed.as_array().expect("json array");
+    assert_eq!(arr.len(), 2, "expected 2 fresh matches: {stdout}");
+
+    // Mutate one pinned file's content -> that memory goes Stale.
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }").unwrap();
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json (2) failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert_eq!(arr.len(), 1, "stale memory must be excluded: {stdout}");
+
+    // `memories --stale` shows the one whose pin drifted.
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "stale listing must show the drifted pin path: {stdout}"
+    );
+    assert!(
+        !stdout.contains("src/b.rs"),
+        "fresh memory must not appear under --stale: {stdout}"
+    );
+
+    // `memories --all` shows both, regardless of freshness.
+    let out = agentrec(root, &["memories", "--all"]);
+    assert!(out.status.success(), "memories --all failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs") && stdout.contains("src/b.rs"),
+        "memories --all must show both: {stdout}"
+    );
+}
+
+/// Seeds `memory.jsonl` directly (no daemon, no subprocess-per-record) with
+/// a stale-heavy corpus shaped exactly like `agentrec-core::memory::tests::
+/// recall_bounds_verification_on_stale_heavy_corpus`'s scenario 2: an
+/// orphaned block strictly larger than `RECALL_VERIFY_CAP`, sharing the same
+/// fact text (and therefore an identical BM25 score) as `fresh_count`
+/// genuinely fresh, real-pinned records that rank strictly BEHIND it via the
+/// idx-ascending tiebreak (insertion order). A filler block pads corpus size
+/// so idf doesn't collapse toward zero. Returns the paths of the fresh
+/// records (already written + hashed) so callers can assert on their facts.
+fn seed_capped_stale_heavy_corpus(root: &Path, fresh_count: u64) {
+    let mut lines = String::new();
+    let orphaned_count = agentrec_core::memory::RECALL_VERIFY_CAP as u64 + 12;
+    for i in 0..orphaned_count {
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("orph{i}"),
+            "op": "assert",
+            "fact": "kraken telemetry batching",
+            "pins": [{
+                "path": format!("missing{i}.rs"),
+                "hash": format!("sha256:{i:064}"),
+            }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 1_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    for i in 0..fresh_count {
+        let rel = format!("fresh{i}.rs");
+        std::fs::write(root.join(&rel), b"fn fresh() {}\n").unwrap();
+        let hash = memory::hash_pin(root, &rel).expect("hash fresh file");
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("fresh{i}"),
+            "op": "assert",
+            "fact": "kraken telemetry batching",
+            "pins": [{ "path": rel, "hash": hash }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 2_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    for i in 0..100 {
+        let rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": format!("filler{i}"),
+            "op": "assert",
+            "fact": "unrelated housekeeping chore",
+            "pins": [{
+                "path": format!("filler_missing{i}.rs"),
+                "hash": format!("sha256:{i:064}"),
+            }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 3_000 + i,
+        });
+        lines.push_str(&rec.to_string());
+        lines.push('\n');
+    }
+    std::fs::write(root.join(".agentrec/memory.jsonl"), lines).unwrap();
+}
+
+/// F3 (RECALL_VERIFY_CAP truncation is silent): on a corpus where the
+/// verify walk exhausts `RECALL_VERIFY_CAP` entirely inside an orphaned
+/// block, `agentrec recall` must print a one-line capped notice to STDERR
+/// (never stdout, keeping stdout parseable/pipeable) so "no fresh matches"
+/// is never indistinguishable from "no fresh matches AND more exist beyond
+/// the cap". Pre-fix, this fails on a plain string-absence assertion
+/// (compiles fine against pre-fix code — no `capped` field existed to
+/// gate a notice on, so none was ever printed).
+#[test]
+fn recall_notice_appears_when_verification_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    seed_capped_stale_heavy_corpus(root, 3);
+
+    let out = agentrec(root, &["recall", "kraken telemetry batching"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("verification capped at 128 candidates — results may be incomplete"),
+        "expected the capped notice on stderr: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("verification capped"),
+        "capped notice must never land on stdout: stdout={stdout}"
+    );
+
+    // `--json` is out of scope for the F3 notice (see recall_cmd's doc
+    // comment) — assert it stays a clean, notice-free array either way.
+    let out = agentrec(root, &["recall", "kraken telemetry batching", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "recall --json stdout must stay valid JSON: {stdout}"
+    );
+}
+
+/// F3 counterpart: a corpus comfortably under `RECALL_VERIFY_CAP` must
+/// never print the capped notice — it is not a generic "results might be
+/// incomplete for some other reason" disclaimer, it fires only when the cap
+/// was actually the reason the walk stopped early.
+#[test]
+fn recall_no_cap_notice_under_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed rotation"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("verification capped"),
+        "under-cap corpus must never print the capped notice: stderr={stderr}"
+    );
+
+    // A genuinely empty result set (no fresh match) under the cap also
+    // must not print the notice — the two "empty" cases (capped vs
+    // genuinely-nothing) must render differently.
+    let out = agentrec(root, &["recall", "zebra quantum flux"]);
+    assert!(out.status.success(), "recall (no match) failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("verification capped"),
+        "genuinely-empty-under-cap must not print the capped notice: stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("no fresh memories match"),
+        "expected the plain no-match message: stdout={stdout}"
+    );
+}
+
+/// F3, hook path: the capped signal must be recorded in
+/// `memory-stats.jsonl` ONLY — the `--for-hook`/hook stdout contract
+/// (fenced block or nothing, exit 0 always) is unconditional and must never
+/// carry the capped notice text. Uses the same stale-heavy construction as
+/// `recall_notice_appears_when_verification_capped`, sized well under the
+/// hook's 50ms self-budget (no `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED`
+/// involved — this proves the capped stat lands on a real, in-budget walk).
+#[test]
+fn hook_records_capped_stat_never_stdout_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // No fresh matches at all — the exact silent-truncation scenario F3
+    // exists for: zero hits AND fresh matches existed beyond the cap.
+    seed_capped_stale_heavy_corpus(root, 0);
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_capped","prompt":"kraken telemetry batching"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "no fresh hits -> hook stdout must be empty, capped or not: {stdout}"
+    );
+    assert!(
+        !stdout.contains("capped"),
+        "capped must never appear in hook stdout: {stdout}"
+    );
+
+    let stats = poll_until(Duration::from_secs(5), || {
+        let lines = memory_stats_lines(root);
+        lines
+            .iter()
+            .any(|l| l.get("capped").and_then(|v| v.as_bool()) == Some(true))
+            .then_some(lines)
+    })
+    .expect("expected a capped:true line in memory-stats.jsonl");
+    assert!(
+        stats
+            .iter()
+            .any(|l| l.get("capped").and_then(|v| v.as_bool()) == Some(true)),
+        "expected capped:true in memory-stats.jsonl: {stats:?}"
+    );
+}
+
+#[test]
+fn recall_for_hook_emits_block_or_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Matching query -> fenced block, capped at 800 chars, never a hash.
+    let out = agentrec(root, &["recall", "nightly seed", "--for-hook"]);
+    assert!(out.status.success(), "recall --for-hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("```agentrec memory"), "stdout: {stdout}");
+    assert!(
+        stdout.chars().count() <= 800,
+        "block exceeds 800 chars ({} chars): {stdout}",
+        stdout.chars().count()
+    );
+    assert!(
+        !stdout.contains("sha256:"),
+        "must not leak hashes: {stdout}"
+    );
+
+    // Nonsense query -> nothing above SCORE_FLOOR -> empty stdout, exit 0.
+    let out = agentrec(root, &["recall", "zebra quantum", "--for-hook"]);
+    assert!(
+        out.status.success(),
+        "nonsense query must still exit 0: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nonsense query must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Uninitialized repo: --for-hook fails open (empty stdout, exit 0);
+    // without --for-hook it's a real error (exit 1, stderr).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+
+    let out = agentrec(root2, &["recall", "anything", "--for-hook"]);
+    assert!(
+        out.status.success(),
+        "uninitialized --for-hook must exit 0: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "uninitialized --for-hook must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = agentrec(root2, &["recall", "anything"]);
+    assert!(
+        !out.status.success(),
+        "uninitialized recall (no --for-hook) must fail: {out:?}"
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "uninitialized recall (no --for-hook) must report on stderr"
+    );
+}
+
+// --- Task 10: `verify` + `forget` — quarantine is recoverable.
+
+#[test]
+fn verify_and_forget_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed rotation keeps torture runs reproducible";
+    let out = agentrec(root, &["remember", fact, "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("newly remembered id not found");
+
+    // Mutate the pinned file -> stale; `memories --stale` surfaces it.
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }").unwrap();
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "stale listing must show the drifted pin: {stdout}"
+    );
+
+    // `verify <id>` (no --confirm): prints drift, changes nothing.
+    let lines_before = memory_records(root).len();
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify (preview) failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("old sha256:") && stdout.contains("-> new sha256:"),
+        "expected a drift line: {stdout}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "preview verify must not append"
+    );
+
+    // `verify <id> --confirm`: fresh again, exactly one new record appended.
+    let out = agentrec(root, &["verify", &id, "--confirm"]);
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before + 1,
+        "reverify must append exactly one record"
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert!(
+        arr.iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "recall must serve the reverified (fresh again) memory: {stdout}"
+    );
+
+    // `forget <id> --reason "wrong"` -> excluded from recall AND hook
+    // injection; `memories --all` shows it retracted with the reason.
+    let out = agentrec(root, &["forget", &id, "--reason", "wrong"]);
+    assert!(out.status.success(), "forget failed: {out:?}");
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert!(
+        !arr.iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "forgotten memory must not appear in recall: {stdout}"
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed", "--for-hook"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "forgotten memory must not be injected: {stdout}"
+    );
+
+    let out = agentrec(root, &["memories", "--all"]);
+    assert!(out.status.success(), "memories --all failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("retracted"),
+        "memories --all must show the retracted state: {stdout}"
+    );
+    assert!(
+        stdout.contains("wrong"),
+        "memories --all must show the retract reason: {stdout}"
+    );
+
+    // `forget <id>` again -> exit 1 (already retracted).
+    let out = agentrec(root, &["forget", &id, "--reason", "again"]);
+    assert!(!out.status.success(), "double forget must fail: {out:?}");
+
+    // Orphan variant: a fresh memory with two pins, one of which is deleted.
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+    std::fs::write(root.join("src/c.rs"), b"fn c() {}").unwrap();
+    let orphan_fact = "orphan variant fact about kraken batching";
+    let out = agentrec(
+        root,
+        &["remember", orphan_fact, "--from", "src/b.rs,src/c.rs"],
+    );
+    assert!(
+        out.status.success(),
+        "remember (orphan fixture) failed: {out:?}"
+    );
+    let orphan_id = memory_records(root)
+        .iter()
+        .rev()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(orphan_fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("orphan id not found");
+
+    std::fs::remove_file(root.join("src/b.rs")).unwrap();
+
+    let lines_before = memory_records(root).len();
+    let out = agentrec(root, &["verify", &orphan_id, "--confirm"]);
+    assert!(
+        !out.status.success(),
+        "verify --confirm without --drop-pin must refuse on an orphaned pin: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("src/b.rs"),
+        "stderr must name the orphaned path: {stderr}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "a refused verify must not append"
+    );
+
+    let out = agentrec(
+        root,
+        &["verify", &orphan_id, "--confirm", "--drop-pin", "src/b.rs"],
+    );
+    assert!(
+        out.status.success(),
+        "verify --confirm --drop-pin failed: {out:?}"
+    );
+    assert_eq!(memory_records(root).len(), lines_before + 1);
+
+    let out = agentrec(root, &["memories", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    let orphan_entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(orphan_id.as_str()))
+        .expect("orphan entry not found in memories --json");
+    let pins = orphan_entry
+        .get("pins")
+        .and_then(|p| p.as_array())
+        .expect("pins array");
+    assert_eq!(pins.len(), 1, "dropped pin must be gone: {pins:?}");
+    assert_eq!(
+        pins[0].get("path").and_then(|p| p.as_str()),
+        Some("src/c.rs")
+    );
+
+    // Dropping the only remaining pin must be refused — a memory must
+    // retain at least one pin.
+    std::fs::remove_file(root.join("src/c.rs")).unwrap();
+    let lines_before = memory_records(root).len();
+    let out = agentrec(
+        root,
+        &["verify", &orphan_id, "--confirm", "--drop-pin", "src/c.rs"],
+    );
+    assert!(
+        !out.status.success(),
+        "dropping the only remaining pin must be refused: {out:?}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "a refused verify must not append"
+    );
+
+    // Origin provenance (design spec, §Quality gate: "origin + source_turns
+    // give provenance"): verify/forget are human-run CLI commands, but they
+    // must not silently reassign an *agent-authored* memory's origin to
+    // "human" — the fold takes `origin` from whichever op is latest
+    // (`agentrec_core::memory::load_effective`), so `verify`/`forget` must
+    // restate the original origin, not the actor running the command.
+    std::fs::write(root.join("src/d.rs"), b"fn d() {}").unwrap();
+    let agent_fact = "agent authored fact about kraken retry batching";
+    let out = agentrec(root, &["remember", agent_fact, "--from", "src/d.rs"]);
+    assert!(
+        out.status.success(),
+        "remember (agent fixture) failed: {out:?}"
+    );
+
+    // Hand-edit that record's `origin` to "agent" — `remember` always
+    // stamps "human"; simulating an agent-authored memory without a live
+    // daemon means rewriting the field directly (same posture as this
+    // file's other direct-JSONL fixtures, e.g. the memory.jsonl scale test
+    // near `hook_...recall_budget`).
+    let memory_path = root.join(".agentrec/memory.jsonl");
+    let text = std::fs::read_to_string(&memory_path).unwrap();
+    let mut agent_id = String::new();
+    let rewritten: String = text
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v.get("fact").and_then(|f| f.as_str()) == Some(agent_fact) {
+                v["origin"] = serde_json::Value::String("agent".to_string());
+                agent_id = v["id"].as_str().unwrap().to_string();
+            }
+            v.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&memory_path, rewritten).unwrap();
+    assert!(!agent_id.is_empty(), "agent fixture id not found");
+
+    let out = agentrec(root, &["verify", &agent_id, "--confirm"]);
+    assert!(
+        out.status.success(),
+        "verify --confirm on agent-origin memory failed: {out:?}"
+    );
+    let out = agentrec(root, &["memories", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().unwrap();
+    let entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(agent_id.as_str()))
+        .expect("agent-origin entry not found after verify");
+    assert_eq!(
+        entry.get("origin").and_then(|o| o.as_str()),
+        Some("agent"),
+        "verify must not reassign an agent-authored memory's origin to human: {entry}"
+    );
+
+    let out = agentrec(root, &["forget", &agent_id, "--reason", "still agent"]);
+    assert!(
+        out.status.success(),
+        "forget (agent fixture) failed: {out:?}"
+    );
+    let out = agentrec(root, &["memories", "--all", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().unwrap();
+    let entry = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|i| i.as_str()) == Some(agent_id.as_str()))
+        .expect("agent-origin entry not found after forget");
+    assert_eq!(
+        entry.get("origin").and_then(|o| o.as_str()),
+        Some("agent"),
+        "forget must not reassign an agent-authored memory's origin to human: {entry}"
+    );
+    assert_eq!(entry.get("retracted").and_then(|r| r.as_bool()), Some(true));
+    assert_eq!(
+        entry.get("reason").and_then(|r| r.as_str()),
+        Some("still agent")
+    );
+}
+
+// F7 part B: design spec §Read path promises `memories --stale` shows WHICH
+// pin drifted and WHEN (a join against the turn log), not just a bare
+// "stale" label. Pre-fix, the listing only prints the fact + freshness
+// label + all pin paths — the drifted pin isn't distinguished from any
+// other pin on the memory, and there is no turn/time reference at all.
+#[test]
+fn memories_stale_shows_drifted_pin_and_when() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Mutate the pinned file and seed a turn recording exactly that drift
+    // (base_turn/seed_turn — same direct-log fixture pattern as the
+    // diff/blame tests above; no daemon needed, only the read-side join is
+    // under test).
+    let new_bytes = b"fn a() { changed(); }\n";
+    std::fs::write(root.join("src/a.rs"), new_bytes).unwrap();
+    let after_hash = agentrec_core::store::hash_bytes(new_bytes);
+    let turn_id = "t_DRIFTJOIN0000000000000A1";
+    let turn = base_turn(
+        turn_id,
+        vec![agentrec_core::record::FileEntry {
+            path: "src/a.rs".into(),
+            before: None,
+            after: Some(after_hash),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "must name the drifted pin path: {stdout}"
+    );
+    assert!(
+        stdout.contains(turn_id),
+        "must reference the turn that produced the drift: {stdout}"
+    );
+    assert!(
+        stdout.lines().count() > 1,
+        "must be more than a bare one-line 'stale' label: {stdout}"
+    );
+}
+
+// F7 part B: design spec §Lifecycle promises `verify <id>` shows a "diff
+// summary via CAS" on drift, not only two hashes. Pre-fix, `verify` prints
+// exactly `old <hash> -> new <hash>` and nothing else.
+#[test]
+fn verify_renders_cas_diff_on_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let original = b"fn a() {}\n";
+    std::fs::write(root.join("src/a.rs"), original).unwrap();
+
+    // Seed the CAS with the pinned content itself — a pin's hash is computed
+    // directly from file bytes (`memory::hash_pin`), it is never written to
+    // the object store by `remember`, so a diff needs this seeded explicitly
+    // (mirrors how `diff`/`undo`'s own tests seed blobs via BlobStore::put).
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+    store.put(original).expect("seed pinned blob");
+
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }\n").unwrap();
+
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("+1/-1"),
+        "expected a diff summary line: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with('+') && l.contains("changed")),
+        "expected an actual added diff line: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with('-') && !l.trim_start().starts_with("---")),
+        "expected an actual removed diff line: {stdout}"
+    );
+}
+
+// F7 part B: the pinned-hash blob is the common case for being unavailable
+// (a pin's hash is computed straight from file bytes; it's only IN the CAS
+// if some turn happened to snapshot identical content) — the diff summary
+// must fall back honestly rather than silently show nothing, mirroring
+// `show --prompt`'s corrupt/purged-blob honesty.
+#[test]
+fn verify_falls_back_when_blob_purged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}\n").unwrap();
+
+    // No CAS seeding — the pinned hash was never written as a blob.
+    let out = agentrec(root, &["remember", "fact about a", "--from", "src/a.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)[0]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }\n").unwrap();
+
+    let out = agentrec(root, &["verify", &id]);
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("blob unavailable"),
+        "expected the honest fallback note: {stdout}"
+    );
+    assert!(
+        stdout.contains("old sha256:") && stdout.contains("-> new sha256:"),
+        "hash line must still be present: {stdout}"
+    );
+}
+
+// F9: renaming the sole pinned file of a memory orphans it forever with only
+// the pre-F9 verb set (`--confirm` refuses without a matching `--drop-pin`,
+// and dropping the only pin is refused outright — a hard dead end). This
+// test proves the gap using ONLY `--replace-pin` (the fix under test); before
+// F9 lands, `--replace-pin` is an unrecognized clap argument, so the CLI
+// invocation itself fails — that failure IS the RED signal for AC-F9.1.
+#[test]
+fn verify_replace_pin_preserves_renamed_sole_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/old_name.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed rotation lives in old_name for now";
+    let out = agentrec(root, &["remember", fact, "--from", "src/old_name.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("newly remembered id not found");
+
+    // Rename: old path gone, new path holds the same content under a new
+    // name — the pin is now orphaned with zero automatic recovery.
+    std::fs::rename(root.join("src/old_name.rs"), root.join("src/new_name.rs")).unwrap();
+
+    // AC-F9.1 (RED before implementation): recall no longer serves the
+    // memory (orphaned pin => never Fresh), and there is no re-pin path
+    // using only the pre-F9 verbs.
+    let out = agentrec(root, &["recall", "nightly seed rotation", "--json"]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        !parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "orphaned-by-rename memory must not recall before re-pinning"
+    );
+
+    // AC-F9.2: preview (no --confirm) shows the orphaned old pin AND the
+    // proposed old -> new mapping; nothing is appended.
+    let lines_before = memory_records(root).len();
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--replace-pin",
+            "src/old_name.rs=src/new_name.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify preview failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/old_name.rs") && stdout.contains("deleted"),
+        "preview must show the orphaned old pin: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/old_name.rs") && stdout.contains("src/new_name.rs"),
+        "preview must show the proposed old -> new mapping: {stdout}"
+    );
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before,
+        "preview must not append"
+    );
+
+    // AC-F9.3: confirmed replacement preserves id + fact, replaces the pin,
+    // and `recall` serves the memory again.
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/old_name.rs=src/new_name.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+    assert_eq!(
+        memory_records(root).len(),
+        lines_before + 1,
+        "replacement must append exactly one record"
+    );
+
+    let effective_pins = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .expect("appended record")
+        .get("pins")
+        .cloned()
+        .expect("pins");
+    let pins_arr = effective_pins.as_array().unwrap();
+    assert_eq!(
+        pins_arr.len(),
+        1,
+        "sole pin replaced, not added to: {pins_arr:?}"
+    );
+    assert_eq!(
+        pins_arr[0].get("path").and_then(|p| p.as_str()),
+        Some("src/new_name.rs")
+    );
+    let last_rec = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .unwrap();
+    assert_eq!(last_rec.get("fact").and_then(|f| f.as_str()), Some(fact));
+    assert_eq!(
+        last_rec.get("op").and_then(|o| o.as_str()),
+        Some("reverify")
+    );
+
+    let out = agentrec(root, &["recall", "nightly seed rotation", "--json"]);
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("id").and_then(|i| i.as_str()) == Some(id.as_str())),
+        "recall must serve the memory again after replacement: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "replaced memory must be fresh again, not stale: {stdout}"
+    );
+}
+
+// AC-F9.5: replacing ONE orphaned pin while another pin on the same memory
+// is retained (re-hashed, not dropped) yields a single valid, non-empty pin
+// set — INV-M1 (a memory always carries >=1 valid pin) holds.
+#[test]
+fn verify_replace_pin_keeps_other_pins_on_multi_pin_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/renamed.rs"), b"fn r() {}").unwrap();
+    std::fs::write(root.join("src/kept.rs"), b"fn k() {}").unwrap();
+    seed_filler_memories(root, 8);
+
+    let fact = "nightly seed kraken batching spans two files";
+    let out = agentrec(
+        root,
+        &["remember", fact, "--from", "src/renamed.rs,src/kept.rs"],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("id not found");
+
+    std::fs::rename(root.join("src/renamed.rs"), root.join("src/renamed2.rs")).unwrap();
+    // Also drift (not orphan) the kept pin, to prove it gets re-hashed, not
+    // just carried forward stale.
+    std::fs::write(root.join("src/kept.rs"), b"fn k() { changed(); }").unwrap();
+    let new_kept_hash = memory::hash_pin(root, "src/kept.rs").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/renamed.rs=src/renamed2.rs",
+        ],
+    );
+    assert!(out.status.success(), "verify --confirm failed: {out:?}");
+
+    let last_rec = memory_records(root)
+        .into_iter()
+        .rfind(|r| r.get("id").and_then(|i| i.as_str()) == Some(id.as_str()))
+        .unwrap();
+    let pins_arr = last_rec.get("pins").unwrap().as_array().unwrap();
+    assert_eq!(pins_arr.len(), 2, "both pins present: {pins_arr:?}");
+    let paths: Vec<&str> = pins_arr
+        .iter()
+        .map(|p| p.get("path").and_then(|x| x.as_str()).unwrap())
+        .collect();
+    assert!(paths.contains(&"src/renamed2.rs"));
+    assert!(paths.contains(&"src/kept.rs"));
+    let kept_entry = pins_arr
+        .iter()
+        .find(|p| p.get("path").and_then(|x| x.as_str()) == Some("src/kept.rs"))
+        .unwrap();
+    assert_eq!(
+        kept_entry.get("hash").and_then(|h| h.as_str()),
+        Some(new_kept_hash.as_str()),
+        "kept pin must be re-hashed fresh, not left stale"
+    );
+
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(fact),
+        "memory must be fully fresh: {stdout}"
+    );
+}
+
+// AC-F9.4: every atomic-refusal case for --replace-pin. Each sub-case
+// re-derives a fresh id off a fresh remember (the prior case's own refusal
+// already proves nothing was appended, so state carries forward safely) and
+// asserts append count is unchanged.
+#[test]
+fn verify_replace_pin_rejections_append_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("outside_root")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+    std::fs::write(root.join("src/c.rs"), b"fn c() {}").unwrap();
+    std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+
+    let fact = "kraken batching rejection fixture fact";
+    let out = agentrec(root, &["remember", fact, "--from", "src/a.rs,src/b.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+    let id = memory_records(root)
+        .iter()
+        .find(|r| r.get("fact").and_then(|f| f.as_str()) == Some(fact))
+        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from))
+        .expect("id not found");
+
+    let assert_refused = |args: &[&str], must_contain: &str, msg: &str| {
+        let lines_before = memory_records(root).len();
+        let out = agentrec(root, args);
+        assert!(
+            !out.status.success(),
+            "{msg}: expected failure, got {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(must_contain),
+            "{msg}: stderr {stderr} must mention '{must_contain}'"
+        );
+        assert_eq!(
+            memory_records(root).len(),
+            lines_before,
+            "{msg}: refusal must append nothing"
+        );
+        // AC-F9.4: a --replace-pin refusal must be atomic on stdout too, not
+        // just on the memory.jsonl append — every validation error is
+        // returned BEFORE the fact is printed (memorycmds.rs::verify), so a
+        // rejected call must produce zero stdout bytes. Guards against a
+        // future regression that moves the print earlier than validation.
+        assert!(
+            out.stdout.is_empty(),
+            "{msg}: refusal must print nothing to stdout, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    };
+
+    // nonexistent old pin (not on this memory)
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/not_a_pin.rs=src/c.rs",
+        ],
+        "not a pin",
+        "nonexistent old pin",
+    );
+
+    // nonexistent new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=src/does_not_exist.rs",
+        ],
+        "does_not_exist",
+        "nonexistent new path",
+    );
+
+    // absolute new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=/etc/passwd",
+        ],
+        "absolute",
+        "absolute new path",
+    );
+
+    // ..-traversal new path
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=../outside_root",
+        ],
+        "..",
+        "traversal new path",
+    );
+
+    // secret-pattern new path
+    assert_refused(
+        &["verify", &id, "--confirm", "--replace-pin", "src/a.rs=.env"],
+        "secret",
+        "secret new path",
+    );
+
+    // duplicate old mappings across multiple --replace-pin flags
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--replace-pin",
+            "src/a.rs=src/c.rs",
+            "--replace-pin",
+            "src/a.rs=src/b.rs",
+        ],
+        "more than once",
+        "duplicate old mapping",
+    );
+
+    // contradictory --drop-pin old + --replace-pin old=new for the same old
+    assert_refused(
+        &[
+            "verify",
+            &id,
+            "--confirm",
+            "--drop-pin",
+            "src/a.rs",
+            "--replace-pin",
+            "src/a.rs=src/c.rs",
+        ],
+        "contradictory",
+        "contradictory drop-pin + replace-pin",
+    );
+
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("src/escape.rs"))
+            .unwrap();
+        assert_refused(
+            &[
+                "verify",
+                &id,
+                "--confirm",
+                "--replace-pin",
+                "src/a.rs=src/escape.rs",
+            ],
+            "escape",
+            "symlink-escape new path",
+        );
+    }
+
+    // Sanity: the memory is still intact and unresolved by any of the above.
+    let effective = agentrec(root, &["memories", "--json"]);
+    assert!(effective.status.success());
+}
+
+// AC-F9.6: `verify --help` documents the explicit `--replace-pin` mechanism
+// and does not claim any automatic rename/successor discovery.
+#[test]
+fn verify_help_documents_replace_pin_no_auto_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["verify", "--help"]);
+    assert!(out.status.success(), "verify --help failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--replace-pin"),
+        "--help must document --replace-pin: {stdout}"
+    );
+    let lower = stdout.to_lowercase();
+    // Must not claim the tool discovers/detects a rename on its own — but
+    // an explicit *denial* of that ("no automatic rename detection") is
+    // exactly what AC-F9.6 wants, so only phrases that assert auto-discovery
+    // as a real capability are forbidden.
+    for forbidden in [
+        "automatically detects",
+        "automatically finds",
+        "automatically re-pins",
+        "auto-detects",
+        "auto-detect a rename",
+        "guesses the rename",
+        "guesses the successor",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "--help must not claim automatic rename discovery (found '{forbidden}'): {stdout}"
+        );
+    }
+    assert!(
+        lower.contains("no automatic") || lower.contains("explicit"),
+        "--help should state the mapping is explicit / not automatic: {stdout}"
+    );
+}
+
+// F1: fact rendering must strip terminal-escape bytes (ESC 0x1b / BEL 0x07)
+// before they reach stdout — same posture prompt excerpts already get via
+// `fmt::sanitize_terminal` (cmds.rs/readcmds.rs). Seeds a memory whose fact
+// carries an OSC "set terminal title" payload plus an SGR color escape
+// directly via `memory::append_memory` (bypasses the CLI's scrub call sites
+// entirely — the escape bytes are not secrets, so `scrub()` at persist time
+// leaves them untouched; asserted below) and checks every render path:
+// `recall`, `memories`, `verify <id>`, and the `--for-hook` block.
+#[test]
+fn memory_fact_render_sanitizes_terminal_escapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/evil.rs"), b"fn evil() {}").unwrap();
+    // Fillers give the "nightly seed" query terms a low document frequency
+    // so BM25 clears SCORE_FLOOR — same pattern as `seed_filler_memories`'s
+    // other callers (e.g. `verify_and_forget_lifecycle`).
+    seed_filler_memories(root, 8);
+
+    let evil_fact = "nightly seed \x1b]0;pwn\x07 rotation \x1b[31mdanger\x1b[0m zone";
+    let hash = memory::hash_pin(root, "src/evil.rs").unwrap();
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: evil_fact.to_string(),
+        pins: vec![Pin {
+            path: "src/evil.rs".to_string(),
+            hash,
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    // Fixture sanity: prove the escape bytes actually survived scrub at
+    // persist time — otherwise this test would pass for the wrong reason.
+    let stored = memory_records(root)
+        .into_iter()
+        .find(|r| r.get("id").and_then(|i| i.as_str()) == Some(rec.id.as_str()))
+        .expect("seeded memory not found on disk");
+    let stored_fact = stored.get("fact").and_then(|f| f.as_str()).unwrap();
+    assert!(
+        stored_fact.contains('\u{1b}') && stored_fact.contains('\u{7}'),
+        "fixture invalid — scrub already stripped the escape bytes at persist time: {stored_fact:?}"
+    );
+
+    let assert_clean = |out: &Output, label: &str| {
+        assert!(out.status.success(), "{label} failed: {out:?}");
+        let leaked = out.stdout.iter().any(|&b| b == 0x1b || 0x07 == b);
+        assert!(
+            !leaked,
+            "{label} leaked a raw ESC/BEL byte: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    };
+
+    assert_clean(&agentrec(root, &["recall", "nightly seed"]), "recall");
+    assert_clean(&agentrec(root, &["memories"]), "memories");
+    assert_clean(&agentrec(root, &["verify", &rec.id]), "verify");
+    assert_clean(
+        &agentrec(root, &["recall", "nightly seed", "--for-hook"]),
+        "recall --for-hook",
+    );
+}
+
 #[test]
 fn log_explain_glossary_matches_only_present_terms() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3015,5 +4528,1377 @@ fn log_explain_glossary_matches_only_present_terms() {
     assert!(
         both_stdout.contains("bare:"),
         "expected a bare glossary entry once a bare turn is present: {both_stdout}"
+    );
+}
+
+// --- Task 8: `agentrec candidate` — agent-emitted memory candidates (the
+// memory WRITE path's CLI emitter half; the daemon-side ingestion is
+// Task 7's `daemon::ingest_candidate`, covered end-to-end here too).
+
+/// Every parsed line of `.agentrec/memory.jsonl`. Absent file = empty vec.
+fn memory_records(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+#[test]
+fn candidate_cli_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(
+        root.join(".github/workflows/nightly.yml"),
+        "name: nightly\n",
+    )
+    .unwrap();
+
+    let mut daemon = spawn_record(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    let out = agentrec(
+        root,
+        &[
+            "candidate",
+            "fact about nightly",
+            "--from",
+            ".github/workflows/nightly.yml",
+        ],
+    );
+    assert!(out.status.success(), "candidate failed: {out:?}");
+
+    // The emitted signal line: type memory-candidate, pins are PATHS ONLY —
+    // no "sha256:" hash anywhere in the line. Hashing is the daemon's job,
+    // done against the live tree at ingestion, never trusted from the
+    // emitter (design spec, "Rejected approaches — emitter-side hashing").
+    let signal_text = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap();
+    let candidate_line = signal_text
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            (v.get("type").and_then(|t| t.as_str()) == Some("memory-candidate")).then_some(v)
+        })
+        .expect("no memory-candidate line appended to signal.jsonl");
+    assert_eq!(
+        candidate_line.get("fact").and_then(|f| f.as_str()),
+        Some("fact about nightly")
+    );
+    let pins = candidate_line
+        .get("pins")
+        .and_then(|p| p.as_array())
+        .expect("pins must be an array");
+    assert_eq!(pins.len(), 1, "expected exactly one pin: {pins:?}");
+    let pin0 = pins[0]
+        .as_str()
+        .expect("pins must be plain path strings, not hash objects");
+    assert_eq!(pin0, ".github/workflows/nightly.yml");
+    assert!(
+        !signal_text.contains("sha256:"),
+        "the emitted signal line must never carry a hash: {signal_text}"
+    );
+
+    // End-to-end through Task 7 ingestion: the daemon tails the inbox and
+    // lands the fact in memory.jsonl, attributed to the agent.
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let recs = memory_records(root);
+        (!recs.is_empty()).then_some(recs)
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let recs = recorded.expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    assert_eq!(
+        recs[0].get("origin").and_then(|v| v.as_str()),
+        Some("agent")
+    );
+    assert_eq!(
+        recs[0].get("fact").and_then(|v| v.as_str()),
+        Some("fact about nightly")
+    );
+}
+
+// Daemon-DOWN replay + D7-preservation pair. A candidate emitted while NO
+// daemon is running must be ingested on the NEXT daemon start (candidate-only
+// startup replay, daemon.rs `replay_pending_candidates`). In the SAME
+// pre-daemon gap, a stale start/stop bracket must NOT be replayed — it would
+// mint a phantom turn misdated to boot (the exact hazard D7's EOF-skip
+// prevents). This is the pair that proves the startup replay is
+// candidate-only and D7 still holds: memory record lands, zero turns appear.
+#[test]
+fn candidate_startup_replay_is_candidate_only_and_preserves_d7() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    // No daemon running yet. Emit a candidate via the real CLI...
+    let out = agentrec(
+        root,
+        &["candidate", "a fact learned offline", "--from", "notes.txt"],
+    );
+    assert!(out.status.success(), "candidate failed: {out:?}");
+    assert!(
+        !root.join(".agentrec/memory.jsonl").exists(),
+        "no daemon was running — nothing should be ingested yet"
+    );
+
+    // ...and, in the SAME gap, plant a stale bracket (start+stop). If replayed
+    // as live, this pair would fabricate an empty turn misdated to boot.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_stale"}"#,
+    );
+    send_hook(root, r#"{"hook_event_name":"Stop","session_id":"s_stale"}"#);
+
+    // Now start the daemon: the candidate is replayed on startup...
+    let mut daemon = spawn_record(root);
+    let recorded = poll_until(Duration::from_secs(6), || {
+        let recs = memory_records(root);
+        (!recs.is_empty()).then_some(recs)
+    });
+
+    // Give the daemon a beat past the replay to confirm no phantom turn lands.
+    std::thread::sleep(Duration::from_secs(1));
+    let phantom = turns(root);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let recs = recorded.expect("candidate emitted while daemon down was never replayed on startup");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    assert_eq!(
+        recs[0].get("fact").and_then(|v| v.as_str()),
+        Some("a fact learned offline")
+    );
+    assert_eq!(
+        recs[0].get("origin").and_then(|v| v.as_str()),
+        Some("agent")
+    );
+
+    assert!(
+        phantom.is_empty(),
+        "a stale start/stop bracket in the pre-daemon gap was replayed and \
+         minted a phantom turn — D7's EOF-skip must still drop start/stop: {phantom:?}"
+    );
+}
+
+// --- Task 9: UserPromptSubmit hook memory injection (INV-M4).
+
+/// `.agentrec/signal.jsonl` lines parsed as JSON, in file order.
+fn signal_events(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// `.agentrec/memory-stats.jsonl` lines parsed as JSON, in file order.
+fn memory_stats_lines(root: &Path) -> Vec<serde_json::Value> {
+    let text =
+        std::fs::read_to_string(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+#[test]
+fn hook_injects_fresh_memories_into_stdout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Matching prompt -> stdout carries the fenced block + the fact; the
+    // start signal (existing behavior) still lands; memory-stats.jsonl
+    // gains exactly one line.
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"nightly seed"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("```agentrec memory"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("nightly seed rotation keeps torture runs reproducible"),
+        "stdout: {stdout}"
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal missing after hook call: {events:?}"
+    );
+
+    let stats = memory_stats_lines(root);
+    assert_eq!(stats.len(), 1, "expected one memory-stats line: {stats:?}");
+    assert!(stats[0].get("ts").and_then(|v| v.as_u64()).is_some());
+    assert_eq!(stats[0].get("n").and_then(|v| v.as_u64()), Some(1));
+
+    // Non-matching prompt -> empty stdout, no new memory-stats line.
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"zebra quantum"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "non-matching prompt must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "no injection -> no new memory-stats line"
+    );
+
+    // memory_enabled = false -> no block, even for a matching prompt.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = false\n",
+    )
+    .unwrap();
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s3","prompt":"nightly seed"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "memory_enabled=false must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "memory_enabled=false -> no new memory-stats line"
+    );
+
+    // The Stop arm is untouched: no block, no memory-stats line, even for a
+    // "matching" prompt field (which Stop payloads don't carry anyway).
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = true\n",
+    )
+    .unwrap();
+    let payload = r#"{"hook_event_name":"Stop","session_id":"s1"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook (Stop) failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "Stop arm must never print a memory block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "Stop arm must never append to memory-stats.jsonl"
+    );
+
+    // Bonus (coupling proof): memory_inject_max > the old hardcoded default
+    // of 5 actually injects more than 5 facts — proves `max_facts` feeds
+    // both `memory::recall`'s `k` and `build_hook_block`'s per-block cap.
+    for i in 0..7 {
+        let rel = format!("src/m{i}.rs");
+        std::fs::write(root.join(&rel), b"fn m() {}").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                &format!("nightly seed shard {i} rotation detail"),
+                "--from",
+                &rel,
+            ],
+        );
+        assert!(out.status.success(), "remember m{i} failed: {out:?}");
+    }
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = true\nmemory_inject_max = 10\n",
+    )
+    .unwrap();
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s4","prompt":"nightly seed rotation shard"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fact_lines = stdout.lines().filter(|l| l.starts_with("- ")).count();
+    assert!(
+        fact_lines > 5,
+        "memory_inject_max=10 must inject more than the old hardcoded 5 \
+         (coupling fix) — got {fact_lines} lines: {stdout}"
+    );
+}
+
+#[test]
+fn hook_fail_open_and_budget() {
+    // Corrupt memory.jsonl -> hook still exits 0, stdout carries no block,
+    // and the start signal is still appended (INV-M4 fail-open).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            root.join(".agentrec/memory.jsonl"),
+            b"\xff\xfenot json at all garbage bytes\x00\x01",
+        )
+        .unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "corrupt store must emit no stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing despite corrupt memory.jsonl: {events:?}"
+        );
+    }
+
+    // Fail-open-under-load: a large store still returns within the
+    // (generous, CI-slack) 500ms wall-clock budget and exits 0. The hook's
+    // own internal self-budget is 50ms (RECALL_BUDGET_MS). At this scale a
+    // *debug* build on a slow shared CI runner can legitimately exceed the
+    // 50ms self-budget and fail open to a no-op — that IS correct fail-open
+    // behavior (see `inject_memory`'s early return), so this leg asserts
+    // only exit-0 + the wall budget, never a hard injection. The real
+    // "injection, not silent degradation" property is proven separately
+    // below at a small, runner-speed-independent store size. The true 50ms
+    // recall envelope at 3000+/10k records (release build) is timing-
+    // dependent and laddered in VERIFY-LEDGER.md, never a per-push CI gate.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let mut lines = String::new();
+        for i in 0..3000 {
+            let rec = serde_json::json!({
+                "v": 1,
+                "type": "memory",
+                "id": format!("m{i}"),
+                "op": "assert",
+                "fact": format!("filler fact number {i} about nightly seed rotation housekeeping"),
+                "pins": [{
+                    "path": format!("missing{i}.rs"),
+                    "hash": format!("sha256:{i:064}"),
+                }],
+                "source_turns": [],
+                "origin": "agent",
+                "ts": i,
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(root.join(".agentrec/memory.jsonl"), lines).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"nightly seed rotation"}"#;
+        let started = Instant::now();
+        let out = send_hook_capture(root, payload);
+        let elapsed = started.elapsed();
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "hook took too long against a 3000-record store: {elapsed:?}"
+        );
+    }
+
+    // Anti-silent-degradation (INV-M4): a genuinely Fresh, real-pinned
+    // record MUST inject a block, not be silently dropped. Proven at a
+    // small, runner-speed-independent store (~200 records) so that even a
+    // *debug* build on the slowest CI runner completes recall well within
+    // the 50ms self-budget — the injection assertion is therefore
+    // deterministic and decoupled from runner speed. (A 3000-record debug
+    // fold IS slow enough on a 2-core CI box to blow the 50ms budget and
+    // fail open — that is a perf-envelope claim laddered in VERIFY-LEDGER,
+    // not something a hard per-push assertion may depend on.)
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let mut lines = String::new();
+        for i in 0..200 {
+            let rec = serde_json::json!({
+                "v": 1,
+                "type": "memory",
+                "id": format!("m{i}"),
+                "op": "assert",
+                "fact": format!("filler fact number {i} about nightly seed rotation housekeeping"),
+                "pins": [{
+                    "path": format!("missing{i}.rs"),
+                    "hash": format!("sha256:{i:064}"),
+                }],
+                "source_turns": [],
+                "origin": "agent",
+                "ts": i,
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(root.join(".agentrec/memory.jsonl"), lines).unwrap();
+
+        std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+        let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+        let fresh_rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": "m-real-fresh",
+            "op": "assert",
+            // "quasar77" is a rare token unique to this one record — BM25's
+            // idf term guarantees it ranks at the top for a query
+            // containing it, deterministically inside the
+            // RECALL_VERIFY_CAP=128 verification window (the 200 filler
+            // candidates all share identical "nightly seed rotation" terms
+            // and are all orphaned/stale — without a distinguishing rare
+            // term, this record could tie-break behind the cap and never be
+            // verified).
+            "fact": "quasar77 nightly seed rotation is genuinely fresh and really pinned",
+            "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 999_999,
+        });
+        let mut with_fresh = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+        with_fresh.push_str(&fresh_rec.to_string());
+        with_fresh.push('\n');
+        std::fs::write(root.join(".agentrec/memory.jsonl"), with_fresh).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2b","prompt":"quasar77 nightly seed rotation"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("```agentrec memory"),
+            "expected a real injection (not silent degradation to no-op) — stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("genuinely fresh and really pinned"),
+            "expected the Fresh record's fact in the injected block — stdout: {stdout}"
+        );
+    }
+
+    // Missing store (never `remember`ed) and a fully uninitialized
+    // `.agentrec/` both exit 0 with no block.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s3","prompt":"anything at all"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(out.stdout.is_empty());
+    }
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path(); // never `init`ed — no .agentrec/ at all yet
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s4","prompt":"anything at all"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(
+            out.status.success(),
+            "hook on an uninitialized repo must exit 0: {out:?}"
+        );
+        assert!(out.stdout.is_empty());
+        // The start signal always-appends property (already asserted for
+        // the corrupt-store case above) must hold here too — an
+        // uninitialized repo is not exempt from the "hook always records
+        // the signal" contract, it just has nowhere to inject memory from.
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing on an uninitialized repo: {events:?}"
+        );
+    }
+}
+
+/// F10: a malformed/unreadable NON-EMPTY `memory.jsonl` is a RECALL FAILURE
+/// distinct from (a) a missing store and (b) a healthy zero-match store.
+/// `hook_fail_open_and_budget`'s corrupt-store leg above only ever asserted
+/// exit-0 + empty-stdout + start-signal-appended — satisfied identically
+/// whether the corruption was genuinely counted as a failure or silently
+/// folded to indistinguishable "no memories". This test requires the
+/// distinguishing signal: exactly one
+/// `{"ts","failure":true,"reason":"store_corrupt"}` line in
+/// `memory-stats.jsonl` per hook attempt, and a non-zero failure count
+/// surfaced by `agentrec status` — and that a missing or healthy-empty store
+/// never trips either.
+#[test]
+fn hook_corrupt_memory_store_is_counted() {
+    // AC-F10.2a: wholly-corrupt store — every line is garbage.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(
+            root.join(".agentrec/memory.jsonl"),
+            b"\xff\xfenot json at all garbage bytes\x00\x01\n",
+        )
+        .unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "corrupt store must inject nothing: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing despite corrupt memory.jsonl: {events:?}"
+        );
+
+        let stats = memory_stats_lines(root);
+        let failures: Vec<_> = stats
+            .iter()
+            .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure stat line per hook attempt: {stats:?}"
+        );
+        assert_eq!(
+            failures[0].get("reason").and_then(|r| r.as_str()),
+            Some("store_corrupt"),
+            "failure reason must be the bounded enum string store_corrupt: {failures:?}"
+        );
+
+        let status_out = agentrec(root, &["status"]);
+        assert!(
+            status_out.status.success(),
+            "status must exit 0: {status_out:?}"
+        );
+        let status_text = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status_text.contains("1 failures"),
+            "status must surface the non-zero memory-store failure count: {status_text}"
+        );
+    }
+
+    // AC-F10.2b: mixed valid+corrupt store — one real, Fresh, on-topic,
+    // real-pinned record alongside a malformed line. Must STILL inject
+    // nothing — a corrupt store may never leak a partial valid fact.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join("mixed.rs"), b"fn mixed() {}\n").unwrap();
+        let hash = memory::hash_pin(root, "mixed.rs").expect("hash mixed.rs");
+        let good = serde_json::json!({
+            "v": 1, "type": "memory", "id": "m-good", "op": "assert",
+            "fact": "quasar99 mixed store genuinely fresh fact",
+            "pins": [{ "path": "mixed.rs", "hash": hash }],
+            "source_turns": [], "origin": "agent", "ts": 1,
+        });
+        let mut content = good.to_string();
+        content.push('\n');
+        content.push_str("{this is not valid json at all}\n");
+        std::fs::write(root.join(".agentrec/memory.jsonl"), content).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"c2","prompt":"quasar99 mixed store"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "mixed valid+corrupt store must never leak a partial fact: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let stats = memory_stats_lines(root);
+        let failures: Vec<_> = stats
+            .iter()
+            .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure stat line for a mixed valid+corrupt store: {stats:?}"
+        );
+        assert_eq!(
+            failures[0].get("reason").and_then(|r| r.as_str()),
+            Some("store_corrupt")
+        );
+    }
+
+    // AC-F10.3a: missing store (never `remember`ed). No failure stat.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"c3","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        let stats = memory_stats_lines(root);
+        assert!(
+            stats.iter().all(|s| s.get("failure").is_none()),
+            "missing store must never be counted as a failure: {stats:?}"
+        );
+    }
+
+    // AC-F10.3b: healthy zero-match store — a real, valid record that just
+    // doesn't match the query. No failure stat.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join("healthy.rs"), b"fn healthy() {}\n").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                "totally unrelated fact about nothing in particular",
+                "--from",
+                "healthy.rs",
+            ],
+        );
+        assert!(out.status.success(), "remember failed: {out:?}");
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"c4","prompt":"zzzznomatchzzzz"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        let stats = memory_stats_lines(root);
+        assert!(
+            stats.iter().all(|s| s.get("failure").is_none()),
+            "a healthy zero-match store must never be counted as a failure: {stats:?}"
+        );
+    }
+}
+
+/// AC-F10.5: the persisted `reason` is the bounded enum string
+/// `"store_corrupt"`, never raw filesystem/error/path text — so terminal-
+/// control bytes embedded in the corrupt content itself (an ESC-prefixed
+/// terminal escape sequence, exactly the class `fmt::sanitize_terminal`
+/// exists to strip elsewhere) can never reach `memory-stats.jsonl` or
+/// `agentrec status`'s stdout. Scans the RAW bytes of both, not just the
+/// parsed JSON strings, so a leak into some other field would still be
+/// caught.
+#[test]
+fn hook_corrupt_store_reason_never_leaks_raw_control_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // An ESC-prefixed terminal title-set + BEL sequence embedded in
+    // otherwise-garbage content — real bytes an attacker-controlled
+    // transcript or a corrupted write could plausibly leave behind.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"\xff\xfenot json \x1b]0;evil-title\x07 more garbage\x00\x01\n",
+    )
+    .unwrap();
+
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"esc1","prompt":"anything"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook must exit 0: {out:?}");
+    assert!(
+        !out.stdout.contains(&0x1b),
+        "hook stdout must never carry a raw ESC byte: {:?}",
+        out.stdout
+    );
+
+    let stats_bytes = std::fs::read(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    assert!(
+        !stats_bytes.contains(&0x1b),
+        "memory-stats.jsonl must never carry a raw ESC byte: {:?}",
+        String::from_utf8_lossy(&stats_bytes)
+    );
+    let stats = memory_stats_lines(root);
+    assert_eq!(
+        stats
+            .iter()
+            .find(|s| s.get("failure").is_some())
+            .and_then(|s| s.get("reason"))
+            .and_then(|r| r.as_str()),
+        Some("store_corrupt"),
+        "reason must be exactly the bounded enum string: {stats:?}"
+    );
+
+    let status_out = agentrec(root, &["status"]);
+    assert!(
+        status_out.status.success(),
+        "status must exit 0: {status_out:?}"
+    );
+    assert!(
+        !status_out.stdout.contains(&0x1b),
+        "status stdout must never carry a raw ESC byte: {:?}",
+        String::from_utf8_lossy(&status_out.stdout)
+    );
+}
+
+/// F2: the 50ms hook recall budget is now a HARD cooperative deadline
+/// (founder decision, option (a)), not the old retrospective
+/// measure-after-the-fact suppression. `hook_fail_open_and_budget` above
+/// already proves the retrospective/fail-open shape at real time scales;
+/// this test proves the *new* bail path specifically — deterministically,
+/// without depending on runner speed to blow a real 50ms window (which
+/// `hook_fail_open_and_budget`'s own comments document as flaky at 3000
+/// records on a slow CI runner, exactly the coupling commit 76a716d
+/// removed). `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED` (test-only,
+/// `cmds::recall_deadline`) substitutes an already-expired deadline before
+/// any recall work starts, so the bail is deterministic on any machine.
+#[test]
+fn hook_recall_bails_at_injected_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    agentrec(root, &["init", "--no-service"]);
+
+    // A real, freshly-pinned, on-topic memory that WOULD be injected on a
+    // normal (non-expired-deadline) call — proves the empty result below is
+    // caused by the injected deadline, not by an unmatchable corpus.
+    std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+    let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+    let rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-deadline-fresh",
+        "op": "assert",
+        "fact": "deadline probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{rec}\n")).unwrap();
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"deadline probe fact"}"#;
+
+    // Sanity: without the forced-expired override, this hook call really
+    // does inject the block — proves the corpus/query are matchable and
+    // isolates the deadline override as the only variable in the next call.
+    let sane = send_hook_capture(root, payload);
+    assert!(sane.status.success(), "sanity hook call failed: {sane:?}");
+    assert!(
+        String::from_utf8_lossy(&sane.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection before testing the bail path: {:?}",
+        String::from_utf8_lossy(&sane.stdout)
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even on a bailed recall: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an already-expired deadline must never print a block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal must still land despite the bailed recall: {events:?}"
+    );
+
+    let stats = memory_stats_lines(root);
+    let bail = stats
+        .iter()
+        .find(|l| l.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true));
+    assert!(
+        bail.is_some(),
+        "expected a budget_exceeded line in memory-stats.jsonl: {stats:?}"
+    );
+    assert!(
+        bail.unwrap().get("ts").and_then(|v| v.as_u64()).is_some(),
+        "budget_exceeded line must still carry a ts: {stats:?}"
+    );
+}
+
+/// F8: the 50ms hook budget must be a HARD WALL, not just cooperative
+/// between-step checks. `hook_recall_bails_at_injected_deadline` above
+/// proves the cooperative deadline bails once it is checked — but every
+/// check happens BETWEEN loop steps, so a single blocking call inside one
+/// step (e.g. `memory::hash_pin`'s `fs::read` during the freshness-verify
+/// walk) can still overrun the budget by however long that one call blocks.
+/// This test proves the outer wall holds even then: `AGENTREC_TEST_SLOW_PIN_READ_MS`
+/// (test-only seam, `memory::hash_pin`) makes the verify walk's pin read
+/// block for 600ms — twelve times the 50ms budget — and the hook process
+/// must still return well inside a 200ms envelope, with empty stdout and no
+/// partial/leaked fact text, and exactly one `budget_exceeded:true` stat
+/// line (never a `n`-bearing injection line — the blocked read never got a
+/// chance to report freshness either way).
+#[test]
+fn hook_recall_hard_wall_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A real, freshly-pinned, on-topic memory that WOULD be injected on a
+    // normal (unblocked) call — isolates the slow read as the only variable.
+    std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+    let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+    let rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-hard-wall-fresh",
+        "op": "assert",
+        "fact": "hard wall probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{rec}\n")).unwrap();
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hard wall probe fact"}"#;
+
+    // Sanity: without the slow-read seam, this hook call really does inject
+    // the block — proves the corpus/query are matchable so the empty result
+    // below is caused by the wall, not an unmatchable corpus.
+    let sane = send_hook_capture(root, payload);
+    assert!(sane.status.success(), "sanity hook call failed: {sane:?}");
+    assert!(
+        String::from_utf8_lossy(&sane.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection before testing the hard wall: {:?}",
+        String::from_utf8_lossy(&sane.stdout)
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_SLOW_PIN_READ_MS", "600")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let started = Instant::now();
+    let out = child.wait_with_output().unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even while the pin read is blocked: {out:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "hook took {elapsed:?} — a blocked 600ms pin read must not push wall \
+         time anywhere near that far past the 50ms budget (hard wall must \
+         abandon the worker, not wait on it)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "a hard-walled recall must never print a block, partial or otherwise: {stdout}"
+    );
+    assert!(
+        !stdout.contains("hard wall probe fact"),
+        "no fact text may leak out despite the blocked read: {stdout}"
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal must still land despite the blocked recall: {events:?}"
+    );
+
+    // Exactly one NEW stat line from this call, carrying budget_exceeded —
+    // never a partial `n`-bearing injection line, never fact text.
+    let stats = memory_stats_lines(root);
+    assert_eq!(
+        stats.len(),
+        2,
+        "expected exactly 2 memory-stats lines total (1 from the sanity call's \
+         real injection + 1 budget_exceeded from the hard-walled call): {stats:?}"
+    );
+    let new_line = &stats[1];
+    assert_eq!(
+        new_line.get("budget_exceeded").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected the second stat line to be budget_exceeded:true: {stats:?}"
+    );
+    assert!(
+        new_line.get("n").is_none(),
+        "a budget_exceeded line must never also carry a partial hit count: {stats:?}"
+    );
+    assert!(
+        !stats
+            .iter()
+            .any(|l| { l.to_string().contains("hard wall probe fact") }),
+        "no fact text may appear anywhere in memory-stats.jsonl: {stats:?}"
+    );
+}
+
+/// INV-M4 concurrent-append leg: the hook path must exit 0 (and keep
+/// appending the start signal) while `.agentrec/memory.jsonl` is being
+/// concurrently APPENDED by another writer — the exact interleaving the
+/// spec's INV-M4 names but which no prior test exercised (the daemon-driven
+/// candidate path and `agentrec remember` both write through the same
+/// `memory::append_memory`, so a direct-API writer thread racing the real
+/// `hook` subprocess is a faithful stand-in for "daemon ingesting a
+/// candidate while a hook fires").
+///
+/// The writer thread appends real, freshly-hashed, Fresh-pinned records in
+/// a tight loop (no sleeps) using `agentrec_core::memory::append_memory`
+/// directly — far tighter than spawning a `remember` subprocess per
+/// iteration, so it actually races the hook's own read of the same file
+/// instead of finishing before the hook loop starts. The hook loop runs
+/// concurrently in the foreground, firing the real `agentrec hook claude`
+/// binary repeatedly; both threads are running for the full duration of
+/// this test, guaranteeing overlap.
+#[test]
+fn hook_exits_zero_under_concurrent_memory_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    // A real, stable pin target: unchanged for the whole test, so every
+    // writer-thread record is genuinely Fresh and eligible for injection —
+    // this exercises the concurrent-write race against a real read path,
+    // not just a race against records that would be filtered out anyway.
+    std::fs::write(root.join("concurrent.rs"), b"fn concurrent() {}\n").unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let writer_root = root.clone();
+    let writer_stop = stop.clone();
+    let writer_count = writes_done.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let Ok(hash) = memory::hash_pin(&writer_root, "concurrent.rs") else {
+                continue;
+            };
+            let rec = MemoryRecord {
+                v: 1,
+                kind: "memory".to_string(),
+                id: format!("wm{i}"),
+                op: MemoryOp::Assert,
+                fact: format!("concurrent writer fact {i} about nightly seed rotation"),
+                pins: vec![Pin {
+                    path: "concurrent.rs".to_string(),
+                    hash,
+                }],
+                source_turns: vec![],
+                origin: "agent".to_string(),
+                ts: i,
+                reason: None,
+            };
+            // Best-effort like the real ingestion paths: a transient
+            // failure here must not panic the writer thread — the hook's
+            // own fail-open posture is what's under test, not this helper.
+            let _ = memory::append_memory(&writer_root, &rec);
+            i += 1;
+            writer_count.store(i, Ordering::Relaxed);
+        }
+    });
+
+    // Give the writer a head start so the hook loop below always overlaps
+    // an in-flight append, never races a not-yet-started writer.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"concurrent","prompt":"nightly seed rotation concurrent"}"#;
+    let iterations = 30;
+    for iter in 0..iterations {
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under concurrent memory.jsonl append at iter {iter}: {out:?}"
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite concurrent memory.jsonl writes \
+             (before={before}, after={})",
+            after.len()
+        );
+        assert_eq!(
+            after
+                .last()
+                .and_then(|e| e.get("event"))
+                .and_then(|v| v.as_str()),
+            Some("start"),
+            "last signal line at iter {iter} was not a start event: {after:?}"
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread panicked");
+
+    // Prove the race actually happened: the writer produced a meaningful
+    // number of concurrent appends during the hook loop's run, not zero or
+    // a token handful that finished before the loop even started.
+    let total_writes = writes_done.load(Ordering::Relaxed);
+    assert!(
+        total_writes >= iterations,
+        "writer thread produced too few appends ({total_writes}) to have \
+         genuinely raced {iterations} hook calls"
+    );
+
+    // The store must never be left torn by the interleaving: every raw
+    // line in memory.jsonl still parses as a MemoryRecord with >=1 pin
+    // (mirrors torture.rs's assert_memory_invariants, INV-M1).
+    let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+    for (n, line) in text.lines().enumerate() {
+        let rec: MemoryRecord = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "memory.jsonl line {n} failed to parse after concurrent append: {e}\nline: {line}"
+            )
+        });
+        assert!(
+            !rec.pins.is_empty(),
+            "memory.jsonl line {n} has zero pins after concurrent append: {line}"
+        );
+    }
+}
+
+/// AC-F10.6: a corrupt `memory.jsonl` (one malformed, newline-terminated
+/// line seeded up front, so it never merges with a concurrently-appended
+/// well-formed line) must not destabilize the hook under real concurrent
+/// daemon-style writes to the SAME file — every hook call still exits 0,
+/// still appends the normal start signal, and `memory-stats.jsonl` /
+/// `signal.jsonl` are never left torn (every line still parses) despite the
+/// interleaving. Mirrors `hook_exits_zero_under_concurrent_memory_append`'s
+/// harness shape, seeded with a permanent corruption up front instead of an
+/// initially-empty store.
+#[test]
+fn hook_corrupt_store_safe_under_concurrent_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    std::fs::write(root.join("concurrent2.rs"), b"fn concurrent2() {}\n").unwrap();
+    // Seeded corruption, `\n`-terminated so it stays its own line no matter
+    // what the writer thread appends after it — the store stays corrupt
+    // (and thus failure-counted) for the entire test.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"{not valid json at all}\n",
+    )
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let writer_root = root.clone();
+    let writer_stop = stop.clone();
+    let writer_count = writes_done.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let Ok(hash) = memory::hash_pin(&writer_root, "concurrent2.rs") else {
+                continue;
+            };
+            let rec = MemoryRecord {
+                v: 1,
+                kind: "memory".to_string(),
+                id: format!("cwm{i}"),
+                op: MemoryOp::Assert,
+                fact: format!("corrupt-concurrent writer fact {i} nightly seed rotation"),
+                pins: vec![Pin {
+                    path: "concurrent2.rs".to_string(),
+                    hash,
+                }],
+                source_turns: vec![],
+                origin: "agent".to_string(),
+                ts: i,
+                reason: None,
+            };
+            let _ = memory::append_memory(&writer_root, &rec);
+            i += 1;
+            writer_count.store(i, Ordering::Relaxed);
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"corrupt-concurrent","prompt":"nightly seed rotation concurrent"}"#;
+    let iterations = 20;
+    for iter in 0..iterations {
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under concurrent append to a corrupt memory.jsonl at iter {iter}: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a corrupt store must never inject, even mid-race, at iter {iter}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite concurrent writes to a \
+             corrupt memory.jsonl (before={before}, after={})",
+            after.len()
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread panicked");
+
+    let total_writes = writes_done.load(Ordering::Relaxed);
+    assert!(
+        total_writes >= iterations,
+        "writer thread produced too few appends ({total_writes}) to have \
+         genuinely raced {iterations} hook calls"
+    );
+
+    // signal.jsonl and memory-stats.jsonl must never be left torn by the
+    // interleaving — every line still parses as JSON.
+    for name in [".agentrec/signal.jsonl", ".agentrec/memory-stats.jsonl"] {
+        let text = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{name} line {n} failed to parse after concurrent append to a corrupt \
+                 memory.jsonl: {line}"
+            );
+        }
+    }
+
+    // Every hook attempt against the still-corrupt store recorded exactly
+    // one failure stat — the corrupt line was seeded once and never healed,
+    // so `iterations` calls means `iterations` failure lines.
+    let stats = memory_stats_lines(&root);
+    let failures = stats
+        .iter()
+        .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+        .count();
+    assert_eq!(
+        failures as u64, iterations,
+        "expected one failure stat per hook attempt against the permanently corrupt \
+         store: {stats:?}"
+    );
+}
+
+/// RAII guard for a single spawned `agentrec record` daemon: `Drop` SIGKILLs
+/// and reaps it, so a test panic mid-assertion never leaks an orphan daemon
+/// (mirrors `torture.rs`'s `DaemonGuard`, scoped down to the single-daemon
+/// case this test needs). `kill()` tears the daemon down explicitly, before
+/// end of scope, so a caller can assert "after teardown" invariants right
+/// away; `Drop` then finds nothing left to do.
+struct SingleDaemonGuard(Option<Child>);
+
+impl SingleDaemonGuard {
+    fn spawn(root: &Path) -> Self {
+        let child = spawn_record(root);
+        // Bounded-poll for the daemon to actually be up (holding the flock,
+        // pid written to state.json) rather than a fixed sleep — proves the
+        // daemon genuinely launched instead of assuming 800ms was enough,
+        // and fails loudly (via `wait_for_live_daemon`'s own assert) if it
+        // never comes up at all.
+        wait_for_live_daemon(root);
+        SingleDaemonGuard(Some(child))
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            sigkill(&c);
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for SingleDaemonGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+// AC-F10.6: the sibling test above only races an IN-PROCESS `append_memory`
+// writer against the hook — it never starts a real `agentrec record` daemon
+// and never validates `state.json`, so it doesn't actually prove the stated
+// guarantee (a concurrent DAEMON + a permanently corrupt memory.jsonl cannot
+// corrupt state.json / memory-stats.jsonl / signal.jsonl, and the hook still
+// appends its start signal). This test drives a REAL daemon subprocess and a
+// REAL `agentrec hook claude` subprocess per iteration, with concurrent fs
+// mutations so the daemon is genuinely active (writing log.jsonl/state.json)
+// while the hook reads the corrupt store. Assertions are deliberately
+// file-parseability + count based (never FSEvents-timing-dependent turn
+// observations) so the test is robust rather than flaky.
+#[test]
+fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    // Seeded corruption, `\n`-terminated so it stays its own line no matter
+    // what the daemon (memory-candidate ingestion) might ever append after
+    // it — the store stays corrupt (and thus failure-counted) for the whole
+    // test.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"{not valid json at all}\n",
+    )
+    .unwrap();
+
+    let mut guard = SingleDaemonGuard::spawn(&root);
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"real-daemon-corrupt","prompt":"real daemon corrupt store probe"}"#;
+    let iterations = 12u64;
+    for iter in 0..iterations {
+        // Concurrent fs mutation: the daemon's watcher observes this while
+        // the hook subprocess concurrently reads the corrupt memory store —
+        // genuine concurrent daemon activity, not just a live process.
+        std::fs::write(
+            root.join("daemon_corrupt.rs"),
+            format!("fn daemon_corrupt_{iter}() {{}}\n").as_bytes(),
+        )
+        .unwrap();
+
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under a real concurrent daemon against a corrupt \
+             memory.jsonl at iter {iter}: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a corrupt store must never inject, even against a real concurrent \
+             daemon, at iter {iter}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite a real concurrent \
+             daemon and a corrupt memory.jsonl (before={before}, after={})",
+            after.len()
+        );
+    }
+
+    // Liveness/concurrency proof, not just "a daemon process existed": every
+    // hook call above appends a start signal to signal.jsonl, and only the
+    // daemon's own signal-tailer advances `signal_offset` in state.json (the
+    // hook process never touches state.json). Bounded-poll for it to advance
+    // past 0 WHILE THE DAEMON IS STILL ALIVE — this must run before
+    // `guard.kill()`, not after: a one-shot post-kill sample races the
+    // guard's SIGKILL against the tailer's own poll loop and can read 0 even
+    // though the daemon genuinely consumed signals throughout the test
+    // (observed twice under adversarial review). Polling here instead proves
+    // the daemon was actively processing the concurrently-appended hook
+    // signals — the exact AC-F10.6 guarantee — without being coupled to
+    // teardown timing.
+    let signal_offset_seen = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let offset = v.get("signal_offset")?.as_u64()?;
+        (offset > 0).then_some(offset)
+    });
+    assert!(
+        signal_offset_seen.is_some(),
+        "state.json's signal_offset never advanced past 0 within 5s while the daemon \
+         was alive — the daemon never consumed any of the {iterations} hooks' start \
+         signals, so this test didn't prove a genuinely concurrent/active daemon"
+    );
+
+    // Teardown the daemon now, after the liveness proof above — killing it
+    // here (rather than only at end-of-scope via Drop) lets the
+    // "after teardown" file-parseability checks below run immediately after
+    // the real interleaving window closes.
+    guard.kill();
+
+    // signal.jsonl and memory-stats.jsonl must never be left torn by the
+    // interleaving between the real daemon and the hook subprocesses — every
+    // line still parses as JSON.
+    for name in [".agentrec/signal.jsonl", ".agentrec/memory-stats.jsonl"] {
+        let text = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{name} line {n} failed to parse after concurrent real-daemon activity \
+                 against a corrupt memory.jsonl: {line}"
+            );
+        }
+    }
+
+    // state.json is written by the daemon itself (pid/signal-offset/etc) and
+    // must survive the same interleaving — the daemon's writer uses tmp+
+    // rename, so a torn read here would indicate a real atomicity bug, not
+    // just a JSONL-append issue. `cli::state` isn't reachable from this
+    // black-box integration test (the `agentrec` crate has no lib target),
+    // so this parses the raw file the same way the CLI's own tests would via
+    // `serde_json::Value` rather than the (error-tolerant) `read_state`
+    // helper, which would silently mask a genuinely corrupt file.
+    let state_text = std::fs::read_to_string(root.join(".agentrec/state.json"))
+        .expect("state.json must exist after a real daemon ran");
+    let _state_json: serde_json::Value = serde_json::from_str(&state_text).unwrap_or_else(|e| {
+        panic!(
+            "state.json failed to parse cleanly after concurrent real-daemon activity \
+             against a corrupt memory.jsonl: {e}: {state_text}"
+        )
+    });
+
+    // Every hook attempt against the still-corrupt store recorded exactly
+    // one failure stat — the corrupt line was seeded once and never healed,
+    // so `iterations` calls means `iterations` failure lines.
+    let stats = memory_stats_lines(&root);
+    let failures = stats
+        .iter()
+        .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+        .count();
+    assert_eq!(
+        failures as u64, iterations,
+        "expected one failure stat per hook attempt against the permanently corrupt \
+         store under a real concurrent daemon: {stats:?}"
+    );
+    let store_corrupt = stats
+        .iter()
+        .filter(|s| s.get("reason").and_then(|r| r.as_str()) == Some("store_corrupt"))
+        .count();
+    assert_eq!(
+        store_corrupt as u64, iterations,
+        "expected every failure stat to be tagged reason:store_corrupt: {stats:?}"
     );
 }

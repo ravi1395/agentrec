@@ -1,14 +1,23 @@
 //! H++ adversarial torture harness (D36, IMPLEMENTATION.md:52/:175).
 //!
 //! Drives the REAL `agentrec` binary through randomized interleavings of
-//! agent bursts, human edits, git checkouts, daemon `kill -9`, and
-//! undo/redo, asserting two invariants after EVERY executed undo:
+//! agent bursts, human edits, git checkouts, daemon `kill -9`, undo/redo,
+//! and (Task 12) memory ops (`remember`/`recall`/`forget`/`candidate` +
+//! pinned-file mutation), asserting invariants after EVERY executed undo
+//! and after every op batch:
 //!
 //!   INV1 — undo never writes to a file whose on-disk hash differs from the
 //!          target turn's recorded `after` (the D30 modified-since rail):
 //!          undo must REFUSE modified-since files, never clobber them.
 //!   INV2 — every executed undo is itself undoable back to the exact
 //!          pre-undo state, byte-for-byte (undo-is-a-turn, re-revertible).
+//!   INV-M1 — every `memory.jsonl` line parses as a `MemoryRecord` and
+//!            carries >=1 pin (checked against the RAW file, not
+//!            `load_effective`'s tolerant fold, so a torn kill-9 line can't
+//!            hide behind that fold's silent skip — see
+//!            `assert_memory_invariants`).
+//!   INV-M2 — every memory `recall` returns re-hashes Fresh right now (no
+//!            drifted pin ever surfaces) — see `op_recall`.
 //!
 //! `torture_survives_chaos` (the heavy run, `#[ignore]`) reads
 //! `AGENTREC_TORTURE_OPS` (default 1200) and `AGENTREC_TORTURE_SEED` (default
@@ -27,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use agentrec_core::memory::{self, Freshness, MemoryRecord, Pin};
 use agentrec_core::record::{LogRecord, TurnRecord};
 use agentrec_core::store::hash_bytes;
 
@@ -232,6 +242,16 @@ struct World {
     seed: u64,
     iter: usize,
     files: Vec<String>,
+    /// Fixture pool for memory pins — deliberately disjoint from `files` (the
+    /// undo-targeted pool): sharing a pool would make every recalled memory
+    /// churn on unrelated undo/redo/git-dance activity, leaving `op_recall`
+    /// almost nothing Fresh to check (INV-M2 would go under-exercised).
+    /// `mem_files[0]` is the ANCHOR file — `op_mutate_pinned_file` and
+    /// `op_forget` both deliberately never touch it (see their doc
+    /// comments), so a Fresh, never-retracted memory is guaranteed to exist
+    /// for the whole run, making `op_recall`'s empty-query fallback always
+    /// have something real to verify.
+    mem_files: Vec<String>,
     trace: Vec<String>,
     branch_a: String,
     on_branch_b: bool,
@@ -240,7 +260,24 @@ struct World {
     stat_undos_executed: u32,
     stat_undos_skipped: u32,
     stat_reverted_nothing: u32,
+    stat_remembers: u32,
+    stat_mutations: u32,
+    stat_recalls: u32,
+    stat_recall_hits: u32,
+    stat_forgets: u32,
+    stat_candidates: u32,
 }
+
+/// Shared vocabulary term every torture-authored fact carries, so
+/// `op_recall`'s topic-query exercises real BM25 ranking (not just the
+/// empty-query freshest-fallback path) — mirrors `memory.rs`'s own
+/// `recall_never_returns_stale` fixture style.
+const MEM_TOPIC: &str = "gremlin";
+/// Marker substring on the anchor memory's fact — `op_forget` filters any
+/// candidate carrying this marker out of its forget-target pool, so the
+/// anchor memory (see `mem_files` doc comment) can never be retracted by
+/// chaos.
+const ANCHOR_MARKER: &str = "ANCHOR-DO-NOT-FORGET";
 
 impl World {
     fn new(seed: u64) -> Self {
@@ -275,6 +312,27 @@ impl World {
             branch_a
         };
 
+        // Seed the memory fixture pool BEFORE the daemon spawns — `remember`
+        // is a direct, daemon-independent CLI write, so this doesn't race
+        // daemon startup. mem_files[0] ("mem_anchor.rs") gets the one memory
+        // `op_mutate_pinned_file`/`op_forget` are barred from ever touching
+        // (see the `World::mem_files` doc comment) — the run-long Fresh
+        // guarantee `op_recall`'s final `stat_recall_hits > 0` check relies
+        // on.
+        let mem_files: Vec<String> = vec![
+            "mem_anchor.rs".into(),
+            "mem0.rs".into(),
+            "mem1.rs".into(),
+            "mem2.rs".into(),
+            "mem3.rs".into(),
+        ];
+        for f in &mem_files {
+            std::fs::write(root.join(f), b"seed\n").expect("seed mem fixture");
+        }
+        let anchor_fact = format!("{ANCHOR_MARKER} torture baseline {MEM_TOPIC} fact");
+        let out = agentrec(&root, &["remember", &anchor_fact, "--from", &mem_files[0]]);
+        assert!(out.status.success(), "seed anchor remember failed: {out:?}");
+
         let daemon = DaemonGuard::spawn(&root);
 
         World {
@@ -294,6 +352,7 @@ impl World {
                 "g.md".into(),
                 "h.json".into(),
             ],
+            mem_files,
             trace: Vec::new(),
             branch_a,
             on_branch_b: false,
@@ -302,6 +361,12 @@ impl World {
             stat_undos_executed: 0,
             stat_undos_skipped: 0,
             stat_reverted_nothing: 0,
+            stat_remembers: 1, // the anchor remember above
+            stat_mutations: 0,
+            stat_recalls: 0,
+            stat_recall_hits: 0,
+            stat_forgets: 0,
+            stat_candidates: 0,
         }
     }
 }
@@ -333,10 +398,21 @@ fn step(world: &mut World) {
         // so at 15% nearly every `BURST_SIZE`-sized window contained one and
         // over 80% of turns came out git-tagged (excluded from undo
         // targeting) — starving undo/redo coverage, not exercising it.
-        0..=69 => op_write(world),
-        70..=84 => op_delete(world),
-        85..=87 => op_git_dance(world),
-        88..=91 => op_kill_daemon(world),
+        //
+        // write/delete are proportionally trimmed (was 70%/15%) to make room
+        // for the Task 12 memory op mix below; git-dance and kill-daemon
+        // keep their original percentages unchanged — this harness's
+        // pre-existing INV1/INV2 coverage must not be diluted by adding
+        // memory ops.
+        0..=54 => op_write(world),
+        55..=66 => op_delete(world),
+        67..=69 => op_git_dance(world),
+        70..=73 => op_kill_daemon(world),
+        74..=78 => op_remember(world),
+        79..=82 => op_mutate_pinned_file(world),
+        83..=86 => op_recall(world),
+        87..=88 => op_forget(world),
+        89..=90 => op_candidate(world),
         _ => op_pause(world),
     }
 }
@@ -420,6 +496,235 @@ fn op_pause(world: &mut World) {
     let ms = 20 + (world.rng.next_u64() % 80);
     std::thread::sleep(Duration::from_millis(ms));
     world.trace.push(format!("[{}] pause {ms}ms", world.iter));
+}
+
+// ---- Task 12: memory ops -----------------------------------------------
+
+/// Writes fresh content to a randomly-chosen `mem_files` fixture, then
+/// `agentrec remember`s a fact pinned to it. `remember` is a synchronous,
+/// daemon-independent write — the content is fresh at the moment of the
+/// call, so this must always succeed (no `.env`/`.pem`-shaped names in
+/// `mem_files`, no secret-shaped fact text) — a failure here is a real bug,
+/// not expected chaos, hence the hard `assert!`.
+fn op_remember(world: &mut World) {
+    let idx = world.rng.gen_range(world.mem_files.len());
+    let path = world.mem_files[idx].clone();
+    let content = format!("mem-iter{}-{:x}\n", world.iter, world.rng.next_u64());
+    std::fs::write(world.root.join(&path), content).expect("write mem fixture");
+    let fact = format!("torture fact {} about {MEM_TOPIC} ({path})", world.iter);
+    let out = agentrec(&world.root, &["remember", &fact, "--from", &path]);
+    assert!(
+        out.status.success(),
+        "remember failed unexpectedly: {out:?}\nSEED={}\n--- trace ---\n{}",
+        world.seed,
+        world.trace.join("\n"),
+    );
+    world.stat_remembers += 1;
+    world
+        .trace
+        .push(format!("[{}] remember: {path}", world.iter));
+}
+
+/// Overwrites a pinned fixture's content — the mechanism that drifts any
+/// memory pinned to it from Fresh to Stale. Never targets `mem_files[0]`
+/// (the ANCHOR file — see `World::mem_files` doc comment), so the
+/// run-long "at least one Fresh memory always exists" guarantee holds.
+fn op_mutate_pinned_file(world: &mut World) {
+    if world.mem_files.len() < 2 {
+        return;
+    }
+    let idx = 1 + world.rng.gen_range(world.mem_files.len() - 1);
+    let path = world.mem_files[idx].clone();
+    let content = format!("mutated-iter{}-{:x}\n", world.iter, world.rng.next_u64());
+    std::fs::write(world.root.join(&path), content).expect("mutate mem fixture");
+    world.stat_mutations += 1;
+    world
+        .trace
+        .push(format!("[{}] mutate-pinned-file: {path}", world.iter));
+}
+
+/// `agentrec recall <query> -k <k> --json`, parsed into `(id, pins)` pairs.
+/// Empty stdout, a non-zero exit, or unparseable JSON all fold to "no hits"
+/// — this helper never panics on its own (the caller decides what an empty
+/// result means).
+fn recall_json(root: &Path, query: &str, k: usize) -> Vec<(String, Vec<Pin>)> {
+    let out = agentrec(root, &["recall", query, "-k", &k.to_string(), "--json"]);
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            let pins_v = m.get("pins")?.as_array()?;
+            let pins: Vec<Pin> = pins_v
+                .iter()
+                .filter_map(|p| {
+                    Some(Pin {
+                        path: p.get("path")?.as_str()?.to_string(),
+                        hash: p.get("hash")?.as_str()?.to_string(),
+                    })
+                })
+                .collect();
+            Some((id, pins))
+        })
+        .collect()
+}
+
+/// INV-M2, load-bearing: every memory `recall` returns must re-hash Fresh
+/// RIGHT NOW. Two queries per call: an empty query (the freshest-fallback
+/// path — no BM25 score floor involved, so with the ANCHOR memory always
+/// live this deterministically returns >=1 hit) and a topic-word query
+/// (exercises real BM25 ranking; may legitimately floor to zero early in a
+/// run before enough on-topic memories exist — never asserted nonempty on
+/// its own).
+fn op_recall(world: &mut World) {
+    world.stat_recalls += 1;
+    let empty_hits = recall_json(&world.root, "", 10);
+    let topic_hits = recall_json(&world.root, MEM_TOPIC, 10);
+
+    for (id, pins) in empty_hits.iter().chain(topic_hits.iter()) {
+        world.stat_recall_hits += 1;
+        let fresh = memory::pin_freshness(&world.root, pins);
+        assert_eq!(
+            fresh,
+            Freshness::Fresh,
+            "INV-M2 VIOLATED: recall returned memory {id} with a drifted \
+             pin (freshness={fresh:?})\nSEED={}\n--- trace ---\n{}",
+            world.seed,
+            world.trace.join("\n"),
+        );
+    }
+    world.trace.push(format!(
+        "[{}] recall: {} empty-query hit(s), {} topic hit(s), all re-verified Fresh",
+        world.iter,
+        empty_hits.len(),
+        topic_hits.len(),
+    ));
+}
+
+/// Picks a random live (non-retracted, non-ANCHOR) memory via `agentrec
+/// memories --json` and `agentrec forget`s it. No live eligible memory
+/// (possible early in a run, or after a run of bad luck) is a skip, not a
+/// failure — mirrors `checkpoint`'s "no eligible turn" skip style.
+fn op_forget(world: &mut World) {
+    let out = agentrec(&world.root, &["memories", "--json"]);
+    if !out.status.success() {
+        return;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return;
+    };
+    let Some(arr) = v.as_array() else {
+        return;
+    };
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|m| {
+            let fact = m.get("fact").and_then(|f| f.as_str()).unwrap_or("");
+            if fact.contains(ANCHOR_MARKER) {
+                return None;
+            }
+            m.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
+        })
+        .collect();
+    if ids.is_empty() {
+        world.trace.push(format!(
+            "[{}] forget: no eligible (non-anchor) memory, skipped",
+            world.iter
+        ));
+        return;
+    }
+    let id = ids[world.rng.gen_range(ids.len())].clone();
+    let out = agentrec(
+        &world.root,
+        &["forget", &id, "--reason", "torture chaos retraction"],
+    );
+    if out.status.success() {
+        world.stat_forgets += 1;
+        world.trace.push(format!("[{}] forget: {id}", world.iter));
+    }
+}
+
+/// Writes fresh content to a random `mem_files` fixture, then `agentrec
+/// candidate`s a fact pinned to it — the agent-authored write path, routed
+/// through `signal.jsonl` for the daemon to validate/hash/ingest
+/// (asynchronous: unlike `remember`, there's no guarantee the daemon has
+/// ingested it by the time this returns — `assert_memory_invariants` at the
+/// next burst boundary checks whatever has actually landed). The CLI call
+/// itself only appends to the signal inbox and does not depend on daemon
+/// liveness, but `DaemonGuard` (see its doc comment) guarantees a live
+/// daemon child exists by the time `step` ever runs, so ingestion always
+/// eventually happens — satisfying the brief's "only when daemon alive"
+/// framing by construction.
+fn op_candidate(world: &mut World) {
+    let idx = world.rng.gen_range(world.mem_files.len());
+    let path = world.mem_files[idx].clone();
+    let content = format!("cand-iter{}-{:x}\n", world.iter, world.rng.next_u64());
+    std::fs::write(world.root.join(&path), content).expect("write mem fixture (candidate)");
+    let fact = format!(
+        "agent-observed fact {} about {MEM_TOPIC} ({path})",
+        world.iter
+    );
+    let out = agentrec(
+        &world.root,
+        &["candidate", &fact, "--from", &path, "--tool", "torture"],
+    );
+    assert!(
+        out.status.success(),
+        "candidate emit failed: {out:?}\nSEED={}\n--- trace ---\n{}",
+        world.seed,
+        world.trace.join("\n"),
+    );
+    world.stat_candidates += 1;
+    world
+        .trace
+        .push(format!("[{}] candidate: {path}", world.iter));
+}
+
+/// INV-M1, load-bearing: reads `memory.jsonl` as RAW TEXT (not via
+/// `memory::load_effective`, which silently skips malformed lines — correct
+/// production tolerance, but it would make this check vacuously pass over a
+/// torn kill-9 line). Every non-empty line must parse as a `MemoryRecord`
+/// and carry >=1 pin. Called after every burst (including right after a
+/// `kill_and_respawn`), so this is also the kill-9-recovery proof: fsynced
+/// appends (`append_line_synced`) mean a SIGKILL mid-write can never leave a
+/// torn line, and this assertion is what actually checks that promise.
+fn assert_memory_invariants(world: &mut World) {
+    let text = std::fs::read_to_string(memory::memory_path(&world.root)).unwrap_or_default();
+    let mut n_lines = 0usize;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        n_lines += 1;
+        let rec: MemoryRecord = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "INV-M1 VIOLATED: memory.jsonl line {i} does not parse \
+                 (torn/invalid line after kill-9?): {e}\nline: {line}\n\
+                 SEED={}\n--- trace ---\n{}",
+                world.seed,
+                world.trace.join("\n"),
+            )
+        });
+        assert!(
+            !rec.pins.is_empty(),
+            "INV-M1 VIOLATED: memory record {} has zero pins\nSEED={}\n--- trace ---\n{}",
+            rec.id,
+            world.seed,
+            world.trace.join("\n"),
+        );
+    }
+    world.trace.push(format!(
+        "[{}] mem-invariants: {n_lines} memory.jsonl line(s) parsed OK, all with >=1 pin",
+        world.iter
+    ));
 }
 
 /// After a burst of raw ops, give the daemon's debounce (1.5s, plus
@@ -653,12 +958,20 @@ fn run_torture(ops: usize, seed: u64) {
     println!("SEED={seed}");
     let mut world = World::new(seed);
 
+    // Baseline: the anchor memory `World::new` just seeded must itself be a
+    // valid, single-pin record before any chaos runs.
+    assert_memory_invariants(&mut world);
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for i in 0..ops {
             world.iter = i;
             step(&mut world);
             if (i + 1) % BURST_SIZE == 0 {
                 settle_burst(&mut world);
+                // INV-M1 (+ kill-9-recovery: no torn line survives a
+                // `kill_and_respawn` that may have landed mid-batch), checked
+                // after every op batch, per the brief.
+                assert_memory_invariants(&mut world);
             }
             if (i + 1) % CHECKPOINT_EVERY == 0 {
                 checkpoint(&mut world);
@@ -666,6 +979,24 @@ fn run_torture(ops: usize, seed: u64) {
         }
         world.iter = ops;
         checkpoint(&mut world); // final checkpoint over any trailing activity
+        assert_memory_invariants(&mut world);
+        // Unconditional final recall check — the randomized `op_recall`
+        // (4% per op) may simply never fire on a short run (e.g.
+        // `torture_smoke`'s 40 ops), and INV-M2 must still be genuinely
+        // exercised every single run, not left to RNG luck.
+        op_recall(&mut world);
+        // The ANCHOR memory (see `World::mem_files`) guarantees at least one
+        // Fresh hit always exists, so this must never be 0 — a violation
+        // here means that guarantee itself broke, not that recall found
+        // nothing to check.
+        assert!(
+            world.stat_recall_hits > 0,
+            "INV-M2 was never exercised: every `op_recall` call returned \
+             zero hits across the whole run (the ANCHOR-memory guarantee is \
+             broken)\nSEED={}\n--- trace ---\n{}",
+            world.seed,
+            world.trace.join("\n"),
+        );
     }));
 
     if let Err(payload) = result {
@@ -680,14 +1011,23 @@ fn run_torture(ops: usize, seed: u64) {
     }
 
     println!(
-        "torture: {ops} ops completed, SEED={seed}, INV1+INV2 held on every undo \
+        "torture: {ops} ops completed, SEED={seed}, INV1+INV2 held on every undo, \
+         INV-M1+INV-M2 held on every memory batch \
          (checkpoints={}, undos_executed(INV1+INV2 both checked)={}, \
-         undos_reverted_nothing(INV1-only)={}, checkpoints_skipped={}, daemon_kills={})",
+         undos_reverted_nothing(INV1-only)={}, checkpoints_skipped={}, daemon_kills={}, \
+         mem_remembers={}, mem_mutations={}, mem_recalls={}, mem_recall_hits(INV-M2 checked)={}, \
+         mem_forgets={}, mem_candidates={})",
         world.stat_checkpoints,
         world.stat_undos_executed,
         world.stat_reverted_nothing,
         world.stat_undos_skipped,
         world.stat_kills,
+        world.stat_remembers,
+        world.stat_mutations,
+        world.stat_recalls,
+        world.stat_recall_hits,
+        world.stat_forgets,
+        world.stat_candidates,
     );
 }
 

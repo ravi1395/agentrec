@@ -55,6 +55,20 @@ A recorder MUST treat signal lines as authoritative turn boundaries and MUST tol
 
 **Crash rule.** A `start` with no matching `stop` (tool crash, Ctrl-C): the recorder MUST close the bracket at the last observed mutation inside it, grade `rich`, with `truncated: true` — attribution is kept (the start signal is authoritative) but the record admits the end is inferred.
 
+**Memory-candidate signal (additive, memory v1).** A distinct signal shape carries a fact-extraction hint rather than a turn boundary:
+
+| Field | Type | Req | Meaning |
+|---|---|---|---|
+| `type` | string | MUST | `"memory-candidate"` |
+| `fact` | string | MUST | Extracted fact text (pre-scrub is the emitter's responsibility; the recorder scrubs before persistence, as with prompts) |
+| `pins` | array of string (paths) | MAY | Paths only — the recorder hashes them at ingestion; an emitter never computes or sends hashes |
+
+```json
+{"v":1,"ts":1751724242183,"tool":"claude-code","type":"memory-candidate","fact":"repo uses pnpm, not npm","pins":["package.json"]}
+```
+
+A memory-candidate line has no `event` field and MUST NOT be treated as a `start` or `stop` signal — a recorder MUST route it to memory ingestion before any start/stop dispatch, never into turn-boundary handling. Consumers (including recorders) MUST tolerate this shape appearing interleaved with ordinary signal lines in `signal.jsonl`.
+
 ## 5. Turn record format — the canonical log
 
 One JSON object per line in `log.jsonl`:
@@ -109,6 +123,7 @@ A conforming MCP server exposes the record to agents. Tools and their capability
 | `agentrec_log` | read | List/filter turns |
 | `agentrec_diff` | read | Per-turn unified diff |
 | `agentrec_blame` | read | File/line → turn, attribution, human-touched-since |
+| `agentrec_recall` | read | Rank-then-verify recall over pinned/derived memory facts (memory v1) |
 | `agentrec_undo` | **destructive** | Gated by the user's `mcp_destructive` mode (below) |
 
 **Destructive tier — the user decides.** Reversion is the point of the record; a recorder that can only watch mistakes is half a product. The user grants agent-driven undo per repo via `config.toml: mcp_destructive = "off" | "confirm" | "auto"` (default `"off"`):
@@ -127,7 +142,7 @@ Prompt text MUST pass a scrub pipeline (secret-shape regexes plus entropy detect
 
 ## 10. Versioning
 
-`v` is per-line, per-schema. Within a major version, changes are additive only; consumers MUST ignore unknown fields and MUST NOT fail on them. A major bump is a new schema, and writers MUST NOT mix majors within one file. This draft is v0.1 of the *document*; both schemas it defines are `v: 1` and freeze as protocol 1.0 per the roadmap's Phase 1 gate.
+`v` is per-line, per-schema. Within a major version, changes are additive only; consumers MUST ignore unknown fields and MUST NOT fail on them. A major bump is a new schema, and writers MUST NOT mix majors within one file. This draft is v0.1 of the *document*; both schemas it defines are `v: 1` and freeze as protocol 1.0 per the roadmap's Phase 1 gate. The memory-candidate signal (§4) is an additive variant of the existing signal schema — it does not bump `v`.
 
 ## 11. Resolved design decisions
 

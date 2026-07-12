@@ -3,6 +3,7 @@
 //! and undo's preview never need the daemon running; `undo --confirm` writes
 //! to the worktree but not to the daemon's internal state.
 
+use crate::cmds::wall_now_ms;
 use crate::state::State;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
@@ -79,27 +80,69 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
 }
 
 /// Match `turn_ref` against recorded turn ids, exact or unambiguous prefix
-/// (K+). Zero or multiple matches is an error naming the valid id range so
-/// the caller can retry (F4).
+/// (K+). Zero matches is an error naming the valid id range so the caller can
+/// retry (F4). Multiple matches error as ambiguous UNLESS they are the same
+/// turn re-emitted under one id by a pre-fix daemon's orphan recovery (PR #2),
+/// in which case they collapse to one — see [`same_turn_ignoring_time`].
 fn resolve_turn<'a>(turns: &[&'a TurnRecord], turn_ref: &str) -> Result<&'a TurnRecord, String> {
     if turns.is_empty() {
         return Err("no turns recorded — is `agentrec record` running?".to_string());
     }
-    let matches: Vec<&&TurnRecord> = turns
+    let matches: Vec<&'a TurnRecord> = turns
         .iter()
+        .copied()
         .filter(|t| t.id == turn_ref || t.id.starts_with(turn_ref))
         .collect();
     match matches.len() {
-        1 => Ok(*matches[0]),
+        1 => Ok(matches[0]),
         0 => Err(format!(
             "unknown turn id '{turn_ref}' — recorded turns: {}",
             turn_range(turns)
         )),
-        n => Err(format!(
-            "ambiguous turn id '{turn_ref}' — matches {n} turns; recorded turns: {}",
-            turn_range(turns)
-        )),
+        n => {
+            // Curative dedup for PR #2: the engine fix stops a post-fix daemon
+            // WRITING a same-id duplicate, but a log.jsonl already written by a
+            // pre-fix daemon can still hold two records for one turn (the
+            // kill-9 window between persist and journal clear made orphan
+            // recovery re-append it under its reserved id). Collapse them when
+            // resolving to either yields an identical revert; a genuine id
+            // collision (two DIFFERENT turns minted with one id) does not, and
+            // still surfaces as ambiguous.
+            let first = matches[0];
+            if matches.iter().copied().all(|t| same_revert(first, t)) {
+                Ok(first)
+            } else {
+                Err(format!(
+                    "ambiguous turn id '{turn_ref}' — matches {n} turns; recorded turns: {}",
+                    turn_range(turns)
+                ))
+            }
+        }
     }
+}
+
+/// Would undoing `a` and undoing `b` touch the worktree identically? True iff
+/// they share an id AND the exact same set of file entries (path + before/
+/// after hashes + op + flags), order-independent.
+///
+/// This is the precise safety condition for collapsing PR #2's orphan-recovery
+/// double-emit: `undo` consumes only `id` and `files`, so two records equal on
+/// both revert byte-for-byte the same and either may be picked. Fields that
+/// legitimately drift between the steady `persist` path and `recover_orphan`
+/// for the *same* turn are deliberately NOT compared — recovery recomputes
+/// `ended` from the crash journal's last-change time, forces `model: None`,
+/// and forces `truncated: true` for a bracket turn — so comparing them would
+/// wrongly refuse to collapse a real duplicate. Conversely, two records whose
+/// `before`/`after` differ would revert to DIFFERENT content, so they are left
+/// ambiguous rather than silently collapsed to an arbitrary one.
+fn same_revert(a: &TurnRecord, b: &TurnRecord) -> bool {
+    if a.id != b.id || a.files.len() != b.files.len() {
+        return false;
+    }
+    // A turn holds at most one entry per path, so equal length + every entry of
+    // `a` present in `b` is set equality (order-independent — recovery's
+    // journaled file order need not match the steady-close order).
+    a.files.iter().all(|fa| b.files.contains(fa))
 }
 
 /// `<oldest_short>..<newest_short> (N turns)` — turns are append order
@@ -1040,13 +1083,4 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
-}
-
-/// Mirrors `cmds::wall_now_ms` (kept local — a one-line helper, not worth a
-/// shared module for).
-fn wall_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }

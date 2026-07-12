@@ -20,6 +20,21 @@ pub struct State {
     /// per-file "no snapshot available" message later.
     #[serde(default)]
     pub io_failed: Vec<String>,
+    /// Count of memory-candidate signals the daemon rejected at ingestion
+    /// (invalid pin, oversize/scrub-empty fact, out-of-bounds pin count) —
+    /// the `snapshot_failures` honesty pattern: a rejection leaves no trace
+    /// in `memory.jsonl`, so this counter is the only evidence it happened.
+    #[serde(default)]
+    pub memory_rejects: u64,
+    /// Count of signal lines dropped because their `type` (PROTOCOL §4) was
+    /// present but not one this daemon recognizes (F5) — forward-compat
+    /// tolerance, not an error. `memory-candidate` is the only recognized
+    /// `type` today and is excluded; every other populated `type` increments
+    /// this. The `memory_rejects` honesty pattern: a dropped signal leaves no
+    /// trace in `log.jsonl`, so this counter is the only visible evidence it
+    /// happened.
+    #[serde(default)]
+    pub unknown_signal_ignored: u64,
 }
 
 pub fn read_state(root: &Path) -> State {

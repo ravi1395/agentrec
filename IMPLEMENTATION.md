@@ -228,6 +228,146 @@ Every call that could have been an open question, resolved. Renegotiable, but th
 2. The npm package version is locked one-to-one to the binary release version; publishing is a CI step of the release workflow, not a manual action.
 3. The mise/asdf plugin installs and pins versions; the README install matrix documents all five paths (installer script, brew, npm, mise, cargo) with one-line commands.
 
+### Memory (v1)
+
+Hash-pinned semantic memory (see `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`,
+status: implemented). All 12 memory tasks landed; every invariant below now names
+its complete test set — no "pending" rows remain.
+
+1. **INV-M1** — no memory record exists without ≥1 valid in-root pin: fuzz malformed
+   candidates (traversal, absolute paths, symlink escape, empty pins). Maps to tests:
+   `agentrec-core::memory::tests::pin_path_rejections` (traversal/absolute/symlink-escape/
+   secret-path/nonexistent-path rejection, unit level); `cli/tests/hardening_daemon.rs::
+   candidate_rejects_counted_never_fabricated` (4 genuinely-rejecting daemon-ingested
+   candidates — traversal pin, secret-file pin, empty-after-scrub fact, >PINS_MAX pins —
+   leave `memory.jsonl` untouched, counted in `state.json.memory_rejects`); `cli/tests/
+   torture.rs::{torture_smoke,torture_survives_chaos}` (`assert_memory_invariants`,
+   Task 12 — every RAW line in `memory.jsonl` parses as a `MemoryRecord` with ≥1 pin,
+   checked after every op batch including immediately after a daemon `kill -9` +
+   respawn, proving fsynced appends never leave a torn line).
+2. **INV-M2** — stale/orphaned memories are never emitted by the injection path:
+   mutate a pinned file, recall again, memory gone. Maps to tests: `agentrec-core::
+   memory::tests::{recall_never_returns_stale,recall_verifies_only_top_candidates,
+   freshness_transitions}` (core rank-then-verify + freshness derivation);
+   `cli/tests/integration.rs::recall_cli_fresh_only_and_json` (CLI-level fresh-only
+   contract); `cli/tests/torture.rs::{torture_smoke,torture_survives_chaos}`
+   (`op_recall`, Task 12 — every memory an in-flight `recall --json` returns is
+   re-hashed against the live working tree and asserted `Freshness::Fresh`, exercised
+   under concurrent chaos mutation/kill-9/undo; a run-long ANCHOR memory guarantees
+   the check is never vacuously skipped).
+3. **INV-M3** — planted secret never lands in `memory.jsonl` via either write path.
+   Maps to tests: `cli/tests/integration.rs::remember_refuses_bad_pins_and_secret_facts`
+   (manual `remember` path); `cli/tests/hardening_daemon.rs::
+   candidate_secret_fact_scrubbed_on_disk` (agent `candidate` → daemon-ingestion path);
+   `cli/tests/integration.rs::secret_prompt_never_reaches_disk_in_cleartext` (Task 12 —
+   extended to drive the SAME planted AWS-key-shaped secret through both `remember` and
+   `candidate`, plus a matching `UserPromptSubmit` hook, then grep all 4 locations —
+   `signal.jsonl`, `log.jsonl`, `.agentrec/objects/**`, `memory.jsonl`, and
+   `memory-stats.jsonl` — proving the raw secret is nowhere while a redaction marker is
+   present everywhere it should be).
+4. **INV-M4** — hook path exits 0 and within budget under: corrupt store, missing
+   store, uninitialized repo, 3000-record store, injection-within-budget-at-that-scale,
+   and concurrent append. Test-closeable legs, each PASS with a named test: `cli/tests/
+   integration.rs::hook_injects_fresh_memories_into_stdout` (enabled-path injection,
+   `memory_enabled=false` kill switch, Stop-arm never injects, `memory_inject_max`
+   coupling); `cli/tests/integration.rs::hook_fail_open_and_budget` (corrupt
+   `memory.jsonl` → exit 0 + no block + start signal still appended; missing store and
+   a fully uninitialized `.agentrec/` both exit 0 with no block, start signal still
+   appended even when `.agentrec/` never existed; a 3000-record store — 3000 orphaned
+   fillers + 1 genuinely Fresh real-pinned record — answers within the 500ms CI-slack
+   budget AND actually emits the injected block for the Fresh record, proving the
+   budget pass isn't silent degradation to a no-op); `cli/tests/integration.rs::
+   hook_exits_zero_under_concurrent_memory_append` (a direct-API writer thread races
+   `memory::append_memory` against 30 real `agentrec hook claude` subprocess calls with
+   no synchronization; every call exits 0, appends its start signal, and every raw
+   `memory.jsonl` line still parses with >=1 pin afterward — the property held on
+   first write, no source change needed).
+
+   The 50ms `RECALL_BUDGET_MS` bound is **not** enforced by the cooperative
+   in-loop deadline checks alone (`memory::recall_with_deadline` re-checking
+   `Instant::now()` between `load_effective`'s fold, `bm25_rank`'s scoring, and
+   the freshness-verify walk) — that shape still lets one slow blocking call
+   *inside* a step (e.g. a stalled-volume `fs::read` in `memory::hash_pin`)
+   overrun the budget by however long that call blocks, so it was cooperative
+   between steps, not a hard outer wall. **F8** (`78cf735`) closes that gap:
+   `inject_memory` (`cli/src/cmds.rs`) now runs the recall on a detached
+   worker thread and waits only for the *remaining* budget via
+   `mpsc::Receiver::recv_timeout`, so a hang anywhere inside the recall —
+   including inside one blocking step — can no longer push the observable
+   hook past `RECALL_BUDGET_MS`; a timed-out or budget-exceeded worker fails
+   open (inject nothing, exit 0) and records one `{"budget_exceeded":true}`
+   line in `memory-stats.jsonl`. The retrospective `elapsed_ms >
+   RECALL_BUDGET_MS` check stays as cheap defense-in-depth, not the primary
+   bound. Test: `cli/tests/integration.rs::hook_recall_hard_wall_deadline`.
+
+   **F10** (`f75267f`) closes a related honesty gap: a malformed/unreadable
+   *non-empty* `memory.jsonl` was previously folded to "no matches" —
+   indistinguishable from a healthy empty-result recall. It is now a distinct
+   RECALL FAILURE: the hook still fails open (inject nothing, exit 0) but
+   appends `{"ts","failure":true,"reason":"store_corrupt"}` to
+   `memory-stats.jsonl` instead of a plain no-match line, and `status` prints
+   an aggregate memory-failure count read from those stat lines. Tests:
+   `cli/tests/integration.rs::hook_corrupt_memory_store_is_counted`,
+   `cli/tests/integration.rs::hook_corrupt_store_reason_never_leaks_raw_control_bytes`,
+   `cli/tests/integration.rs::hook_corrupt_store_safe_under_concurrent_append`,
+   `cli/src/cmds.rs::tests::status_counts_memory_failures_and_tolerates_malformed_stats_lines`.
+
+   **LADDERED, not test-closeable on CI:** the spec's 10k-record / 50ms
+   **hard** performance envelope (`docs/superpowers/specs/
+   2026-07-12-agentrec-memory-design.md` §Performance envelope) is wall-clock
+   timing that varies by CI runner load — the tests above prove correctness
+   (fail-open, real injection, no torn writes, hard-wall enforcement, corrupt-
+   store honesty) at a 3000-record/500ms CI-slack scale, not the spec's exact
+   10k/50ms hard budget; that number is verified via the 1-week dogfood
+   counters in `status` (injections/rejects/stale-quarantined/failures) per
+   the spec's Success gate, never claimed as CI-test-proven.
+5. **INV-M5** — fold determinism: same records ingested in any order produce the
+   same effective state (property test). Maps to tests: `agentrec-core::memory::
+   tests::fold_latest_op_wins_any_order` (Task 1 — 6-permutation assert/reverify/retract
+   fold); `agentrec-core::memory::tests::{fold_equal_ts_retract_wins_any_order,
+   fold_equal_ts_reverify_wins_over_assert_any_order}` (codex-found equal-timestamp fix —
+   op-precedence tie-break, both file orderings); `cli/tests/hardening_daemon.rs::
+   dangling_source_turns_closed_by_pre_persist_journal_sync` (codex-found crash-window
+   fix — a candidate's `source_turns` id is always journal-recoverable before it's
+   durably referenced, closing the same-iteration start+candidate race).
+
+**F8/F9/F10 (PR #2 review-findings fix round, 2026-07-12, branch `feat/memory-v1`):**
+
+- **F8** (`78cf735`) — see INV-M4 above: replaces the cooperative-only recall
+  deadline with a hard outer wall via a detached worker thread +
+  `mpsc::Receiver::recv_timeout` in `inject_memory` (`cli/src/cmds.rs`), so a
+  blocking call inside one recall step can no longer push the hook past
+  `RECALL_BUDGET_MS`. Test: `cli/tests/integration.rs::
+  hook_recall_hard_wall_deadline`.
+- **F9** (`742ef04`) — `agentrec verify <id> [--confirm] --replace-pin
+  <old>=<new>` (repeatable): re-points an existing pin (fresh, stale, or
+  orphaned) to an explicit successor path instead of only allowing
+  `--drop-pin`, closing the "sole pinned file renamed" recovery gap without
+  minting a new memory id (`op: Reverify`, same id, per the design spec's
+  "reverify/retract never mint a new id" rule). `new` is validated identically
+  to `remember --from` (`memory::validate_pin_path`: in-root, no `..`
+  traversal, no symlink escape, must exist, not a secret path); every
+  `--replace-pin` is parsed and validated up front, atomically, before
+  anything is printed or appended — malformed `OLD=NEW` syntax, a duplicate
+  `old`, an `old` also named by `--drop-pin`, an `old` not currently a pin on
+  the memory, or an invalid `new` all abort with nothing appended. Deliberately
+  **no automatic rename detection** — an ambiguous guess could silently
+  re-ground a fact against the wrong source (design spec's rejected-approaches
+  list). Implementation: `cli/src/memorycmds.rs::{parse_replace_pin,verify}`,
+  flag wired in `cli/src/main.rs`. Tests: `cli/tests/integration.rs::
+  {verify_replace_pin_preserves_renamed_sole_pin,
+  verify_replace_pin_keeps_other_pins_on_multi_pin_memory,
+  verify_replace_pin_rejections_append_nothing}`.
+- **F10** (`f75267f`) — see INV-M4 above: a malformed/unreadable non-empty
+  `memory.jsonl` is now a distinct RECALL FAILURE (`memory-stats.jsonl`
+  `{"failure":true,"reason":"store_corrupt"}`, never silently folded to
+  "no matches"), still exit 0 / inject nothing; `status` surfaces an
+  aggregate failure count. Tests: `cli/tests/integration.rs::
+  {hook_corrupt_memory_store_is_counted,
+  hook_corrupt_store_reason_never_leaks_raw_control_bytes,
+  hook_corrupt_store_safe_under_concurrent_append}`, `cli/src/cmds.rs::
+  tests::status_counts_memory_failures_and_tolerates_malformed_stats_lines`.
+
 ## 5. v2 — The integration release (Codex, MCP, VS Code)
 
 ### O. Codex CLI capture

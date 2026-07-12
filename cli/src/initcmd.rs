@@ -17,6 +17,8 @@ const DEFAULT_CONFIG: &str = "\
 # agentrec configuration (PROTOCOL.md / SPEC.md)
 ttl_days = 90
 mcp_destructive = \"off\"   # off | confirm | auto (used from v2)
+memory_enabled = true      # inject recalled memories into UserPromptSubmit hooks
+memory_inject_max = 5      # max facts injected per hook call
 ";
 
 pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Result<(), String> {
