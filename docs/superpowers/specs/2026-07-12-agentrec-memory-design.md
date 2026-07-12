@@ -181,7 +181,7 @@ Empty query → recency-ordered fresh list.
 3. **MCP:** `agentrec_recall`, read tier — added to PROTOCOL.md §8 table + schema
    now (frozen), implemented when the v2 MCP server lands.
 
-Kill-switch: `[memory] enabled = false` disables injection + candidate ingestion;
+Kill-switch: `memory_enabled = false` disables injection + candidate ingestion;
 store stays readable.
 
 ## Lifecycle

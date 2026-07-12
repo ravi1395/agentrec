@@ -602,6 +602,90 @@ fn candidate_ingestion_disabled_when_memory_disabled() {
     );
 }
 
+// GAP: `candidate_ingestion_disabled_when_memory_disabled` above only drives
+// the LIVE ingestion site (daemon.rs main loop, ~:178). The kill-switch is
+// also checked at a SECOND site — `replay_pending_candidates` (daemon.rs
+// ~:864, `if sig.is_memory_candidate() && memory_enabled`) — which handles
+// candidates emitted in the pre-daemon gap (no daemon running yet, same
+// scenario as `candidate_startup_replay_is_candidate_only_and_preserves_d7`
+// in integration.rs). Nothing previously exercised that conjunct with
+// `memory_enabled = false`. This plants a candidate signal while no daemon
+// is running, then starts the daemon and asserts the startup replay honors
+// the kill-switch — plus a control (default `memory_enabled = true`) proving
+// the identical scenario DOES ingest on replay, so the assertions above test
+// the kill-switch specifically, not a broken replay path in general.
+#[test]
+fn replay_ingestion_disabled_when_memory_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    write_memory_enabled(root, false);
+    std::fs::write(root.join("notes.txt"), "hello world").unwrap();
+
+    // No daemon running yet — plant the candidate directly into the inbox,
+    // landing in the pre-daemon gap so only `replay_pending_candidates`
+    // (never the live loop) ever sees it.
+    let candidate = memory_signal("replay should be off right now", &["notes.txt"]);
+    append_signal_line(root, &candidate);
+    assert!(
+        !root.join(".agentrec/memory.jsonl").exists(),
+        "no daemon was running — nothing should be ingested yet"
+    );
+
+    // Start the daemon: `run()` calls `replay_pending_candidates` BEFORE
+    // appending the "start" epoch, so observing "start" in the log proves
+    // the replay already ran to completion.
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // A beat past startup in case the live loop (wrongly) re-tailed the line.
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        memories(root).is_empty(),
+        "memory_enabled = false must block candidate ingestion on startup replay: {:?}",
+        memories(root)
+    );
+
+    // Control: with memory_enabled = true (default), the identical
+    // pre-daemon-gap scenario DOES ingest on replay.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    init(root2);
+    std::fs::write(root2.join("notes.txt"), "hello world").unwrap();
+
+    let candidate2 = memory_signal("replay should be on right now", &["notes.txt"]);
+    append_signal_line(root2, &candidate2);
+    assert!(
+        !root2.join(".agentrec/memory.jsonl").exists(),
+        "no daemon was running — nothing should be ingested yet (control)"
+    );
+
+    let mut daemon2 = spawn_record(root2);
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let m = memories(root2);
+        (!m.is_empty()).then_some(m)
+    });
+
+    let _ = daemon2.kill();
+    let _ = daemon2.wait();
+
+    let recs = recorded
+        .expect("control: default memory_enabled must ingest a valid candidate on startup replay");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record from replay: {recs:?}"
+    );
+}
+
 // Four genuinely-rejecting candidates — traversal pin, secret-file (`.env`)
 // pin, a whitespace-only fact (scrubs to empty — NOT a secret-only fact:
 // scrub redacts rather than deletes, so `"AKIA..."` alone would scrub to a
