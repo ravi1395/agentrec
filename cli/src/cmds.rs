@@ -207,8 +207,14 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         }
     }
     let state = read_state(root);
+    // I = memory-stats.jsonl line count (0 if absent) — the hook-owned
+    // injection log (Task 9); this is the only visible evidence recall
+    // actually fired into a prompt, so status surfaces it verbatim.
+    let injections = std::fs::read_to_string(crate::memory_stats_path(root))
+        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
     out.push_str(&format!(
-        "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects\n",
+        "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections\n",
         state.memory_rejects
     ));
 

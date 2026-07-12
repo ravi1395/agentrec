@@ -593,3 +593,223 @@ fn e9_second_rerun_with_no_drift_is_still_a_real_noop() {
         "a genuine no-op re-run must still say so: {stdout}"
     );
 }
+
+// ---- Task 11: purge --memories-retracted (archive-never-delete) ----------
+
+fn mem_rec(
+    id: &str,
+    op: agentrec_core::memory::MemoryOp,
+    fact: &str,
+    ts: u64,
+) -> agentrec_core::memory::MemoryRecord {
+    agentrec_core::memory::MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: id.to_string(),
+        op,
+        fact: fact.to_string(),
+        pins: vec![agentrec_core::memory::Pin {
+            path: "src/a.rs".to_string(),
+            hash: format!("sha256:{}", "a".repeat(64)),
+        }],
+        source_turns: vec![],
+        origin: "human".to_string(),
+        ts,
+        reason: None,
+    }
+}
+
+fn mem_line_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+}
+
+// Task 11 acceptance test: a LIVE fact, a STALE-but-unretracted fact (old
+// assert, never retracted), a fact retracted YESTERDAY (inside the default
+// 90-day TTL), and a fact retracted 100 DAYS AGO (past TTL) — only the
+// 100-day chain's records (assert + retract) move to
+// memory.archived.*.jsonl; the other three chains' lines survive in
+// memory.jsonl byte-for-byte. A second run is a genuine no-op (no new
+// archive file, memory.jsonl unchanged). Finally, the archive+survivor union
+// covers exactly the original line set — the crash-safety property that a
+// kill-9 between the archive fsync and the source rewrite can only ever
+// leave memory.jsonl a superset, never drop a record.
+#[test]
+fn purge_archives_only_expired_retracted_chains() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "the daemon uses signal-tailer offsets",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "stale1",
+            MemoryOp::Assert,
+            "legacy config path moved to config toml",
+            now_ms - 200 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_recent",
+            MemoryOp::Assert,
+            "old build script used make",
+            now_ms - 5 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_recent",
+            MemoryOp::Retract,
+            "old build script used make",
+            now_ms - DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mem_path = root.join(".agentrec/memory.jsonl");
+    let before_lines: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(before_lines.len(), 6, "6 records seeded");
+
+    let out = agentrec(root, &["purge", "--memories-retracted"]);
+    assert!(out.status.success(), "purge failed: {out:?}");
+
+    let archive_files: Vec<_> = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .collect();
+    assert_eq!(
+        archive_files.len(),
+        1,
+        "expected exactly one archive file: {archive_files:?}"
+    );
+    let archive_text = std::fs::read_to_string(archive_files[0].path()).unwrap();
+    let archive_lines: Vec<&str> = archive_text.lines().collect();
+    assert_eq!(archive_lines.len(), 2, "only retracted_old's 2 records");
+    for line in &archive_lines {
+        assert_eq!(mem_line_id(line).as_deref(), Some("retracted_old"));
+    }
+
+    // Archived lines are byte-identical to the originals (no reserialization).
+    let orig_old_lines: Vec<&String> = before_lines
+        .iter()
+        .filter(|l| mem_line_id(l).as_deref() == Some("retracted_old"))
+        .collect();
+    assert_eq!(
+        archive_lines,
+        orig_old_lines
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        "archived lines must be byte-for-byte the originals"
+    );
+
+    // memory.jsonl retains the other 4 lines byte-for-byte, original order.
+    let after_lines: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let expected_survivors: Vec<&String> = before_lines
+        .iter()
+        .filter(|l| mem_line_id(l).as_deref() != Some("retracted_old"))
+        .collect();
+    assert_eq!(
+        after_lines.iter().collect::<Vec<_>>(),
+        expected_survivors,
+        "surviving lines must be byte-for-byte, in original order"
+    );
+
+    // Second run -> genuine no-op: no new archive file, memory.jsonl unchanged.
+    let out2 = agentrec(root, &["purge", "--memories-retracted"]);
+    assert!(out2.status.success(), "second purge failed: {out2:?}");
+    let archive_files_2: Vec<_> = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .collect();
+    assert_eq!(
+        archive_files_2.len(),
+        1,
+        "second run must not create a new archive file"
+    );
+    let after_lines_2: Vec<String> = std::fs::read_to_string(&mem_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        after_lines_2, after_lines,
+        "second run must not change memory.jsonl"
+    );
+
+    // Crash-safety proxy: the archive+source union equals the original full
+    // set — no record is ever lost (worst case, a kill-9 mid-way leaves a
+    // record in both places, never in neither).
+    let mut union: Vec<String> = after_lines.clone();
+    union.extend(archive_lines.iter().map(|s| s.to_string()));
+    let mut union_sorted = union.clone();
+    union_sorted.sort();
+    let mut before_sorted = before_lines.clone();
+    before_sorted.sort();
+    assert_eq!(
+        union_sorted, before_sorted,
+        "archive+source union must equal the original full set"
+    );
+}

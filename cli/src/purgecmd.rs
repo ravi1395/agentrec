@@ -9,16 +9,24 @@
 //! disjoint set only touched by `--snapshots-before`.
 
 use crate::{agentrec_dir, log_path, objects_dir};
+use agentrec_core::memory::{memory_path, MemoryRecord};
 use agentrec_core::record::{LogRecord, TurnRecord};
 use agentrec_core::store::BlobStore;
 use std::collections::HashSet;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TTL_DAYS: u64 = 90;
 const DAY_MS: u64 = 86_400_000;
 
-pub fn run(root: &Path, all_prompts: bool, snapshots_before: Option<&str>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    root: &Path,
+    all_prompts: bool,
+    snapshots_before: Option<&str>,
+    memories_retracted: bool,
+) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = owned_turns(&records);
     let store = BlobStore::new(objects_dir(root));
@@ -26,6 +34,9 @@ pub fn run(root: &Path, all_prompts: bool, snapshots_before: Option<&str>) -> Re
     purge_prompts(&store, &turns, root, all_prompts);
     if let Some(date) = snapshots_before {
         purge_snapshots_before(&store, &turns, date, root)?;
+    }
+    if memories_retracted {
+        purge_memories_retracted(root)?;
     }
     Ok(())
 }
@@ -193,6 +204,178 @@ fn delete_all(store: &BlobStore, hashes: &HashSet<&str>) -> (usize, u64) {
         }
     }
     (count, bytes)
+}
+
+/// `purge --memories-retracted` (the ONLY sanctioned rewrite of
+/// `memory.jsonl` — handle with care): chains whose folded effective state
+/// is `retracted` AND whose retract `ts` is older than `ttl_days` move to
+/// `.agentrec/memory.archived.<unix_ts>.jsonl`. Live memories and
+/// stale-but-unretracted memories (any chain not currently `retracted`) are
+/// never touched, regardless of pin freshness — freshness is orthogonal to
+/// this retention policy.
+///
+/// Crash-safety ordering (load-bearing, do not reorder): (a) determine the
+/// expired-retracted ids from the folded state; (b) gather every raw line
+/// belonging to those ids (assert + reverify + retract, verbatim bytes) and
+/// append+fsync them to the archive file; only once that fsync has returned
+/// (c) rewrite `memory.jsonl` without those lines, atomically (tmp + fsync +
+/// rename + dir-fsync, mirroring `store.rs`'s blob-write pattern). A kill-9
+/// between (b) and (c) leaves `memory.jsonl` a strict superset of what it
+/// should be — the archived records are also still in the (unreplaced)
+/// source — never a subset, so no record is ever lost.
+fn purge_memories_retracted(root: &Path) -> Result<(), String> {
+    let ttl_days = read_ttl_days(root);
+    let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
+
+    let mem_path = memory_path(root);
+    let Ok(text) = std::fs::read_to_string(&mem_path) else {
+        println!("purged 0 retracted memory chain(s) (ttl {ttl_days}d) — no memory.jsonl yet");
+        return Ok(());
+    };
+
+    // Raw (line, id) pairs — the id is parsed only to decide which lines
+    // move, never to reserialize: survivors and archived lines both keep
+    // their exact original bytes.
+    let raw_lines: Vec<(&str, Option<String>)> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let id = serde_json::from_str::<MemoryRecord>(l).ok().map(|r| r.id);
+            (l, id)
+        })
+        .collect();
+
+    let effective = agentrec_core::memory::load_effective(root)?;
+    let expired_ids: HashSet<String> = effective
+        .iter()
+        .filter(|m| m.retracted && m.ts < cutoff_ms)
+        .map(|m| m.id.clone())
+        .collect();
+
+    if expired_ids.is_empty() {
+        println!("purged 0 retracted memory chain(s) (ttl {ttl_days}d)");
+        return Ok(());
+    }
+
+    let is_expired = |id: &Option<String>| id.as_deref().is_some_and(|i| expired_ids.contains(i));
+    let archived_lines: Vec<&str> = raw_lines
+        .iter()
+        .filter(|(_, id)| is_expired(id))
+        .map(|(l, _)| *l)
+        .collect();
+    let survivor_lines: Vec<&str> = raw_lines
+        .iter()
+        .filter(|(_, id)| !is_expired(id))
+        .map(|(l, _)| *l)
+        .collect();
+
+    // (b) archive first, fsynced, BEFORE the source is touched at all.
+    let archive_path = memory_archive_path(root);
+    append_lines_synced(&archive_path, &archived_lines)?;
+    agentrec_core::perms::lock_file(&archive_path);
+
+    // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site.
+    rewrite_memory_atomic(&mem_path, &survivor_lines)?;
+    agentrec_core::perms::lock_file(&mem_path);
+
+    println!(
+        "purged {} retracted memory chain(s) (ttl {ttl_days}d) — archived to {}",
+        expired_ids.len(),
+        archive_path.display()
+    );
+    Ok(())
+}
+
+/// `.agentrec/memory.archived.<unix_ts>.jsonl` — mirrors `uninstallcmd`'s
+/// `.agentrec.archived.<unix_ts>` naming (whole-seconds unix timestamp).
+fn memory_archive_path(root: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    agentrec_dir(root).join(format!("memory.archived.{ts}.jsonl"))
+}
+
+/// Append `lines` (each written verbatim + a trailing `\n`) to `path`,
+/// creating it if absent, then fsync the file handle before returning —
+/// callers must be able to trust the archive is durable the moment this
+/// returns `Ok`, since the source rewrite is only safe to start afterward.
+fn append_lines_synced(path: &Path, lines: &[&str]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    for line in lines {
+        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Rewrite `mem_path` to contain exactly `lines` (verbatim bytes, one per
+/// line), atomically: write a per-process-unique tmp file in the same
+/// directory, fsync it, rename over `mem_path`, then fsync the parent dir —
+/// the same tmp+fsync+rename+dir-fsync shape as `store.rs`'s blob writes, so
+/// a crash mid-rewrite either leaves the old file intact or the new one
+/// fully written, never a truncated/partial file.
+fn rewrite_memory_atomic(mem_path: &Path, lines: &[&str]) -> Result<(), String> {
+    let parent = mem_path
+        .parent()
+        .ok_or_else(|| "memory.jsonl has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(
+        ".memory.jsonl.tmp.{}.{}",
+        std::process::id(),
+        wall_now_ms()
+    ));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut file = create_tmp_file(&tmp)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, mem_path)?;
+        Ok(())
+    })();
+
+    match write {
+        Ok(()) => {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("failed to rewrite memory.jsonl: {e}"))
+        }
+    }
+}
+
+/// Create the rewrite tmp file at mode 0600 (unix) in the same syscall that
+/// creates it — mirrors `store.rs::create_tmp_file`'s set-at-create posture
+/// (no window where the tmp file is briefly reachable at the umask default).
+#[cfg(unix)]
+fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Read `ttl_days` from `.agentrec/config.toml` (a hand-rolled `key = value`

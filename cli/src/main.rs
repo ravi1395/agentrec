@@ -135,6 +135,10 @@ enum Command {
         /// Delete snapshot blobs for turns started before this date (YYYY-MM-DD).
         #[arg(long = "snapshots-before", value_name = "DATE")]
         snapshots_before: Option<String>,
+        /// Archive (never delete) fully-retracted memory chains older than
+        /// ttl_days into `.agentrec/memory.archived.<ts>.jsonl`.
+        #[arg(long = "memories-retracted")]
+        memories_retracted: bool,
     },
     /// Record a manual, human-authored pinned memory.
     Remember {
@@ -250,7 +254,13 @@ fn main() {
         Command::Purge {
             all_prompts,
             snapshots_before,
-        } => purgecmd::run(&root, all_prompts, snapshots_before.as_deref()),
+            memories_retracted,
+        } => purgecmd::run(
+            &root,
+            all_prompts,
+            snapshots_before.as_deref(),
+            memories_retracted,
+        ),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
         Command::Recall {
             query,
