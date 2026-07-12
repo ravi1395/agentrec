@@ -224,6 +224,22 @@ fn delete_all(store: &BlobStore, hashes: &HashSet<&str>) -> (usize, u64) {
 /// should be — the archived records are also still in the (unreplaced)
 /// source — never a subset, so no record is ever lost.
 fn purge_memories_retracted(root: &Path) -> Result<(), String> {
+    // The `record` daemon (a long-running launchd/systemd service) appends
+    // memory candidates to `memory.jsonl` continuously (Task 7). This is the
+    // ONLY code path that rewrites that append-only file — a concurrent
+    // daemon append landing between our read and our rename would be silently
+    // clobbered (permanent data loss). A reload-before-rename does NOT close
+    // the window (TOCTOU between reload and rename); the robust fix is to
+    // refuse entirely while the daemon holds its flock. Reuse the existing
+    // non-blocking flock probe — never reimplement liveness detection.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before purging memories — \
+             the daemon appends memory.jsonl concurrently"
+                .to_string(),
+        );
+    }
+
     let ttl_days = read_ttl_days(root);
     let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
 

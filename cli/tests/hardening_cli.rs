@@ -5,8 +5,8 @@
 //! (kept separate per file-ownership rules for this hardening round).
 
 use std::path::Path;
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
@@ -811,5 +811,123 @@ fn purge_archives_only_expired_retracted_chains() {
     assert_eq!(
         union_sorted, before_sorted,
         "archive+source union must equal the original full set"
+    );
+}
+
+fn spawn_record(root: &Path) -> Child {
+    Command::new(bin())
+        .args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn record")
+}
+
+fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The `record` daemon appends memory.jsonl concurrently (Task 7); the ONLY
+/// sanctioned rewrite (`purge --memories-retracted`) would otherwise clobber
+/// an append that lands between its read and its rename. So while the daemon
+/// holds its flock, purge must refuse and touch nothing — exit 1, a
+/// running-daemon reason on stderr, memory.jsonl byte-for-byte unchanged, and
+/// no archive file created.
+#[test]
+fn purge_memories_retracted_refuses_while_daemon_running() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // An expired-retracted chain that WOULD be archived if the guard weren't
+    // there — so a passing test proves the refusal, not an empty candidate set.
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mem_path = root.join(".agentrec/memory.jsonl");
+    let before = std::fs::read(&mem_path).unwrap();
+
+    let mut daemon = spawn_record(root);
+    // Wait until the daemon has actually taken its flock (start epoch appended).
+    let up = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).ok()?;
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("epoch")
+                    && v.get("event").and_then(|e| e.as_str()) == Some("start")
+            })
+            .then_some(())
+    });
+    assert!(up.is_some(), "daemon never came up");
+
+    let out = agentrec(root, &["purge", "--memories-retracted"]);
+
+    // Tear the daemon down before any assertion can early-return and leak it.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge must exit non-zero while the daemon is recording: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("recording") || stderr.contains("running"),
+        "stderr must name the running-daemon reason: {stderr}"
+    );
+
+    // memory.jsonl untouched byte-for-byte (nothing rewritten).
+    let after = std::fs::read(&mem_path).unwrap();
+    assert_eq!(before, after, "memory.jsonl must be untouched on refusal");
+
+    // No archive file created.
+    let archive_count = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("memory.archived.")
+        })
+        .count();
+    assert_eq!(
+        archive_count, 0,
+        "no archive file may be created on refusal"
     );
 }
