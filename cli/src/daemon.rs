@@ -929,7 +929,11 @@ fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_t
         reason: None,
     };
 
-    match agentrec_core::memory::append_memory(root, &rec) {
+    // F4: route through the shared memory.lock choke point like every other
+    // writer — the daemon holds `daemon.lock` for its whole lifetime, so
+    // reusing it here would deadlock this call against a live `purge
+    // --memories-retracted` forever instead of just making it wait.
+    match crate::memlock::append_memory_locked(root, &rec) {
         Ok(()) => test_pause_after_candidate_persist(),
         Err(_) => reject_candidate(root, state),
     }

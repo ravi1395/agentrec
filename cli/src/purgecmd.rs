@@ -225,12 +225,9 @@ fn delete_all(store: &BlobStore, hashes: &HashSet<&str>) -> (usize, u64) {
 /// source — never a subset, so no record is ever lost.
 fn purge_memories_retracted(root: &Path) -> Result<(), String> {
     // The `record` daemon (a long-running launchd/systemd service) appends
-    // memory candidates to `memory.jsonl` continuously (Task 7). This is the
-    // ONLY code path that rewrites that append-only file — a concurrent
-    // daemon append landing between our read and our rename would be silently
-    // clobbered (permanent data loss). A reload-before-rename does NOT close
-    // the window (TOCTOU between reload and rename); the robust fix is to
-    // refuse entirely while the daemon holds its flock. Reuse the existing
+    // memory candidates to `memory.jsonl` continuously (Task 7). Belt and
+    // suspenders: refuse outright while the daemon holds its own flock,
+    // before ever touching `memory.lock` below. Reuse the existing
     // non-blocking flock probe — never reimplement liveness detection.
     if crate::daemon::daemon_is_running(root) {
         return Err(
@@ -239,6 +236,20 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    // F4: hold the dedicated `memory.lock` (non-blocking) across the ENTIRE
+    // read -> archive -> rewrite -> rename sequence below. This is what
+    // actually closes the probe/act race the daemon-liveness check alone
+    // can't: a manual `remember`/`verify`/`forget` (or a daemon starting up
+    // right after the check above) landing between our read and our rename
+    // would otherwise be silently clobbered by the atomic rewrite. Every
+    // writer (`memlock::append_memory_locked`) takes this same lock
+    // BLOCKING, so from here until the lock drops at the end of this
+    // function, any concurrent writer simply waits its turn and its append
+    // lands intact right after — never lost. If we can't acquire it (another
+    // purge or a writer already holds it), refuse loudly rather than
+    // proceeding unlocked.
+    let _lock = crate::memlock::try_acquire(root)?;
 
     let ttl_days = read_ttl_days(root);
     let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
@@ -290,6 +301,8 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
     append_lines_synced(&archive_path, &archived_lines)?;
     agentrec_core::perms::lock_file(&archive_path);
 
+    test_pause_before_memory_rewrite();
+
     // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site.
     rewrite_memory_atomic(&mem_path, &survivor_lines)?;
     agentrec_core::perms::lock_file(&mem_path);
@@ -300,6 +313,28 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
         archive_path.display()
     );
     Ok(())
+}
+
+/// Test-only race-window widener (F4, mirrors `daemon.rs`'s
+/// `test_pause_after_candidate_persist`): when
+/// `AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS` is set (only ever done by
+/// `cli/tests/hardening_cli.rs`'s F4 tests), sleeps for the given duration
+/// right after the archive fsync and right before the atomic rewrite of
+/// `memory.jsonl` — i.e. inside the exact window a concurrent writer's
+/// append must survive. With `memory.lock` held across this whole function
+/// (see the call site above), a concurrent writer blocks for the entire
+/// pause and lands only after this function's lock drops; on unfixed
+/// (unlocked) code the same pause instead gives a concurrent writer a wide,
+/// reliable opening to land its append here — where it is invisible to the
+/// already-computed `survivor_lines` and gets silently clobbered by the
+/// rewrite that follows. A single env var read (no-op) when unset — no
+/// effect on production behavior.
+fn test_pause_before_memory_rewrite() {
+    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
 }
 
 /// `.agentrec/memory.archived.<unix_ts>.jsonl` — mirrors `uninstallcmd`'s

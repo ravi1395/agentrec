@@ -52,7 +52,7 @@ pub fn remember(root: &Path, fact: &str, from: &str) -> Result<(), String> {
         ts: wall_now_ms(),
         reason: None,
     };
-    memory::append_memory(root, &rec)
+    crate::memlock::append_memory_locked(root, &rec)
 }
 
 /// `agentrec candidate` (Task 8): the memory WRITE path's agent-facing
@@ -245,7 +245,7 @@ pub fn verify(root: &Path, id: &str, confirm: bool, drop_pins: &[String]) -> Res
         ts: wall_now_ms(),
         reason: None,
     };
-    memory::append_memory(root, &rec)
+    crate::memlock::append_memory_locked(root, &rec)
 }
 
 /// `forget <id> [--reason <text>]` (Task 10): retracts a memory. Refuses
@@ -294,7 +294,7 @@ pub fn forget(root: &Path, id: &str, reason: Option<&str>) -> Result<(), String>
         ts: wall_now_ms(),
         reason: scrubbed_reason,
     };
-    memory::append_memory(root, &rec)
+    crate::memlock::append_memory_locked(root, &rec)
 }
 
 /// Mirrors the same one-line helper repeated across `cmds.rs`/`purgecmd.rs`/

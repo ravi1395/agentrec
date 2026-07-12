@@ -122,7 +122,7 @@ On Claude Code's `UserPromptSubmit` hook, agentrec injects the top matching Fres
 
 `agentrec status` reports memory counters (`fresh`/`stale`/`rejects`/`injections`) alongside the usual turn stats.
 
-`purge --memories-retracted` rewrites `memory.jsonl` in place; run it with the daemon stopped and not concurrently with `remember`/`verify`/`forget` — those appends aren't lock-coordinated with a purge in progress.
+`purge --memories-retracted` rewrites `memory.jsonl` in place; it refuses while the daemon is recording. A dedicated `.agentrec/memory.lock` (separate from the daemon's own lock) coordinates it with `remember`/`verify`/`forget`: a concurrent write simply waits for the purge to finish and lands right after — it is never silently lost.
 
 ## License
 

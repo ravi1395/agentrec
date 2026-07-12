@@ -823,6 +823,20 @@ fn spawn_record(root: &Path) -> Child {
         .expect("spawn record")
 }
 
+/// Like `agentrec`/`spawn_record`, but with extra env vars set on the child —
+/// used by the F4 tests below to drive `AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS`.
+fn spawn_agentrec_with_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .args(["--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn agentrec")
+}
+
 fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -929,6 +943,302 @@ fn purge_memories_retracted_refuses_while_daemon_running() {
     assert_eq!(
         archive_count, 0,
         "no archive file may be created on refusal"
+    );
+}
+
+// ---- F4: dedicated memory.lock closes the purge/append probe->act race ----
+//
+// The daemon-liveness refusal above only ever protects against the daemon.
+// It does nothing for a MANUAL writer (`remember`/`verify`/`forget`) racing a
+// concurrent `purge --memories-retracted`: purge reads memory.jsonl, computes
+// its survivor set, then (pre-F4) rewrites the file with no lock held at all
+// — a manual append landing in that window was silently clobbered by the
+// rewrite. F4 adds a dedicated `.agentrec/memory.lock` that purge holds
+// (non-blocking) across its whole read->archive->rewrite->rename sequence,
+// and every writer now blocks on that same lock rather than racing it.
+//
+// `AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS` (purgecmd.rs) widens the
+// window between purge's archive-fsync and its atomic rewrite long enough for
+// these tests to land a concurrent writer deterministically inside it, using
+// the archive file's appearance on disk as the observable "purge has read
+// and archived, is now paused right before the rewrite" marker — no sleeps
+// guessing at timing.
+
+/// Core F4 acceptance test: a `remember` that starts while purge is paused
+/// mid-rewrite must still have its record survive the rewrite.
+///
+/// RED (pre-F4, no `memory.lock`): `remember`'s unlocked `append_memory`
+/// call succeeds immediately, appending its line to `memory.jsonl` on disk
+/// while purge is paused — but purge already captured `survivor_lines` from
+/// its EARLIER read, before that append happened. When purge's pause ends
+/// and its atomic rewrite lands, it overwrites `memory.jsonl` with only the
+/// old survivors, silently erasing the concurrent `remember`. Confirmed by
+/// running this exact test against the code as it stood before this commit
+/// (writers calling `agentrec_core::memory::append_memory` directly, no
+/// lock anywhere): it fails — the new fact is absent from the post-purge
+/// store, and `remember` returns near-instantly (it was never blocked).
+/// GREEN (post-F4): `remember` blocks on `memory.lock` for (most of) the
+/// pause — proven by wall-clock elapsed time, not just eventual presence —
+/// and only appends after purge's rename has landed, so the final store has
+/// BOTH the rewritten survivors AND the new fact, and the archive is
+/// untouched.
+#[test]
+fn purge_rewrite_never_loses_concurrent_append() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // A live memory that must survive the rewrite untouched — part of the
+    // "old survivors" set purge captures before it pauses.
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "the daemon uses signal-tailer offsets",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    // A retracted-and-expired chain, so purge actually reaches the
+    // archive+rewrite (an empty candidate set would take the fast "0
+    // chains" path and never pause at all).
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--memories-retracted"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS", "3000")],
+    );
+
+    // Observable proof purge has read + archived and is now paused
+    // immediately before the rewrite that would otherwise clobber a
+    // concurrent append.
+    let archive_path = poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("memory.archived.")
+            })
+            .map(|e| e.path())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // While purge is paused, a concurrent writer appends a brand-new fact.
+    let write_started = Instant::now();
+    let out = agentrec(
+        root,
+        &["remember", "a fresh fact pinned to a.rs", "--from", "a.rs"],
+    );
+    let write_elapsed = write_started.elapsed();
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let purge_status = purge.wait().expect("purge exited");
+    assert!(purge_status.success(), "purge itself must succeed");
+
+    // Proof the writer genuinely BLOCKED on memory.lock for (most of) the
+    // pause, rather than racing in and getting lucky.
+    assert!(
+        write_elapsed >= Duration::from_millis(1500),
+        "remember returned in {write_elapsed:?} — too fast to have waited \
+         for purge's lock; the writer is not actually blocking on memory.lock"
+    );
+
+    let effective = agentrec_core::memory::load_effective(root).unwrap();
+    assert!(
+        effective.iter().any(|m| m.fact.contains("fresh fact")),
+        "the concurrent remember's fact must survive purge's rewrite: {effective:?}"
+    );
+    assert!(
+        effective.iter().any(|m| m.id == "live1"),
+        "pre-existing live memory must also survive: {effective:?}"
+    );
+    assert!(
+        !effective.iter().any(|m| m.id == "retracted_old"),
+        "retracted_old was archived by this same purge and must be gone \
+         from memory.jsonl: {effective:?}"
+    );
+
+    // Archive is intact and correct — the concurrent append never touched
+    // it (archive-then-rewrite ordering, and the lock, are both undisturbed
+    // by a writer that landed after the rewrite).
+    let archive_text = std::fs::read_to_string(&archive_path).unwrap();
+    let archive_ids: Vec<Option<String>> = archive_text.lines().map(mem_line_id).collect();
+    assert_eq!(
+        archive_ids.len(),
+        2,
+        "archive must still hold exactly retracted_old's 2 records: {archive_ids:?}"
+    );
+    assert!(
+        archive_ids
+            .iter()
+            .all(|id| id.as_deref() == Some("retracted_old")),
+        "archive must contain only retracted_old's records: {archive_ids:?}"
+    );
+}
+
+/// Companion to the above: `verify --confirm` and `forget` (not just
+/// `remember`) also route through `memory.lock`. Two DIFFERENT manual
+/// writers, both started while purge is paused mid-rewrite, must both
+/// eventually land — serialized by the lock, neither silently dropped —
+/// rather than either racing purge's rewrite or failing outright on
+/// contention.
+///
+/// RED (pre-F4): both `verify --confirm` and `forget` call unlocked
+/// `append_memory` directly; whichever of them (or purge's rewrite) lands
+/// last during the pause wins, silently discarding the others' appends —
+/// this test's presence/absence assertions fail non-deterministically
+/// depending on interleaving, and reliably fail under the widened pause
+/// window used here.
+/// GREEN (post-F4): both block on `memory.lock`, are serialized by the OS
+/// (one after the other, after purge's rename), and both end up recorded.
+#[test]
+fn remember_waits_or_fails_cleanly_during_purge() {
+    use agentrec_core::memory::{append_memory, MemoryOp};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("c.rs"), b"fn c() {}").unwrap();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    const DAY_MS: u64 = 86_400_000;
+
+    // `live1` will be retracted (via `forget`) by one of the two concurrent
+    // writers below — its pin path doesn't need to exist on disk since
+    // `forget` never re-hashes pins, only carries them forward.
+    append_memory(
+        root,
+        &mem_rec(
+            "live1",
+            MemoryOp::Assert,
+            "old build script used make",
+            now_ms,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Assert,
+            "prototype used sqlite for storage",
+            now_ms - 150 * DAY_MS,
+        ),
+    )
+    .unwrap();
+    append_memory(
+        root,
+        &mem_rec(
+            "retracted_old",
+            MemoryOp::Retract,
+            "prototype used sqlite for storage",
+            now_ms - 100 * DAY_MS,
+        ),
+    )
+    .unwrap();
+
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--memories-retracted"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS", "3000")],
+    );
+
+    poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("memory.archived.")
+            })
+            .map(|_| ())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // Two independent writers, spawned concurrently (both real, separate
+    // processes), both attempting to touch memory.jsonl while purge holds
+    // the lock paused.
+    let spawn_started = Instant::now();
+    let mut forget_child = spawn_agentrec_with_env(root, &["forget", "live1"], &[]);
+    let mut remember_child = spawn_agentrec_with_env(
+        root,
+        &["remember", "a second concurrent fact", "--from", "c.rs"],
+        &[],
+    );
+
+    let forget_status = forget_child.wait().expect("forget exited");
+    let remember_status = remember_child.wait().expect("remember exited");
+    let spawn_elapsed = spawn_started.elapsed();
+
+    let purge_status = purge.wait().expect("purge exited");
+    assert!(purge_status.success(), "purge itself must succeed");
+
+    // Both concurrent writers must land cleanly — waiting, never a silent
+    // drop or a contention error.
+    assert!(
+        forget_status.success(),
+        "forget must succeed (wait, not fail)"
+    );
+    assert!(
+        remember_status.success(),
+        "remember must succeed (wait, not fail)"
+    );
+    assert!(
+        spawn_elapsed >= Duration::from_millis(1500),
+        "both writers returned in {spawn_elapsed:?} combined — too fast to \
+         have waited for purge's lock"
+    );
+
+    let effective = agentrec_core::memory::load_effective(root).unwrap();
+    let live1 = effective
+        .iter()
+        .find(|m| m.id == "live1")
+        .expect("live1 must still be present (retracted, not deleted)");
+    assert!(
+        live1.retracted,
+        "forget's retraction must have landed: {live1:?}"
+    );
+    assert!(
+        effective
+            .iter()
+            .any(|m| m.fact.contains("second concurrent fact")),
+        "remember's fact must have landed: {effective:?}"
     );
 }
 

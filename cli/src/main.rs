@@ -6,6 +6,7 @@ mod daemon;
 mod doctorcmd;
 mod fmt;
 mod initcmd;
+mod memlock;
 mod memorycmds;
 mod purgecmd;
 mod readcmds;
@@ -137,8 +138,9 @@ enum Command {
         snapshots_before: Option<String>,
         /// Archive (never delete) fully-retracted memory chains older than
         /// ttl_days into `.agentrec/memory.archived.<ts>.jsonl`. Rewrites
-        /// memory.jsonl in place — run with the daemon stopped and not
-        /// concurrently with remember/verify/forget.
+        /// memory.jsonl in place — refuses while the daemon is recording;
+        /// concurrent remember/verify/forget are lock-serialized (they wait,
+        /// never lost).
         #[arg(long = "memories-retracted")]
         memories_retracted: bool,
     },
