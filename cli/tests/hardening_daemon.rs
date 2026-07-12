@@ -8,6 +8,7 @@
 //! another concurrent hardening pass) — helpers below are intentionally
 //! duplicated rather than shared, to avoid touching that file.
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -33,6 +34,19 @@ fn spawn_record(root: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn record")
+}
+
+/// Like `spawn_record`, but with extra environment variables — used by the
+/// D-M6 crash-window test to set `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS`.
+fn spawn_record_with_env(root: &Path, envs: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn record")
 }
 
 fn send_hook(root: &Path, payload: &str) {
@@ -74,6 +88,43 @@ fn append_signal_line(root: &Path, line: &str) {
         .open(path)
         .expect("open signal.jsonl");
     writeln!(f, "{line}").unwrap();
+}
+
+/// Appends several raw lines to `signal.jsonl` in a SINGLE `write_all` call.
+/// `write()` on a regular file opened `O_APPEND` is atomic — the whole buffer
+/// lands or none of it does — so this guarantees `lines` land in the file
+/// together, with no window in which the daemon's tailer could observe only
+/// a prefix. Used to force two signals (a `start` and a `memory-candidate`)
+/// into the SAME `SignalTailer::poll()` batch, which the D-M6 race requires;
+/// two separate `append_signal_line` calls would only make that likely, not
+/// certain.
+fn append_signal_lines_atomic(root: &Path, lines: &[String]) {
+    let path = root.join(".agentrec/signal.jsonl");
+    let mut buf = String::new();
+    for line in lines {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open signal.jsonl");
+    f.write_all(buf.as_bytes()).unwrap();
+}
+
+/// A raw `start` bracket signal (PROTOCOL §4), ready for
+/// `append_signal_lines_atomic` — bypasses `agentrec hook`'s subprocess spawn
+/// so it can be combined with a candidate line in one atomic write.
+fn start_signal(session: &str) -> String {
+    serde_json::json!({
+        "v": 1,
+        "ts": 1_700_000_000_000u64,
+        "tool": "claude-code",
+        "event": "start",
+        "session": session,
+    })
+    .to_string()
 }
 
 /// Every line of `.agentrec/memory.jsonl`, parsed. Absent file = empty vec.
@@ -551,5 +602,137 @@ fn candidate_secret_fact_scrubbed_on_disk() {
     assert!(
         !memory_text.contains("AKIAABCDEFGHIJKLMNOP"),
         "raw key must not appear anywhere in memory.jsonl: {memory_text}"
+    );
+}
+
+// ---- D-M6: dangling source_turns on a same-batch [start, candidate] crash --
+
+// Independent adversarial review found: when a `start` signal and a
+// `memory-candidate` signal land in the SAME polled batch, the daemon's
+// bracket-open reserves a turn id purely in memory
+// (`TurnEngine::open_turn_id`), then `ingest_candidate` durably fsyncs a
+// memory record whose `source_turns` names that id — all BEFORE the
+// once-per-loop-iteration `sync_journal` call (which runs only after the
+// whole `for sig in tailer.poll(...)` loop finishes) ever makes the open
+// turn recoverable. A kill-9 landing in that window means: on restart,
+// `recover_orphan` finds no crash journal, so the turn is never written to
+// `log.jsonl` — the memory record's `source_turns` id dangles, referencing a
+// turn that does not exist. This defeats the entire point of reserving the
+// id at open time (PROTOCOL.md memory-candidate design): `source_turns` is
+// supposed to be a real, always-resolvable reference.
+//
+// The real window is a handful of in-process instructions wide (same loop
+// iteration, no I/O in between beyond the two fsyncs) — far too narrow for
+// an external test process to land a SIGKILL inside via timing alone. This
+// test widens it deterministically instead of hoping for luck: the daemon
+// under test is started with `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS` set,
+// which makes it sleep for several seconds immediately after
+// `ingest_candidate` durably persists the candidate — i.e. still inside the
+// real race window, just held open long enough for the test to land its
+// kill with certainty. `append_signal_lines_atomic` guarantees the `start`
+// and candidate land in the daemon's SAME poll() batch (a single O_APPEND
+// `write()` on a regular file is atomic), which is the race's precondition.
+//
+// Coverage note: this proves the exact ordering hazard described above —
+// candidate-persisted-before-journaled, same batch, kill before the
+// post-loop journal sync would otherwise run. It does not (and cannot, from
+// outside the process) prove anything about crash windows narrower than one
+// full statement, e.g. a kill landing between `fs::write` and `fs::rename`
+// inside `sync_journal` itself — that residual is far narrower still and
+// out of scope for this fix.
+//
+// RED (pre-fix): the pause sits entirely inside `ingest_candidate`, which
+// runs BEFORE the post-loop `sync_journal` call, so no journal is ever
+// written before the kill — `recover_orphan` finds nothing, the turn is
+// never recovered, and `referenced_id` is absent from `log.jsonl` post-
+// restart: the assertion below fails.
+// GREEN (post-fix): the batch loop now calls `sync_journal` up front, before
+// `ingest_candidate`, whenever a candidate arrives with a turn open — the
+// journal (naming the same reserved id) is written and renamed into place
+// before the candidate is even persisted, long before the pause is reached.
+// `recover_orphan` on restart finds it, logs a truncated-rich turn under
+// exactly `referenced_id`, and the assertion passes.
+#[test]
+fn dangling_source_turns_closed_by_pre_persist_journal_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    let mut daemon =
+        spawn_record_with_env(root, &[("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS", "4000")]);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // One atomic write puts both lines in the SAME poll() batch: the
+    // candidate's source_turns will name the id the start signal reserves
+    // moments earlier, in that very batch.
+    let candidate = memory_signal("the daemon debounces bursts for 1.5s", &["notes.txt"]);
+    append_signal_lines_atomic(root, &[start_signal("s_dangle"), candidate]);
+
+    // The candidate is durably fsynced to memory.jsonl; thanks to the env
+    // var, the daemon then parks for 4s still inside the pre-fix race
+    // window (before the post-loop journal sync would otherwise run).
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let m = memories(root);
+        (!m.is_empty()).then_some(m)
+    });
+    let recs = recorded.expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    let source_turns = recs[0]["source_turns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        source_turns.len(),
+        1,
+        "candidate must reference the open turn reserved in the same batch: {:?}",
+        recs[0]
+    );
+    let referenced_id = source_turns[0]
+        .as_str()
+        .expect("source_turns[0] is a string")
+        .to_string();
+
+    // Kill -9 while the daemon is still parked in the pause — i.e. strictly
+    // before the post-loop `sync_journal` call could run on unfixed code.
+    daemon.kill().expect("kill -9 the daemon");
+    let _ = daemon.wait();
+
+    // Restart: recover_orphan runs before the new epoch is appended, so by
+    // the time a second "start" epoch is visible, recovery has already
+    // happened (or not, if there was no journal to recover).
+    let mut second = spawn_record(root);
+    let restarted = poll_until(Duration::from_secs(5), || {
+        let starts = epoch_events(root)
+            .iter()
+            .filter(|e| e.as_str() == "start")
+            .count();
+        (starts >= 2).then_some(())
+    });
+    assert!(restarted.is_some(), "second daemon never started");
+    // Let the fresh daemon settle briefly, then shut it down cleanly so it
+    // can't itself mint a fresh turn under the same id and mask a failure.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = second.kill();
+    let _ = second.wait();
+
+    let logged_ids: HashSet<String> = turns(root)
+        .iter()
+        .filter_map(|t| t["id"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        logged_ids.contains(&referenced_id),
+        "DANGLE: memory record's source_turns references turn {referenced_id}, \
+         which never appears in log.jsonl after crash recovery — \
+         logged turn ids: {logged_ids:?}"
     );
 }

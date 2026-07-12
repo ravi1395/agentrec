@@ -170,6 +170,22 @@ pub fn run(root: &Path) -> Result<(), String> {
             // exists to close; see cli/tests/hardening_daemon.rs).
             if sig.is_memory_candidate() {
                 let mut state = read_state(&root);
+                // D-M6: if a turn is open, its id was only RESERVED in
+                // memory (`TurnEngine::open_turn_id`) — the crash journal
+                // that makes it recoverable after a kill-9 is normally
+                // written once per loop iteration, AFTER this whole `for
+                // sig` loop finishes. When a `start` and a `memory-candidate`
+                // land in the SAME polled batch, `ingest_candidate` below
+                // fsyncs a memory record whose `source_turns` names that
+                // reserved id BEFORE the post-loop `sync_journal` call ever
+                // runs. A kill-9 in that window leaves the id durably
+                // referenced in memory.jsonl but recoverable nowhere — the
+                // reference dangles. Force the journal write here, before
+                // the candidate is persisted, so the open turn is always
+                // recoverable before anything references its id.
+                if engine.open_turn_id().is_some() {
+                    sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
+                }
                 ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
                 continue;
             }
@@ -894,8 +910,27 @@ fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_t
         reason: None,
     };
 
-    if agentrec_core::memory::append_memory(root, &rec).is_err() {
-        reject_candidate(root, state);
+    match agentrec_core::memory::append_memory(root, &rec) {
+        Ok(()) => test_pause_after_candidate_persist(),
+        Err(_) => reject_candidate(root, state),
+    }
+}
+
+/// Test-only crash-window widener (`cli/tests/hardening_daemon.rs`,
+/// `dangling_source_turns_closed_by_pre_persist_journal_sync`). The real
+/// D-M6 race — a candidate's `source_turns` fsynced before the open turn it
+/// names is journaled — is a same-iteration, sub-millisecond window; no
+/// external test process can land a SIGKILL inside it reliably. When
+/// `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS` is set (only ever done by that
+/// test), this sleeps for the given duration immediately after a candidate
+/// is durably persisted, holding the daemon inside the exact window the fix
+/// closes long enough for a deterministic external kill. A single env var
+/// read (no-op) when unset — no effect on production behavior or perf.
+fn test_pause_after_candidate_persist() {
+    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
     }
 }
 
