@@ -1208,11 +1208,21 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     // `remove_file(&path)` a few lines down (or the equivalent window in the
     // steady-state journal-close path) leaves the journal on disk describing
     // a turn that's ALREADY in log.jsonl. Recovering it again on the next
-    // startup would double-log the same turn. Idempotent by construction:
-    // before appending, check whether the tail of the log already has a turn
-    // for this root with this exact start/end and file set — if so, this is
-    // a replay of a recovery that already landed; just clean up the journal.
-    if already_logged(root, &journal.root, &started, &ended, &journal.files) {
+    // startup would double-log the same turn — and since the id was reserved
+    // at OPEN, that duplicate carries the SAME id, breaking `undo` with an
+    // "ambiguous turn id". Idempotent by construction: skip if a turn with
+    // this reserved id (or, for legacy pre-reserved-id journals, this exact
+    // root/start/end/file set) already sits in the log tail. See
+    // `already_logged` for why the id key is load-bearing (`ended` drifts
+    // between the persist path and recovery).
+    if already_logged(
+        root,
+        &journal.id,
+        &journal.root,
+        &started,
+        &ended,
+        &journal.files,
+    ) {
         let _ = std::fs::remove_file(&path);
         eprintln!(
             "agentrec: crash journal matches an already-logged turn — skipping duplicate recovery"
@@ -1265,13 +1275,24 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// D8: does the log tail already contain a turn matching this journal's
-/// root + both wall-clock endpoints + exact file set? Bounded to the most
-/// recent 50 records — a duplicate-recovery replay is always near the tail
-/// (it can only happen across back-to-back crashes), so there's no reason to
-/// scan the whole history.
+/// D8: does the log tail already contain the turn this journal describes?
+/// Bounded to the most recent 50 records — a duplicate-recovery replay is
+/// always near the tail (it can only happen across back-to-back crashes),
+/// so there's no reason to scan the whole history.
+///
+/// Idempotent by turn `id` first (the canonical unique key, stable across
+/// open -> journal -> recovery now that ids are RESERVED AT OPEN): if a turn
+/// with this reserved id is already logged, this journal is a replay of a
+/// close/recovery that already landed — even when the logged turn's `ended`
+/// drifted from the journal's recomputed one (a turn closed by an incoming
+/// start signal is logged at the start time, not `last_change`). The
+/// root+times+files match is retained as a fallback for journals written by
+/// a pre-reserved-id daemon binary across an upgrade: their `id` deserializes
+/// to a fresh ULID (`#[serde(default)]`) that can't match anything logged, so
+/// the original content-based D8 guarantee still holds for them.
 fn already_logged(
     root: &Path,
+    id: &str,
     journal_root: &str,
     started: &str,
     ended: &str,
@@ -1280,10 +1301,11 @@ fn already_logged(
     let records = agentrec_core::record::load_log(&log_path(root));
     records.iter().rev().take(50).any(|r| match r {
         LogRecord::Turn(t) => {
-            t.root == journal_root
-                && t.started == started
-                && t.ended == ended
-                && files_match(&t.files, files)
+            t.id == id
+                || (t.root == journal_root
+                    && t.started == started
+                    && t.ended == ended
+                    && files_match(&t.files, files))
         }
         LogRecord::Epoch(_) => false,
     })
@@ -2011,6 +2033,88 @@ mod tests {
             !open_path(root).exists(),
             "the stale journal is still cleaned up on the duplicate path"
         );
+    }
+
+    // Regression: a turn closed by an incoming *start* signal is logged with
+    // `ended` = the start time (engine `observe_start` closes at `now`, not
+    // `last_change_at`), but its crash journal was written earlier carrying
+    // `last_change_wall_ms` < that. A kill-9 in the persist->sync_journal
+    // window leaves that stale journal; on restart `recover_orphan`
+    // recomputes `ended` from `last_change` and it no longer matches the
+    // logged turn. Because turn ids are now RESERVED AT OPEN, the journal and
+    // the already-logged turn share the SAME id — a content-only idempotency
+    // check misses the drift and re-appends that id, producing an "ambiguous
+    // turn id" that breaks `undo`. Dedup must key on the (unique, stable)
+    // turn id, not just root+times+files.
+    #[test]
+    fn recover_orphan_skips_duplicate_by_id_even_when_ended_drifted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let files = vec![FileEntry {
+            path: "a.rs".into(),
+            before: None,
+            after: Some("sha256:aaa".into()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }];
+
+        let id = turn_id();
+        // Logged turn: closed at now=3_000 (a later start signal), NOT at
+        // last_change=2_000.
+        let existing = TurnRecord {
+            v: 1,
+            id: id.clone(),
+            grade: "bare".to_string(),
+            truncated: false,
+            started: rfc3339(1_000),
+            ended: rfc3339(3_000),
+            tool: None,
+            model: None,
+            session: None,
+            root: root.to_string_lossy().to_string(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            files: files.clone(),
+        };
+        append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
+
+        // Journal written before the close, same reserved id, last_change
+        // 2_000 -> recover_orphan recomputes ended = rfc3339(2_000) != 3_000.
+        let journal = OrphanJournal {
+            source: "quiet".to_string(),
+            tool: None,
+            prompt: None,
+            session: None,
+            opened_wall_ms: 1_000,
+            last_change_wall_ms: 2_000,
+            root: root.to_string_lossy().to_string(),
+            files,
+            id: id.clone(),
+        };
+        std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
+
+        recover_orphan(root).unwrap();
+
+        let turns: Vec<_> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let with_id = turns.iter().filter(|t| t.id == id).count();
+        assert_eq!(
+            with_id, 1,
+            "the reserved id must appear exactly once — a drifted `ended` must \
+             not defeat idempotency and re-log the same id (ambiguous `undo`)"
+        );
+        assert_eq!(turns.len(), 1, "no duplicate turn appended");
+        assert!(!open_path(root).exists(), "stale journal cleaned up");
     }
 
     // A genuinely new orphaned turn (different times/files than anything
