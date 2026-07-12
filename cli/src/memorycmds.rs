@@ -134,9 +134,59 @@ fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Max facts injected into a `--for-hook` block (design spec
-/// `memory_inject_max`; hardcoded here, config wiring is Task 9).
-const HOOK_MAX_FACTS: usize = 5;
+/// Read `memory_enabled` from `.agentrec/config.toml` — mirrors
+/// `purgecmd::read_ttl_days`'s hand-rolled `key = value` scan (not worth a
+/// `toml` dependency for two more keys). Missing file, missing key, or an
+/// unparseable value all fall back to the documented default of `true`.
+pub fn read_memory_enabled(root: &Path) -> bool {
+    let path = crate::agentrec_dir(root).join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return true;
+    };
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("memory_enabled") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        match value.trim() {
+            "true" => return true,
+            "false" => return false,
+            _ => continue,
+        }
+    }
+    true
+}
+
+/// Read `memory_inject_max` from `.agentrec/config.toml` — same scanning
+/// pattern as [`read_memory_enabled`] / `purgecmd::read_ttl_days`. Missing
+/// file, missing key, or an unparseable value all fall back to
+/// [`HOOK_MAX_FACTS_DEFAULT`].
+pub fn read_memory_inject_max(root: &Path) -> usize {
+    let path = crate::agentrec_dir(root).join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HOOK_MAX_FACTS_DEFAULT;
+    };
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("memory_inject_max") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if let Ok(n) = value.trim().parse::<usize>() {
+            return n;
+        }
+    }
+    HOOK_MAX_FACTS_DEFAULT
+}
+
+/// Default `memory_inject_max` (design spec) when `config.toml` has no such
+/// key — `agentrec recall --for-hook`'s own `-k` default matches this.
+pub const HOOK_MAX_FACTS_DEFAULT: usize = 5;
 /// Max total chars (fence lines included) of a `--for-hook` block.
 const HOOK_MAX_CHARS: usize = 800;
 
@@ -163,30 +213,19 @@ pub fn recall_cmd(
     json: bool,
     for_hook: bool,
 ) -> Result<(), String> {
-    if !crate::agentrec_dir(root).is_dir() {
-        if for_hook {
-            return Ok(());
-        }
-        return Err("not initialized — run `agentrec init`".to_string());
-    }
-
-    let hits = match memory::recall(root, query, k) {
-        Ok(v) => v,
-        Err(e) => {
-            if for_hook {
-                return Ok(());
-            }
-            return Err(e);
-        }
-    };
-
     if for_hook {
-        let block = build_hook_block(&hits);
+        let block = recall_for_hook(root, query, k);
         if !block.is_empty() {
             print!("{block}");
         }
         return Ok(());
     }
+
+    if !crate::agentrec_dir(root).is_dir() {
+        return Err("not initialized — run `agentrec init`".to_string());
+    }
+
+    let hits = memory::recall(root, query, k)?;
 
     if json {
         let arr: Vec<EffectiveJson> = hits
@@ -265,21 +304,44 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
     Ok(())
 }
 
+/// Task 9: the recall-for-hook logic, shared IN-PROCESS by `agentrec recall
+/// --for-hook` (Task 5, CLI `-k`) and `cmds::hook`'s UserPromptSubmit arm
+/// (Task 9, config-driven `memory_inject_max`) — never a subprocess. Fail-
+/// open on every edge (uninitialized repo, corrupt store, any
+/// `memory::recall` error): always returns `""`, never panics.
+///
+/// `max_facts` feeds BOTH the `k` passed to `memory::recall` AND
+/// `build_hook_block`'s per-block cap — this is the fix for the coupling bug
+/// a prior review flagged: passing `max_facts` only to one side would let a
+/// `memory_inject_max=10` config get silently capped at the old hardcoded
+/// `HOOK_MAX_FACTS_DEFAULT=5` (`build_hook_block` still took at most 5 lines
+/// regardless of how many `recall` returned).
+pub fn recall_for_hook(root: &Path, query: &str, max_facts: usize) -> String {
+    if !crate::agentrec_dir(root).is_dir() {
+        return String::new();
+    }
+    let hits = match memory::recall(root, query, max_facts) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    build_hook_block(&hits, max_facts)
+}
+
 /// Builds the exact `--for-hook` fenced block (Task 9's parse contract):
 /// ```text
 /// ```agentrec memory
 /// - <fact>  [pins: <p1>, <p2>]
 /// ```
 /// ```
-/// Takes at most `HOOK_MAX_FACTS` of `hits` (already rank-ordered, Fresh
-/// only), then — if the rendered block still exceeds `HOOK_MAX_CHARS` —
-/// drops whole trailing (lowest-ranked) facts, never truncates a line mid-
-/// way, until it fits or nothing is left (-> `""`, meaning "print nothing").
-/// No id or hash ever appears in a line.
-fn build_hook_block(hits: &[EffectiveMemory]) -> String {
+/// Takes at most `max_facts` of `hits` (already rank-ordered, Fresh only),
+/// then — if the rendered block still exceeds `HOOK_MAX_CHARS` — drops whole
+/// trailing (lowest-ranked) facts, never truncates a line mid-way, until it
+/// fits or nothing is left (-> `""`, meaning "print nothing"). No id or hash
+/// ever appears in a line.
+fn build_hook_block(hits: &[EffectiveMemory], max_facts: usize) -> String {
     let mut lines: Vec<String> = hits
         .iter()
-        .take(HOOK_MAX_FACTS)
+        .take(max_facts)
         .map(|m| {
             let pins: Vec<&str> = m.pins.iter().map(|p| p.path.as_str()).collect();
             format!("- {}  [pins: {}]", m.fact, pins.join(", "))

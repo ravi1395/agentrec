@@ -46,6 +46,25 @@ fn send_hook(root: &Path, payload: &str) {
     child.wait().unwrap();
 }
 
+/// Like [`send_hook`] but captures stdout/status instead of discarding it —
+/// Task 9's memory-injection block is written to stdout.
+fn send_hook_capture(root: &Path, payload: &str) -> Output {
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 /// Turn records currently in the log (epoch lines skipped).
 fn turns(root: &Path) -> Vec<serde_json::Value> {
     let path = root.join(".agentrec/log.jsonl");
@@ -3481,4 +3500,257 @@ fn candidate_startup_replay_is_candidate_only_and_preserves_d7() {
         "a stale start/stop bracket in the pre-daemon gap was replayed and \
          minted a phantom turn — D7's EOF-skip must still drop start/stop: {phantom:?}"
     );
+}
+
+// --- Task 9: UserPromptSubmit hook memory injection (INV-M4).
+
+/// `.agentrec/signal.jsonl` lines parsed as JSON, in file order.
+fn signal_events(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// `.agentrec/memory-stats.jsonl` lines parsed as JSON, in file order.
+fn memory_stats_lines(root: &Path) -> Vec<serde_json::Value> {
+    let text =
+        std::fs::read_to_string(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+#[test]
+fn hook_injects_fresh_memories_into_stdout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Matching prompt -> stdout carries the fenced block + the fact; the
+    // start signal (existing behavior) still lands; memory-stats.jsonl
+    // gains exactly one line.
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"nightly seed"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("```agentrec memory"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("nightly seed rotation keeps torture runs reproducible"),
+        "stdout: {stdout}"
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal missing after hook call: {events:?}"
+    );
+
+    let stats = memory_stats_lines(root);
+    assert_eq!(stats.len(), 1, "expected one memory-stats line: {stats:?}");
+    assert!(stats[0].get("ts").and_then(|v| v.as_u64()).is_some());
+    assert_eq!(stats[0].get("n").and_then(|v| v.as_u64()), Some(1));
+
+    // Non-matching prompt -> empty stdout, no new memory-stats line.
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"zebra quantum"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "non-matching prompt must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "no injection -> no new memory-stats line"
+    );
+
+    // memory_enabled = false -> no block, even for a matching prompt.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = false\n",
+    )
+    .unwrap();
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s3","prompt":"nightly seed"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "memory_enabled=false must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "memory_enabled=false -> no new memory-stats line"
+    );
+
+    // The Stop arm is untouched: no block, no memory-stats line, even for a
+    // "matching" prompt field (which Stop payloads don't carry anyway).
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = true\n",
+    )
+    .unwrap();
+    let payload = r#"{"hook_event_name":"Stop","session_id":"s1"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook (Stop) failed: {out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "Stop arm must never print a memory block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        memory_stats_lines(root).len(),
+        1,
+        "Stop arm must never append to memory-stats.jsonl"
+    );
+
+    // Bonus (coupling proof): memory_inject_max > the old hardcoded default
+    // of 5 actually injects more than 5 facts — proves `max_facts` feeds
+    // both `memory::recall`'s `k` and `build_hook_block`'s per-block cap.
+    for i in 0..7 {
+        let rel = format!("src/m{i}.rs");
+        std::fs::write(root.join(&rel), b"fn m() {}").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                &format!("nightly seed shard {i} rotation detail"),
+                "--from",
+                &rel,
+            ],
+        );
+        assert!(out.status.success(), "remember m{i} failed: {out:?}");
+    }
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\nmemory_enabled = true\nmemory_inject_max = 10\n",
+    )
+    .unwrap();
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s4","prompt":"nightly seed rotation shard"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fact_lines = stdout.lines().filter(|l| l.starts_with("- ")).count();
+    assert!(
+        fact_lines > 5,
+        "memory_inject_max=10 must inject more than the old hardcoded 5 \
+         (coupling fix) — got {fact_lines} lines: {stdout}"
+    );
+}
+
+#[test]
+fn hook_fail_open_and_budget() {
+    // Corrupt memory.jsonl -> hook still exits 0, stdout carries no block,
+    // and the start signal is still appended (INV-M4 fail-open).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            root.join(".agentrec/memory.jsonl"),
+            b"\xff\xfenot json at all garbage bytes\x00\x01",
+        )
+        .unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "corrupt store must emit no stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing despite corrupt memory.jsonl: {events:?}"
+        );
+    }
+
+    // A large store still returns within the (generous, CI-slack) 500ms
+    // wall-clock budget asserted here; the hook's own internal self-budget
+    // is 50ms (RECALL_BUDGET_MS).
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let mut lines = String::new();
+        for i in 0..3000 {
+            let rec = serde_json::json!({
+                "v": 1,
+                "type": "memory",
+                "id": format!("m{i}"),
+                "op": "assert",
+                "fact": format!("filler fact number {i} about nightly seed rotation housekeeping"),
+                "pins": [{
+                    "path": format!("missing{i}.rs"),
+                    "hash": format!("sha256:{i:064}"),
+                }],
+                "source_turns": [],
+                "origin": "agent",
+                "ts": i,
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(root.join(".agentrec/memory.jsonl"), lines).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"nightly seed rotation"}"#;
+        let started = Instant::now();
+        let out = send_hook_capture(root, payload);
+        let elapsed = started.elapsed();
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "hook took too long against a 3000-record store: {elapsed:?}"
+        );
+    }
+
+    // Missing store (never `remember`ed) and a fully uninitialized
+    // `.agentrec/` both exit 0 with no block.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s3","prompt":"anything at all"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(out.stdout.is_empty());
+    }
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path(); // never `init`ed — no .agentrec/ at all yet
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s4","prompt":"anything at all"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(
+            out.status.success(),
+            "hook on an uninitialized repo must exit 0: {out:?}"
+        );
+        assert!(out.stdout.is_empty());
+    }
 }

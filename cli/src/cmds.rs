@@ -3,14 +3,21 @@
 
 use crate::fmt;
 use crate::state::{read_state, write_state};
-use crate::{log_path, objects_dir, signal_path};
+use crate::{log_path, memorycmds, objects_dir, signal_path};
 use agentrec_core::record::{append_log_line, LogRecord, SignalEvent, TurnRecord};
 use agentrec_core::scrub;
 use agentrec_core::store::BlobStore;
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Task 9 (INV-M4): self-measured wall-time budget for the in-process
+/// `recall_for_hook` call inside the UserPromptSubmit hook arm. Exceeding it
+/// discards the computed block (empty output) rather than risk a slow
+/// recall delaying the agent's prompt — measured, not pre-emptively
+/// interrupted, since `recall_for_hook` is synchronous.
+const RECALL_BUDGET_MS: u128 = 50;
 
 /// `log`: turns newest-first. Git turns and superseded (merged) turns are hidden
 /// unless `--all`. Bare turns render without fabricated tool/prompt columns.
@@ -254,10 +261,11 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         "UserPromptSubmit" => "start",
         _ => "stop",
     };
-    let prompt = payload
+    let prompt_raw = payload
         .get("prompt")
         .and_then(|v| v.as_str())
-        .map(scrub::scrub);
+        .map(String::from);
+    let prompt = prompt_raw.as_deref().map(scrub::scrub);
     let session = payload
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -280,7 +288,45 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         pins: None,
     };
     let line = serde_json::to_string(&signal).map_err(|e| e.to_string())?;
-    append_log_line(&signal_path(root), &line)
+    append_log_line(&signal_path(root), &line)?;
+
+    // Task 9 (INV-M4): memory injection is strictly additive to the signal
+    // append above, which — per the existing contract — must ALWAYS happen
+    // regardless of memory outcome. This runs only on the "start" event
+    // (UserPromptSubmit); the Stop arm is untouched. Every failure mode
+    // (disabled, uninitialized, corrupt store, recall error, over budget,
+    // no matches) fails open to "print nothing" — `inject_memory` never
+    // returns an error to this function.
+    if event == "start" && memorycmds::read_memory_enabled(root) {
+        inject_memory(root, prompt_raw.as_deref().unwrap_or(""));
+    }
+
+    Ok(())
+}
+
+/// Recalls fresh matching memories for `query` in-process
+/// (`memorycmds::recall_for_hook`, not a subprocess) and prints the fenced
+/// block to stdout — budgeted and fail-open (INV-M4). Self-measures wall
+/// time around the recall call; past [`RECALL_BUDGET_MS`] the result is
+/// discarded (empty output) even if it computed successfully. On an actual
+/// injection (non-empty block, within budget) appends one line to the
+/// hook-owned `memory-stats.jsonl` — never `state.json`, which only the
+/// daemon writes (the hazard this task is explicitly gated against).
+fn inject_memory(root: &Path, query: &str) {
+    let max_facts = memorycmds::read_memory_inject_max(root);
+    let started = Instant::now();
+    let block = memorycmds::recall_for_hook(root, query, max_facts);
+    let elapsed_ms = started.elapsed().as_millis();
+    if block.is_empty() || elapsed_ms > RECALL_BUDGET_MS {
+        return;
+    }
+    print!("{block}");
+    let n = block.lines().filter(|l| l.starts_with("- ")).count();
+    let stats_line = serde_json::json!({ "ts": wall_now_ms(), "n": n }).to_string();
+    // Best-effort: a memory-stats write failure must not turn a successful
+    // injection into a hook failure (same fail-open posture as the recall
+    // itself).
+    let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
 }
 
 // ---- helpers ----------------------------------------------------------------

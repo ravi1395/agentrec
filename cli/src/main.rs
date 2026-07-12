@@ -267,6 +267,11 @@ pub fn state_path(root: &std::path::Path) -> PathBuf {
 pub fn open_path(root: &std::path::Path) -> PathBuf {
     agentrec_dir(root).join("open.json")
 }
+/// Task 9: hook-owned, append-only injection log — the daemon never reads or
+/// writes this file (`state.json` stays daemon-exclusive; see `cmds::hook`).
+pub fn memory_stats_path(root: &std::path::Path) -> PathBuf {
+    agentrec_dir(root).join("memory-stats.jsonl")
+}
 /// Coordination file for an in-progress `undo --confirm` (AC H7): while it
 /// exists (and hasn't expired), the daemon must not mint a turn for the
 /// listed paths — those writes are undo's own, not agent/human activity.
