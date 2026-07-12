@@ -85,6 +85,100 @@ pub fn memory_path(root: &Path) -> PathBuf {
     root.join(".agentrec").join("memory.jsonl")
 }
 
+/// Derived (never persisted — INV-M2) freshness of a memory's pins against
+/// the current working tree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Freshness {
+    /// Every pinned path exists and hashes to the pinned value.
+    Fresh,
+    /// Every pinned path exists but at least one hash no longer matches.
+    Stale,
+    /// At least one pinned path no longer exists. Checked before `Stale` —
+    /// a missing file is reported as orphaned, not folded into "stale".
+    Orphaned,
+}
+
+/// Validate a pin candidate path and normalize it to a root-relative string.
+///
+/// Rejects (mirrors `store::BlobStore::object_path`'s strict-validation
+/// posture — malformed input never reaches disk logic):
+/// - absolute paths
+/// - any `..` path component, regardless of whether it would normalize back
+///   inside `root` — rejecting unconditionally is simplest and safest, and
+///   matches the design spec's rejected-approaches list (no clever
+///   normalization that could be bypassed).
+/// - paths that don't exist under `root` (canonicalization requires it)
+/// - symlinks that resolve outside `root` (caught by comparing the
+///   canonicalized target against the canonicalized root)
+/// - secret-file paths per `scrub::is_secret_path`
+///
+/// On success, returns the root-relative path as given (already relative,
+/// already `..`-free, verified to live inside `root`).
+pub fn validate_pin_path(root: &Path, path: &str) -> Result<String, String> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Err(format!("pin path must be relative, got absolute: {path}"));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("pin path must not contain '..': {path}"));
+    }
+
+    let canonical_root = fs::canonicalize(root).map_err(|e| {
+        format!(
+            "pin root {} could not be canonicalized: {e}",
+            root.display()
+        )
+    })?;
+    let joined = root.join(candidate);
+    let canonical_target =
+        fs::canonicalize(&joined).map_err(|e| format!("pin path does not exist: {path} ({e})"))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(format!("pin path escapes root: {path}"));
+    }
+
+    if scrub::is_secret_path(path) {
+        return Err(format!(
+            "pin path looks like a secret file, refusing: {path}"
+        ));
+    }
+
+    Ok(path.to_string())
+}
+
+/// Hash the file at `root/rel` right now, as `"sha256:<hex>"` via
+/// `store::hash_bytes` — the same CAS blob-id format used elsewhere.
+pub fn hash_pin(root: &Path, rel: &str) -> Result<String, String> {
+    let bytes = fs::read(root.join(rel))
+        .map_err(|e| format!("could not read pin path {rel} for hashing: {e}"))?;
+    Ok(crate::store::hash_bytes(&bytes))
+}
+
+/// Derive freshness of `pins` against the current working tree. Orphaned
+/// (any pinned path missing) is checked before stale (any hash mismatch) —
+/// orphaned is a labeled sub-case of stale, and takes priority in the
+/// result.
+pub fn pin_freshness(root: &Path, pins: &[Pin]) -> Freshness {
+    let mut any_stale = false;
+    for p in pins {
+        match hash_pin(root, &p.path) {
+            Ok(current) => {
+                if current != p.hash {
+                    any_stale = true;
+                }
+            }
+            Err(_) => return Freshness::Orphaned,
+        }
+    }
+    if any_stale {
+        Freshness::Stale
+    } else {
+        Freshness::Fresh
+    }
+}
+
 /// Validate and append one memory record. Fsynced (mirrors `record.rs`
 /// turn-close durability — a memory write must survive a kill-9 immediately
 /// after this call returns `Ok`).
@@ -418,5 +512,96 @@ mod tests {
         .unwrap();
         let effective = load_effective(root).unwrap();
         assert!(effective.iter().any(|m| m.id == "E5"));
+    }
+
+    // INV-M1 core: pin path validation rejects absolute paths, `..`
+    // traversal (however it normalizes), symlink escape out of root, and
+    // secret-file names — each with an error mentioning the offending
+    // path/reason. A nonexistent file is rejected (can't hash what isn't
+    // there). A legitimate in-root file normalizes to a root-relative path.
+    #[test]
+    fn pin_path_rejections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/ok.rs"), b"fn main() {}").unwrap();
+
+        let err = validate_pin_path(root, "/etc/passwd").unwrap_err();
+        assert!(err.contains("/etc/passwd"), "absolute-path error: {err}");
+
+        let err = validate_pin_path(root, "../x").unwrap_err();
+        assert!(err.contains("../x"), "traversal error: {err}");
+
+        let err = validate_pin_path(root, "a/../../x").unwrap_err();
+        assert!(err.contains("a/../../x"), "traversal error: {err}");
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("secret.rs"), b"outside").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("escape.rs"))
+                .unwrap();
+            let err = validate_pin_path(root, "escape.rs").unwrap_err();
+            assert!(err.contains("escape.rs"), "symlink-escape error: {err}");
+        }
+
+        fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        let err = validate_pin_path(root, ".env").unwrap_err();
+        assert!(err.contains("secret"), "secret-path error: {err}");
+
+        fs::write(root.join("key.pem"), b"-----BEGIN-----").unwrap();
+        let err = validate_pin_path(root, "key.pem").unwrap_err();
+        assert!(err.contains("secret"), "secret-path error: {err}");
+
+        let err = validate_pin_path(root, "ghost.rs").unwrap_err();
+        assert!(err.contains("ghost.rs"), "nonexistent-file error: {err}");
+
+        let ok = validate_pin_path(root, "src/ok.rs").unwrap();
+        assert_eq!(ok, "src/ok.rs");
+    }
+
+    // INV-M1 core: freshness is derived, never persisted. Pinning a file
+    // (hash now) yields Fresh; overwriting its content yields Stale;
+    // deleting it yields Orphaned (checked before Stale); with two pins,
+    // changing only one still yields Stale for the whole set.
+    #[test]
+    fn freshness_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+        fs::write(root.join("b.rs"), b"fn b() {}").unwrap();
+
+        let hash_a = hash_pin(root, "a.rs").unwrap();
+        let hash_b = hash_pin(root, "b.rs").unwrap();
+
+        let one_pin = vec![Pin {
+            path: "a.rs".to_string(),
+            hash: hash_a.clone(),
+        }];
+        assert_eq!(pin_freshness(root, &one_pin), Freshness::Fresh);
+
+        fs::write(root.join("a.rs"), b"fn a() { changed(); }").unwrap();
+        assert_eq!(pin_freshness(root, &one_pin), Freshness::Stale);
+
+        fs::remove_file(root.join("a.rs")).unwrap();
+        assert_eq!(pin_freshness(root, &one_pin), Freshness::Orphaned);
+
+        let two_pins = vec![
+            Pin {
+                path: "a.rs".to_string(),
+                hash: hash_a,
+            },
+            Pin {
+                path: "b.rs".to_string(),
+                hash: hash_b,
+            },
+        ];
+        // a.rs deleted above -> Orphaned takes priority over b.rs still
+        // matching.
+        assert_eq!(pin_freshness(root, &two_pins), Freshness::Orphaned);
+
+        fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
+        fs::write(root.join("b.rs"), b"fn b() { changed(); }").unwrap();
+        assert_eq!(pin_freshness(root, &two_pins), Freshness::Stale);
     }
 }
