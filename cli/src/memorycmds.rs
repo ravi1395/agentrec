@@ -767,10 +767,19 @@ pub fn recall_for_hook(root: &Path, query: &str, max_facts: usize) -> String {
 /// `memory-stats.jsonl` ONLY — this struct's `block` never carries the
 /// capped notice text; the `--for-hook`/hook stdout contract (block or
 /// nothing, exit 0 always) is unconditional and F3 does not touch it.
+///
+/// `store_corrupt` (F10) mirrors `memory::RecallOutcome::store_corrupt` —
+/// set when `memory.jsonl` exists, is non-empty, and contains at least one
+/// unreadable line or unparseable non-empty record. `block` is always empty
+/// when it is `true` (a corrupt store never leaks a partial fact); the
+/// caller (`cmds::inject_memory`) records ONE
+/// `{"failure":true,"reason":"store_corrupt"}` stat line, distinct from
+/// `budget_exceeded`.
 pub struct HookRecallOutcome {
     pub block: String,
     pub budget_exceeded: bool,
     pub capped: bool,
+    pub store_corrupt: bool,
 }
 
 /// F2 (founder decision, option (a)): the hard-deadline twin of
@@ -794,6 +803,7 @@ pub fn recall_for_hook_with_deadline(
             block: String::new(),
             budget_exceeded: false,
             capped: false,
+            store_corrupt: false,
         };
     }
     match memory::recall_with_deadline(root, query, max_facts, deadline) {
@@ -801,16 +811,25 @@ pub fn recall_for_hook_with_deadline(
             block: String::new(),
             budget_exceeded: true,
             capped: false,
+            store_corrupt: false,
+        },
+        Ok(outcome) if outcome.store_corrupt => HookRecallOutcome {
+            block: String::new(),
+            budget_exceeded: false,
+            capped: false,
+            store_corrupt: true,
         },
         Ok(outcome) => HookRecallOutcome {
             block: build_hook_block(&outcome.hits, max_facts),
             budget_exceeded: false,
             capped: outcome.capped,
+            store_corrupt: false,
         },
         Err(_) => HookRecallOutcome {
             block: String::new(),
             budget_exceeded: false,
             capped: false,
+            store_corrupt: false,
         },
     }
 }

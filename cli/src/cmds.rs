@@ -241,8 +241,27 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
                 .count()
         })
         .unwrap_or(0);
+    // F10: memory-store recall failures (a malformed/unreadable NON-EMPTY
+    // memory.jsonl, per hook attempt) — same read-only
+    // parse-and-count-defensively pattern as `injections` above, keyed on
+    // `failure` instead of `n`. Malformed lines in memory-stats.jsonl
+    // itself (any JSON parse failure, or a value that isn't a JSON object)
+    // are ignored, never a panic — same `.unwrap_or(false)` posture as
+    // `injections`. Never mutates state.json (only the daemon writes that).
+    let mem_failures = std::fs::read_to_string(crate::memory_stats_path(root))
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .map(|v| v.get("failure").and_then(|f| f.as_bool()) == Some(true))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
     out.push_str(&format!(
-        "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections\n",
+        "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections, {mem_failures} failures\n",
         state.memory_rejects
     ));
 
@@ -461,6 +480,23 @@ fn inject_memory(root: &Path, query: &str) {
         let stats_line =
             serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
         // Best-effort, same fail-open posture as the recall itself.
+        let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
+        return;
+    }
+    // F10: a malformed/unreadable NON-EMPTY memory.jsonl is a RECALL
+    // FAILURE, distinct from budget_exceeded and from a healthy "no
+    // matches" (`outcome.block` empty with every flag `false`). Still
+    // fail-open (inject nothing, exit 0 — the caller, `hook`, never sees an
+    // error), but — unlike the old silent-skip behavior — record it as one
+    // bounded, sanitizer-safe `reason` string, never raw filesystem/error/
+    // path text (which could carry terminal-control bytes).
+    if outcome.store_corrupt {
+        let stats_line = serde_json::json!({
+            "ts": wall_now_ms(),
+            "failure": true,
+            "reason": "store_corrupt",
+        })
+        .to_string();
         let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
         return;
     }
@@ -722,6 +758,36 @@ mod tests {
         assert!(
             !out.contains("check `agentrec init`"),
             "remedy must no longer point at `agentrec init`: {out}"
+        );
+    }
+
+    // AC-F10.4: `status` derives its memory-failure count from
+    // memory-stats.jsonl `failure:true` lines, and malformed lines in that
+    // same file (not valid JSON at all, or a JSON value that isn't an
+    // object) are ignored rather than panicking status — same defensive
+    // posture as the pre-existing `injections` count just above it.
+    #[test]
+    fn status_counts_memory_failures_and_tolerates_malformed_stats_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let stats_path = crate::memory_stats_path(root);
+        std::fs::create_dir_all(stats_path.parent().unwrap()).unwrap();
+        let lines = [
+            r#"{"ts":1,"failure":true,"reason":"store_corrupt"}"#,
+            r#"{"ts":2,"n":3}"#, // a real injection — not a failure
+            "not json at all — must not panic status",
+            r#"[1,2,3]"#, // valid JSON but not an object — must not panic
+            r#"{"ts":3,"failure":true,"reason":"store_corrupt"}"#,
+        ];
+        std::fs::write(&stats_path, lines.join("\n") + "\n").unwrap();
+
+        // Must not panic despite the malformed lines.
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("2 failures"),
+            "expected exactly 2 memory-store failures counted, malformed lines ignored: {out}"
         );
     }
 }

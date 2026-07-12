@@ -4619,6 +4619,226 @@ fn hook_fail_open_and_budget() {
     }
 }
 
+/// F10: a malformed/unreadable NON-EMPTY `memory.jsonl` is a RECALL FAILURE
+/// distinct from (a) a missing store and (b) a healthy zero-match store.
+/// `hook_fail_open_and_budget`'s corrupt-store leg above only ever asserted
+/// exit-0 + empty-stdout + start-signal-appended — satisfied identically
+/// whether the corruption was genuinely counted as a failure or silently
+/// folded to indistinguishable "no memories". This test requires the
+/// distinguishing signal: exactly one
+/// `{"ts","failure":true,"reason":"store_corrupt"}` line in
+/// `memory-stats.jsonl` per hook attempt, and a non-zero failure count
+/// surfaced by `agentrec status` — and that a missing or healthy-empty store
+/// never trips either.
+#[test]
+fn hook_corrupt_memory_store_is_counted() {
+    // AC-F10.2a: wholly-corrupt store — every line is garbage.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(
+            root.join(".agentrec/memory.jsonl"),
+            b"\xff\xfenot json at all garbage bytes\x00\x01\n",
+        )
+        .unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"c1","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "corrupt store must inject nothing: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing despite corrupt memory.jsonl: {events:?}"
+        );
+
+        let stats = memory_stats_lines(root);
+        let failures: Vec<_> = stats
+            .iter()
+            .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure stat line per hook attempt: {stats:?}"
+        );
+        assert_eq!(
+            failures[0].get("reason").and_then(|r| r.as_str()),
+            Some("store_corrupt"),
+            "failure reason must be the bounded enum string store_corrupt: {failures:?}"
+        );
+
+        let status_out = agentrec(root, &["status"]);
+        assert!(
+            status_out.status.success(),
+            "status must exit 0: {status_out:?}"
+        );
+        let status_text = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status_text.contains("1 failures"),
+            "status must surface the non-zero memory-store failure count: {status_text}"
+        );
+    }
+
+    // AC-F10.2b: mixed valid+corrupt store — one real, Fresh, on-topic,
+    // real-pinned record alongside a malformed line. Must STILL inject
+    // nothing — a corrupt store may never leak a partial valid fact.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join("mixed.rs"), b"fn mixed() {}\n").unwrap();
+        let hash = memory::hash_pin(root, "mixed.rs").expect("hash mixed.rs");
+        let good = serde_json::json!({
+            "v": 1, "type": "memory", "id": "m-good", "op": "assert",
+            "fact": "quasar99 mixed store genuinely fresh fact",
+            "pins": [{ "path": "mixed.rs", "hash": hash }],
+            "source_turns": [], "origin": "agent", "ts": 1,
+        });
+        let mut content = good.to_string();
+        content.push('\n');
+        content.push_str("{this is not valid json at all}\n");
+        std::fs::write(root.join(".agentrec/memory.jsonl"), content).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"c2","prompt":"quasar99 mixed store"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "mixed valid+corrupt store must never leak a partial fact: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let stats = memory_stats_lines(root);
+        let failures: Vec<_> = stats
+            .iter()
+            .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "expected exactly one failure stat line for a mixed valid+corrupt store: {stats:?}"
+        );
+        assert_eq!(
+            failures[0].get("reason").and_then(|r| r.as_str()),
+            Some("store_corrupt")
+        );
+    }
+
+    // AC-F10.3a: missing store (never `remember`ed). No failure stat.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"c3","prompt":"anything"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        let stats = memory_stats_lines(root);
+        assert!(
+            stats.iter().all(|s| s.get("failure").is_none()),
+            "missing store must never be counted as a failure: {stats:?}"
+        );
+    }
+
+    // AC-F10.3b: healthy zero-match store — a real, valid record that just
+    // doesn't match the query. No failure stat.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::write(root.join("healthy.rs"), b"fn healthy() {}\n").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                "totally unrelated fact about nothing in particular",
+                "--from",
+                "healthy.rs",
+            ],
+        );
+        assert!(out.status.success(), "remember failed: {out:?}");
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"c4","prompt":"zzzznomatchzzzz"}"#;
+        let out = send_hook_capture(root, payload);
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        let stats = memory_stats_lines(root);
+        assert!(
+            stats.iter().all(|s| s.get("failure").is_none()),
+            "a healthy zero-match store must never be counted as a failure: {stats:?}"
+        );
+    }
+}
+
+/// AC-F10.5: the persisted `reason` is the bounded enum string
+/// `"store_corrupt"`, never raw filesystem/error/path text — so terminal-
+/// control bytes embedded in the corrupt content itself (an ESC-prefixed
+/// terminal escape sequence, exactly the class `fmt::sanitize_terminal`
+/// exists to strip elsewhere) can never reach `memory-stats.jsonl` or
+/// `agentrec status`'s stdout. Scans the RAW bytes of both, not just the
+/// parsed JSON strings, so a leak into some other field would still be
+/// caught.
+#[test]
+fn hook_corrupt_store_reason_never_leaks_raw_control_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // An ESC-prefixed terminal title-set + BEL sequence embedded in
+    // otherwise-garbage content — real bytes an attacker-controlled
+    // transcript or a corrupted write could plausibly leave behind.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"\xff\xfenot json \x1b]0;evil-title\x07 more garbage\x00\x01\n",
+    )
+    .unwrap();
+
+    let payload =
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"esc1","prompt":"anything"}"#;
+    let out = send_hook_capture(root, payload);
+    assert!(out.status.success(), "hook must exit 0: {out:?}");
+    assert!(
+        !out.stdout.contains(&0x1b),
+        "hook stdout must never carry a raw ESC byte: {:?}",
+        out.stdout
+    );
+
+    let stats_bytes = std::fs::read(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    assert!(
+        !stats_bytes.contains(&0x1b),
+        "memory-stats.jsonl must never carry a raw ESC byte: {:?}",
+        String::from_utf8_lossy(&stats_bytes)
+    );
+    let stats = memory_stats_lines(root);
+    assert_eq!(
+        stats
+            .iter()
+            .find(|s| s.get("failure").is_some())
+            .and_then(|s| s.get("reason"))
+            .and_then(|r| r.as_str()),
+        Some("store_corrupt"),
+        "reason must be exactly the bounded enum string: {stats:?}"
+    );
+
+    let status_out = agentrec(root, &["status"]);
+    assert!(
+        status_out.status.success(),
+        "status must exit 0: {status_out:?}"
+    );
+    assert!(
+        !status_out.stdout.contains(&0x1b),
+        "status stdout must never carry a raw ESC byte: {:?}",
+        String::from_utf8_lossy(&status_out.stdout)
+    );
+}
+
 /// F2: the 50ms hook recall budget is now a HARD cooperative deadline
 /// (founder decision, option (a)), not the old retrospective
 /// measure-after-the-fact suppression. `hook_fail_open_and_budget` above
@@ -4959,4 +5179,124 @@ fn hook_exits_zero_under_concurrent_memory_append() {
             "memory.jsonl line {n} has zero pins after concurrent append: {line}"
         );
     }
+}
+
+/// AC-F10.6: a corrupt `memory.jsonl` (one malformed, newline-terminated
+/// line seeded up front, so it never merges with a concurrently-appended
+/// well-formed line) must not destabilize the hook under real concurrent
+/// daemon-style writes to the SAME file — every hook call still exits 0,
+/// still appends the normal start signal, and `memory-stats.jsonl` /
+/// `signal.jsonl` are never left torn (every line still parses) despite the
+/// interleaving. Mirrors `hook_exits_zero_under_concurrent_memory_append`'s
+/// harness shape, seeded with a permanent corruption up front instead of an
+/// initially-empty store.
+#[test]
+fn hook_corrupt_store_safe_under_concurrent_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    std::fs::write(root.join("concurrent2.rs"), b"fn concurrent2() {}\n").unwrap();
+    // Seeded corruption, `\n`-terminated so it stays its own line no matter
+    // what the writer thread appends after it — the store stays corrupt
+    // (and thus failure-counted) for the entire test.
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        b"{not valid json at all}\n",
+    )
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let writer_root = root.clone();
+    let writer_stop = stop.clone();
+    let writer_count = writes_done.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let Ok(hash) = memory::hash_pin(&writer_root, "concurrent2.rs") else {
+                continue;
+            };
+            let rec = MemoryRecord {
+                v: 1,
+                kind: "memory".to_string(),
+                id: format!("cwm{i}"),
+                op: MemoryOp::Assert,
+                fact: format!("corrupt-concurrent writer fact {i} nightly seed rotation"),
+                pins: vec![Pin {
+                    path: "concurrent2.rs".to_string(),
+                    hash,
+                }],
+                source_turns: vec![],
+                origin: "agent".to_string(),
+                ts: i,
+                reason: None,
+            };
+            let _ = memory::append_memory(&writer_root, &rec);
+            i += 1;
+            writer_count.store(i, Ordering::Relaxed);
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"corrupt-concurrent","prompt":"nightly seed rotation concurrent"}"#;
+    let iterations = 20;
+    for iter in 0..iterations {
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under concurrent append to a corrupt memory.jsonl at iter {iter}: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "a corrupt store must never inject, even mid-race, at iter {iter}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite concurrent writes to a \
+             corrupt memory.jsonl (before={before}, after={})",
+            after.len()
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread panicked");
+
+    let total_writes = writes_done.load(Ordering::Relaxed);
+    assert!(
+        total_writes >= iterations,
+        "writer thread produced too few appends ({total_writes}) to have \
+         genuinely raced {iterations} hook calls"
+    );
+
+    // signal.jsonl and memory-stats.jsonl must never be left torn by the
+    // interleaving — every line still parses as JSON.
+    for name in [".agentrec/signal.jsonl", ".agentrec/memory-stats.jsonl"] {
+        let text = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{name} line {n} failed to parse after concurrent append to a corrupt \
+                 memory.jsonl: {line}"
+            );
+        }
+    }
+
+    // Every hook attempt against the still-corrupt store recorded exactly
+    // one failure stat — the corrupt line was seeded once and never healed,
+    // so `iterations` calls means `iterations` failure lines.
+    let stats = memory_stats_lines(&root);
+    let failures = stats
+        .iter()
+        .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
+        .count();
+    assert_eq!(
+        failures as u64, iterations,
+        "expected one failure stat per hook attempt against the permanently corrupt \
+         store: {stats:?}"
+    );
 }

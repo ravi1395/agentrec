@@ -314,31 +314,69 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
 fn load_effective_checked(
     root: &Path,
     deadline: Option<Instant>,
-) -> Result<(Vec<EffectiveMemory>, bool), String> {
+) -> Result<(Vec<EffectiveMemory>, bool, bool), String> {
     let path = memory_path(root);
+    // F10: `store_corrupt` distinguishes a genuinely malformed/unreadable
+    // NON-EMPTY `memory.jsonl` from a healthy empty corpus (missing file, or
+    // an empty/whitespace-only file). It is a RECALL FAILURE, not something
+    // to fold silently — `recall_impl` bails to empty hits rather than
+    // returning whatever parseable records happen to also be in the file
+    // (a mixed valid+corrupt store must never leak a partial fact). This
+    // flag does not change `load_effective`'s own tolerant behavior (still
+    // used broadly for non-recall reads like `status`'s fresh/stale count
+    // and `memories`/`purge` — those keep folding whatever parses, same as
+    // before F10); only `recall_impl` (the hook's injection path) acts on
+    // it.
+    let mut store_corrupt = false;
     let records = match fs::File::open(&path) {
         Ok(file) => {
             let reader = std::io::BufReader::new(file);
             let mut out = Vec::new();
             for line in reader.lines() {
                 if deadline_exceeded(deadline) {
-                    return Ok((Vec::new(), true));
+                    return Ok((Vec::new(), true, false));
                 }
-                let Ok(line) = line else { continue };
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => {
+                        // Non-UTF8 bytes mid-file: an unreadable line in a
+                        // file that DID open successfully — corruption, not
+                        // absence.
+                        store_corrupt = true;
+                        continue;
+                    }
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(rec) = serde_json::from_str::<MemoryRecord>(trimmed) {
-                    out.push(rec);
+                match serde_json::from_str::<MemoryRecord>(trimmed) {
+                    Ok(rec) => out.push(rec),
+                    Err(_) => {
+                        // Unparseable non-empty line (malformed JSON, or a
+                        // well-formed object whose `op` isn't one of
+                        // assert/reverify/retract) — corrupt, not skipped
+                        // silently as far as F10's failure signal goes
+                        // (the fold below still tolerates it, for callers
+                        // other than recall).
+                        store_corrupt = true;
+                    }
                 }
-                // Unparseable line (malformed JSON, or a well-formed object
-                // whose `op` isn't one of assert/reverify/retract) is
-                // skipped silently — never fatal to the fold.
             }
             out
         }
-        Err(_) => return Ok((vec![], false)),
+        Err(_) => {
+            // `File::open` failing is a healthy empty corpus when the path
+            // simply doesn't exist yet (never `remember`ed); it's F10
+            // corruption when the path exists but couldn't be opened
+            // (permissions, races, etc.). Best-effort, TOCTOU-tolerant:
+            // worst case a file deleted between the failed open and this
+            // check reads as healthy-empty, never the reverse.
+            if path.exists() {
+                store_corrupt = true;
+            }
+            Vec::new()
+        }
     };
 
     // Group by id. File (insertion) order within each group is irrelevant
@@ -357,7 +395,7 @@ fn load_effective_checked(
     let mut out = Vec::with_capacity(order.len());
     for id in order {
         if deadline_exceeded(deadline) {
-            return Ok((Vec::new(), true));
+            return Ok((Vec::new(), true, false));
         }
         let mut group = by_id.remove(&id).unwrap_or_default();
         // Total order: `ts` ascending, then op precedence (retract >
@@ -407,7 +445,7 @@ fn load_effective_checked(
             retracted,
         });
     }
-    Ok((out, false))
+    Ok((out, false, store_corrupt))
 }
 
 /// BM25 score floor for a candidate to be recall-eligible at all (tuned in
@@ -619,10 +657,21 @@ pub fn recall_outcome(root: &Path, query: &str, k: usize) -> Result<RecallOutcom
 /// always `false` on a `budget_exceeded` outcome (a deadline bail never
 /// walked far enough to distinguish "capped" from any other reason it
 /// stopped early). See `recall_impl`'s loop for the exact boundary.
+///
+/// `store_corrupt` (F10) is set iff `memory.jsonl` exists, is non-empty, and
+/// contains at least one unreadable line or unparseable non-empty record —
+/// a genuine RECALL FAILURE, distinct from both `budget_exceeded` (recall
+/// didn't finish in time) and a healthy "no matches" (`hits` empty, every
+/// flag `false`). When `true`, `hits` is always empty: a mixed
+/// valid+corrupt store never leaks the valid records it also contains
+/// (INV-M2-adjacent — never surface anything from a store recall can't
+/// trust as a whole). Never set on a missing file or an empty/whitespace-
+/// only file — both are the pre-existing healthy-empty corpus.
 pub struct RecallOutcome {
     pub hits: Vec<EffectiveMemory>,
     pub budget_exceeded: bool,
     pub capped: bool,
+    pub store_corrupt: bool,
 }
 
 /// Deadline-bounded [`recall`] (F2, founder-decided option (a) — a hard
@@ -656,15 +705,32 @@ fn recall_impl(
             hits: Vec::new(),
             budget_exceeded: true,
             capped: false,
+            store_corrupt: false,
         });
     }
 
-    let (all, load_exceeded) = load_effective_checked(root, deadline)?;
+    let (all, load_exceeded, store_corrupt) = load_effective_checked(root, deadline)?;
     if load_exceeded {
         return Ok(RecallOutcome {
             hits: Vec::new(),
             budget_exceeded: true,
             capped: false,
+            store_corrupt: false,
+        });
+    }
+    // F10: a corrupt store is a recall failure, full stop — bail before
+    // ranking/verifying rather than folding whatever parseable records also
+    // happen to be present. `all` may well contain valid `EffectiveMemory`
+    // entries here (the fold in `load_effective_checked` still tolerates
+    // bad lines for other callers), but a caller of `recall`/
+    // `recall_with_deadline` must never see a partial result from a store
+    // it can't trust as a whole.
+    if store_corrupt {
+        return Ok(RecallOutcome {
+            hits: Vec::new(),
+            budget_exceeded: false,
+            capped: false,
+            store_corrupt: true,
         });
     }
 
@@ -679,6 +745,7 @@ fn recall_impl(
                 hits: Vec::new(),
                 budget_exceeded: true,
                 capped: false,
+                store_corrupt: false,
             });
         }
         ranked.into_iter().map(|(idx, _score)| &all[idx]).collect()
@@ -708,6 +775,7 @@ fn recall_impl(
                 hits: Vec::new(),
                 budget_exceeded: true,
                 capped: false,
+                store_corrupt: false,
             });
         }
         if pin_freshness(root, &m.pins) == Freshness::Fresh {
@@ -718,6 +786,7 @@ fn recall_impl(
         hits: out,
         budget_exceeded: false,
         capped,
+        store_corrupt: false,
     })
 }
 
