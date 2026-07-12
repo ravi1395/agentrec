@@ -266,13 +266,29 @@ its complete test set — no "pending" rows remain.
    `memory-stats.jsonl` — proving the raw secret is nowhere while a redaction marker is
    present everywhere it should be).
 4. **INV-M4** — hook path exits 0 and within budget under: corrupt store, missing
-   store, 10k-record store, concurrent append. Maps to tests: `cli/tests/integration.rs::
-   hook_injects_fresh_memories_into_stdout` (enabled-path injection, `memory_enabled=false`
-   kill switch, Stop-arm never injects, `memory_inject_max` coupling); `cli/tests/
-   integration.rs::hook_fail_open_and_budget` (corrupt `memory.jsonl` → exit 0 + no
-   block + start signal still appended; 3000-record store answers within the 500ms
-   CI-slack budget against the hook's internal 50ms self-budget; missing store and a
-   fully uninitialized `.agentrec/` both exit 0 with no block).
+   store, uninitialized repo, 3000-record store, injection-within-budget-at-that-scale,
+   and concurrent append. Test-closeable legs, each PASS with a named test: `cli/tests/
+   integration.rs::hook_injects_fresh_memories_into_stdout` (enabled-path injection,
+   `memory_enabled=false` kill switch, Stop-arm never injects, `memory_inject_max`
+   coupling); `cli/tests/integration.rs::hook_fail_open_and_budget` (corrupt
+   `memory.jsonl` → exit 0 + no block + start signal still appended; missing store and
+   a fully uninitialized `.agentrec/` both exit 0 with no block, start signal still
+   appended even when `.agentrec/` never existed; a 3000-record store — 3000 orphaned
+   fillers + 1 genuinely Fresh real-pinned record — answers within the 500ms CI-slack
+   budget AND actually emits the injected block for the Fresh record, proving the
+   budget pass isn't silent degradation to a no-op); `cli/tests/integration.rs::
+   hook_exits_zero_under_concurrent_memory_append` (a direct-API writer thread races
+   `memory::append_memory` against 30 real `agentrec hook claude` subprocess calls with
+   no synchronization; every call exits 0, appends its start signal, and every raw
+   `memory.jsonl` line still parses with >=1 pin afterward — the property held on
+   first write, no source change needed). **LADDERED, not test-closeable on CI:** the
+   spec's 10k-record / 50ms **hard** performance envelope (`docs/superpowers/specs/
+   2026-07-12-agentrec-memory-design.md` §Performance envelope) is wall-clock timing
+   that varies by CI runner load — the tests above prove correctness (fail-open,
+   real injection, no torn writes) at a 3000-record/500ms CI-slack scale, not the
+   spec's exact 10k/50ms hard budget; that number is verified via the 1-week dogfood
+   counters in `status` (injections/rejects/stale-quarantined) per the spec's Success
+   gate, never claimed as CI-test-proven.
 5. **INV-M5** — fold determinism: same records ingested in any order produce the
    same effective state (property test). Maps to tests: `agentrec-core::memory::
    tests::fold_latest_op_wins_any_order` (Task 1 — 6-permutation assert/reverify/retract

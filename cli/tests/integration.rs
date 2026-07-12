@@ -7,7 +7,11 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use agentrec_core::memory::{self, MemoryOp, MemoryRecord, Pin};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
@@ -4084,6 +4088,59 @@ fn hook_fail_open_and_budget() {
             elapsed < Duration::from_millis(500),
             "hook took too long against a 3000-record store: {elapsed:?}"
         );
+        // Every pin above is deliberately orphaned (`missing{i}.rs` never
+        // exists), so that call only proves fail-open-under-load: at this
+        // scale, `elapsed < 500ms` alone is also satisfied by silent
+        // degradation (recall exceeds its internal 50ms self-budget,
+        // discards the result, and the hook exits 0 with no block — see
+        // `inject_memory`'s early return). Prove that did NOT happen by
+        // adding one genuinely Fresh, real-pinned record and asserting a
+        // block is actually injected within budget at this same scale.
+        std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+        let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+        let fresh_rec = serde_json::json!({
+            "v": 1,
+            "type": "memory",
+            "id": "m-real-fresh",
+            "op": "assert",
+            // "quasar77" is a rare token unique to this one record among
+            // 3001 — BM25's idf term guarantees it ranks at the top for a
+            // query containing it, deterministically inside the
+            // RECALL_VERIFY_CAP=128 verification window (the 3000 filler
+            // candidates all share identical "nightly seed rotation"
+            // terms and are all orphaned/stale — without a distinguishing
+            // rare term, this record could tie-break behind the cap and
+            // never be verified).
+            "fact": "quasar77 nightly seed rotation is genuinely fresh and really pinned",
+            "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+            "source_turns": [],
+            "origin": "agent",
+            "ts": 999_999,
+        });
+        let mut with_fresh = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+        with_fresh.push_str(&fresh_rec.to_string());
+        with_fresh.push('\n');
+        std::fs::write(root.join(".agentrec/memory.jsonl"), with_fresh).unwrap();
+
+        let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2b","prompt":"quasar77 nightly seed rotation"}"#;
+        let started = Instant::now();
+        let out = send_hook_capture(root, payload);
+        let elapsed = started.elapsed();
+        assert!(out.status.success(), "hook must exit 0: {out:?}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "hook took too long against a 3001-record store: {elapsed:?}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("```agentrec memory"),
+            "expected a real injection at 3000-record scale within budget \
+             (not silent degradation to no-op) — stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("genuinely fresh and really pinned"),
+            "expected the Fresh record's fact in the injected block — stdout: {stdout}"
+        );
     }
 
     // Missing store (never `remember`ed) and a fully uninitialized
@@ -4107,5 +4164,140 @@ fn hook_fail_open_and_budget() {
             "hook on an uninitialized repo must exit 0: {out:?}"
         );
         assert!(out.stdout.is_empty());
+        // The start signal always-appends property (already asserted for
+        // the corrupt-store case above) must hold here too — an
+        // uninitialized repo is not exempt from the "hook always records
+        // the signal" contract, it just has nowhere to inject memory from.
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal missing on an uninitialized repo: {events:?}"
+        );
+    }
+}
+
+/// INV-M4 concurrent-append leg: the hook path must exit 0 (and keep
+/// appending the start signal) while `.agentrec/memory.jsonl` is being
+/// concurrently APPENDED by another writer — the exact interleaving the
+/// spec's INV-M4 names but which no prior test exercised (the daemon-driven
+/// candidate path and `agentrec remember` both write through the same
+/// `memory::append_memory`, so a direct-API writer thread racing the real
+/// `hook` subprocess is a faithful stand-in for "daemon ingesting a
+/// candidate while a hook fires").
+///
+/// The writer thread appends real, freshly-hashed, Fresh-pinned records in
+/// a tight loop (no sleeps) using `agentrec_core::memory::append_memory`
+/// directly — far tighter than spawning a `remember` subprocess per
+/// iteration, so it actually races the hook's own read of the same file
+/// instead of finishing before the hook loop starts. The hook loop runs
+/// concurrently in the foreground, firing the real `agentrec hook claude`
+/// binary repeatedly; both threads are running for the full duration of
+/// this test, guaranteeing overlap.
+#[test]
+fn hook_exits_zero_under_concurrent_memory_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    init(&root);
+
+    // A real, stable pin target: unchanged for the whole test, so every
+    // writer-thread record is genuinely Fresh and eligible for injection —
+    // this exercises the concurrent-write race against a real read path,
+    // not just a race against records that would be filtered out anyway.
+    std::fs::write(root.join("concurrent.rs"), b"fn concurrent() {}\n").unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes_done = Arc::new(AtomicU64::new(0));
+    let writer_root = root.clone();
+    let writer_stop = stop.clone();
+    let writer_count = writes_done.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let Ok(hash) = memory::hash_pin(&writer_root, "concurrent.rs") else {
+                continue;
+            };
+            let rec = MemoryRecord {
+                v: 1,
+                kind: "memory".to_string(),
+                id: format!("wm{i}"),
+                op: MemoryOp::Assert,
+                fact: format!("concurrent writer fact {i} about nightly seed rotation"),
+                pins: vec![Pin {
+                    path: "concurrent.rs".to_string(),
+                    hash,
+                }],
+                source_turns: vec![],
+                origin: "agent".to_string(),
+                ts: i,
+                reason: None,
+            };
+            // Best-effort like the real ingestion paths: a transient
+            // failure here must not panic the writer thread — the hook's
+            // own fail-open posture is what's under test, not this helper.
+            let _ = memory::append_memory(&writer_root, &rec);
+            i += 1;
+            writer_count.store(i, Ordering::Relaxed);
+        }
+    });
+
+    // Give the writer a head start so the hook loop below always overlaps
+    // an in-flight append, never races a not-yet-started writer.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"concurrent","prompt":"nightly seed rotation concurrent"}"#;
+    let iterations = 30;
+    for iter in 0..iterations {
+        let before = signal_events(&root).len();
+        let out = send_hook_capture(&root, payload);
+        assert!(
+            out.status.success(),
+            "hook exited nonzero under concurrent memory.jsonl append at iter {iter}: {out:?}"
+        );
+        let after = signal_events(&root);
+        assert!(
+            after.len() > before,
+            "start signal not appended at iter {iter} despite concurrent memory.jsonl writes \
+             (before={before}, after={})",
+            after.len()
+        );
+        assert_eq!(
+            after
+                .last()
+                .and_then(|e| e.get("event"))
+                .and_then(|v| v.as_str()),
+            Some("start"),
+            "last signal line at iter {iter} was not a start event: {after:?}"
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread panicked");
+
+    // Prove the race actually happened: the writer produced a meaningful
+    // number of concurrent appends during the hook loop's run, not zero or
+    // a token handful that finished before the loop even started.
+    let total_writes = writes_done.load(Ordering::Relaxed);
+    assert!(
+        total_writes >= iterations,
+        "writer thread produced too few appends ({total_writes}) to have \
+         genuinely raced {iterations} hook calls"
+    );
+
+    // The store must never be left torn by the interleaving: every raw
+    // line in memory.jsonl still parses as a MemoryRecord with >=1 pin
+    // (mirrors torture.rs's assert_memory_invariants, INV-M1).
+    let text = std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).unwrap();
+    for (n, line) in text.lines().enumerate() {
+        let rec: MemoryRecord = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "memory.jsonl line {n} failed to parse after concurrent append: {e}\nline: {line}"
+            )
+        });
+        assert!(
+            !rec.pins.is_empty(),
+            "memory.jsonl line {n} has zero pins after concurrent append: {line}"
+        );
     }
 }
