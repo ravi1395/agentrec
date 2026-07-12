@@ -2562,10 +2562,11 @@ fn secret_prompt_never_reaches_disk_in_cleartext() {
         "expected a redaction marker in memory.jsonl"
     );
 
-    // `memory-stats.jsonl` only ever holds `{"ts","n"}` counts — no fact
-    // text — so it should trivially never carry the secret. Asserted anyway
-    // for completeness (INV-M3, 4th and final location) against the real
-    // line the matching hook above produced, not an absent file.
+    // `memory-stats.jsonl` only ever holds `{"ts","n"}` injection counts or
+    // (F2) `{"ts","budget_exceeded"}` bail markers — no fact text in either
+    // shape — so it should trivially never carry the secret. Asserted
+    // anyway for completeness (INV-M3, 4th and final location) against the
+    // real line the matching hook above produced, not an absent file.
     let memory_stats_jsonl =
         std::fs::read(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
     assert!(
@@ -4275,6 +4276,102 @@ fn hook_fail_open_and_budget() {
             "start signal missing on an uninitialized repo: {events:?}"
         );
     }
+}
+
+/// F2: the 50ms hook recall budget is now a HARD cooperative deadline
+/// (founder decision, option (a)), not the old retrospective
+/// measure-after-the-fact suppression. `hook_fail_open_and_budget` above
+/// already proves the retrospective/fail-open shape at real time scales;
+/// this test proves the *new* bail path specifically — deterministically,
+/// without depending on runner speed to blow a real 50ms window (which
+/// `hook_fail_open_and_budget`'s own comments document as flaky at 3000
+/// records on a slow CI runner, exactly the coupling commit 76a716d
+/// removed). `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED` (test-only,
+/// `cmds::recall_deadline`) substitutes an already-expired deadline before
+/// any recall work starts, so the bail is deterministic on any machine.
+#[test]
+fn hook_recall_bails_at_injected_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    agentrec(root, &["init"]);
+
+    // A real, freshly-pinned, on-topic memory that WOULD be injected on a
+    // normal (non-expired-deadline) call — proves the empty result below is
+    // caused by the injected deadline, not by an unmatchable corpus.
+    std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+    let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+    let rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-deadline-fresh",
+        "op": "assert",
+        "fact": "deadline probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{rec}\n")).unwrap();
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"deadline probe fact"}"#;
+
+    // Sanity: without the forced-expired override, this hook call really
+    // does inject the block — proves the corpus/query are matchable and
+    // isolates the deadline override as the only variable in the next call.
+    let sane = send_hook_capture(root, payload);
+    assert!(sane.status.success(), "sanity hook call failed: {sane:?}");
+    assert!(
+        String::from_utf8_lossy(&sane.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection before testing the bail path: {:?}",
+        String::from_utf8_lossy(&sane.stdout)
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even on a bailed recall: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an already-expired deadline must never print a block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal must still land despite the bailed recall: {events:?}"
+    );
+
+    let stats = memory_stats_lines(root);
+    let bail = stats
+        .iter()
+        .find(|l| l.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true));
+    assert!(
+        bail.is_some(),
+        "expected a budget_exceeded line in memory-stats.jsonl: {stats:?}"
+    );
+    assert!(
+        bail.unwrap().get("ts").and_then(|v| v.as_u64()).is_some(),
+        "budget_exceeded line must still carry a ts: {stats:?}"
+    );
 }
 
 /// INV-M4 concurrent-append leg: the hook path must exit 0 (and keep

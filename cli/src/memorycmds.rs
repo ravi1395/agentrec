@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// `from` is a comma-separated list of repo-relative paths. Each is
 /// validated (`memory::validate_pin_path`) and hashed (`memory::hash_pin`)
@@ -540,11 +540,17 @@ fn latest_retract_reasons(root: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// Task 9: the recall-for-hook logic, shared IN-PROCESS by `agentrec recall
-/// --for-hook` (Task 5, CLI `-k`) and `cmds::hook`'s UserPromptSubmit arm
-/// (Task 9, config-driven `memory_inject_max`) — never a subprocess. Fail-
-/// open on every edge (uninitialized repo, corrupt store, any
-/// `memory::recall` error): always returns `""`, never panics.
+/// Task 9: the recall-for-hook logic for the `agentrec recall --for-hook`
+/// CLI path (Task 5, CLI `-k`) — in-process, never a subprocess. Fail-open
+/// on every edge (uninitialized repo, corrupt store, any `memory::recall`
+/// error): always returns `""`, never panics.
+///
+/// F2 (2026-07-12): `cmds::hook`'s UserPromptSubmit arm no longer calls this
+/// — it uses [`recall_for_hook_with_deadline`] instead, so the hard 50ms
+/// budget can be threaded in. This function stays unbounded/undeadlined; it
+/// is a deliberate scope call (F2 was scoped to `inject_memory` only), not
+/// an oversight — `--for-hook` is a manual CLI simulation, not the
+/// wall-clock-sensitive lifecycle hook path.
 ///
 /// `max_facts` feeds BOTH the `k` passed to `memory::recall` AND
 /// `build_hook_block`'s per-block cap — this is the fix for the coupling bug
@@ -561,6 +567,55 @@ pub fn recall_for_hook(root: &Path, query: &str, max_facts: usize) -> String {
         Err(_) => return String::new(),
     };
     build_hook_block(&hits, max_facts)
+}
+
+/// Outcome of [`recall_for_hook_with_deadline`] (F2): `budget_exceeded`
+/// distinguishes "the cooperative deadline tripped" (which the hook must
+/// record as a stat, not treat as an ordinary no-match) from "recall
+/// genuinely found nothing" (empty `block`, `budget_exceeded: false`, no
+/// stat line — the existing INV-M4 fail-open contract). When
+/// `budget_exceeded` is `true`, `block` is always empty.
+pub struct HookRecallOutcome {
+    pub block: String,
+    pub budget_exceeded: bool,
+}
+
+/// F2 (founder decision, option (a)): the hard-deadline twin of
+/// [`recall_for_hook`], used ONLY by `cmds::inject_memory` (the
+/// `UserPromptSubmit` hook arm). Threads `deadline` into
+/// `memory::recall_with_deadline`, which cooperatively bails out of its
+/// internal `load_effective`/`bm25_rank`/verify loops the instant the
+/// deadline passes, instead of running the full (possibly unbounded)
+/// computation to completion and only discarding the *output* afterward.
+/// Fail-open on every other edge exactly like `recall_for_hook`
+/// (uninitialized repo, corrupt store, any `memory::recall_with_deadline`
+/// error): `budget_exceeded: false`, empty block, never panics.
+pub fn recall_for_hook_with_deadline(
+    root: &Path,
+    query: &str,
+    max_facts: usize,
+    deadline: Instant,
+) -> HookRecallOutcome {
+    if !crate::agentrec_dir(root).is_dir() {
+        return HookRecallOutcome {
+            block: String::new(),
+            budget_exceeded: false,
+        };
+    }
+    match memory::recall_with_deadline(root, query, max_facts, deadline) {
+        Ok(outcome) if outcome.budget_exceeded => HookRecallOutcome {
+            block: String::new(),
+            budget_exceeded: true,
+        },
+        Ok(outcome) => HookRecallOutcome {
+            block: build_hook_block(&outcome.hits, max_facts),
+            budget_exceeded: false,
+        },
+        Err(_) => HookRecallOutcome {
+            block: String::new(),
+            budget_exceeded: false,
+        },
+    }
 }
 
 /// Builds the exact `--for-hook` fenced block (Task 9's parse contract):

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Max stored length of a memory's `fact` text (design spec §Data model).
 pub const FACT_MAX_CHARS: usize = 500;
@@ -273,12 +274,30 @@ fn content_key(rec: &MemoryRecord) -> (Vec<(String, String)>, String, String) {
 /// string this build doesn't recognize) are skipped, never fatal — mirrors
 /// `record::load_log`'s tolerance.
 pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
+    Ok(load_effective_checked(root, None)?.0)
+}
+
+/// Deadline-cooperative twin of [`load_effective`] (F2). Behaves
+/// byte-identically to `load_effective` when `deadline` is `None` — every
+/// check below is a cheap `Option`-match that short-circuits to "never
+/// exceeded". When `Some`, checks at each record/id loop boundary (not
+/// per-byte) and bails to `(vec![], true)` the moment the deadline has
+/// passed, discarding whatever partial fold was in progress — the hook path
+/// needs a clean "did or didn't finish in budget" signal, not a partial
+/// read.
+fn load_effective_checked(
+    root: &Path,
+    deadline: Option<Instant>,
+) -> Result<(Vec<EffectiveMemory>, bool), String> {
     let path = memory_path(root);
     let records = match fs::File::open(&path) {
         Ok(file) => {
             let reader = std::io::BufReader::new(file);
             let mut out = Vec::new();
             for line in reader.lines() {
+                if deadline_exceeded(deadline) {
+                    return Ok((Vec::new(), true));
+                }
                 let Ok(line) = line else { continue };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -293,7 +312,7 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
             }
             out
         }
-        Err(_) => return Ok(vec![]),
+        Err(_) => return Ok((vec![], false)),
     };
 
     // Group by id. File (insertion) order within each group is irrelevant
@@ -311,6 +330,9 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
 
     let mut out = Vec::with_capacity(order.len());
     for id in order {
+        if deadline_exceeded(deadline) {
+            return Ok((Vec::new(), true));
+        }
         let mut group = by_id.remove(&id).unwrap_or_default();
         // Total order: `ts` ascending, then op precedence (retract >
         // reverify > assert), then `content_key` as a final deterministic
@@ -359,7 +381,7 @@ pub fn load_effective(root: &Path) -> Result<Vec<EffectiveMemory>, String> {
             retracted,
         });
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// BM25 score floor for a candidate to be recall-eligible at all (tuned in
@@ -403,21 +425,37 @@ fn doc_text(m: &EffectiveMemory) -> String {
 /// all-stopword-stripped-to-nothing) query -> empty vec, no vacuous "top
 /// of nothing" match.
 pub fn bm25_rank(corpus: &[EffectiveMemory], query: &str) -> Vec<(usize, f64)> {
+    bm25_rank_checked(corpus, query, None).0
+}
+
+/// Deadline-cooperative twin of [`bm25_rank`] (F2) — byte-identical output
+/// to `bm25_rank` when `deadline` is `None`. `Some` checks the deadline at
+/// each doc-tokenization and doc-scoring loop boundary (the two `O(corpus)`
+/// passes — a "debug BM25 fold over 3001 records" is exactly what blew the
+/// old retrospective-only 50ms budget in CI, per commit 76a716d) and bails
+/// to `(vec![], true)` the instant it has passed, discarding whatever
+/// partial ranking was in progress.
+fn bm25_rank_checked(
+    corpus: &[EffectiveMemory],
+    query: &str,
+    deadline: Option<Instant>,
+) -> (Vec<(usize, f64)>, bool) {
     let q_tokens = tokenize(query);
     if q_tokens.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
-    let docs: Vec<(usize, Vec<String>)> = corpus
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !m.retracted)
-        .map(|(i, m)| (i, tokenize(&doc_text(m))))
-        .collect();
+    let mut docs: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, m) in corpus.iter().enumerate().filter(|(_, m)| !m.retracted) {
+        if deadline_exceeded(deadline) {
+            return (Vec::new(), true);
+        }
+        docs.push((i, tokenize(&doc_text(m))));
+    }
 
     let n = docs.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let avg_dl: f64 = {
@@ -437,43 +475,55 @@ pub fn bm25_rank(corpus: &[EffectiveMemory], query: &str) -> Vec<(usize, f64)> {
         .filter(|t| seen.insert(t.as_str()))
         .collect();
 
-    let idf: HashMap<&str, f64> = unique_q_terms
-        .iter()
-        .map(|term| {
-            let df = docs
-                .iter()
-                .filter(|(_, tokens)| tokens.iter().any(|w| w == *term))
-                .count() as f64;
-            let val = ((n as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
-            (term.as_str(), val)
-        })
-        .collect();
+    let mut idf: HashMap<&str, f64> = HashMap::new();
+    for term in &unique_q_terms {
+        if deadline_exceeded(deadline) {
+            return (Vec::new(), true);
+        }
+        let df = docs
+            .iter()
+            .filter(|(_, tokens)| tokens.iter().any(|w| w == *term))
+            .count() as f64;
+        let val = ((n as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+        idf.insert(term.as_str(), val);
+    }
 
-    let mut results: Vec<(usize, f64)> = docs
-        .iter()
-        .map(|(orig_idx, tokens)| {
-            let dl = tokens.len() as f64;
-            let mut score = 0.0;
-            for term in &unique_q_terms {
-                let tf = tokens.iter().filter(|w| *w == *term).count() as f64;
-                if tf == 0.0 {
-                    continue;
-                }
-                let term_idf = *idf.get(term.as_str()).unwrap_or(&0.0);
-                score += term_idf * (tf * (BM25_K1 + 1.0))
-                    / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avg_dl));
+    let mut results: Vec<(usize, f64)> = Vec::new();
+    for (orig_idx, tokens) in &docs {
+        if deadline_exceeded(deadline) {
+            return (Vec::new(), true);
+        }
+        let dl = tokens.len() as f64;
+        let mut score = 0.0;
+        for term in &unique_q_terms {
+            let tf = tokens.iter().filter(|w| *w == *term).count() as f64;
+            if tf == 0.0 {
+                continue;
             }
-            (*orig_idx, score)
-        })
-        .filter(|(_, score)| *score >= SCORE_FLOOR)
-        .collect();
+            let term_idf = *idf.get(term.as_str()).unwrap_or(&0.0);
+            score += term_idf * (tf * (BM25_K1 + 1.0))
+                / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avg_dl));
+        }
+        if score >= SCORE_FLOOR {
+            results.push((*orig_idx, score));
+        }
+    }
 
     results.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
-    results
+    (results, false)
+}
+
+/// Cheap deadline check shared by every F2 cooperative loop boundary
+/// (`load_effective_checked`, `bm25_rank_checked`, `recall_impl`'s verify
+/// walk). `None` (no deadline — every non-hook caller) always returns
+/// `false`, so threading `deadline: Option<Instant>` through these
+/// functions has zero behavioral effect when unset.
+fn deadline_exceeded(deadline: Option<Instant>) -> bool {
+    matches!(deadline, Some(dl) if Instant::now() >= dl)
 }
 
 /// Hard cap on how many ranked candidates a single `recall` call will
@@ -506,17 +556,73 @@ pub const RECALL_VERIFY_CAP: usize = 128;
 /// (by `ts`, most-recent-first) non-retracted memories that are Fresh,
 /// walked in the same lazy-verify, cap-bounded style.
 pub fn recall(root: &Path, query: &str, k: usize) -> Result<Vec<EffectiveMemory>, String> {
-    let all = load_effective(root)?;
+    Ok(recall_impl(root, query, k, None)?.hits)
+}
+
+/// Result of a deadline-bounded [`recall_with_deadline`] call (F2).
+/// `budget_exceeded` is set iff the cooperative deadline tripped before the
+/// walk completed — when it is `true`, `hits` is always empty (a hard
+/// bail, never a partial result, so a caller can't confuse "budget blown"
+/// with "genuinely no matches").
+pub struct RecallOutcome {
+    pub hits: Vec<EffectiveMemory>,
+    pub budget_exceeded: bool,
+}
+
+/// Deadline-bounded [`recall`] (F2, founder-decided option (a) — a hard
+/// cooperative budget, not the old measure-after-the-fact suppression).
+/// Identical rank-then-verify semantics to `recall`, except every
+/// `O(corpus)` pass — `load_effective`'s fold, `bm25_rank`'s scoring, and
+/// this function's own freshness-verify walk — checks `deadline` at each
+/// loop boundary and bails out to an empty, `budget_exceeded: true` result
+/// the instant `Instant::now() >= deadline`, rather than running the full
+/// (potentially unboundedly slow) computation to completion and only
+/// discarding the *output* afterward. Intended for exactly one caller: the
+/// `UserPromptSubmit` hook's injection path (`cmds::inject_memory`), which
+/// must never let recall delay the user's prompt past its budget.
+pub fn recall_with_deadline(
+    root: &Path,
+    query: &str,
+    k: usize,
+    deadline: Instant,
+) -> Result<RecallOutcome, String> {
+    recall_impl(root, query, k, Some(deadline))
+}
+
+fn recall_impl(
+    root: &Path,
+    query: &str,
+    k: usize,
+    deadline: Option<Instant>,
+) -> Result<RecallOutcome, String> {
+    if deadline_exceeded(deadline) {
+        return Ok(RecallOutcome {
+            hits: Vec::new(),
+            budget_exceeded: true,
+        });
+    }
+
+    let (all, load_exceeded) = load_effective_checked(root, deadline)?;
+    if load_exceeded {
+        return Ok(RecallOutcome {
+            hits: Vec::new(),
+            budget_exceeded: true,
+        });
+    }
 
     let ordered_candidates: Vec<&EffectiveMemory> = if tokenize(query).is_empty() {
         let mut candidates: Vec<&EffectiveMemory> = all.iter().filter(|m| !m.retracted).collect();
         candidates.sort_by_key(|m| std::cmp::Reverse(m.ts));
         candidates
     } else {
-        bm25_rank(&all, query)
-            .into_iter()
-            .map(|(idx, _score)| &all[idx])
-            .collect()
+        let (ranked, rank_exceeded) = bm25_rank_checked(&all, query, deadline);
+        if rank_exceeded {
+            return Ok(RecallOutcome {
+                hits: Vec::new(),
+                budget_exceeded: true,
+            });
+        }
+        ranked.into_iter().map(|(idx, _score)| &all[idx]).collect()
     };
 
     let mut out = Vec::new();
@@ -524,16 +630,26 @@ pub fn recall(root: &Path, query: &str, k: usize) -> Result<Vec<EffectiveMemory>
         if out.len() >= k || verified >= RECALL_VERIFY_CAP {
             break;
         }
+        if deadline_exceeded(deadline) {
+            return Ok(RecallOutcome {
+                hits: Vec::new(),
+                budget_exceeded: true,
+            });
+        }
         if pin_freshness(root, &m.pins) == Freshness::Fresh {
             out.push(m.clone());
         }
     }
-    Ok(out)
+    Ok(RecallOutcome {
+        hits: out,
+        budget_exceeded: false,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn pin(path: &str, hash: &str) -> Pin {
         Pin {
@@ -1242,5 +1358,82 @@ mod tests {
                  block before ever reaching the fresh one: {found:?}"
             );
         }
+    }
+
+    // F2: the cooperative deadline is a HARD bail, not the old
+    // measure-after-the-fact suppression — proven by injecting a deadline
+    // that is already in the past (deterministic, no runner-speed
+    // coupling) against a corpus that would otherwise recall real, fresh
+    // hits. `recall` (the un-deadlined, pre-F2-shaped call) still returns
+    // the real match — the only thing that changed is that
+    // `recall_with_deadline` now has a way to bail *before* doing any of
+    // that work, which `recall`'s old retrospective-only budget check
+    // (measured after the call returned) could never express: an
+    // already-expired deadline passed in has nothing to cooperate with
+    // that pre-F2 code, because pre-F2 there was no deadline parameter at
+    // all, so this exact assertion could not even be written against HEAD.
+    #[test]
+    fn recall_with_deadline_bails_when_already_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        seed_memory(
+            root,
+            "A",
+            "nightly seed rotation keeps torture runs reproducible",
+            "a.rs",
+            b"fn a() {}",
+            1_000,
+        );
+        // Off-topic filler, same reason as `recall_never_returns_stale`:
+        // pads corpus N so idf(nightly)/idf(seed) clears SCORE_FLOOR.
+        for i in 0..8 {
+            seed_memory(
+                root,
+                &format!("filler{i}"),
+                "unrelated documentation cleanup housekeeping chore",
+                &format!("filler{i}.rs"),
+                b"fn filler() {}",
+                2_000 + i as u64,
+            );
+        }
+
+        // Sanity: with no deadline, this corpus really does recall a hit —
+        // proves the "empty" result below is caused by the expired
+        // deadline, not by the corpus being unmatchable.
+        let undeadlined = recall(root, "nightly seed", 5).unwrap();
+        assert_eq!(
+            undeadlined.len(),
+            1,
+            "sanity: query must match without a deadline"
+        );
+
+        let already_expired = Instant::now() - Duration::from_secs(1);
+        let outcome = recall_with_deadline(root, "nightly seed", 5, already_expired).unwrap();
+        assert!(
+            outcome.budget_exceeded,
+            "an already-expired deadline must report budget_exceeded"
+        );
+        assert!(
+            outcome.hits.is_empty(),
+            "a budget_exceeded outcome must never carry partial hits: {:?}",
+            outcome.hits
+        );
+    }
+
+    // Empty-query fallback path (freshest-first, no BM25) is also bounded
+    // by the deadline — an already-expired deadline bails before even the
+    // `load_effective` fold, regardless of which ranking branch would have
+    // run next.
+    #[test]
+    fn recall_with_deadline_bails_on_empty_query_fallback_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_memory(root, "A", "anything", "a.rs", b"fn a() {}", 1_000);
+
+        let already_expired = Instant::now() - Duration::from_secs(1);
+        let outcome = recall_with_deadline(root, "", 5, already_expired).unwrap();
+        assert!(outcome.budget_exceeded);
+        assert!(outcome.hits.is_empty());
     }
 }

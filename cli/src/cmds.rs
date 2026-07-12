@@ -10,13 +10,21 @@ use agentrec_core::store::BlobStore;
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Task 9 (INV-M4): self-measured wall-time budget for the in-process
-/// `recall_for_hook` call inside the UserPromptSubmit hook arm. Exceeding it
-/// discards the computed block (empty output) rather than risk a slow
-/// recall delaying the agent's prompt — measured, not pre-emptively
-/// interrupted, since `recall_for_hook` is synchronous.
+/// Task 9 / F2 (INV-M4): hard cooperative wall-time budget for the
+/// in-process `recall_for_hook_with_deadline` call inside the
+/// UserPromptSubmit hook arm. Unlike the original Task 9 shape (measured
+/// only AFTER `recall_for_hook` returned, so a slow recall still ran to
+/// completion and only its *output* was discarded), `inject_memory` now
+/// passes a `deadline = Instant::now() + RECALL_BUDGET_MS` INTO the recall
+/// call — `memory::recall_with_deadline` checks it at each internal loop
+/// boundary (`load_effective`'s fold, `bm25_rank`'s scoring, the
+/// freshness-verify walk) and bails out empty the instant it passes,
+/// bounding wall time itself, not just the visible output. The retrospective
+/// `elapsed_ms > RECALL_BUDGET_MS` check is kept as a cheap defense-in-depth
+/// net (e.g. a single very slow `pin_freshness` file read between deadline
+/// checks) but is no longer the primary bound.
 const RECALL_BUDGET_MS: u128 = 50;
 
 /// `log`: turns newest-first. Git turns and superseded (merged) turns are hidden
@@ -207,11 +215,24 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         }
     }
     let state = read_state(root);
-    // I = memory-stats.jsonl line count (0 if absent) — the hook-owned
-    // injection log (Task 9); this is the only visible evidence recall
-    // actually fired into a prompt, so status surfaces it verbatim.
+    // I = memory-stats.jsonl lines that recorded a real injection (carry
+    // `n`) — the hook-owned injection log (Task 9); this is the only
+    // visible evidence recall actually fired into a prompt, so status
+    // surfaces it verbatim. F2 also appends `budget_exceeded` lines to the
+    // same file (a bailed-out recall, never an injection) — those must NOT
+    // inflate this count, so the filter is content-aware, not a raw line
+    // count.
     let injections = std::fs::read_to_string(crate::memory_stats_path(root))
-        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .map(|v| v.get("n").is_some())
+                        .unwrap_or(false)
+                })
+                .count()
+        })
         .unwrap_or(0);
     out.push_str(&format!(
         "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections\n",
@@ -310,24 +331,66 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Test-only override (`cli/tests/integration.rs`,
+/// `hook_recall_bails_at_injected_deadline`) that forces `recall_deadline`
+/// to return a deadline already in the past. The real ~50ms window is far
+/// too fast for an external test process to race deterministically (and
+/// doing so would just reintroduce the exact runner-speed coupling commit
+/// 76a716d removed), so this substitutes a deadline that has already
+/// expired *before any recall work starts*, regardless of how fast or slow
+/// the machine is. A single env var read (no-op) when unset; no effect on
+/// production behavior.
+const TEST_FORCE_BUDGET_EXCEEDED_VAR: &str = "AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED";
+
+/// The cooperative deadline (F2) `inject_memory` passes into
+/// `recall_for_hook_with_deadline`: `started + RECALL_BUDGET_MS`, unless
+/// [`TEST_FORCE_BUDGET_EXCEEDED_VAR`] is set, in which case it is a fixed
+/// point already 1s in the past.
+fn recall_deadline(started: Instant) -> Instant {
+    if std::env::var_os(TEST_FORCE_BUDGET_EXCEEDED_VAR).is_some() {
+        return started
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(started);
+    }
+    started + Duration::from_millis(RECALL_BUDGET_MS as u64)
+}
+
 /// Recalls fresh matching memories for `query` in-process
-/// (`memorycmds::recall_for_hook`, not a subprocess) and prints the fenced
-/// block to stdout — budgeted and fail-open (INV-M4). Self-measures wall
-/// time around the recall call; past [`RECALL_BUDGET_MS`] the result is
-/// discarded (empty output) even if it computed successfully. On an actual
-/// injection (non-empty block, within budget) appends one line to the
-/// hook-owned `memory-stats.jsonl` — never `state.json`, which only the
-/// daemon writes (the hazard this task is explicitly gated against).
+/// (`memorycmds::recall_for_hook_with_deadline`, not a subprocess) and
+/// prints the fenced block to stdout — hard-budgeted and fail-open (INV-M4,
+/// F2). The deadline is threaded INTO the recall call (see
+/// [`RECALL_BUDGET_MS`]'s doc comment) so a slow recall bails out of its own
+/// internal loops rather than running to completion; the retrospective
+/// `elapsed_ms` check below is kept only as defense-in-depth. Either a
+/// cooperative bail (`budget_exceeded`) or the retrospective net tripping
+/// appends a `{"ts","budget_exceeded":true}` line to `memory-stats.jsonl` —
+/// visible evidence the budget was actually hit, not silent degradation. On
+/// an actual injection (non-empty block, within budget) appends
+/// `{"ts","n"}` instead. Never `state.json`, which only the daemon writes
+/// (the hazard this task is explicitly gated against).
 fn inject_memory(root: &Path, query: &str) {
     let max_facts = memorycmds::read_memory_inject_max(root);
     let started = Instant::now();
-    let block = memorycmds::recall_for_hook(root, query, max_facts);
+    let deadline = recall_deadline(started);
+    let outcome = memorycmds::recall_for_hook_with_deadline(root, query, max_facts, deadline);
     let elapsed_ms = started.elapsed().as_millis();
-    if block.is_empty() || elapsed_ms > RECALL_BUDGET_MS {
+
+    if outcome.budget_exceeded || elapsed_ms > RECALL_BUDGET_MS {
+        let stats_line =
+            serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+        // Best-effort, same fail-open posture as the recall itself.
+        let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
         return;
     }
-    print!("{block}");
-    let n = block.lines().filter(|l| l.starts_with("- ")).count();
+    if outcome.block.is_empty() {
+        return;
+    }
+    print!("{}", outcome.block);
+    let n = outcome
+        .block
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        .count();
     let stats_line = serde_json::json!({ "ts": wall_now_ms(), "n": n }).to_string();
     // Best-effort: a memory-stats write failure must not turn a successful
     // injection into a hook failure (same fail-open posture as the recall
