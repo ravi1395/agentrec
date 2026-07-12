@@ -4634,7 +4634,7 @@ fn hook_fail_open_and_budget() {
 fn hook_recall_bails_at_injected_deadline() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    agentrec(root, &["init"]);
+    agentrec(root, &["init", "--no-service"]);
 
     // A real, freshly-pinned, on-topic memory that WOULD be injected on a
     // normal (non-expired-deadline) call — proves the empty result below is
