@@ -144,6 +144,32 @@ enum Command {
         #[arg(long)]
         from: String,
     },
+    /// Rank-then-verify search over pinned memories; only Fresh matches.
+    Recall {
+        /// Free-text query.
+        query: String,
+        /// Max results.
+        #[arg(short, default_value = "5")]
+        k: usize,
+        /// Emit the full effective records (+ freshness) as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Internal: emit the fenced hook-injection block (or nothing).
+        #[arg(long, hide = true)]
+        for_hook: bool,
+    },
+    /// List recorded memories (audit view, not a query).
+    Memories {
+        /// Show only non-fresh (stale/orphaned) memories.
+        #[arg(long)]
+        stale: bool,
+        /// Include retracted memories too.
+        #[arg(long)]
+        all: bool,
+        /// Emit the full effective records (+ freshness) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -191,6 +217,13 @@ fn main() {
             snapshots_before,
         } => purgecmd::run(&root, all_prompts, snapshots_before.as_deref()),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
+        Command::Recall {
+            query,
+            k,
+            json,
+            for_hook,
+        } => memorycmds::recall_cmd(&root, &query, k, json, for_hook),
+        Command::Memories { stale, all, json } => memorycmds::memories(&root, stale, all, json),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");

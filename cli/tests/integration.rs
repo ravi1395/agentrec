@@ -3110,6 +3110,175 @@ fn remember_refuses_bad_pins_and_secret_facts() {
     }
 }
 
+// --- Task 5: `agentrec recall` + `agentrec memories`.
+
+/// Seeds `count` off-topic filler memories, each pinned to its own file —
+/// mirrors `agentrec_core::memory::recall_never_returns_stale`'s fixture:
+/// with only 1-2 on-topic memories in a tiny corpus, idf(shared terms)
+/// doesn't clear SCORE_FLOOR on its own, so tests that exercise real BM25
+/// ranking need the corpus padded to N ~10.
+fn seed_filler_memories(root: &Path, count: usize) {
+    for i in 0..count {
+        let rel = format!("filler{i}.rs");
+        std::fs::write(root.join(&rel), b"fn filler() {}").unwrap();
+        let out = agentrec(
+            root,
+            &[
+                "remember",
+                "unrelated documentation cleanup housekeeping chore",
+                "--from",
+                &rel,
+            ],
+        );
+        assert!(out.status.success(), "remember filler{i} failed: {out:?}");
+    }
+}
+
+#[test]
+fn recall_cli_fresh_only_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), b"fn b() {}").unwrap();
+
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember A failed: {out:?}");
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed also drives the fuzz corpus replay",
+            "--from",
+            "src/b.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember B failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid json: {e}: {stdout}"));
+    let arr = parsed.as_array().expect("json array");
+    assert_eq!(arr.len(), 2, "expected 2 fresh matches: {stdout}");
+
+    // Mutate one pinned file's content -> that memory goes Stale.
+    std::fs::write(root.join("src/a.rs"), b"fn a() { changed(); }").unwrap();
+
+    let out = agentrec(root, &["recall", "nightly seed", "--json"]);
+    assert!(out.status.success(), "recall --json (2) failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let arr = parsed.as_array().expect("json array");
+    assert_eq!(arr.len(), 1, "stale memory must be excluded: {stdout}");
+
+    // `memories --stale` shows the one whose pin drifted.
+    let out = agentrec(root, &["memories", "--stale"]);
+    assert!(out.status.success(), "memories --stale failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs"),
+        "stale listing must show the drifted pin path: {stdout}"
+    );
+    assert!(
+        !stdout.contains("src/b.rs"),
+        "fresh memory must not appear under --stale: {stdout}"
+    );
+
+    // `memories --all` shows both, regardless of freshness.
+    let out = agentrec(root, &["memories", "--all"]);
+    assert!(out.status.success(), "memories --all failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("src/a.rs") && stdout.contains("src/b.rs"),
+        "memories --all must show both: {stdout}"
+    );
+}
+
+#[test]
+fn recall_for_hook_emits_block_or_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    seed_filler_memories(root, 8);
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    // Matching query -> fenced block, capped at 800 chars, never a hash.
+    let out = agentrec(root, &["recall", "nightly seed", "--for-hook"]);
+    assert!(out.status.success(), "recall --for-hook failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("```agentrec memory"), "stdout: {stdout}");
+    assert!(
+        stdout.chars().count() <= 800,
+        "block exceeds 800 chars ({} chars): {stdout}",
+        stdout.chars().count()
+    );
+    assert!(
+        !stdout.contains("sha256:"),
+        "must not leak hashes: {stdout}"
+    );
+
+    // Nonsense query -> nothing above SCORE_FLOOR -> empty stdout, exit 0.
+    let out = agentrec(root, &["recall", "zebra quantum", "--for-hook"]);
+    assert!(
+        out.status.success(),
+        "nonsense query must still exit 0: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nonsense query must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Uninitialized repo: --for-hook fails open (empty stdout, exit 0);
+    // without --for-hook it's a real error (exit 1, stderr).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+
+    let out = agentrec(root2, &["recall", "anything", "--for-hook"]);
+    assert!(
+        out.status.success(),
+        "uninitialized --for-hook must exit 0: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "uninitialized --for-hook must emit no stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = agentrec(root2, &["recall", "anything"]);
+    assert!(
+        !out.status.success(),
+        "uninitialized recall (no --for-hook) must fail: {out:?}"
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "uninitialized recall (no --for-hook) must report on stderr"
+    );
+}
+
 #[test]
 fn log_explain_glossary_matches_only_present_terms() {
     let tmp = tempfile::tempdir().unwrap();
