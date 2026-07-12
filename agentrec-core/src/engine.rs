@@ -40,9 +40,10 @@ struct OpenTurn {
     /// Reserved at open time rather than generated lazily at close (as every
     /// other turn id used to be) — this lets an external process learn the id
     /// a still-open turn WILL close under, before it closes. Motivating case:
-    /// the daemon's memory-candidate ingestion (PROTOCOL.md memory-candidate
-    /// design, "source_turns links to the enclosing turn") needs to stamp
-    /// `source_turns` on a candidate that arrives mid-bracket. Safe because
+    /// the daemon's memory-candidate ingestion (design spec
+    /// `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`
+    /// §Write path, "source_turns linked to the enclosing turn") needs to
+    /// stamp `source_turns` on a candidate that arrives mid-bracket. Safe because
     /// exactly one turn is ever open per root (strictly serialized
     /// open→close→open), so reserving here doesn't change ULID ordering
     /// across turns, only shifts one id's embedded timestamp a few seconds

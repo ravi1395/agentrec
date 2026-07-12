@@ -15,8 +15,9 @@ served back to the agent at the right moment.
 
 The differentiator over existing memory products (mem0, Zep, Letta): every memory is
 **content-addressed-invalidated**. A memory pins the file hashes it derives from; when
-the code changes, the memory is provably stale and is never served. Memory that cannot
-silently lie.
+the code changes, the pin hash no longer matches and staleness is detected — not
+guessed — and the memory is never served stale. A Fresh pin proves the file hasn't
+changed since pinning, not that the fact is still true.
 
 ## Decisions log (user-confirmed; executors may not re-litigate)
 
@@ -39,6 +40,18 @@ silently lie.
    verification**. No watcher coupling.
 8. **Bucketing:** structural, never inferred. Per-repo store; pins must resolve
    inside the repo root; provenance via `source_turns` join. No classifier.
+9. **Retro-recorded (process note, added F7):** implementing decision 8's
+   `source_turns` join required a turn id that's known before the turn closes
+   — the engine change that made this possible (turn id reserved at
+   `observe_start`/OPEN, was previously minted lazily at close,
+   `agentrec-core/src/engine.rs:OpenTurn.id`) was outside this plan's
+   original task scope; it landed as an implicit prerequisite rather than a
+   planned task. That change is what caused the PR #2 kill-9 duplicate-id
+   bug repaired by commit `cb5dcd1` (a pre-fix daemon's orphan recovery could
+   re-append a closed turn under its now-stable reserved id instead of a
+   fresh one). Recorded here after the fact so the causal chain — decision 8
+   → reserve-at-open → the dup-id bug class — is traceable from the spec that
+   motivated it, not just from the bugfix commit log.
 
 ## Rejected approaches (with reasons — do not resurrect)
 

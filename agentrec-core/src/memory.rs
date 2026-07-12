@@ -41,9 +41,14 @@ pub enum MemoryOp {
     Retract,
 }
 
-/// One line of `.agentrec/memory.jsonl` (protocol-additive, `v: 1`).
-/// Consumers MUST tolerate unknown fields (serde default: unrecognized keys
-/// are ignored on read).
+/// One line of `.agentrec/memory.jsonl` — an implementation-local format
+/// (design spec `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`
+/// §Data model), independently versioned via its own `v: 1` field. NOT
+/// defined by PROTOCOL.md: only the emitter-facing `memory-candidate` signal
+/// (§4) is wire protocol; the on-disk record shape here is out of scope for
+/// that document, same posture as `state.json` (PROTOCOL.md §5's
+/// "Local-only state, not wire protocol" note). Consumers MUST tolerate
+/// unknown fields (serde default: unrecognized keys are ignored on read).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MemoryRecord {
     pub v: u32,
