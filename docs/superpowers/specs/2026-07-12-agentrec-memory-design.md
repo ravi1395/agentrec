@@ -1,7 +1,7 @@
 # agentrec memory — design spec
 
 Date: 2026-07-12
-Status: approved in brainstorm; pending implementation plan
+Status: implemented (v1, memory Tasks 1–12 complete — see IMPLEMENTATION.md § Memory (v1))
 Owner: Ravi (founder)
 
 ## Problem

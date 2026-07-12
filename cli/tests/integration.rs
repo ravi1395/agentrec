@@ -2434,6 +2434,58 @@ fn secret_prompt_never_reaches_disk_in_cleartext() {
     })
     .expect("turn with secret-bearing prompt recorded");
 
+    // INV-M3 (memory locations 3 and 4, Task 12): drive the SAME planted
+    // secret through both memory write paths — `remember` (direct,
+    // daemon-independent write) and `candidate` (async, daemon-ingested
+    // write) — then a matching `UserPromptSubmit` hook so a
+    // `memory-stats.jsonl` line actually exists. All three must land on
+    // disk with the raw key nowhere. The daemon must still be alive for
+    // `candidate` to be ingested, so this all happens BEFORE the
+    // `sigkill` below.
+    seed_filler_memories(root, 8);
+    let remember_fact = format!("deploy with key {secret} now");
+    let out = agentrec(root, &["remember", &remember_fact, "--from", "touched.rs"]);
+    assert!(out.status.success(), "remember failed: {out:?}");
+
+    let candidate_fact = format!("the deploy key {secret} rotates every staging release cycle");
+    let out = agentrec(
+        root,
+        &[
+            "candidate",
+            &candidate_fact,
+            "--from",
+            "touched.rs",
+            "--tool",
+            "test-candidate",
+        ],
+    );
+    assert!(out.status.success(), "candidate emit failed: {out:?}");
+
+    let memories_after_candidate = poll_until(Duration::from_secs(10), || {
+        let recs = memory_records(root);
+        (recs.len() >= 10).then_some(recs) // 8 filler + remember + candidate
+    })
+    .expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        memories_after_candidate.len(),
+        10,
+        "expected exactly 10 memory records: {memories_after_candidate:?}"
+    );
+
+    // Matching UserPromptSubmit -> a real memory-stats.jsonl line (not just
+    // an absent-file vacuous pass).
+    let hook_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_secret_hook","prompt":"deploy key rotation"}"#;
+    send_hook(root, hook_payload);
+    let stats_after_hook = poll_until(Duration::from_secs(5), || {
+        let lines = memory_stats_lines(root);
+        (!lines.is_empty()).then_some(lines)
+    })
+    .expect("expected a memory-stats.jsonl line after a matching hook prompt");
+    assert!(
+        !stats_after_hook.is_empty(),
+        "expected at least one memory-stats.jsonl line"
+    );
+
     sigkill(&daemon);
     let _ = daemon.wait();
 
@@ -2492,6 +2544,34 @@ fn secret_prompt_never_reaches_disk_in_cleartext() {
         }
     }
     assert!(checked_any, "expected at least one blob object to check");
+
+    // INV-M3 complete (locations 3 and 4): `memory.jsonl` carries the
+    // scrubbed fact (redaction marker present, raw key absent) for BOTH the
+    // `remember` and `candidate` write paths.
+    let memory_jsonl = std::fs::read(root.join(".agentrec/memory.jsonl")).unwrap_or_default();
+    assert!(
+        !contains_bytes(&memory_jsonl, secret.as_bytes()),
+        "raw secret leaked into memory.jsonl"
+    );
+    assert!(
+        contains_bytes(&memory_jsonl, b"[redacted:"),
+        "expected a redaction marker in memory.jsonl"
+    );
+
+    // `memory-stats.jsonl` only ever holds `{"ts","n"}` counts — no fact
+    // text — so it should trivially never carry the secret. Asserted anyway
+    // for completeness (INV-M3, 4th and final location) against the real
+    // line the matching hook above produced, not an absent file.
+    let memory_stats_jsonl =
+        std::fs::read(root.join(".agentrec/memory-stats.jsonl")).unwrap_or_default();
+    assert!(
+        !memory_stats_jsonl.is_empty(),
+        "expected a real memory-stats.jsonl to check, not an absent file"
+    );
+    assert!(
+        !contains_bytes(&memory_stats_jsonl, secret.as_bytes()),
+        "raw secret leaked into memory-stats.jsonl"
+    );
 }
 
 // ---- `agentrec doctor` (D41 / AC-Y++) ---------------------------------------

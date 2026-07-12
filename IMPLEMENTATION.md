@@ -230,23 +230,58 @@ Every call that could have been an open question, resolved. Renegotiable, but th
 
 ### Memory (v1)
 
-Hash-pinned semantic memory (see `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`).
-Every invariant below maps to ≥1 automated test, filled in as the memory tasks land
-(Tasks 1–12); a name still reading "pending" has no test yet and must not be
-treated as verified.
+Hash-pinned semantic memory (see `docs/superpowers/specs/2026-07-12-agentrec-memory-design.md`,
+status: implemented). All 12 memory tasks landed; every invariant below now names
+its complete test set — no "pending" rows remain.
 
 1. **INV-M1** — no memory record exists without ≥1 valid in-root pin: fuzz malformed
-   candidates (traversal, absolute paths, symlink escape, empty pins). Maps to test:
-   pending.
+   candidates (traversal, absolute paths, symlink escape, empty pins). Maps to tests:
+   `agentrec-core::memory::tests::pin_path_rejections` (traversal/absolute/symlink-escape/
+   secret-path/nonexistent-path rejection, unit level); `cli/tests/hardening_daemon.rs::
+   candidate_rejects_counted_never_fabricated` (4 genuinely-rejecting daemon-ingested
+   candidates — traversal pin, secret-file pin, empty-after-scrub fact, >PINS_MAX pins —
+   leave `memory.jsonl` untouched, counted in `state.json.memory_rejects`); `cli/tests/
+   torture.rs::{torture_smoke,torture_survives_chaos}` (`assert_memory_invariants`,
+   Task 12 — every RAW line in `memory.jsonl` parses as a `MemoryRecord` with ≥1 pin,
+   checked after every op batch including immediately after a daemon `kill -9` +
+   respawn, proving fsynced appends never leave a torn line).
 2. **INV-M2** — stale/orphaned memories are never emitted by the injection path:
-   mutate a pinned file, recall again, memory gone. Maps to test: pending.
+   mutate a pinned file, recall again, memory gone. Maps to tests: `agentrec-core::
+   memory::tests::{recall_never_returns_stale,recall_verifies_only_top_candidates,
+   freshness_transitions}` (core rank-then-verify + freshness derivation);
+   `cli/tests/integration.rs::recall_cli_fresh_only_and_json` (CLI-level fresh-only
+   contract); `cli/tests/torture.rs::{torture_smoke,torture_survives_chaos}`
+   (`op_recall`, Task 12 — every memory an in-flight `recall --json` returns is
+   re-hashed against the live working tree and asserted `Freshness::Fresh`, exercised
+   under concurrent chaos mutation/kill-9/undo; a run-long ANCHOR memory guarantees
+   the check is never vacuously skipped).
 3. **INV-M3** — planted secret never lands in `memory.jsonl` via either write path.
-   Maps to test: pending.
+   Maps to tests: `cli/tests/integration.rs::remember_refuses_bad_pins_and_secret_facts`
+   (manual `remember` path); `cli/tests/hardening_daemon.rs::
+   candidate_secret_fact_scrubbed_on_disk` (agent `candidate` → daemon-ingestion path);
+   `cli/tests/integration.rs::secret_prompt_never_reaches_disk_in_cleartext` (Task 12 —
+   extended to drive the SAME planted AWS-key-shaped secret through both `remember` and
+   `candidate`, plus a matching `UserPromptSubmit` hook, then grep all 4 locations —
+   `signal.jsonl`, `log.jsonl`, `.agentrec/objects/**`, `memory.jsonl`, and
+   `memory-stats.jsonl` — proving the raw secret is nowhere while a redaction marker is
+   present everywhere it should be).
 4. **INV-M4** — hook path exits 0 and within budget under: corrupt store, missing
-   store, 10k-record store, concurrent append. Maps to test: pending.
+   store, 10k-record store, concurrent append. Maps to tests: `cli/tests/integration.rs::
+   hook_injects_fresh_memories_into_stdout` (enabled-path injection, `memory_enabled=false`
+   kill switch, Stop-arm never injects, `memory_inject_max` coupling); `cli/tests/
+   integration.rs::hook_fail_open_and_budget` (corrupt `memory.jsonl` → exit 0 + no
+   block + start signal still appended; 3000-record store answers within the 500ms
+   CI-slack budget against the hook's internal 50ms self-budget; missing store and a
+   fully uninitialized `.agentrec/` both exit 0 with no block).
 5. **INV-M5** — fold determinism: same records ingested in any order produce the
-   same effective state (property test). Maps to test:
-   `agentrec-core::memory::tests::fold_latest_op_wins_any_order` (Task 1).
+   same effective state (property test). Maps to tests: `agentrec-core::memory::
+   tests::fold_latest_op_wins_any_order` (Task 1 — 6-permutation assert/reverify/retract
+   fold); `agentrec-core::memory::tests::{fold_equal_ts_retract_wins_any_order,
+   fold_equal_ts_reverify_wins_over_assert_any_order}` (codex-found equal-timestamp fix —
+   op-precedence tie-break, both file orderings); `cli/tests/hardening_daemon.rs::
+   dangling_source_turns_closed_by_pre_persist_journal_sync` (codex-found crash-window
+   fix — a candidate's `source_turns` id is always journal-recoverable before it's
+   durably referenced, closing the same-iteration start+candidate race).
 
 ## 5. v2 — The integration release (Codex, MCP, VS Code)
 
