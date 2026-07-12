@@ -471,6 +471,137 @@ fn candidate_ingestion_end_to_end() {
     );
 }
 
+/// Overwrites `.agentrec/config.toml` with a single `memory_enabled = <val>`
+/// line — matches the hand-rolled `key = value` scan `memorycmds::
+/// read_memory_enabled` performs (no `toml` dependency), so this is a valid
+/// config regardless of what `init` wrote as the default.
+fn write_memory_enabled(root: &Path, enabled: bool) {
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        format!("memory_enabled = {enabled}\n"),
+    )
+    .unwrap();
+}
+
+// Fix D (codex cross-review): the design spec's kill-switch (line 184,
+// binding) reads "`[memory] enabled = false` disables injection **+
+// candidate ingestion**" — but pre-fix, `memory_enabled` was only checked on
+// the hook-injection path (`cmds.rs`); the daemon's live ingestion
+// (`daemon.rs` main loop) and startup replay (`replay_pending_candidates`)
+// ingested candidates regardless. This drives the real daemon with
+// `memory_enabled = false` in config.toml, plants a valid memory-candidate
+// signal exactly like `candidate_ingestion_end_to_end`, and asserts NOTHING
+// lands in memory.jsonl — plus the regression pair from Task 6: a disabled
+// candidate must still never fabricate a turn closure (the routing guard
+// that keeps candidate lines away from the stop arm is orthogonal to the
+// kill-switch and must stay intact).
+#[test]
+fn candidate_ingestion_disabled_when_memory_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    write_memory_enabled(root, false);
+    std::fs::write(root.join("notes.txt"), "hello world").unwrap();
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // Open the bracket (same shape as candidate_ingestion_end_to_end).
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_disabled"}"#,
+    );
+
+    let candidate = memory_signal("memory should be off right now", &["notes.txt"]);
+    append_signal_line(root, &candidate);
+
+    // Several poll cycles (POLL = 250ms) for the daemon to tail the line and,
+    // if the kill-switch were unguarded, ingest it.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        memories(root).is_empty(),
+        "memory_enabled = false must block candidate ingestion: {:?}",
+        memories(root)
+    );
+
+    // Regression pair (Task 6 guard): even disabled, the candidate line must
+    // not fall through to the stop arm and fabricate a turn closure.
+    let premature = turns(root);
+    assert!(
+        premature.is_empty(),
+        "a disabled memory-candidate signal closed a turn — routing guard \
+         regressed: {premature:?}"
+    );
+
+    // Regression pair (rejects counter): a disabled candidate is a disabled
+    // FEATURE, not an invalid candidate — it must not be counted as a reject.
+    let state = state_json(root);
+    assert_eq!(
+        state.get("memory_rejects").and_then(|v| v.as_u64()),
+        Some(0),
+        "a disabled candidate must not be counted as a reject: {state:?}"
+    );
+
+    // Close the bracket normally — confirms the real Stop hook still works
+    // and the daemon isn't wedged by the disabled-candidate path.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"Stop","session_id":"s_disabled"}"#,
+    );
+    let closed = poll_until(Duration::from_secs(5), || {
+        let t = turns(root);
+        (!t.is_empty()).then_some(t)
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        closed.is_some(),
+        "no turn ever closed after the real Stop hook — daemon wedged?"
+    );
+
+    // Control: with memory_enabled = true (default), the identical candidate
+    // IS ingested — proves the assertions above test the kill-switch, not a
+    // broken ingestion path in general.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    init(root2);
+    std::fs::write(root2.join("notes.txt"), "hello world").unwrap();
+
+    let mut daemon2 = spawn_record(root2);
+    let started2 = poll_until(Duration::from_secs(5), || {
+        epoch_events(root2)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(
+        started2.is_some(),
+        "control daemon never appended a start epoch"
+    );
+
+    let candidate2 = memory_signal("memory should be on right now", &["notes.txt"]);
+    append_signal_line(root2, &candidate2);
+
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let m = memories(root2);
+        (!m.is_empty()).then_some(m)
+    });
+
+    let _ = daemon2.kill();
+    let _ = daemon2.wait();
+
+    assert!(
+        recorded.is_some(),
+        "control: default memory_enabled must still ingest a valid candidate"
+    );
+}
+
 // Four genuinely-rejecting candidates — traversal pin, secret-file (`.env`)
 // pin, a whitespace-only fact (scrubs to empty — NOT a secret-only fact:
 // scrub redacts rather than deletes, so `"AKIA..."` alone would scrub to a

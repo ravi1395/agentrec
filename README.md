@@ -117,10 +117,12 @@ Two write paths: `agentrec remember` for a human asserting a fact directly, and 
 
 On Claude Code's `UserPromptSubmit` hook, agentrec injects the top matching Fresh memories as a fenced block into the agent's context — budgeted and fail-open, so a corrupt or oversized store never blocks a prompt. Two `config.toml` keys control this:
 
-- `memory_enabled` (default `true`) — kill switch; set `false` to disable injection (and the write paths still work, they're just never surfaced).
+- `memory_enabled` (default `true`) — kill switch; set `false` to disable **both** automatic paths: hook injection (no fenced block is ever printed) and the daemon's candidate ingestion (an `agentrec candidate` signal is consumed from the inbox but never written to `memory.jsonl`, live or on startup replay). It does not gate the manual `agentrec remember` / `verify` / `forget` verbs — those are deliberate user actions and always work.
 - `memory_inject_max` (default `5`) — max facts injected per prompt.
 
 `agentrec status` reports memory counters (`fresh`/`stale`/`rejects`/`injections`) alongside the usual turn stats.
+
+`purge --memories-retracted` rewrites `memory.jsonl` in place; run it with the daemon stopped and not concurrently with `remember`/`verify`/`forget` — those appends aren't lock-coordinated with a purge in progress.
 
 ## License
 
