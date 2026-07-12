@@ -1,7 +1,7 @@
 # agentrec memory — design spec
 
 Date: 2026-07-12
-Status: implemented (v1, memory Tasks 1–12 complete — see IMPLEMENTATION.md § Memory (v1))
+Status: approved in brainstorm; pending implementation plan
 Owner: Ravi (founder)
 
 ## Problem
@@ -15,9 +15,8 @@ served back to the agent at the right moment.
 
 The differentiator over existing memory products (mem0, Zep, Letta): every memory is
 **content-addressed-invalidated**. A memory pins the file hashes it derives from; when
-the code changes, the pin hash no longer matches and staleness is detected — not
-guessed — and the memory is never served stale. A Fresh pin proves the file hasn't
-changed since pinning, not that the fact is still true.
+the code changes, the memory is provably stale and is never served. Memory that cannot
+silently lie.
 
 ## Decisions log (user-confirmed; executors may not re-litigate)
 
@@ -40,18 +39,6 @@ changed since pinning, not that the fact is still true.
    verification**. No watcher coupling.
 8. **Bucketing:** structural, never inferred. Per-repo store; pins must resolve
    inside the repo root; provenance via `source_turns` join. No classifier.
-9. **Retro-recorded (process note, added F7):** implementing decision 8's
-   `source_turns` join required a turn id that's known before the turn closes
-   — the engine change that made this possible (turn id reserved at
-   `observe_start`/OPEN, was previously minted lazily at close,
-   `agentrec-core/src/engine.rs:OpenTurn.id`) was outside this plan's
-   original task scope; it landed as an implicit prerequisite rather than a
-   planned task. That change is what caused the PR #2 kill-9 duplicate-id
-   bug repaired by commit `cb5dcd1` (a pre-fix daemon's orphan recovery could
-   re-append a closed turn under its now-stable reserved id instead of a
-   fresh one). Recorded here after the fact so the causal chain — decision 8
-   → reserve-at-open → the dup-id bug class — is traceable from the spec that
-   motivated it, not just from the bugfix commit log.
 
 ## Rejected approaches (with reasons — do not resurrect)
 
@@ -172,30 +159,10 @@ counterweight. Tighten only on dogfood evidence.
 
 ## Read path
 
-Core: `recall(query, k)` in `agentrec-core` — load → fold → BM25 over `fact` text +
-pin path segments → **rank-then-verify**: pin-verify candidates in rank order until
-k fresh results found (verification cost scales with k, not corpus size — this is
-what keeps INV-M4's 10k-record/50 ms budget honest). Stale/orphaned candidates are
-skipped, never served. Cold read; no
+Core: `recall(query, k)` in `agentrec-core` — load → fold → pin-verify → BM25 over
+`fact` text + pin path segments, **fresh memories only** → top-k. Cold read; no
 daemon. Tokenization: lowercase, split non-alphanumeric, path segments are terms.
 Empty query → recency-ordered fresh list.
-
-**Verify cap (F3, `RECALL_VERIFY_CAP = 128`):** the rank-then-verify walk never
-freshness-verifies more than 128 ranked candidates per call, regardless of `k` —
-without this, a stale/orphaned-heavy corpus would hash an unbounded number of files
-on every recall (unbounded I/O inside the hook's 50 ms budget). On a corpus where
-the 128 highest-ranked candidates are all stale/orphaned, recall can return fewer
-than `k` (even zero) results while genuinely Fresh, on-topic memories exist further
-down the ranking — capping never serves a stale/orphaned candidate (INV-M2 intact),
-it only ever means some Fresh ones past the cap are never reached. This is silent by
-construction, so the read path surfaces it explicitly: `recall_outcome`/
-`recall_with_deadline` return `capped: bool` (`RecallOutcome`), and `agentrec
-recall`'s human output prints a one-line `verification capped at 128 candidates —
-results may be incomplete` notice to **stderr** (never stdout — keeps stdout
-parseable/pipeable) when it fires. `--json` output and `agentrec memories` (which
-never verify-caps — it walks every record via `pin_freshness`, not `recall`) are
-unaffected. The hook injection path (below) records `capped` as a
-`memory-stats.jsonl` stat only, never as injected text.
 
 1. **CLI:** `agentrec recall "<query>" [-k N] [--json]`;
    `agentrec memories [--stale|--all]` — stale rows show which pin drifted and when
@@ -208,15 +175,10 @@ unaffected. The hook injection path (below) records `capped` as a
      Failures increment a counter, never break the prompt.
    - Format: fenced `agentrec memory` block, one fact per line + pin paths; no
      ids/hashes in injected text.
-   - Verify cap (F3): a capped walk (see above) records `capped: true` in the
-     `memory-stats.jsonl` line it appends — including the zero-hit case, where
-     a bare `{"ts","capped":true}` line lands even though no block is
-     injected. Never appears in stdout; the block-or-nothing/exit-0 contract
-     is unconditional.
 3. **MCP:** `agentrec_recall`, read tier — added to PROTOCOL.md §8 table + schema
    now (frozen), implemented when the v2 MCP server lands.
 
-Kill-switch: `memory_enabled = false` disables injection + candidate ingestion;
+Kill-switch: `[memory] enabled = false` disables injection + candidate ingestion;
 store stays readable.
 
 ## Lifecycle
@@ -261,22 +223,6 @@ Invariants (each maps to ≥1 automated test; add to IMPLEMENTATION.md AC regist
 Success gate: all invariants green + 1-week dogfood in this repo with counters in
 `status` (injections / rejects / stale-quarantined). Token A/B harness = later eval
 round.
-
-## Performance envelope (low-end target: 8 GB laptop)
-
-Baseline measured on the live v0.1.0 daemon (29 h run): 9.8 MB idle RSS, 0.018 %
-idle CPU, ~100 ms per 50-file mutation burst, sha256 at 555 MB/s. Budgets this
-feature must hold:
-
-- Daemon idle RSS ≤ 25 MB including the live dedup set (facts are ≤ 500 chars;
-  10k facts ≈ 3 MB — nothing resident scales with repo size).
-- No new timers, no polling: ingestion is signal-tailer-driven; recall is a
-  transient process (~5–10 MB RSS, exits).
-- Recall hook: 50 ms hard self-budget via rank-then-verify (§Read path).
-  Optional `(path, mtime, size)` hash cache is an advisory fast-path only —
-  mtime can lie; any cache miss or doubt falls back to full hashing.
-- `memory.jsonl` disk growth is KB–low-MB; CAS remains the only large store and
-  keeps its existing 2 GiB eviction cap.
 
 ## Phasing (independently mergeable)
 
