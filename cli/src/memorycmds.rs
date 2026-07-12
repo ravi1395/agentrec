@@ -6,6 +6,7 @@
 //! built, and only the scrubbed text — never the raw one — is ever placed
 //! into the record.
 
+use crate::cmds::wall_now_ms;
 use crate::fmt;
 use agentrec_core::memory::{self, EffectiveMemory, Freshness, MemoryOp, MemoryRecord, Pin};
 use agentrec_core::record::{append_log_line, SignalEvent};
@@ -14,7 +15,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 /// `from` is a comma-separated list of repo-relative paths. Each is
 /// validated (`memory::validate_pin_path`) and hashed (`memory::hash_pin`)
@@ -297,33 +298,15 @@ pub fn forget(root: &Path, id: &str, reason: Option<&str>) -> Result<(), String>
     crate::memlock::append_memory_locked(root, &rec)
 }
 
-/// Mirrors the same one-line helper repeated across `cmds.rs`/`purgecmd.rs`/
-/// `daemon.rs`/`readcmds.rs` — a 3-line `SystemTime` call, not worth sharing.
-fn wall_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Read `memory_enabled` from `.agentrec/config.toml` — mirrors
-/// `purgecmd::read_ttl_days`'s hand-rolled `key = value` scan (not worth a
-/// `toml` dependency for two more keys). Missing file, missing key, or an
+/// Read `memory_enabled` from `.agentrec/config.toml` via the shared
+/// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
 /// unparseable value all fall back to the documented default of `true`.
 pub fn read_memory_enabled(root: &Path) -> bool {
-    let path = crate::agentrec_dir(root).join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Some(text) = crate::cmds::read_config_text(root) else {
         return true;
     };
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("memory_enabled") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        match value.trim() {
+    for value in crate::cmds::config_values(&text, "memory_enabled") {
+        match value {
             "true" => return true,
             "false" => return false,
             _ => continue,
@@ -332,24 +315,15 @@ pub fn read_memory_enabled(root: &Path) -> bool {
     true
 }
 
-/// Read `memory_inject_max` from `.agentrec/config.toml` — same scanning
-/// pattern as [`read_memory_enabled`] / `purgecmd::read_ttl_days`. Missing
-/// file, missing key, or an unparseable value all fall back to
-/// [`HOOK_MAX_FACTS_DEFAULT`].
+/// Read `memory_inject_max` from `.agentrec/config.toml` — same shared
+/// scanner as [`read_memory_enabled`]. Missing file, missing key, or an
+/// unparseable value all fall back to [`HOOK_MAX_FACTS_DEFAULT`].
 pub fn read_memory_inject_max(root: &Path) -> usize {
-    let path = crate::agentrec_dir(root).join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Some(text) = crate::cmds::read_config_text(root) else {
         return HOOK_MAX_FACTS_DEFAULT;
     };
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("memory_inject_max") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        if let Ok(n) = value.trim().parse::<usize>() {
+    for value in crate::cmds::config_values(&text, "memory_inject_max") {
+        if let Ok(n) = value.parse::<usize>() {
             return n;
         }
     }
@@ -728,11 +702,7 @@ fn format_memory_line(
 }
 
 fn short_id(id: &str) -> String {
-    if id.len() <= 8 {
-        id.to_string()
-    } else {
-        id[..8].to_string()
-    }
+    id.chars().take(8).collect()
 }
 
 fn freshness_str(f: Freshness) -> &'static str {
@@ -818,5 +788,21 @@ mod tests {
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].origin, "human");
         assert_eq!(effective[0].pins[0].path, "a.rs");
+    }
+
+    /// Byte-slicing `id[..8]` panics when byte 8 lands mid-character (e.g.
+    /// multi-byte UTF-8). A hand-edited `memory.jsonl` can carry a non-ASCII
+    /// id, and the "malformed line never crashes" posture requires this to
+    /// degrade gracefully, not panic. `short_id` must be char-boundary-safe.
+    #[test]
+    fn short_id_non_ascii_does_not_panic() {
+        // "€€€a" is 3 three-byte chars + 1 one-byte char = 10 bytes; byte
+        // index 8 falls inside the 3rd '€', which is exactly the panic the
+        // old `id[..8]` byte-slice implementation hit.
+        let id = "€€€a";
+        assert_eq!(short_id(id), "€€€a");
+
+        let longer = "€€€€€€€€€€"; // 10 chars, well past the 8-char cutoff
+        assert_eq!(short_id(longer), "€€€€€€€€");
     }
 }

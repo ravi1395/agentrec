@@ -3,6 +3,7 @@
 //! and undo's preview never need the daemon running; `undo --confirm` writes
 //! to the worktree but not to the daemon's internal state.
 
+use crate::cmds::wall_now_ms;
 use crate::state::State;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
@@ -1082,13 +1083,4 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
-}
-
-/// Mirrors `cmds::wall_now_ms` (kept local — a one-line helper, not worth a
-/// shared module for).
-fn wall_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }

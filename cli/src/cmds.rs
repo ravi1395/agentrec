@@ -481,11 +481,37 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn wall_now_ms() -> u64 {
+/// Current wall-clock time in milliseconds since the Unix epoch. Shared
+/// across CLI modules (daemon crash-journal timestamps, purge TTL math,
+/// memory record timestamps, etc.) — the single definition here is
+/// canonical; do not add another local copy.
+pub(crate) fn wall_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Read `.agentrec/config.toml`'s raw text, or `None` if it doesn't exist.
+/// Shared entry point for the hand-rolled `key = value` scanners below (not
+/// worth a `toml` dependency for a handful of scalar keys).
+pub(crate) fn read_config_text(root: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(crate::agentrec_dir(root).join("config.toml")).ok()
+}
+
+/// Every `key = value` line in `text` (comments stripped after `#`), in file
+/// order, with the raw trimmed value text. `key` is matched as a literal
+/// prefix before whitespace + `=`, so `memory_enabled_foo = true` never
+/// matches `key: "memory_enabled"`. Multiple matching lines are all
+/// yielded — callers that skip unparseable values fall through to a later
+/// line, exactly like the original per-site scanners.
+pub(crate) fn config_values<'a>(text: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    text.lines().filter_map(move |line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let rest = line.strip_prefix(key)?;
+        let value = rest.trim_start().strip_prefix('=')?;
+        Some(value.trim())
+    })
 }
 
 #[cfg(test)]

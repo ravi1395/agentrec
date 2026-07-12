@@ -8,6 +8,7 @@
 //! unaffected by the default (prompt-only) purge, since snapshot blobs are a
 //! disjoint set only touched by `--snapshots-before`.
 
+use crate::cmds::wall_now_ms;
 use crate::{agentrec_dir, log_path, objects_dir};
 use agentrec_core::memory::{memory_path, MemoryRecord};
 use agentrec_core::record::{LogRecord, TurnRecord};
@@ -20,7 +21,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_TTL_DAYS: u64 = 90;
 const DAY_MS: u64 = 86_400_000;
 
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     root: &Path,
     all_prompts: bool,
@@ -373,6 +373,17 @@ fn append_lines_synced(path: &Path, lines: &[&str]) -> Result<(), String> {
 /// the same tmp+fsync+rename+dir-fsync shape as `store.rs`'s blob writes, so
 /// a crash mid-rewrite either leaves the old file intact or the new one
 /// fully written, never a truncated/partial file.
+///
+/// F6: evaluated reusing `BlobStore::put`/`put_result` directly instead of
+/// this hand-rolled shape — skipped, not just duplicated for its own sake.
+/// `put_result` writes to a path it *derives from the content hash* (the
+/// object store's fan-out layout); this function must overwrite one
+/// specific, already-named path (`memory.jsonl`), which is a different unit
+/// of operation `put_result`'s signature can't express. Its `create_tmp_file`
+/// helper is also private to `agentrec-core::store` and not part of that
+/// crate's public surface — exporting it across the crate boundary just for
+/// this call site would be a real API change to durability-sensitive code,
+/// out of scope for a behavior-neutral polish pass.
 fn rewrite_memory_atomic(mem_path: &Path, lines: &[&str]) -> Result<(), String> {
     let parent = mem_path
         .parent()
@@ -429,24 +440,15 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Read `ttl_days` from `.agentrec/config.toml` (a hand-rolled `key = value`
-/// scan — the config is two lines and doesn't warrant a `toml` dependency).
-/// Missing file, missing key, or an unparseable value all fall back to the
-/// documented default of 90.
+/// Read `ttl_days` from `.agentrec/config.toml` via the shared
+/// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
+/// unparseable value all fall back to the documented default of 90.
 fn read_ttl_days(root: &Path) -> u64 {
-    let path = agentrec_dir(root).join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Some(text) = crate::cmds::read_config_text(root) else {
         return DEFAULT_TTL_DAYS;
     };
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("ttl_days") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        if let Ok(n) = value.trim().parse::<u64>() {
+    for value in crate::cmds::config_values(&text, "ttl_days") {
+        if let Ok(n) = value.parse::<u64>() {
             return n;
         }
     }
@@ -477,13 +479,6 @@ fn parse_date_cutoff(date: &str) -> Result<String, String> {
         return Err(invalid());
     }
     Ok(format!("{y:04}-{m:02}-{d:02}T00:00:00.000Z"))
-}
-
-fn wall_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn human_bytes(n: u64) -> String {

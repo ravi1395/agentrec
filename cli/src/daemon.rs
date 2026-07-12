@@ -8,6 +8,7 @@
 //! record timestamps are derived by adding a fixed startup offset, keeping them
 //! sane (end >= start) regardless of clock changes.
 
+use crate::cmds::wall_now_ms;
 use crate::state::{read_state, record_io_failure, write_state, State};
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Debounce window before a mutation burst is staged (SPEC.md: 1.5 s).
 const DEBOUNCE: Duration = Duration::from_millis(1_500);
@@ -288,13 +289,6 @@ impl Clock {
         self.max_wall_ms.set(clamped);
         clamped
     }
-}
-
-fn wall_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---- watch event draining (D9) ----------------------------------------------
@@ -1250,14 +1244,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
     // root/start/end/file set) already sits in the log tail. See
     // `already_logged` for why the id key is load-bearing (`ended` drifts
     // between the persist path and recovery).
-    if already_logged(
-        root,
-        &journal.id,
-        &journal.root,
-        &started,
-        &ended,
-        &journal.files,
-    ) {
+    if already_logged(root, &journal, &started, &ended) {
         let _ = std::fs::remove_file(&path);
         eprintln!(
             "agentrec: crash journal matches an already-logged turn — skipping duplicate recovery"
@@ -1325,22 +1312,15 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
 /// a pre-reserved-id daemon binary across an upgrade: their `id` deserializes
 /// to a fresh ULID (`#[serde(default)]`) that can't match anything logged, so
 /// the original content-based D8 guarantee still holds for them.
-fn already_logged(
-    root: &Path,
-    id: &str,
-    journal_root: &str,
-    started: &str,
-    ended: &str,
-    files: &[FileEntry],
-) -> bool {
+fn already_logged(root: &Path, journal: &OrphanJournal, started: &str, ended: &str) -> bool {
     let records = agentrec_core::record::load_log(&log_path(root));
     records.iter().rev().take(50).any(|r| match r {
         LogRecord::Turn(t) => {
-            t.id == id
-                || (t.root == journal_root
+            t.id == journal.id
+                || (t.root == journal.root
                     && t.started == started
                     && t.ended == ended
-                    && files_match(&t.files, files))
+                    && files_match(&t.files, &journal.files))
         }
         LogRecord::Epoch(_) => false,
     })
