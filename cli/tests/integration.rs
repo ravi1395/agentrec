@@ -4715,6 +4715,128 @@ fn hook_recall_bails_at_injected_deadline() {
     );
 }
 
+/// F8: the 50ms hook budget must be a HARD WALL, not just cooperative
+/// between-step checks. `hook_recall_bails_at_injected_deadline` above
+/// proves the cooperative deadline bails once it is checked — but every
+/// check happens BETWEEN loop steps, so a single blocking call inside one
+/// step (e.g. `memory::hash_pin`'s `fs::read` during the freshness-verify
+/// walk) can still overrun the budget by however long that one call blocks.
+/// This test proves the outer wall holds even then: `AGENTREC_TEST_SLOW_PIN_READ_MS`
+/// (test-only seam, `memory::hash_pin`) makes the verify walk's pin read
+/// block for 600ms — twelve times the 50ms budget — and the hook process
+/// must still return well inside a 200ms envelope, with empty stdout and no
+/// partial/leaked fact text, and exactly one `budget_exceeded:true` stat
+/// line (never a `n`-bearing injection line — the blocked read never got a
+/// chance to report freshness either way).
+#[test]
+fn hook_recall_hard_wall_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A real, freshly-pinned, on-topic memory that WOULD be injected on a
+    // normal (unblocked) call — isolates the slow read as the only variable.
+    std::fs::write(root.join("real_fresh.rs"), b"fn real_fresh() {}\n").unwrap();
+    let hash = memory::hash_pin(root, "real_fresh.rs").expect("hash real_fresh.rs");
+    let rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-hard-wall-fresh",
+        "op": "assert",
+        "fact": "hard wall probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "real_fresh.rs", "hash": hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{rec}\n")).unwrap();
+
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hard wall probe fact"}"#;
+
+    // Sanity: without the slow-read seam, this hook call really does inject
+    // the block — proves the corpus/query are matchable so the empty result
+    // below is caused by the wall, not an unmatchable corpus.
+    let sane = send_hook_capture(root, payload);
+    assert!(sane.status.success(), "sanity hook call failed: {sane:?}");
+    assert!(
+        String::from_utf8_lossy(&sane.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection before testing the hard wall: {:?}",
+        String::from_utf8_lossy(&sane.stdout)
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_SLOW_PIN_READ_MS", "600")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let started = Instant::now();
+    let out = child.wait_with_output().unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even while the pin read is blocked: {out:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "hook took {elapsed:?} — a blocked 600ms pin read must not push wall \
+         time anywhere near that far past the 50ms budget (hard wall must \
+         abandon the worker, not wait on it)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "a hard-walled recall must never print a block, partial or otherwise: {stdout}"
+    );
+    assert!(
+        !stdout.contains("hard wall probe fact"),
+        "no fact text may leak out despite the blocked read: {stdout}"
+    );
+
+    let events = signal_events(root);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+        "start signal must still land despite the blocked recall: {events:?}"
+    );
+
+    // Exactly one NEW stat line from this call, carrying budget_exceeded —
+    // never a partial `n`-bearing injection line, never fact text.
+    let stats = memory_stats_lines(root);
+    assert_eq!(
+        stats.len(),
+        2,
+        "expected exactly 2 memory-stats lines total (1 from the sanity call's \
+         real injection + 1 budget_exceeded from the hard-walled call): {stats:?}"
+    );
+    let new_line = &stats[1];
+    assert_eq!(
+        new_line.get("budget_exceeded").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected the second stat line to be budget_exceeded:true: {stats:?}"
+    );
+    assert!(
+        new_line.get("n").is_none(),
+        "a budget_exceeded line must never also carry a partial hit count: {stats:?}"
+    );
+    assert!(
+        !stats
+            .iter()
+            .any(|l| { l.to_string().contains("hard wall probe fact") }),
+        "no fact text may appear anywhere in memory-stats.jsonl: {stats:?}"
+    );
+}
+
 /// INV-M4 concurrent-append leg: the hook path must exit 0 (and keep
 /// appending the start signal) while `.agentrec/memory.jsonl` is being
 /// concurrently APPENDED by another writer — the exact interleaving the

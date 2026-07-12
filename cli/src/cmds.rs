@@ -10,21 +10,26 @@ use agentrec_core::store::BlobStore;
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Task 9 / F2 (INV-M4): hard cooperative wall-time budget for the
-/// in-process `recall_for_hook_with_deadline` call inside the
-/// UserPromptSubmit hook arm. Unlike the original Task 9 shape (measured
-/// only AFTER `recall_for_hook` returned, so a slow recall still ran to
-/// completion and only its *output* was discarded), `inject_memory` now
-/// passes a `deadline = Instant::now() + RECALL_BUDGET_MS` INTO the recall
-/// call — `memory::recall_with_deadline` checks it at each internal loop
-/// boundary (`load_effective`'s fold, `bm25_rank`'s scoring, the
-/// freshness-verify walk) and bails out empty the instant it passes,
-/// bounding wall time itself, not just the visible output. The retrospective
-/// `elapsed_ms > RECALL_BUDGET_MS` check is kept as a cheap defense-in-depth
-/// net (e.g. a single very slow `pin_freshness` file read between deadline
-/// checks) but is no longer the primary bound.
+/// Task 9 / F2 / F8 (INV-M4): hard wall-time budget for the in-process
+/// `recall_for_hook_with_deadline` call inside the UserPromptSubmit hook
+/// arm. Unlike the original Task 9 shape (measured only AFTER
+/// `recall_for_hook` returned, so a slow recall still ran to completion and
+/// only its *output* was discarded), `inject_memory` passes a
+/// `deadline = Instant::now() + RECALL_BUDGET_MS` INTO the recall call —
+/// `memory::recall_with_deadline` checks it at each internal loop boundary
+/// (`load_effective`'s fold, `bm25_rank`'s scoring, the freshness-verify
+/// walk) and bails out empty the instant it passes. That cooperative check
+/// alone is not a hard wall, though: it only runs BETWEEN loop steps, so one
+/// slow blocking call inside a step (e.g. `memory::hash_pin`'s `fs::read` on
+/// a stalled volume) can still overrun the budget by however long that one
+/// call blocks. F8 closes that gap by running the recall on a detached
+/// worker thread and waiting only for the REMAINING budget via
+/// `mpsc::Receiver::recv_timeout` — see `inject_memory`'s doc comment. The
+/// retrospective `elapsed_ms > RECALL_BUDGET_MS` check inside `inject_memory`
+/// is kept as a cheap defense-in-depth net, not the primary bound.
 const RECALL_BUDGET_MS: u128 = 50;
 
 /// `log`: turns newest-first. Git turns and superseded (merged) turns are hidden
@@ -377,11 +382,79 @@ fn recall_deadline(started: Instant) -> Instant {
 /// its own `{"ts","capped":true}` line rather than returning with no stat at
 /// all. Never `state.json`, which only the daemon writes (the hazard this
 /// task is explicitly gated against).
+/// F8: the recall call runs on a detached worker thread; this function
+/// waits only for the REMAINING wall budget (`deadline - now`) via
+/// `mpsc::Receiver::recv_timeout`, not for the worker itself. That is the
+/// hard wall — a single blocking `fs::read` deep inside recall (see
+/// [`RECALL_BUDGET_MS`]'s doc comment) can no longer push the OBSERVABLE
+/// wall time past budget, because this thread stops waiting the instant the
+/// budget elapses regardless of what the worker is still doing.
+///
+/// The worker is never joined. On a `recv_timeout` timeout (or a
+/// disconnect, e.g. the worker panicked before sending), `inject_memory`
+/// records `budget_exceeded` and returns immediately; `hook`'s `main()`
+/// returns right after, and the process exits — Rust does not wait for
+/// detached threads on exit, so a thread still stuck in a slow read cannot
+/// hang process shutdown or leave anything running once the process is
+/// gone. Abandoning it is safe: `recall_for_hook_with_deadline` only reads
+/// (`memory.jsonl` and pinned working-tree files) and never touches
+/// `memlock` (only writers — `remember`/`verify`/`forget`/daemon ingest —
+/// take that lock), so there is no lock for an abandoned reader to hold
+/// across process exit.
+///
+/// REJECTED alternatives (do not reintroduce, see F8 finding): checking the
+/// deadline immediately before/after the blocking read (one call still
+/// blows the budget regardless); a file-size cap as a latency proxy (size
+/// != latency for slow volumes/special files, and it would change valid-pin
+/// semantics).
 fn inject_memory(root: &Path, query: &str) {
     let max_facts = memorycmds::read_memory_inject_max(root);
     let started = Instant::now();
     let deadline = recall_deadline(started);
-    let outcome = memorycmds::recall_for_hook_with_deadline(root, query, max_facts, deadline);
+
+    let (tx, rx) = mpsc::channel::<memorycmds::HookRecallOutcome>();
+    let root_owned = root.to_path_buf();
+    let query_owned = query.to_string();
+    let spawn_result = std::thread::Builder::new()
+        .name("agentrec-hook-recall".into())
+        .spawn(move || {
+            let outcome = memorycmds::recall_for_hook_with_deadline(
+                &root_owned,
+                &query_owned,
+                max_facts,
+                deadline,
+            );
+            // Best-effort: if the receiver already timed out (dropped),
+            // there is nothing left to deliver to — the worker just
+            // finishes on its own, same fail-open posture as everywhere
+            // else in this path.
+            let _ = tx.send(outcome);
+        });
+    // `Builder::spawn` only fails on OS-level thread-creation exhaustion —
+    // an extreme edge. Fail open exactly like a timed-out recv: no stdout,
+    // one budget_exceeded stat line.
+    if spawn_result.is_err() {
+        let stats_line =
+            serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+        let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
+        return;
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let outcome = match rx.recv_timeout(remaining) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // Hard wall tripped (Timeout), or the worker vanished without
+            // sending (Disconnected — e.g. a panic). Both fail open
+            // identically: no stdout, one budget_exceeded stat line. Any
+            // still-running worker is abandoned here, per this function's
+            // doc comment.
+            let stats_line =
+                serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+            let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
+            return;
+        }
+    };
     let elapsed_ms = started.elapsed().as_millis();
 
     if outcome.budget_exceeded || elapsed_ms > RECALL_BUDGET_MS {

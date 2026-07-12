@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Max stored length of a memory's `fact` text (design spec §Data model).
 pub const FACT_MAX_CHARS: usize = 500;
@@ -154,9 +154,30 @@ pub fn validate_pin_path(root: &Path, path: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+/// Test-only seam (F8): if `AGENTREC_TEST_SLOW_PIN_READ_MS` is set to a
+/// parseable `u64`, `hash_pin` sleeps that many milliseconds before its
+/// `fs::read` — a deterministic, OS-independent stand-in for a blocking read
+/// (stalled network volume, special file) that the outer hook wall-deadline
+/// test (`cli/tests/integration.rs::hook_recall_hard_wall_deadline`) uses to
+/// prove a single slow read cannot push the hook's observable wall time past
+/// its budget. Runtime env read, not `cfg(test)`-gated — the integration
+/// test drives the real compiled `agentrec` binary as a subprocess, which
+/// never builds with `cfg(test)`. A no-op unless a caller's process
+/// environment explicitly sets the var (never true in production; the CLI
+/// never sets it).
+fn test_slow_pin_read_delay() -> Option<Duration> {
+    std::env::var("AGENTREC_TEST_SLOW_PIN_READ_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
 /// Hash the file at `root/rel` right now, as `"sha256:<hex>"` via
 /// `store::hash_bytes` — the same CAS blob-id format used elsewhere.
 pub fn hash_pin(root: &Path, rel: &str) -> Result<String, String> {
+    if let Some(delay) = test_slow_pin_read_delay() {
+        std::thread::sleep(delay);
+    }
     let bytes = fs::read(root.join(rel))
         .map_err(|e| format!("could not read pin path {rel} for hashing: {e}"))?;
     Ok(crate::store::hash_bytes(&bytes))
