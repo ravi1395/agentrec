@@ -376,6 +376,94 @@ fn memory_candidate_signal_never_closes_a_turn() {
     );
 }
 
+// F5 hazard-register test. `memory_candidate_signal_never_closes_a_turn`
+// above proves the specific `type: "memory-candidate"` shape can't fabricate
+// a close because it's intercepted before `apply_signal` ever runs. But
+// `apply_signal`'s own dispatch (`if sig.is_start() { .. } else { ..stop.. }`)
+// is a catch-all `else` — ANY signal that isn't a recognized start, memory-
+// candidate included or not, falls into the stop arm. A signal with a `type`
+// this daemon has never heard of (a genuinely forward-compat shape a future
+// producer might emit) has no `event` field either, so pre-fix it fabricates
+// a close exactly like the memory-candidate case did before its guard.
+// PROTOCOL §10 requires unknown fields/types be tolerated, never
+// reinterpreted as a different signal — this drives the real daemon against
+// that shape and asserts the open bracket survives it, AND that the drop is
+// visible somewhere (the `unknown_signal_ignored` state counter), not just
+// silently swallowed with zero trace.
+#[test]
+fn unknown_signal_type_never_closes_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // Open the bracket.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_unk"}"#,
+    );
+
+    // Plant a signal with an unrecognized `type` and no `event` field — a
+    // hypothetical future-minor-version signal shape, not memory-candidate.
+    let unknown = serde_json::json!({
+        "v": 1,
+        "ts": 1_700_000_000_000u64,
+        "tool": "claude-code",
+        "type": "future-thing",
+    });
+    append_signal_line(root, &unknown.to_string());
+
+    // Mutate a file inside the (should-still-be-open) bracket.
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    // Several poll cycles for the daemon to tail the unknown-type line and,
+    // if unguarded, fabricate a closure.
+    std::thread::sleep(Duration::from_secs(3));
+    let premature = turns(root);
+    assert!(
+        premature.is_empty(),
+        "an unknown-type signal (no `event` field) closed a turn — it must \
+         never reach the stop arm: {premature:?}"
+    );
+
+    let ignored = state_json(root)
+        .get("unknown_signal_ignored")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        ignored >= 1,
+        "unknown signal was dropped but never counted: {:?}",
+        state_json(root)
+    );
+
+    // Regression pair: a legacy Stop hook signal (no `kind`/`type` at all)
+    // still closes the bracket normally — the fix must not over-correct into
+    // refusing genuine stops.
+    send_hook(root, r#"{"hook_event_name":"Stop","session_id":"s_unk"}"#);
+    let closed = poll_until(Duration::from_secs(5), || {
+        let t = turns(root);
+        (!t.is_empty()).then_some(t)
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let t = closed.expect("no turn ever closed after the real Stop hook");
+    assert_eq!(t.len(), 1, "expected exactly one rich turn: {t:?}");
+    assert_eq!(
+        t[0].get("grade").and_then(|g| g.as_str()),
+        Some("rich"),
+        "turn should be rich (bracket-closed): {t:?}"
+    );
+}
+
 // ---- Task 7: daemon ingestion + rejects counter ---------------------------
 
 // End-to-end happy path: a candidate emitted while a bracket is open is

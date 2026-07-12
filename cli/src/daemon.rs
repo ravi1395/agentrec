@@ -207,7 +207,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
             }
-            let closed = apply_signal(&mut engine, &sig, prompt, now);
+            let closed = apply_signal(&root, &mut engine, &sig, prompt, now);
             persist(&root, &recorder, &clock, closed)?;
         }
 
@@ -974,6 +974,7 @@ fn reject_candidate(root: &Path, state: &mut State) {
 }
 
 fn apply_signal(
+    root: &Path,
     engine: &mut TurnEngine,
     sig: &SignalEvent,
     prompt: Option<String>,
@@ -982,9 +983,39 @@ fn apply_signal(
     // `prompt` is already resolved (hook-provided or transcript-extracted);
     // persist() scrubs before anything reaches disk (idempotent, AC I4).
     if sig.is_start() {
-        engine.observe_start(now, &sig.tool, prompt, sig.session.clone())
-    } else {
-        engine.observe_stop(now, &sig.tool, prompt, sig.session.clone())
+        return engine.observe_start(now, &sig.tool, prompt, sig.session.clone());
+    }
+    // F5 / PROTOCOL §10 additive-versioning: a signal carrying a `type` this
+    // consumer doesn't recognize MUST be tolerated, never reinterpreted as a
+    // stop. `memory-candidate` is already routed away before this function is
+    // ever called (see the poll loop above), so any `kind` still present here
+    // is, by construction, unknown — but this check does not lean on that
+    // routing: it re-derives "unknown" locally (`Some(kind)` where
+    // `kind != "memory-candidate"`) so `apply_signal` stays correct even if a
+    // future caller stops pre-filtering. A signal with NO `type` at all
+    // (every legacy start/stop producer, and the real Stop hook payload) is
+    // the only shape that may fall through to the stop arm — that path is
+    // unchanged.
+    if let Some(kind) = sig.kind.as_deref() {
+        if kind != "memory-candidate" {
+            record_unknown_signal(root);
+            return Vec::new();
+        }
+    }
+    engine.observe_stop(now, &sig.tool, prompt, sig.session.clone())
+}
+
+/// Persist a forward-compat "unknown signal type" drop (F5, PROTOCOL §10
+/// additive-versioning). Mirrors `reject_candidate`'s counter mechanism — a
+/// dropped signal leaves no trace in `log.jsonl`/`memory.jsonl`, so this
+/// counter is the only visible evidence it happened. Not a DEGRADED
+/// condition: an unrecognized-but-tolerated signal is expected forward
+/// compatibility, not a daemon health problem.
+fn record_unknown_signal(root: &Path) {
+    let mut state = read_state(root);
+    state.unknown_signal_ignored += 1;
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist unknown-signal state: {e}");
     }
 }
 
