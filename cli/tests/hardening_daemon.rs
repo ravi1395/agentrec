@@ -76,6 +76,42 @@ fn append_signal_line(root: &Path, line: &str) {
     writeln!(f, "{line}").unwrap();
 }
 
+/// Every line of `.agentrec/memory.jsonl`, parsed. Absent file = empty vec.
+fn memories(root: &Path) -> Vec<serde_json::Value> {
+    let path = root.join(".agentrec/memory.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
+/// Parsed `.agentrec/state.json`. Absent/corrupt file = `{}` (matches the
+/// daemon's own `State::default()` tolerance).
+fn state_json(root: &Path) -> serde_json::Value {
+    std::fs::read_to_string(root.join(".agentrec/state.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// A memory-candidate signal line (PROTOCOL §4 additive), ready for
+/// `append_signal_line` — no CLI-facing emitter exists yet (Task 8), so
+/// Task 7's tests plant the shape directly, same convention as Task 6's
+/// `memory_candidate_signal_never_closes_a_turn`.
+fn memory_signal(fact: &str, pins: &[&str]) -> String {
+    serde_json::json!({
+        "v": 1,
+        "ts": 1_700_000_000_000u64,
+        "tool": "claude-code",
+        "type": "memory-candidate",
+        "fact": fact,
+        "pins": pins,
+    })
+    .to_string()
+}
+
 fn init(root: &Path) {
     // A git repo so gitignore semantics are exercised; --no-hook/--no-service
     // avoid touching real Claude Code settings or a real launchd/systemd unit.
@@ -286,5 +322,234 @@ fn memory_candidate_signal_never_closes_a_turn() {
         t[0].get("grade").and_then(|g| g.as_str()),
         Some("rich"),
         "turn should be rich (bracket-closed): {t:?}"
+    );
+}
+
+// ---- Task 7: daemon ingestion + rejects counter ---------------------------
+
+// End-to-end happy path: a candidate emitted while a bracket is open is
+// ingested with a DAEMON-computed pin hash (never a hash the emitter could
+// have supplied — the candidate signal carries paths only) and a non-empty
+// `source_turns`. The id in `source_turns` is asserted to be the SAME id the
+// enclosing turn actually closes under (real provenance, not a dangling
+// reference to an id that never lands in log.jsonl — the reason
+// `TurnEngine::open_turn_id()` reserves the id at open time rather than
+// generating a fresh one at close). A byte-identical duplicate candidate
+// must not create a second record (dedup, silent drop).
+#[test]
+fn candidate_ingestion_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello world").unwrap();
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // Open the bracket.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_mem1"}"#,
+    );
+
+    let candidate = memory_signal("the daemon debounces bursts for 1.5s", &["notes.txt"]);
+    append_signal_line(root, &candidate);
+
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let m = memories(root);
+        (!m.is_empty()).then_some(m)
+    });
+    let recs = recorded.expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    let rec = recs[0].clone();
+    assert_eq!(rec.get("origin").and_then(|v| v.as_str()), Some("agent"));
+
+    let expected_hash = agentrec_core::memory::hash_pin(root, "notes.txt")
+        .expect("daemon and test read the same file, hashing must succeed");
+    let actual_hash = rec["pins"][0]["hash"].as_str().expect("pin hash present");
+    assert_eq!(
+        actual_hash, expected_hash,
+        "the daemon must compute the pin hash itself at ingestion, not trust the emitter"
+    );
+
+    let source_turns = rec["source_turns"]
+        .as_array()
+        .expect("source_turns must be an array");
+    assert!(
+        !source_turns.is_empty(),
+        "expected non-empty source_turns while a bracket is open: {rec:?}"
+    );
+
+    // Duplicate candidate (byte-identical fact + pin set) -> still exactly 1
+    // record; several poll cycles (POLL = 250ms) for the daemon to tail it.
+    append_signal_line(root, &candidate);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        memories(root).len(),
+        1,
+        "a duplicate candidate must not create a second record"
+    );
+
+    // Close the bracket and confirm source_turns really points at the turn
+    // that ends up in log.jsonl.
+    send_hook(root, r#"{"hook_event_name":"Stop","session_id":"s_mem1"}"#);
+    let closed = poll_until(Duration::from_secs(5), || {
+        let t = turns(root);
+        (!t.is_empty()).then_some(t)
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let t = closed.expect("no turn ever closed after Stop");
+    let closed_id = t[0]["id"].as_str().expect("closed turn has an id");
+    assert_eq!(
+        source_turns[0].as_str(),
+        Some(closed_id),
+        "source_turns must reference the id the enclosing turn actually \
+         closed under, not a fabricated/dangling one: memory={rec:?} turn={:?}",
+        t[0]
+    );
+}
+
+// Four genuinely-rejecting candidates — traversal pin, secret-file (`.env`)
+// pin, a whitespace-only fact (scrubs to empty — NOT a secret-only fact:
+// scrub redacts rather than deletes, so `"AKIA..."` alone would scrub to a
+// non-empty `[redacted:...]` and PERSIST, not reject; see brief note), and 9
+// pins (over PINS_MAX=8) — must leave memory.jsonl untouched (INV-M1),
+// persist `memory_rejects == 4` in state.json, and surface "4 rejects" in
+// `agentrec status` stdout. No daemon bracket needed; rejects are counted
+// independent of any open turn.
+#[test]
+fn candidate_rejects_counted_never_fabricated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+    std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+    for i in 0..9 {
+        std::fs::write(root.join(format!("f{i}.txt")), "x").unwrap();
+    }
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // 1. Traversal pin — rejected unconditionally by `validate_pin_path`,
+    //    regardless of whether the target exists.
+    append_signal_line(
+        root,
+        &memory_signal("fact about something outside the repo", &["../outside.txt"]),
+    );
+    // 2. Secret-file pin.
+    append_signal_line(
+        root,
+        &memory_signal("fact pinned to a secret file", &[".env"]),
+    );
+    // 3. Whitespace-only fact (valid pin, but scrubs to empty).
+    append_signal_line(root, &memory_signal("   ", &["notes.txt"]));
+    // 4. 9 pins — every individual pin is valid, but the record as a whole
+    //    exceeds PINS_MAX=8 (enforced by `append_memory`).
+    let nine: Vec<String> = (0..9).map(|i| format!("f{i}.txt")).collect();
+    let nine_refs: Vec<&str> = nine.iter().map(|s| s.as_str()).collect();
+    append_signal_line(root, &memory_signal("fact with too many pins", &nine_refs));
+
+    // Poll: state.json's memory_rejects must reach 4.
+    let rejects = poll_until(Duration::from_secs(5), || {
+        state_json(root)
+            .get("memory_rejects")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n >= 4)
+    });
+
+    let out = agentrec(root, &["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert_eq!(
+        rejects,
+        Some(4),
+        "expected exactly 4 rejects, state.json: {:?}",
+        state_json(root)
+    );
+    assert!(
+        memories(root).is_empty(),
+        "INV-M1: a rejected candidate must persist NOTHING to memory.jsonl: {:?}",
+        memories(root)
+    );
+    assert!(
+        stdout.contains("4 rejects"),
+        "expected `agentrec status` to report 4 rejects, got: {stdout}"
+    );
+}
+
+// INV-M3 half 2: a fact shaped like a live AWS key is scrubbed before it
+// lands on disk. The persisted fact carries the `[redacted:` marker and the
+// raw key never appears anywhere in `memory.jsonl`. (`signal.jsonl` DOES
+// still carry the raw key here — this test plants the candidate directly,
+// bypassing the not-yet-built Task 8 emitter, which is the component
+// responsible for scrubbing before anything reaches `signal.jsonl`; that is
+// out of scope for this assertion, which is about the persistence site.)
+#[test]
+fn candidate_secret_fact_scrubbed_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    let secret_fact = "the deploy key is AKIAABCDEFGHIJKLMNOP for staging";
+    let candidate = memory_signal(secret_fact, &["notes.txt"]);
+    append_signal_line(root, &candidate);
+
+    let recorded = poll_until(Duration::from_secs(5), || {
+        let m = memories(root);
+        (!m.is_empty()).then_some(m)
+    });
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let recs = recorded.expect("candidate was never ingested into memory.jsonl");
+    assert_eq!(
+        recs.len(),
+        1,
+        "expected exactly one memory record: {recs:?}"
+    );
+    let persisted_fact = recs[0]["fact"].as_str().expect("fact present");
+    assert!(
+        persisted_fact.contains("[redacted:"),
+        "persisted fact must be scrubbed: {persisted_fact}"
+    );
+    assert!(
+        !persisted_fact.contains("AKIAABCDEFGHIJKLMNOP"),
+        "raw key must not survive scrub: {persisted_fact}"
+    );
+
+    let memory_text =
+        std::fs::read_to_string(root.join(".agentrec/memory.jsonl")).expect("memory.jsonl exists");
+    assert!(
+        !memory_text.contains("AKIAABCDEFGHIJKLMNOP"),
+        "raw key must not appear anywhere in memory.jsonl: {memory_text}"
     );
 }

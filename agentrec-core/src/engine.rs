@@ -37,6 +37,17 @@ struct OpenTurn {
     session: Option<String>,
     opened_at: u64,
     files: Vec<ChangeObs>,
+    /// Reserved at open time rather than generated lazily at close (as every
+    /// other turn id used to be) — this lets an external process learn the id
+    /// a still-open turn WILL close under, before it closes. Motivating case:
+    /// the daemon's memory-candidate ingestion (PROTOCOL.md memory-candidate
+    /// design, "source_turns links to the enclosing turn") needs to stamp
+    /// `source_turns` on a candidate that arrives mid-bracket. Safe because
+    /// exactly one turn is ever open per root (strictly serialized
+    /// open→close→open), so reserving here doesn't change ULID ordering
+    /// across turns, only shifts one id's embedded timestamp a few seconds
+    /// earlier; every record still carries explicit `started`/`ended`.
+    id: String,
 }
 
 /// A closed turn, engine-level (unix-ms times; persistence converts).
@@ -67,6 +78,11 @@ pub struct OpenSnapshot {
     pub opened_at: u64,
     pub last_change_at: u64,
     pub files: Vec<ChangeObs>,
+    /// The id this turn will close under (reserved at open, per `OpenTurn`).
+    /// `#[serde(default)]` with a fresh id keeps a crash journal written by a
+    /// pre-this-change daemon binary still parseable across an upgrade.
+    #[serde(default = "crate::id::turn_id")]
+    pub id: String,
 }
 
 pub struct TurnEngine {
@@ -109,6 +125,15 @@ impl TurnEngine {
         self.open.is_some()
     }
 
+    /// The id the currently-open turn will close under, if any (reserved at
+    /// open time — see `OpenTurn::id`). Lets an in-flight process — the
+    /// daemon's memory-candidate ingestion is the motivating case — stamp
+    /// `source_turns` on a candidate that arrives mid-bracket, before the
+    /// turn actually closes.
+    pub fn open_turn_id(&self) -> Option<&str> {
+        self.open.as_ref().map(|o| o.id.as_str())
+    }
+
     /// Serializable view of the currently-open turn, for the daemon's crash
     /// journal (AC B2). None when no turn is open. Times are engine ms; the
     /// daemon converts them to wall clock before persisting the journal.
@@ -127,6 +152,7 @@ impl TurnEngine {
             opened_at: open.opened_at,
             last_change_at: self.last_change_at.unwrap_or(open.opened_at),
             files: open.files.clone(),
+            id: open.id.clone(),
         })
     }
 
@@ -154,6 +180,7 @@ impl TurnEngine {
                 session: None,
                 opened_at: now,
                 files: vec![],
+                id: (self.id_gen)(),
             });
         }
         let open = self.open.as_mut().expect("just ensured");
@@ -235,6 +262,7 @@ impl TurnEngine {
             session,
             opened_at: now,
             files: vec![],
+            id: (self.id_gen)(),
         });
         closed
     }
@@ -421,7 +449,7 @@ impl TurnEngine {
     ) -> ClosedTurn {
         self.last_change_at = None;
         ClosedTurn {
-            id: (self.id_gen)(),
+            id: open.id,
             grade,
             boundary,
             truncated,
@@ -637,6 +665,28 @@ mod tests {
         assert_eq!(back.files[0].path, "a.rs");
         e.observe_stop(2_000, "claude-code", None, None);
         assert!(e.snapshot_open().is_none());
+    }
+
+    // The id `open_turn_id()` reports mid-bracket must be the SAME id the
+    // turn actually closes under — a caller (the daemon's memory-candidate
+    // ingestion) that reads it before the stop signal must not get a
+    // dangling reference once the turn lands in the log.
+    #[test]
+    fn open_turn_id_matches_the_id_it_closes_under() {
+        let mut e = TurnEngine::new();
+        assert_eq!(e.open_turn_id(), None, "nothing open yet");
+
+        e.observe_start(1_000, "claude-code", None, Some("s1".into()));
+        let reserved = e.open_turn_id().expect("bracket is open").to_string();
+        assert!(!reserved.is_empty());
+
+        let closed = e.observe_stop(2_000, "claude-code", None, Some("s1".into()));
+        assert_eq!(closed.len(), 1);
+        assert_eq!(
+            closed[0].id, reserved,
+            "the id reserved at open must be the id the closed turn actually carries"
+        );
+        assert_eq!(e.open_turn_id(), None, "nothing open after close");
     }
 
     // Bare fragments older than the fold window are not absorbed.

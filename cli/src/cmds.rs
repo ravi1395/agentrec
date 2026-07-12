@@ -184,6 +184,27 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         }
     }
 
+    // Memory v1: fresh/stale are computed by scanning `load_effective` +
+    // re-verifying pin hashes right now (never persisted — INV-M2); rejects
+    // is the daemon's persisted counter (`memory_rejects`, the
+    // `snapshot_failures` honesty pattern — a rejected candidate leaves no
+    // trace in `memory.jsonl`, so this counter is the only visible evidence
+    // it happened).
+    let all_memories = agentrec_core::memory::load_effective(root).unwrap_or_default();
+    let (mut mem_fresh, mut mem_stale) = (0usize, 0usize);
+    for m in all_memories.iter().filter(|m| !m.retracted) {
+        match agentrec_core::memory::pin_freshness(root, &m.pins) {
+            agentrec_core::memory::Freshness::Fresh => mem_fresh += 1,
+            agentrec_core::memory::Freshness::Stale
+            | agentrec_core::memory::Freshness::Orphaned => mem_stale += 1,
+        }
+    }
+    let state = read_state(root);
+    out.push_str(&format!(
+        "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects\n",
+        state.memory_rejects
+    ));
+
     // AC I+: the store is checked (and, if over, evicted) here rather than
     // from the daemon's turn-close path — see DEVIATIONS in the delivery
     // receipt for why. Prompt blobs are exempt; only snapshot blobs evict.
@@ -198,7 +219,6 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         ));
     }
 
-    let state = read_state(root);
     if state.snapshot_failures > 0 {
         out.push('\n');
         out.push_str(&format!(

@@ -8,7 +8,7 @@
 //! record timestamps are derived by adding a fixed startup offset, keeping them
 //! sane (end >= start) regardless of clock changes.
 
-use crate::state::{read_state, record_io_failure, write_state};
+use crate::state::{read_state, record_io_failure, write_state, State};
 use crate::{log_path, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
@@ -165,7 +165,8 @@ pub fn run(root: &Path) -> Result<(), String> {
             // stop arm and fabricate a turn closure (the hazard this guard
             // exists to close; see cli/tests/hardening_daemon.rs).
             if sig.is_memory_candidate() {
-                ingest_candidate(&sig);
+                let mut state = read_state(&root);
+                ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
                 continue;
             }
             let (prompt, model) = signal_context(&sig);
@@ -759,12 +760,103 @@ impl SignalTailer {
     }
 }
 
-/// Task 7 stub: memory-candidate signals land here instead of the turn-
-/// closing `apply_signal` stop arm. No-op for now — a compile-firewall seam
-/// that Task 7 wires into `MemoryEngine` ingestion (fact + pins hashing).
-/// Deliberately takes the whole `SignalEvent` (not just `fact`/`pins`) so
-/// Task 7 can also read `session`/`ts` without changing this call site.
-fn ingest_candidate(_sig: &SignalEvent) {}
+/// Memory-candidate ingestion (design spec §Write path/Agent-emitted;
+/// PROTOCOL §4). Runs on the daemon thread — the only writer of both
+/// `memory.jsonl` (via `append_memory`) and `state.json`'s `memory_rejects`
+/// counter, so no lock/TOCTOU concerns beyond what already applies elsewhere
+/// in this file.
+///
+/// Trust boundary (design spec, "Rejected approaches — emitter-side
+/// hashing"): the candidate carries pin PATHS only; hashing happens HERE,
+/// now, against the current working tree — never trust a hash the emitter
+/// computed, since the file may have changed between emit and ingest.
+///
+/// Order: validate + hash every pin (any failure -> reject, nothing
+/// persisted, INV-M1) -> scrub the fact (scrub-empty -> reject) -> dedup
+/// against live (non-retracted) memories (an exact normalized-fact +
+/// pin-path-set match is dropped silently — neither persisted nor counted
+/// as a reject, a duplicate is not an error) -> append with `source_turns`
+/// pointing at the enclosing open turn, if any. `append_memory` is the final
+/// gate for the length/pins-count bounds (PINS_MAX, FACT_MAX_CHARS) and
+/// re-scrubs before writing (idempotent on already-scrubbed text, matching
+/// the prompt-persistence discipline elsewhere in this file); any of its
+/// refusals also counts as a reject here.
+fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_turn: Option<&str>) {
+    let raw_pins: &[String] = sig.pins.as_deref().unwrap_or(&[]);
+    let mut pins = Vec::with_capacity(raw_pins.len());
+    for raw in raw_pins {
+        let validated = match agentrec_core::memory::validate_pin_path(root, raw) {
+            Ok(v) => v,
+            Err(_) => return reject_candidate(root, state),
+        };
+        let hash = match agentrec_core::memory::hash_pin(root, &validated) {
+            Ok(h) => h,
+            Err(_) => return reject_candidate(root, state),
+        };
+        pins.push(agentrec_core::memory::Pin {
+            path: validated,
+            hash,
+        });
+    }
+
+    let fact = sig.fact.clone().unwrap_or_default();
+    let scrubbed = scrub::scrub(&fact);
+    if scrubbed.trim().is_empty() {
+        return reject_candidate(root, state);
+    }
+
+    let norm_fact = normalize_fact(&scrubbed);
+    let pin_set: HashSet<&str> = pins.iter().map(|p| p.path.as_str()).collect();
+    if let Ok(existing) = agentrec_core::memory::load_effective(root) {
+        let is_dup = existing.iter().any(|m| {
+            !m.retracted
+                && normalize_fact(&m.fact) == norm_fact
+                && m.pins
+                    .iter()
+                    .map(|p| p.path.as_str())
+                    .collect::<HashSet<_>>()
+                    == pin_set
+        });
+        if is_dup {
+            return; // silent drop — a duplicate is not an error (not a reject)
+        }
+    }
+
+    let rec = agentrec_core::memory::MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: agentrec_core::memory::MemoryOp::Assert,
+        fact,
+        pins,
+        source_turns: current_turn
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+        origin: "agent".to_string(),
+        ts: sig.ts,
+        reason: None,
+    };
+
+    if agentrec_core::memory::append_memory(root, &rec).is_err() {
+        reject_candidate(root, state);
+    }
+}
+
+/// Lowercase + whitespace-collapse, for order-independent-of-spacing dedup
+/// key comparison (design spec's dedup normalization).
+fn normalize_fact(fact: &str) -> String {
+    fact.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn reject_candidate(root: &Path, state: &mut State) {
+    state.memory_rejects += 1;
+    if let Err(e) = write_state(root, state) {
+        eprintln!("agentrec: warning: failed to persist memory-reject state: {e}");
+    }
+}
 
 fn apply_signal(
     engine: &mut TurnEngine,
@@ -915,6 +1007,14 @@ struct OrphanJournal {
     last_change_wall_ms: u64,
     root: String,
     files: Vec<FileEntry>,
+    /// The id this turn was reserved under at open (`TurnEngine::open_turn_id`)
+    /// — recovery must reuse it, not mint a fresh one, or an in-flight
+    /// memory-candidate ingested against this turn (`source_turns`) would be
+    /// left pointing at an id that never appears in `log.jsonl`.
+    /// `#[serde(default = "turn_id")]` keeps a journal from a pre-this-change
+    /// daemon binary still parseable across an upgrade.
+    #[serde(default = "turn_id")]
+    id: String,
 }
 
 /// Write the open-turn journal (atomic tmp+rename), or remove it when idle.
@@ -938,6 +1038,7 @@ fn sync_journal(
                 last_change_wall_ms: clock.wall_ms(snap.last_change_at),
                 root: root.to_string_lossy().to_string(),
                 files,
+                id: snap.id,
             };
             let Ok(text) = serde_json::to_string(&journal) else {
                 return;
@@ -1030,7 +1131,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
 
     let record = TurnRecord {
         v: 1,
-        id: turn_id(),
+        id: journal.id.clone(),
         grade: grade.to_string(),
         truncated,
         started,
@@ -1718,6 +1819,7 @@ mod tests {
             last_change_wall_ms: 2_000,
             root: root.to_string_lossy().to_string(),
             files,
+            id: turn_id(),
         };
         std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
 
@@ -1764,6 +1866,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
             }],
+            id: turn_id(),
         };
         std::fs::write(open_path(root), serde_json::to_string(&journal).unwrap()).unwrap();
 

@@ -20,6 +20,12 @@ pub struct State {
     /// per-file "no snapshot available" message later.
     #[serde(default)]
     pub io_failed: Vec<String>,
+    /// Count of memory-candidate signals the daemon rejected at ingestion
+    /// (invalid pin, oversize/scrub-empty fact, out-of-bounds pin count) —
+    /// the `snapshot_failures` honesty pattern: a rejection leaves no trace
+    /// in `memory.jsonl`, so this counter is the only evidence it happened.
+    #[serde(default)]
+    pub memory_rejects: u64,
 }
 
 pub fn read_state(root: &Path) -> State {
