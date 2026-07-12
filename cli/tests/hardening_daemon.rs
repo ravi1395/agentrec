@@ -8,6 +8,8 @@
 //! another concurrent hardening pass) — helpers below are intentionally
 //! duplicated rather than shared, to avoid touching that file.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -31,6 +33,47 @@ fn spawn_record(root: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn record")
+}
+
+fn send_hook(root: &Path, payload: &str) {
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait().unwrap();
+}
+
+/// Turn records currently in the log (epoch lines skipped).
+fn turns(root: &Path) -> Vec<serde_json::Value> {
+    let path = root.join(".agentrec/log.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn"))
+        .collect()
+}
+
+/// Appends a raw line directly to `signal.jsonl` — used to plant signal
+/// shapes (like a memory-candidate line) that no CLI-facing emitter writes
+/// yet, bypassing `agentrec hook` entirely.
+fn append_signal_line(root: &Path, line: &str) {
+    let path = root.join(".agentrec/signal.jsonl");
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open signal.jsonl");
+    writeln!(f, "{line}").unwrap();
 }
 
 fn init(root: &Path) {
@@ -164,5 +207,84 @@ fn sigterm_releases_the_lock_for_a_subsequent_daemon() {
     assert!(
         ok.is_some(),
         "second daemon never started — the lock from the SIGTERM'd first daemon was leaked"
+    );
+}
+
+// Task 6 hazard-register test. A memory-candidate signal line has no `event`
+// field. Before the routing guard, `SignalEvent::is_start()` on such a line
+// is false, so the daemon's poll-dispatch loop fell into the stop arm
+// (`apply_signal` -> `engine.observe_stop`) and closed whatever bracket was
+// currently open — a fabricated turn closure the agent never asked for. This
+// drives the real daemon against that exact shape (planted directly into
+// `signal.jsonl`, since no emitter writes it yet — that's Task 7) and
+// asserts the open bracket survives it; only a genuine Stop hook may close
+// the turn. The tail end doubles as the regression pair: a legacy signal
+// with no `kind`/`type` (the real Stop hook payload) must still close
+// normally.
+#[test]
+fn memory_candidate_signal_never_closes_a_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = spawn_record(root);
+    let started = poll_until(Duration::from_secs(5), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    // Open the bracket.
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_mc"}"#,
+    );
+
+    // Plant a memory-candidate signal line directly. Deliberately NO "event"
+    // field: this is exactly the shape that, pre-guard, falls through
+    // `SignalEvent::is_start() == false` and hits the stop arm.
+    let candidate = serde_json::json!({
+        "v": 1,
+        "ts": 1_700_000_000_000u64,
+        "tool": "claude-code",
+        "type": "memory-candidate",
+        "fact": "user prefers dark mode",
+        "pins": ["src/main.rs"]
+    });
+    append_signal_line(root, &candidate.to_string());
+
+    // Mutate a file inside the (should-still-be-open) bracket.
+    std::fs::write(root.join("notes.txt"), "hello").unwrap();
+
+    // Several poll cycles (POLL = 250ms in the daemon loop) for the daemon to
+    // tail the candidate line and, if unguarded, fabricate a closure. No
+    // quiet-window wait needed — the bug fires as soon as the signal is
+    // tailed, not on a debounce/quiet-window timer.
+    std::thread::sleep(Duration::from_secs(3));
+    let premature = turns(root);
+    assert!(
+        premature.is_empty(),
+        "a memory-candidate signal (no `event` field) closed a turn — \
+         it must never reach the stop arm: {premature:?}"
+    );
+
+    // Regression pair: the real Stop hook (a legacy signal, no `kind`/`type`)
+    // still closes the bracket normally.
+    send_hook(root, r#"{"hook_event_name":"Stop","session_id":"s_mc"}"#);
+    let closed = poll_until(Duration::from_secs(5), || {
+        let t = turns(root);
+        (!t.is_empty()).then_some(t)
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let t = closed.expect("no turn ever closed after the real Stop hook");
+    assert_eq!(t.len(), 1, "expected exactly one rich turn: {t:?}");
+    assert_eq!(
+        t[0].get("grade").and_then(|g| g.as_str()),
+        Some("rich"),
+        "turn should be rich (bracket-closed): {t:?}"
     );
 }

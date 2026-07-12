@@ -159,6 +159,15 @@ pub fn run(root: &Path) -> Result<(), String> {
         // Consume any new hook signals (start/stop brackets). Fill missing
         // prompt/model from the transcript (Q+) before feeding the engine.
         for sig in tailer.poll(&root) {
+            // Memory-candidate lines (PROTOCOL §4, additive) carry no `event`
+            // field, so `is_start()` is false — routed here BEFORE
+            // `apply_signal` ever sees them, or they'd fall through to the
+            // stop arm and fabricate a turn closure (the hazard this guard
+            // exists to close; see cli/tests/hardening_daemon.rs).
+            if sig.is_memory_candidate() {
+                ingest_candidate(&sig);
+                continue;
+            }
             let (prompt, model) = signal_context(&sig);
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
@@ -749,6 +758,13 @@ impl SignalTailer {
         events
     }
 }
+
+/// Task 7 stub: memory-candidate signals land here instead of the turn-
+/// closing `apply_signal` stop arm. No-op for now — a compile-firewall seam
+/// that Task 7 wires into `MemoryEngine` ingestion (fact + pins hashing).
+/// Deliberately takes the whole `SignalEvent` (not just `fact`/`pins`) so
+/// Task 7 can also read `session`/`ts` without changing this call site.
+fn ingest_candidate(_sig: &SignalEvent) {}
 
 fn apply_signal(
     engine: &mut TurnEngine,

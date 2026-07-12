@@ -255,6 +255,9 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         session,
         transcript,
         prompt,
+        kind: None,
+        fact: None,
+        pins: None,
     };
     let line = serde_json::to_string(&signal).map_err(|e| e.to_string())?;
     append_log_line(&signal_path(root), &line)
