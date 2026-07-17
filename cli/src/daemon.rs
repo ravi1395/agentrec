@@ -387,6 +387,7 @@ fn record_watch_error(root: &Path, cause: &str) {
 
 // ---- change classification --------------------------------------------------
 
+#[derive(Debug, PartialEq)]
 enum Class {
     /// A git ref/index/HEAD transition — drives git-turn classification.
     GitRef,
@@ -409,11 +410,16 @@ fn classify(root: &Path, path: &Path, ignore_set: &IgnoreSet) -> Class {
     }
     // Built-in denylist — robust regardless of gitignore contents. `.agentrec`
     // suppression is load-bearing: it prevents the recorder's own writes from
-    // opening turns (no feedback loop). `.git` HEAD/index/refs feed git-turn
-    // classification; the rest of `.git` is noise.
+    // opening turns (no feedback loop). `.git` HEAD/index/refs/packed-refs
+    // feed git-turn classification; the rest of `.git` is noise. Item 3:
+    // `packed-refs` sits alongside `refs/` — `git pack-refs`/`git gc`/some
+    // clones move ref state there instead of (or in addition to) loose files
+    // under `.git/refs/`, so a ref transition can be invisible without it,
+    // misclassifying a git operation as a bare mutation burst.
     if comps[0] == ".git" {
         return match comps.get(1).copied() {
-            Some("HEAD") | Some("ORIG_HEAD") | Some("index") | Some("refs") => Class::GitRef,
+            Some("HEAD") | Some("ORIG_HEAD") | Some("index") | Some("refs")
+            | Some("packed-refs") => Class::GitRef,
             _ => Class::Ignore,
         };
     }
@@ -1962,6 +1968,142 @@ mod tests {
             mems2.len(),
             1,
             "a re-scanned/duplicate candidate dedups to a no-op: {mems2:?}"
+        );
+    }
+
+    // ---- Item 3: .git/packed-refs classification ------------------------------
+
+    // `git pack-refs` / `git gc` / some clones move ref state into
+    // `.git/packed-refs` instead of (or alongside) loose files under
+    // `.git/refs/` — a ref transition that lands there must classify as a
+    // git signal exactly like HEAD/index/refs, or a `git gc`/repack burst
+    // gets misclassified as a bare human mutation burst (never let a git
+    // operation become a fabricated bare turn). Sibling `.git` content
+    // (logs, objects) must stay denied.
+    #[test]
+    fn classify_admits_packed_refs_as_git_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        assert_eq!(
+            classify(root, &root.join(".git/packed-refs"), &ignore_set),
+            Class::GitRef
+        );
+    }
+
+    #[test]
+    fn classify_still_denies_other_git_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        assert_eq!(
+            classify(root, &root.join(".git/logs/HEAD"), &ignore_set),
+            Class::Ignore
+        );
+        assert_eq!(
+            classify(root, &root.join(".git/objects/ab/cdef"), &ignore_set),
+            Class::Ignore
+        );
+        assert_eq!(
+            classify(root, &root.join(".git/config"), &ignore_set),
+            Class::Ignore
+        );
+    }
+
+    // End to end: a mutation burst coinciding with a packed-refs transition
+    // must classify as a `tool:"git"` rich turn, not a bare human burst —
+    // chains the daemon's `classify()` decision straight into the real
+    // engine (`agentrec_core::engine::TurnEngine`), the same way the main
+    // loop does (`Class::GitRef` -> `observe_git_change`, `Class::Watch` ->
+    // `observe_changes`).
+    #[test]
+    fn packed_refs_burst_classifies_as_git_rich_turn_via_engine() {
+        use agentrec_core::engine::{ChangeObs, TurnEngine};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        let mut engine = TurnEngine::new();
+
+        // A `git pack-refs`-shaped burst: many files touched by a checkout,
+        // plus the packed-refs transition itself.
+        let burst = [
+            root.join("src/a.rs"),
+            root.join("src/b.rs"),
+            root.join(".git/packed-refs"),
+        ];
+        let mut git_hit = false;
+        for p in &burst {
+            match classify(root, p, &ignore_set) {
+                Class::GitRef => git_hit = true,
+                Class::Watch => { /* fed to observe_changes below */ }
+                Class::Ignore => panic!("unexpected Ignore for {p:?}"),
+            }
+        }
+        assert!(git_hit, "packed-refs must have set git_hit");
+
+        engine.observe_git_change(0);
+        let changes = vec![
+            ChangeObs {
+                path: "src/a.rs".into(),
+                before_hash: Some("sha256:a".into()),
+                snapshotted: true,
+                withheld: false,
+                baseline_unknown: false,
+                deleted: false,
+            },
+            ChangeObs {
+                path: "src/b.rs".into(),
+                before_hash: Some("sha256:b".into()),
+                snapshotted: true,
+                withheld: false,
+                baseline_unknown: false,
+                deleted: false,
+            },
+        ];
+        engine.observe_changes(500, &changes);
+        let closed = engine.tick(500 + agentrec_core::GIT_SETTLE_MS + 1);
+
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool.as_deref(), Some("git"));
+        assert_eq!(closed[0].grade, "rich");
+        assert_eq!(closed[0].boundary, "git");
+        assert_eq!(closed[0].files.len(), 2);
+    }
+
+    // The watch-event path (not just the pure classifier) must flip
+    // `git_hit` for a packed-refs event, the same signal HEAD/index/refs
+    // already produce — this is the whole path a real notify event takes.
+    #[test]
+    fn drain_watch_events_sets_git_hit_on_packed_refs_transition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+
+        tx.send(Ok(
+            notify::Event::default().add_path(root.join(".git/packed-refs"))
+        ))
+        .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+        );
+
+        assert!(git_hit, "a packed-refs transition must set git_hit");
+        assert!(
+            pending.is_empty(),
+            "a GitRef signal is not itself a watched mutation"
         );
     }
 
