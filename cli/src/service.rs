@@ -129,22 +129,40 @@ WantedBy=default.target\n",
     )
 }
 
-/// Per-OS unit file path under `$HOME`. A bare env read (no filesystem
-/// access), so it errs rather than panics when `HOME` is unset, and stays
-/// hermetically unit-testable.
-pub fn unit_path(root: &Path) -> Result<PathBuf, String> {
+/// XDG Base Directory config home: `$XDG_CONFIG_HOME` if set to a non-empty
+/// value, else `$HOME/.config` (the XDG basedir spec's documented fallback).
+/// Linux-only call site — launchd's `~/Library/LaunchAgents` is not an XDG
+/// path and must never route through this helper.
+fn config_home() -> Result<PathBuf, String> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg));
+        }
+    }
     let home = std::env::var("HOME").map_err(|_| {
         "HOME environment variable is not set — cannot locate the service directory".to_string()
     })?;
+    Ok(PathBuf::from(home).join(".config"))
+}
+
+/// Per-OS unit file path. A bare env read (no filesystem access), so it errs
+/// rather than panics when `HOME` is unset, and stays hermetically
+/// unit-testable. macOS always uses `$HOME/Library/LaunchAgents` (not an XDG
+/// path); Linux resolves the systemd user-unit directory via `config_home`
+/// (`$XDG_CONFIG_HOME`, falling back to `$HOME/.config`) — the single
+/// resolver `install`/`uninstall` both go through.
+pub fn unit_path(root: &Path) -> Result<PathBuf, String> {
     let s = slug(root);
     let path = if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").map_err(|_| {
+            "HOME environment variable is not set — cannot locate the service directory".to_string()
+        })?;
         PathBuf::from(home)
             .join("Library")
             .join("LaunchAgents")
             .join(format!("com.agentrec.{s}.plist"))
     } else {
-        PathBuf::from(home)
-            .join(".config")
+        config_home()?
             .join("systemd")
             .join("user")
             .join(format!("agentrec-{s}.service"))
@@ -278,6 +296,12 @@ fn manual_load_command(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Env vars are process-global, not thread-local — Rust runs #[test]
+    // functions on parallel threads by default, so any test that mutates
+    // XDG_CONFIG_HOME (or relies on its absence) must serialize against every
+    // other such test via this lock, or the mutations race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // CONCERN A: two relative spellings of one repo canonicalize to the same
     // path, so a relative `--root` doesn't fork the slug/unit off from what
@@ -440,9 +464,21 @@ mod tests {
 
     #[test]
     fn unit_path_uses_home_and_slug() {
+        // Deterministic regardless of the ambient environment (and immune to
+        // racing the XDG_CONFIG_HOME tests below): explicitly clear it so
+        // Linux falls back to $HOME/.config, the behavior this test asserts.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::remove_var("XDG_CONFIG_HOME");
+
         let root = Path::new("/repo/example");
         let home = std::env::var("HOME").expect("HOME must be set to run this test");
         let path = unit_path(root).expect("HOME is set in this test environment");
+
+        if let Some(v) = prev_xdg {
+            std::env::set_var("XDG_CONFIG_HOME", v);
+        }
+
         assert!(path.starts_with(&home));
         assert!(path.to_string_lossy().contains(&slug(root)));
         #[cfg(target_os = "macos")]
@@ -455,6 +491,75 @@ mod tests {
             assert!(path.to_string_lossy().contains(".config/systemd/user"));
             assert_eq!(path.extension().and_then(|e| e.to_str()), Some("service"));
         }
+    }
+
+    // XDG basedir spec: an explicit, non-empty XDG_CONFIG_HOME overrides
+    // $HOME/.config outright. `config_home` is the resolver both `unit_path`
+    // (Linux branch) and any future call site must share.
+    #[test]
+    fn config_home_prefers_xdg_config_home_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+
+        std::env::set_var("XDG_CONFIG_HOME", "/custom/xdg-config");
+        let result = config_home();
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert_eq!(result, Ok(PathBuf::from("/custom/xdg-config")));
+    }
+
+    // Both the "never set" and the "set but empty" cases fall back to
+    // $HOME/.config per the XDG basedir spec (an empty value is treated as
+    // unset, not as "use the current directory").
+    #[test]
+    fn config_home_falls_back_to_home_dot_config_when_xdg_unset_or_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        let expected = PathBuf::from(&home).join(".config");
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let unset_result = config_home();
+
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        let empty_result = config_home();
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert_eq!(unset_result, Ok(expected.clone()));
+        assert_eq!(empty_result, Ok(expected));
+    }
+
+    // unit_path itself (not just the config_home helper) must actually route
+    // the systemd user-unit path through XDG_CONFIG_HOME on Linux — this is
+    // the regression the two config_home tests above can't catch alone since
+    // they don't exercise unit_path's branch wiring.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unit_path_respects_xdg_config_home_on_linux() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let root = Path::new("/repo/example");
+        let path = unit_path(root);
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        let path = path.unwrap();
+        assert!(path.starts_with(tmp.path().join("systemd").join("user")));
+        assert!(path.to_string_lossy().contains(&slug(root)));
     }
 
     // No test drives `install`/`uninstall` directly — both shell out to the
