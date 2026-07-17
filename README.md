@@ -94,9 +94,9 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec blame <file>[:line]` | Which turn last touched a file, or introduced a current line |
 | `agentrec show <turn> [--prompt]` | Print a turn's header (excerpt discipline: no full prompt without the flag); `--prompt` prints the full post-scrub prompt text |
 | `agentrec undo [turn]` | Revert a turn's changes, per file. Preview-only unless `--confirm`. `--allow-modified`, `--files a,b,c`. Omit `turn` for panic mode: targets the most recent non-git rich turn |
-| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot failures. `--ack-degraded` clears it |
+| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot or prompt-blob write failures. `--ack-degraded` clears both |
 | `agentrec doctor` | One-shot diagnosis of the whole recording chain: daemon liveness, hooks, signal freshness, store health, permissions, (Linux) inotify headroom. `--json` |
-| `agentrec purge` | Delete blob objects: expired prompts by default (TTL from `config.toml`). `--all-prompts`, `--snapshots-before <DATE>`, `--memories-retracted` (archives expired retracted memory chains, never deletes) |
+| `agentrec purge` | Delete blob objects: expired prompts by default (TTL from `config.toml`). `--all-prompts`, `--snapshots-before <DATE>`, `--memories-retracted` (archives expired retracted memory chains, never deletes), `--log-duplicates` (archives+repairs a `log.jsonl` carrying a pre-fix duplicate turn record, never deletes) |
 | `agentrec uninstall` | Remove hooks + service unit, archive `.agentrec/` to a sibling directory. Nothing is ever deleted. `--no-service` |
 | `agentrec remember <fact> --from <paths>` | Record a manual, human-authored pinned memory. `--from` is a comma-separated list of repo-relative paths |
 | `agentrec recall <query>` | Rank-then-verify search over pinned memories — only returns Fresh matches. `-k <n>`, `--json`. Verification is capped at 128 candidates per call; if the cap is hit, a notice prints to stderr ("results may be incomplete") since fresh matches could exist beyond it |
@@ -106,6 +106,8 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec forget <id>` | Retract a memory — recoverable (quarantined, not deleted) until `purge --memories-retracted` archives it past TTL. `--reason <text>` |
 
 Run `agentrec <command> --help` for the full flag reference.
+
+`log.jsonl` is append-only by design (history is corrected by appending, never rewritten), with one narrow exception: `purge --log-duplicates` repairs a `log.jsonl` that a pre-fix daemon (a since-fixed kill-9 crash window) wrote a same-id duplicate turn record into. It archives the whole file, unmodified, to `.agentrec/log.archived.<ts>.jsonl` before touching anything, then rewrites `log.jsonl` dropping only lines that are exact duplicates of an earlier same-id record — a same-id pair that genuinely touched different files is left untouched rather than guessed at. It refuses outright while the daemon is recording, and a run that finds nothing to fix touches no files and creates no archive.
 
 ## Memory
 
@@ -130,7 +132,7 @@ On Claude Code's `UserPromptSubmit` hook, agentrec injects the top matching Fres
 
 `agentrec status` reports memory counters (`fresh`/`stale`/`rejects`/`injections`) alongside the usual turn stats.
 
-`purge --memories-retracted` rewrites `memory.jsonl` in place; it refuses while the daemon is recording. A dedicated `.agentrec/memory.lock` (separate from the daemon's own lock) coordinates it with `remember`/`verify`/`forget`: a concurrent write simply waits for the purge to finish and lands right after — it is never silently lost.
+`purge --memories-retracted` rewrites `memory.jsonl` in place; it refuses while the daemon is recording. A dedicated `.agentrec/memory.lock` (separate from the daemon's own lock) coordinates it with `remember`/`verify`/`forget`: a concurrent write simply waits for the purge to finish and lands right after — it is never silently lost. This flock is advisory and only covers agentrec's own writers (`remember`/`verify`/`forget`/`purge`/the daemon's candidate ingestion); a hand-rolled process that writes `memory.jsonl` directly, bypassing the lock, is out of scope for a local single-user tool.
 
 ## License
 

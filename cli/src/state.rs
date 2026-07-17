@@ -35,6 +35,30 @@ pub struct State {
     /// happened.
     #[serde(default)]
     pub unknown_signal_ignored: u64,
+    /// Count of file-change events skipped because the OS path's raw bytes
+    /// are not valid UTF-8 (`agentrec_core::pathenc::utf8_path` returned
+    /// `None` — rare, Linux-only in practice). Records serialize paths as
+    /// JSON strings, so such a path can never round-trip; a lossy
+    /// `to_string_lossy()` conversion would silently record a different
+    /// path than the one that actually changed, breaking undo/blame hash
+    /// lookups keyed on that string. No path list here (unlike
+    /// `io_failed`) — the whole problem is that the path has no valid
+    /// String form to store. The `snapshot_failures` honesty pattern: a
+    /// skip leaves no trace in `log.jsonl`, so this counter is the only
+    /// visible evidence it happened.
+    #[serde(default)]
+    pub non_utf8_path_skips: u64,
+    /// Count of genuine I/O failures storing a turn's PROMPT blob (D35 gap
+    /// closure — the taxonomy originally covered only file snapshots).
+    /// Deliberately a SEPARATE counter from `snapshot_failures`/`io_failed`:
+    /// those are file-scoped (a path can be named and refused at undo time),
+    /// a prompt failure is turn-scoped and has no file path to track. A
+    /// failed prompt put leaves `prompt_ref: null` on the closed turn —
+    /// indistinguishable on the wire from a turn that simply had no prompt
+    /// — so this counter (plus the `status` DEGRADED banner) is the only
+    /// evidence the write was attempted and failed, not silently absent.
+    #[serde(default)]
+    pub prompt_put_failures: u64,
 }
 
 pub fn read_state(root: &Path) -> State {
@@ -71,6 +95,20 @@ pub fn record_io_failure(state: &mut State, rel_path: &str) {
     if !state.io_failed.iter().any(|p| p == rel_path) {
         state.io_failed.push(rel_path.to_string());
     }
+}
+
+/// Record a file-change event skipped for having a non-UTF8 path. No path
+/// argument (there is no valid `String` to take — see the field doc).
+pub fn record_non_utf8_path_skip(state: &mut State) {
+    state.non_utf8_path_skips += 1;
+}
+
+/// Record a genuine PROMPT blob I/O failure (D35 gap closure). Bumps its own
+/// counter — never `record_io_failure`'s — so a prompt-store failure and a
+/// file-snapshot failure are never conflated in `status`'s DEGRADED banner
+/// or in `doctor`'s reading of the same state.
+pub fn record_prompt_put_failure(state: &mut State) {
+    state.prompt_put_failures += 1;
 }
 
 #[cfg(test)]
@@ -113,5 +151,41 @@ mod tests {
         assert_eq!(state.pid, 7);
         assert_eq!(state.snapshot_failures, 0);
         assert!(state.io_failed.is_empty());
+        assert_eq!(state.non_utf8_path_skips, 0);
+        assert_eq!(state.prompt_put_failures, 0);
+    }
+
+    #[test]
+    fn record_non_utf8_path_skip_increments_and_round_trips() {
+        let mut state = State::default();
+        record_non_utf8_path_skip(&mut state);
+        record_non_utf8_path_skip(&mut state);
+        assert_eq!(state.non_utf8_path_skips, 2);
+        let text = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.non_utf8_path_skips, 2);
+    }
+
+    // D35 gap closure: a prompt-put failure must bump its OWN counter, never
+    // the file-scoped `snapshot_failures`/`io_failed` — the two failure
+    // modes are unrelated causes with unrelated remedies (undo per-file vs.
+    // "this turn's attribution excerpt has no full-text backing").
+    #[test]
+    fn record_prompt_put_failure_increments_its_own_counter_only() {
+        let mut state = State::default();
+        record_prompt_put_failure(&mut state);
+        record_prompt_put_failure(&mut state);
+        assert_eq!(state.prompt_put_failures, 2);
+        assert_eq!(state.snapshot_failures, 0);
+        assert!(state.io_failed.is_empty());
+    }
+
+    #[test]
+    fn prompt_put_failures_round_trips_through_serde() {
+        let mut state = State::default();
+        record_prompt_put_failure(&mut state);
+        let text = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.prompt_put_failures, 1);
     }
 }

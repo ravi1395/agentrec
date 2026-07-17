@@ -213,7 +213,7 @@ fn recall_verifies_only_top_candidates() {
 }
 ```
 
-- [ ] **Step 2: FAIL** → 3 failed. **Step 3: Implement** (textbook BM25, avg-doc-len over corpus; no index persistence — build per call, corpus is small). **Step 4: PASS** — `cargo test -p agentrec-core` → all green (core suite still 48+ passing). 
+- [ ] **Step 2: FAIL** → 3 failed. **Step 3: Implement** (textbook BM25, avg-doc-len over corpus; no index persistence — build per call, corpus is small). **Step 4: PASS** — `cargo test -p agentrec-core` → all green (core suite still 48+ passing).
 - [ ] **Step 5: Commit** — `feat(core): BM25 + rank-then-verify recall, fresh-only (INV-M2 core)`
 
 ### Task 4: CLI `remember`
@@ -289,7 +289,7 @@ fn recall_for_hook_emits_block_or_nothing() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement** (zero-state honesty: bare `recall` on empty store prints `no memories yet — agentrec remember "<fact>" --from <file>` to stderr, exit 0 — PD3 posture). **Step 4: PASS** — `cargo test --test integration memor recall` green. 
+- [ ] **Step 2: FAIL.** **Step 3: Implement** (zero-state honesty: bare `recall` on empty store prints `no memories yet — agentrec remember "<fact>" --from <file>` to stderr, exit 0 — PD3 posture). **Step 4: PASS** — `cargo test --test integration memor recall` green.
 - [ ] **Step 5: Commit** — `feat(cli): recall + memories verbs; --for-hook contract (dogfoodable P1)`
 
 ### Task 6: memory-candidate signal — format, routing, spurious-stop guard
@@ -364,7 +364,7 @@ fn candidate_secret_fact_scrubbed_on_disk() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS** — suite green, `status` line verified in test output. 
+- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS** — suite green, `status` line verified in test output.
 - [ ] **Step 5: Commit** — `feat(daemon): candidate ingestion — validate, hash, scrub, dedup; rejects counter (INV-M1/M3)`
 
 ### Task 8: `agentrec candidate` emitter CLI + companion skill
@@ -392,7 +392,7 @@ fn candidate_cli_round_trip() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement + write SKILL.md** (≤ 40 lines: trigger = turn end; quality bar with 2 good / 2 bad examples; hard rules: file-groundable only, no narration, ≤ 3 per turn). **Step 4: PASS.** 
+- [ ] **Step 2: FAIL.** **Step 3: Implement + write SKILL.md** (≤ 40 lines: trigger = turn end; quality bar with 2 good / 2 bad examples; hard rules: file-groundable only, no narration, ≤ 3 per turn). **Step 4: PASS.**
 - [ ] **Step 5: Commit** — `feat(cli): candidate emitter verb + companion skill (write path complete)`
 
 ### Task 9: hook injection
@@ -426,7 +426,7 @@ fn hook_fail_open_and_budget() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS + manual smoke:** in this repo run `echo '{"hook_event_name":"UserPromptSubmit","prompt":"nightly torture seed"}' | agentrec hook claude` → block printed. Paste output into PR/commit body. 
+- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS + manual smoke:** in this repo run `echo '{"hook_event_name":"UserPromptSubmit","prompt":"nightly torture seed"}' | agentrec hook claude` → block printed. Paste output into PR/commit body.
 - [ ] **Step 5: Commit** — `feat(cli): UserPromptSubmit memory injection — budgeted, fail-open (INV-M4)`
 
 ### Task 10: lifecycle — `verify` + `forget`
@@ -454,7 +454,7 @@ fn verify_and_forget_lifecycle() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS.** 
+- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS.**
 - [ ] **Step 5: Commit** — `feat(cli): verify/forget lifecycle — quarantine is recoverable`
 
 ### Task 11: purge integration + status counters complete
@@ -484,7 +484,7 @@ fn purge_archives_only_expired_retracted_chains() {
 }
 ```
 
-- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS + full workspace green.** 
+- [ ] **Step 2: FAIL.** **Step 3: Implement.** **Step 4: PASS + full workspace green.**
 - [ ] **Step 5: Commit** — `feat(cli): purge --memories-retracted (archive-never-delete) + status counters`
 
 ### Task 12: torture join, secret 4th location, docs

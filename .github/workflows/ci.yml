@@ -58,7 +58,37 @@ jobs:
         # cargo stops at the first failing binary, so a failure in `integration`
         # masks one in `torture` entirely (torture_smoke never runs) — every
         # such collision costs a CI round-trip. See CLAUDE.md "PR #2 CI-red fix".
-        run: cargo test --workspace --all-features --no-fail-fast
+        #
+        # --test-threads=3: `cli/tests/integration.rs` spawns real `agentrec
+        # record` daemons (each arms its own notify/FSEvents watch) from many
+        # tests; at full default parallelism (== runner CPU count) roughly 6
+        # of those daemon-heavy tests contend on the OS file-watch layer and
+        # flake together — a known, pre-existing, environmental flake (see
+        # CLAUDE.md "agentrec daemon-test FSEvents contention"), not a product
+        # race (one daemon per root; the contention is the test harness
+        # co-locating many daemons on one host). It was observed on a
+        # high-core *local* macOS dev box, where the default thread count
+        # (>>3) let a whole batch spawn at once.
+        #
+        # HONEST scope of this cap on CI, per platform:
+        #  - macOS-14 GitHub runners are 3-vCPU, so the Rust default is already
+        #    3 — this cap is a NO-OP there. The flake is not expected on CI
+        #    macOS precisely because 3 concurrent daemons is already the
+        #    ceiling; if it ever reproduces on CI macOS, THIS LINE DOES NOT FIX
+        #    IT (lower the number then).
+        #  - Ubuntu runners have more headroom (4), so the cap actually trims
+        #    inotify-backed contention there from 4 -> 3.
+        # `-- --test-threads=N` is forwarded to every test binary in this one
+        # invocation — a single-line, workspace-wide cap rather than splitting
+        # `integration` into its own step; the lighter suites are cheap enough
+        # that capping their parallelism too costs negligible wall time, and a
+        # flat cap can't silently drop a future test target the way an explicit
+        # `--test <name>` allowlist would.
+        #
+        # NOTE: validated locally (integration 86/0 at --test-threads=3 on a
+        # high-core Mac); this workflow change itself has NOT yet run on a
+        # GitHub runner (batch unpushed) — treat as pending CI verification.
+        run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=3
 
   inotify-low-watches:
     name: doctor inotify headroom (induced low watches, AC Y++2)

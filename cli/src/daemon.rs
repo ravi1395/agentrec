@@ -9,7 +9,10 @@
 //! sane (end >= start) regardless of clock changes.
 
 use crate::cmds::wall_now_ms;
-use crate::state::{read_state, record_io_failure, write_state, State};
+use crate::state::{
+    read_state, record_io_failure, record_non_utf8_path_skip, record_prompt_put_failure,
+    write_state, State,
+};
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
@@ -387,6 +390,7 @@ fn record_watch_error(root: &Path, cause: &str) {
 
 // ---- change classification --------------------------------------------------
 
+#[derive(Debug, PartialEq)]
 enum Class {
     /// A git ref/index/HEAD transition — drives git-turn classification.
     GitRef,
@@ -409,11 +413,16 @@ fn classify(root: &Path, path: &Path, ignore_set: &IgnoreSet) -> Class {
     }
     // Built-in denylist — robust regardless of gitignore contents. `.agentrec`
     // suppression is load-bearing: it prevents the recorder's own writes from
-    // opening turns (no feedback loop). `.git` HEAD/index/refs feed git-turn
-    // classification; the rest of `.git` is noise.
+    // opening turns (no feedback loop). `.git` HEAD/index/refs/packed-refs
+    // feed git-turn classification; the rest of `.git` is noise. Item 3:
+    // `packed-refs` sits alongside `refs/` — `git pack-refs`/`git gc`/some
+    // clones move ref state there instead of (or in addition to) loose files
+    // under `.git/refs/`, so a ref transition can be invisible without it,
+    // misclassifying a git operation as a bare mutation burst.
     if comps[0] == ".git" {
         return match comps.get(1).copied() {
-            Some("HEAD") | Some("ORIG_HEAD") | Some("index") | Some("refs") => Class::GitRef,
+            Some("HEAD") | Some("ORIG_HEAD") | Some("index") | Some("refs")
+            | Some("packed-refs") => Class::GitRef,
             _ => Class::Ignore,
         };
     }
@@ -532,6 +541,11 @@ struct Recorder {
     /// (rel_path, cause) pairs for genuine snapshot I/O failures this batch,
     /// drained by the caller into `state.json` after each `stage()` call.
     io_failures: Vec<(String, String)>,
+    /// Count of file-change events skipped this batch because the OS path
+    /// is not valid UTF-8 (item 2, non-UTF8 path handling) — no path list
+    /// (there is no valid `String` form to store), drained into
+    /// `state.json`'s `non_utf8_path_skips` the same way `io_failures` is.
+    non_utf8_skips: u64,
 }
 
 impl Recorder {
@@ -560,6 +574,7 @@ impl Recorder {
             after: HashMap::new(),
             models: HashMap::new(),
             io_failures: Vec::new(),
+            non_utf8_skips: 0,
         }
     }
 
@@ -581,7 +596,19 @@ impl Recorder {
                 continue;
             };
             let rel = rel.to_path_buf();
-            let rel_str = rel.to_string_lossy().to_string();
+            // Item 2 (non-UTF8 path handling): a path whose raw OS bytes
+            // aren't valid UTF-8 has no valid String form for the wire
+            // record (paths serialize as JSON strings). Skip it outright —
+            // `to_string_lossy()` would substitute U+FFFD and silently
+            // record a DIFFERENT path than the one that actually changed,
+            // breaking every later hash lookup keyed on that string (undo,
+            // blame). Never snapshot, never emit a ChangeObs for it; just
+            // count the skip so `status`'s DEGRADED surfacing sees it.
+            let Some(rel_str) = agentrec_core::pathenc::utf8_path(&rel) else {
+                self.non_utf8_skips += 1;
+                continue;
+            };
+            let rel_str = rel_str.to_string();
             let secret = scrub::is_secret_path(&rel_str);
 
             let meta = std::fs::symlink_metadata(abs);
@@ -692,17 +719,30 @@ impl Recorder {
     }
 }
 
-/// Drain `recorder`'s pending snapshot I/O failures (D35) into `state.json`:
-/// bump the counter, track the path, and warn loudly on stderr. Mirrors the
-/// SignalTailer offset pattern — read, mutate, write.
+/// Drain `recorder`'s pending snapshot failures (D35 I/O failures, item 2
+/// non-UTF8 path skips) into `state.json`: bump the counters, track I/O
+/// failure paths, and warn loudly on stderr. One read-mutate-write cycle for
+/// both (mirrors the SignalTailer offset pattern) rather than two, so a
+/// batch that hits both kinds doesn't race itself across two separate
+/// state.json writes.
 fn drain_io_failures(root: &Path, recorder: &mut Recorder) {
-    if recorder.io_failures.is_empty() {
+    if recorder.io_failures.is_empty() && recorder.non_utf8_skips == 0 {
         return;
     }
     let mut state = read_state(root);
     for (path, cause) in recorder.io_failures.drain(..) {
         record_io_failure(&mut state, &path);
         eprintln!("agentrec: snapshot write failed for {path}: {cause}");
+    }
+    if recorder.non_utf8_skips > 0 {
+        for _ in 0..recorder.non_utf8_skips {
+            record_non_utf8_path_skip(&mut state);
+        }
+        eprintln!(
+            "agentrec: skipped {} file change(s) with a non-UTF8 path (undo/blame cannot track them)",
+            recorder.non_utf8_skips
+        );
+        recorder.non_utf8_skips = 0;
     }
     if let Err(e) = write_state(root, &state) {
         eprintln!("agentrec: warning: failed to persist snapshot-failure state: {e}");
@@ -941,13 +981,33 @@ fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_t
 /// `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS` is set (only ever done by that
 /// test), this sleeps for the given duration immediately after a candidate
 /// is durably persisted, holding the daemon inside the exact window the fix
-/// closes long enough for a deterministic external kill. A single env var
-/// read (no-op) when unset — no effect on production behavior or perf.
+/// closes long enough for a deterministic external kill. The env read is
+/// compiled out entirely in release builds (`#[cfg(not(debug_assertions))]`
+/// arm always returns `None` without touching the environment) — same
+/// fail-safe class as `agentrec_core::memory::test_slow_pin_read_delay`: a
+/// release/production daemon can never have an arbitrary sleep injected
+/// into its candidate-ingestion path. It stays active under
+/// `cfg(debug_assertions)`, which `cargo test` sets and which
+/// `cli/tests/hardening_daemon.rs`'s spawned `CARGO_BIN_EXE_agentrec`
+/// (always a debug build) inherits, so the seam still bites in the test
+/// suite.
+fn test_pause_after_candidate_persist_delay() -> Option<Duration> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 fn test_pause_after_candidate_persist() {
-    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            std::thread::sleep(Duration::from_millis(ms));
-        }
+    if let Some(delay) = test_pause_after_candidate_persist_delay() {
+        std::thread::sleep(delay);
     }
 }
 
@@ -1106,7 +1166,29 @@ fn persist(
             Some(text) => {
                 let excerpt = scrub::excerpt(text);
                 let full = scrub::scrub(text);
-                (recorder.store.put(full.as_bytes()), Some(excerpt))
+                // D35 gap closure: distinguish a genuine I/O failure from an
+                // over-cap prompt (both leave prompt_ref: None on the wire,
+                // same as `BlobStore::put`) so it can be counted separately
+                // from file-snapshot failures — see `prompt_put_failures`.
+                let prompt_ref = match recorder.store.put_result(full.as_bytes()) {
+                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::OverCap => None,
+                    PutResult::IoError(cause) => {
+                        let mut state = read_state(root);
+                        record_prompt_put_failure(&mut state);
+                        if let Err(e) = write_state(root, &state) {
+                            eprintln!(
+                                "agentrec: warning: failed to persist prompt-failure state: {e}"
+                            );
+                        }
+                        eprintln!(
+                            "agentrec: prompt write failed for turn {}: {cause}",
+                            turn.id
+                        );
+                        None
+                    }
+                };
+                (prompt_ref, Some(excerpt))
             }
             None => (None, None),
         };
@@ -1257,11 +1339,32 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         (None, None, None, None)
     } else {
         let store = BlobStore::new(objects_dir(root));
+        // D35 gap closure: same IoError-vs-OverCap distinction as the
+        // steady-state `persist` path — a crash-recovery prompt write can
+        // fail for the same real-world reasons (disk full, permissions).
         let (prompt_ref, excerpt) = match &journal.prompt {
-            Some(text) => (
-                store.put(scrub::scrub(text).as_bytes()),
-                Some(scrub::excerpt(text)),
-            ),
+            Some(text) => {
+                let scrubbed = scrub::scrub(text);
+                let prompt_ref = match store.put_result(scrubbed.as_bytes()) {
+                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::OverCap => None,
+                    PutResult::IoError(cause) => {
+                        let mut state = read_state(root);
+                        record_prompt_put_failure(&mut state);
+                        if let Err(e) = write_state(root, &state) {
+                            eprintln!(
+                                "agentrec: warning: failed to persist prompt-failure state: {e}"
+                            );
+                        }
+                        eprintln!(
+                            "agentrec: prompt write failed recovering orphaned turn {}: {cause}",
+                            journal.id
+                        );
+                        None
+                    }
+                };
+                (prompt_ref, Some(scrub::excerpt(text)))
+            }
             None => (None, None),
         };
         (
@@ -1462,6 +1565,25 @@ fn watch_error(e: &notify::Error) -> String {
 mod tests {
     use super::*;
 
+    /// Mirrors `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`:
+    /// in a release build (`debug_assertions` off), the D-M6 pause seam must
+    /// return `None` even when the env var IS set — proves the
+    /// `#[cfg(not(debug_assertions))]` arm actually compiles out the env
+    /// read rather than merely being unreachable dead code. Only runs under
+    /// `cargo test --release` (the `debug_assertions`-on debug test build
+    /// never exercises this arm at all).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn pause_after_candidate_persist_delay_is_none_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS", "5000");
+        assert_eq!(
+            test_pause_after_candidate_persist_delay(),
+            None,
+            "release builds must never honor AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS"
+        );
+        std::env::remove_var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS");
+    }
+
     // B+ / D29: nested `.gitignore` precedence follows git's rules — deeper
     // files override shallower ones, `!` re-includes, and a matched directory
     // ignores everything beneath it.
@@ -1541,6 +1663,7 @@ mod tests {
                 .collect(),
             models: HashMap::new(),
             io_failures: Vec::new(),
+            non_utf8_skips: 0,
         }
     }
 
@@ -1582,6 +1705,71 @@ mod tests {
         let entry = rec.resolve(&change("c.rs", None, true, false));
         assert_eq!(entry.op, "create");
         assert_eq!(entry.after.as_deref(), Some("sha256:new"));
+    }
+
+    // Item 2 (non-UTF8 path handling): a path whose raw OS bytes are not
+    // valid UTF-8 can never round-trip through a wire record (paths
+    // serialize as JSON strings). `stage()` must skip it — never fall back
+    // to `to_string_lossy()`, which would silently record a *different*
+    // path than the one that actually changed and break undo/blame hash
+    // lookups keyed on that string — and count the skip so `status`'s
+    // DEGRADED surfacing sees it (the `snapshot_failures` honesty pattern:
+    // a skip leaves no trace in `log.jsonl`). Linux-only: this needs to
+    // actually create a file with invalid-UTF8 bytes in its name, which
+    // macOS/APFS refuses at the syscall level ("Illegal byte sequence") —
+    // the pure conversion decision itself (`pathenc::utf8_path`) is tested
+    // cross-platform in agentrec-core without touching a real filesystem.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stage_skips_non_utf8_path_never_lossily_recorded() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join("obj"));
+        let mut recorder = Recorder::scan(root, store);
+
+        // "fo\xFFo" — 0xFF is not valid UTF-8 in any position.
+        let bytes = [0x66, 0x6f, 0xff, 0x6f];
+        let bad_name = OsStr::from_bytes(&bytes);
+        let bad_path = root.join(bad_name);
+        std::fs::write(&bad_path, b"hello").unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(bad_path);
+        let changes = recorder.stage(&paths);
+
+        assert!(
+            changes.is_empty(),
+            "a non-UTF8 path must never produce a ChangeObs: {changes:?}"
+        );
+        assert_eq!(recorder.non_utf8_skips, 1);
+        assert!(
+            recorder.io_failures.is_empty(),
+            "distinct skip reason, not an I/O write failure"
+        );
+    }
+
+    // A UTF-8 path containing non-ASCII (but valid) bytes is unaffected —
+    // the bound is on VALID UTF-8, not on ASCII-only.
+    #[test]
+    fn stage_records_valid_non_ascii_utf8_path_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join("obj"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let path = root.join("café.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(path);
+        let changes = recorder.stage(&paths);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "café.rs");
+        assert_eq!(recorder.non_utf8_skips, 0);
     }
 
     // ---- D2: flock-based lock -----------------------------------------------
@@ -1865,6 +2053,142 @@ mod tests {
             mems2.len(),
             1,
             "a re-scanned/duplicate candidate dedups to a no-op: {mems2:?}"
+        );
+    }
+
+    // ---- Item 3: .git/packed-refs classification ------------------------------
+
+    // `git pack-refs` / `git gc` / some clones move ref state into
+    // `.git/packed-refs` instead of (or alongside) loose files under
+    // `.git/refs/` — a ref transition that lands there must classify as a
+    // git signal exactly like HEAD/index/refs, or a `git gc`/repack burst
+    // gets misclassified as a bare human mutation burst (never let a git
+    // operation become a fabricated bare turn). Sibling `.git` content
+    // (logs, objects) must stay denied.
+    #[test]
+    fn classify_admits_packed_refs_as_git_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        assert_eq!(
+            classify(root, &root.join(".git/packed-refs"), &ignore_set),
+            Class::GitRef
+        );
+    }
+
+    #[test]
+    fn classify_still_denies_other_git_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        assert_eq!(
+            classify(root, &root.join(".git/logs/HEAD"), &ignore_set),
+            Class::Ignore
+        );
+        assert_eq!(
+            classify(root, &root.join(".git/objects/ab/cdef"), &ignore_set),
+            Class::Ignore
+        );
+        assert_eq!(
+            classify(root, &root.join(".git/config"), &ignore_set),
+            Class::Ignore
+        );
+    }
+
+    // End to end: a mutation burst coinciding with a packed-refs transition
+    // must classify as a `tool:"git"` rich turn, not a bare human burst —
+    // chains the daemon's `classify()` decision straight into the real
+    // engine (`agentrec_core::engine::TurnEngine`), the same way the main
+    // loop does (`Class::GitRef` -> `observe_git_change`, `Class::Watch` ->
+    // `observe_changes`).
+    #[test]
+    fn packed_refs_burst_classifies_as_git_rich_turn_via_engine() {
+        use agentrec_core::engine::{ChangeObs, TurnEngine};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ignore_set = IgnoreSet::build(root);
+        let mut engine = TurnEngine::new();
+
+        // A `git pack-refs`-shaped burst: many files touched by a checkout,
+        // plus the packed-refs transition itself.
+        let burst = [
+            root.join("src/a.rs"),
+            root.join("src/b.rs"),
+            root.join(".git/packed-refs"),
+        ];
+        let mut git_hit = false;
+        for p in &burst {
+            match classify(root, p, &ignore_set) {
+                Class::GitRef => git_hit = true,
+                Class::Watch => { /* fed to observe_changes below */ }
+                Class::Ignore => panic!("unexpected Ignore for {p:?}"),
+            }
+        }
+        assert!(git_hit, "packed-refs must have set git_hit");
+
+        engine.observe_git_change(0);
+        let changes = vec![
+            ChangeObs {
+                path: "src/a.rs".into(),
+                before_hash: Some("sha256:a".into()),
+                snapshotted: true,
+                withheld: false,
+                baseline_unknown: false,
+                deleted: false,
+            },
+            ChangeObs {
+                path: "src/b.rs".into(),
+                before_hash: Some("sha256:b".into()),
+                snapshotted: true,
+                withheld: false,
+                baseline_unknown: false,
+                deleted: false,
+            },
+        ];
+        engine.observe_changes(500, &changes);
+        let closed = engine.tick(500 + agentrec_core::GIT_SETTLE_MS + 1);
+
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].tool.as_deref(), Some("git"));
+        assert_eq!(closed[0].grade, "rich");
+        assert_eq!(closed[0].boundary, "git");
+        assert_eq!(closed[0].files.len(), 2);
+    }
+
+    // The watch-event path (not just the pure classifier) must flip
+    // `git_hit` for a packed-refs event, the same signal HEAD/index/refs
+    // already produce — this is the whole path a real notify event takes.
+    #[test]
+    fn drain_watch_events_sets_git_hit_on_packed_refs_transition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+
+        tx.send(Ok(
+            notify::Event::default().add_path(root.join(".git/packed-refs"))
+        ))
+        .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+        );
+
+        assert!(git_hit, "a packed-refs transition must set git_hit");
+        assert!(
+            pending.is_empty(),
+            "a GitRef signal is not itself a watched mutation"
         );
     }
 
