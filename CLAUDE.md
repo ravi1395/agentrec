@@ -8,6 +8,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Debt-burn round (2026-07-17, `main`, `ed21bc8..4da51b5`):** 5 parallel **Sonnet** worktree
+agents (one isolated git worktree each — no shared-tree clobber), Opus orchestrator, binding
+**skeptical-reviewer done-gate in an isolated worktree: GATE PASS** (all 10 ACs MET; refuted the
+4 highest-stakes guards by neutering each in-worktree → named test RED → restored byte-identical).
+**333 tests, 0 failed, 1 ignored** (was 299; +34), fmt/clippy clean debug+release, torture_smoke
+green, `strings` on release binary shows no `AGENTREC_TEST_PAUSE_*`. Landed: **(D-PD6)** one
+turn renderer — `fmt::SEP` (` · `) + `turn_list_line`/`turn_detail_header` in `fmt.rs`,
+`format_turn`/`render_turn` now thin wrappers, third renderer (diff `header_line`) found and
+SEP-unified, `--json` byte-identical, SPEC.md sample reconciled; **(log repair, Option 2)**
+`purge --log-duplicates` — archive-fsync-first rewrite dropping only exact `same_revert` same-id
+dups (pre-fix-daemon residue), ambiguous pairs/epoch/unknown-type lines byte-preserved, daemon-
+liveness refusal, concurrent-growth length-recheck abort (TOCTOU narrowed-not-closed, documented
+— no new log.lock, deliberate); **(watch-list)** the 2 remaining runtime test-pause seams
+cfg(debug_assertions)-gated (+ the round's own new log-rewrite seam, caught at integration —
+parallel agents drift: one agent re-introduced the exact pattern another was concurrently gating),
+`sanitize_terminal` now strips C1 (U+0080–U+009F, CSI/OSC) not just C0+DEL, F4 advisory-flock
+scope documented README+spec; **(engine)** stop-only fold bounded by `FOLD_WINDOW_MS` on **two**
+paths the agent found (fold filter never bounded a bare's own `opened_at`; direct Quiet→rich stop
+conversion had no bound at all), non-UTF8 paths skip+count (`non_utf8_path_skips`, lossy
+conversion would break undo/blame hash keys; APFS rejects non-UTF8 at syscall so e2e is
+Linux-gated), `.git/packed-refs` admitted to git-turn classification; **(small)** CI integration
+`--test-threads=3` cap (FSEvents de-flake; checkout@v5 + `--no-fail-fast` were already landed —
+prior "owed" notes stale), XDG_CONFIG_HOME via single `config_home()` resolver in `service.rs`
+(launchd untouched), D35 prompt-put-failure taxonomy (`prompt_put_failures` in persist +
+recover_orphan, status/doctor DEGRADED, `--ack-degraded` clears, `show --prompt` 4-way honest
+message). Doctor store-health now fails on all three counters (non-UTF8 leg wired at integration,
+RED-proven). **Deliberately NOT done: P3 polish** (no enumerated list exists — needs founder
+pointer). Skeptic residual risks (accepted): length-recheck TOCTOU microsecond window;
+Linux-specific legs (XDG/systemd, non-UTF8 e2e) verified via CI matrix not local Linux. Not
+pushed (no ask).
+
 **D36 closed + repo truth-up (2026-07-17, `main`):** **D36 7-consecutive-green-nights torture
 streak is CLOSED** — 7 consecutive scheduled `nightly.yml` runs green 2026-07-11 → 2026-07-17
 (run ids in VERIFY-LEDGER "Closed here" row; wall-clock-derived per-night seeds, macOS + Ubuntu
