@@ -138,6 +138,7 @@ pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
         let mut state = read_state(root);
         state.snapshot_failures = 0;
         state.io_failed.clear();
+        state.non_utf8_path_skips = 0;
         // D2: state.json is a real persistence path now (its tmp file can
         // fail to write/rename, e.g. disk full) — a swallowed error here
         // would print "cleared" while the DEGRADED counter is still on disk.
@@ -279,18 +280,28 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         ));
     }
 
-    if state.snapshot_failures > 0 {
+    if state.snapshot_failures > 0 || state.non_utf8_path_skips > 0 {
         out.push('\n');
-        out.push_str(&format!(
-            "DEGRADED — {} snapshot write(s) failed (likely disk full or permissions); \
-             undo on affected files has no snapshot. Run `agentrec status --ack-degraded` to acknowledge.\n",
-            state.snapshot_failures
-        ));
-        if !state.io_failed.is_empty() {
-            out.push_str("  affected files:\n");
-            for path in &state.io_failed {
-                out.push_str(&format!("    {path}\n"));
+        if state.snapshot_failures > 0 {
+            out.push_str(&format!(
+                "DEGRADED — {} snapshot write(s) failed (likely disk full or permissions); \
+                 undo on affected files has no snapshot. Run `agentrec status --ack-degraded` to acknowledge.\n",
+                state.snapshot_failures
+            ));
+            if !state.io_failed.is_empty() {
+                out.push_str("  affected files:\n");
+                for path in &state.io_failed {
+                    out.push_str(&format!("    {path}\n"));
+                }
             }
+        }
+        if state.non_utf8_path_skips > 0 {
+            out.push_str(&format!(
+                "DEGRADED — {} file change(s) skipped (non-UTF8 path — cannot be represented \
+                 in a wire record); those files have no coverage and undo/blame can't track \
+                 them. Run `agentrec status --ack-degraded` to acknowledge.\n",
+                state.non_utf8_path_skips
+            ));
         }
     }
     Ok(out)
@@ -701,6 +712,40 @@ mod tests {
             "no over-budget notice expected: {out}"
         );
         assert!(store.contains(&hash));
+    }
+
+    // Item 2 (non-UTF8 path handling): a persisted `non_utf8_path_skips`
+    // count must surface via the same DEGRADED mechanism as I/O snapshot
+    // failures, and `--ack-degraded` must clear it the same way.
+    #[test]
+    fn status_surfaces_non_utf8_path_skips_as_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let mut state = crate::state::State::default();
+        crate::state::record_non_utf8_path_skip(&mut state);
+        crate::state::record_non_utf8_path_skip(&mut state);
+        write_state(root, &state).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(out.contains("DEGRADED"), "expected DEGRADED notice: {out}");
+        assert!(out.contains("non-UTF8"), "expected non-UTF8 mention: {out}");
+        assert!(out.contains('2'), "expected the count in the notice: {out}");
+    }
+
+    #[test]
+    fn status_ack_degraded_clears_non_utf8_path_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let mut state = crate::state::State::default();
+        crate::state::record_non_utf8_path_skip(&mut state);
+        write_state(root, &state).unwrap();
+
+        status(root, true).unwrap();
+
+        let after = read_state(root);
+        assert_eq!(after.non_utf8_path_skips, 0);
     }
 
     // D-PD5: the turns line drops implementer jargon ("agent, git/merged

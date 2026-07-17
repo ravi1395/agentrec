@@ -9,7 +9,7 @@
 //! sane (end >= start) regardless of clock changes.
 
 use crate::cmds::wall_now_ms;
-use crate::state::{read_state, record_io_failure, write_state, State};
+use crate::state::{read_state, record_io_failure, record_non_utf8_path_skip, write_state, State};
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
@@ -532,6 +532,11 @@ struct Recorder {
     /// (rel_path, cause) pairs for genuine snapshot I/O failures this batch,
     /// drained by the caller into `state.json` after each `stage()` call.
     io_failures: Vec<(String, String)>,
+    /// Count of file-change events skipped this batch because the OS path
+    /// is not valid UTF-8 (item 2, non-UTF8 path handling) — no path list
+    /// (there is no valid `String` form to store), drained into
+    /// `state.json`'s `non_utf8_path_skips` the same way `io_failures` is.
+    non_utf8_skips: u64,
 }
 
 impl Recorder {
@@ -560,6 +565,7 @@ impl Recorder {
             after: HashMap::new(),
             models: HashMap::new(),
             io_failures: Vec::new(),
+            non_utf8_skips: 0,
         }
     }
 
@@ -581,7 +587,19 @@ impl Recorder {
                 continue;
             };
             let rel = rel.to_path_buf();
-            let rel_str = rel.to_string_lossy().to_string();
+            // Item 2 (non-UTF8 path handling): a path whose raw OS bytes
+            // aren't valid UTF-8 has no valid String form for the wire
+            // record (paths serialize as JSON strings). Skip it outright —
+            // `to_string_lossy()` would substitute U+FFFD and silently
+            // record a DIFFERENT path than the one that actually changed,
+            // breaking every later hash lookup keyed on that string (undo,
+            // blame). Never snapshot, never emit a ChangeObs for it; just
+            // count the skip so `status`'s DEGRADED surfacing sees it.
+            let Some(rel_str) = agentrec_core::pathenc::utf8_path(&rel) else {
+                self.non_utf8_skips += 1;
+                continue;
+            };
+            let rel_str = rel_str.to_string();
             let secret = scrub::is_secret_path(&rel_str);
 
             let meta = std::fs::symlink_metadata(abs);
@@ -692,17 +710,30 @@ impl Recorder {
     }
 }
 
-/// Drain `recorder`'s pending snapshot I/O failures (D35) into `state.json`:
-/// bump the counter, track the path, and warn loudly on stderr. Mirrors the
-/// SignalTailer offset pattern — read, mutate, write.
+/// Drain `recorder`'s pending snapshot failures (D35 I/O failures, item 2
+/// non-UTF8 path skips) into `state.json`: bump the counters, track I/O
+/// failure paths, and warn loudly on stderr. One read-mutate-write cycle for
+/// both (mirrors the SignalTailer offset pattern) rather than two, so a
+/// batch that hits both kinds doesn't race itself across two separate
+/// state.json writes.
 fn drain_io_failures(root: &Path, recorder: &mut Recorder) {
-    if recorder.io_failures.is_empty() {
+    if recorder.io_failures.is_empty() && recorder.non_utf8_skips == 0 {
         return;
     }
     let mut state = read_state(root);
     for (path, cause) in recorder.io_failures.drain(..) {
         record_io_failure(&mut state, &path);
         eprintln!("agentrec: snapshot write failed for {path}: {cause}");
+    }
+    if recorder.non_utf8_skips > 0 {
+        for _ in 0..recorder.non_utf8_skips {
+            record_non_utf8_path_skip(&mut state);
+        }
+        eprintln!(
+            "agentrec: skipped {} file change(s) with a non-UTF8 path (undo/blame cannot track them)",
+            recorder.non_utf8_skips
+        );
+        recorder.non_utf8_skips = 0;
     }
     if let Err(e) = write_state(root, &state) {
         eprintln!("agentrec: warning: failed to persist snapshot-failure state: {e}");
@@ -1541,6 +1572,7 @@ mod tests {
                 .collect(),
             models: HashMap::new(),
             io_failures: Vec::new(),
+            non_utf8_skips: 0,
         }
     }
 
@@ -1582,6 +1614,71 @@ mod tests {
         let entry = rec.resolve(&change("c.rs", None, true, false));
         assert_eq!(entry.op, "create");
         assert_eq!(entry.after.as_deref(), Some("sha256:new"));
+    }
+
+    // Item 2 (non-UTF8 path handling): a path whose raw OS bytes are not
+    // valid UTF-8 can never round-trip through a wire record (paths
+    // serialize as JSON strings). `stage()` must skip it — never fall back
+    // to `to_string_lossy()`, which would silently record a *different*
+    // path than the one that actually changed and break undo/blame hash
+    // lookups keyed on that string — and count the skip so `status`'s
+    // DEGRADED surfacing sees it (the `snapshot_failures` honesty pattern:
+    // a skip leaves no trace in `log.jsonl`). Linux-only: this needs to
+    // actually create a file with invalid-UTF8 bytes in its name, which
+    // macOS/APFS refuses at the syscall level ("Illegal byte sequence") —
+    // the pure conversion decision itself (`pathenc::utf8_path`) is tested
+    // cross-platform in agentrec-core without touching a real filesystem.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stage_skips_non_utf8_path_never_lossily_recorded() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join("obj"));
+        let mut recorder = Recorder::scan(root, store);
+
+        // "fo\xFFo" — 0xFF is not valid UTF-8 in any position.
+        let bytes = [0x66, 0x6f, 0xff, 0x6f];
+        let bad_name = OsStr::from_bytes(&bytes);
+        let bad_path = root.join(bad_name);
+        std::fs::write(&bad_path, b"hello").unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(bad_path);
+        let changes = recorder.stage(&paths);
+
+        assert!(
+            changes.is_empty(),
+            "a non-UTF8 path must never produce a ChangeObs: {changes:?}"
+        );
+        assert_eq!(recorder.non_utf8_skips, 1);
+        assert!(
+            recorder.io_failures.is_empty(),
+            "distinct skip reason, not an I/O write failure"
+        );
+    }
+
+    // A UTF-8 path containing non-ASCII (but valid) bytes is unaffected —
+    // the bound is on VALID UTF-8, not on ASCII-only.
+    #[test]
+    fn stage_records_valid_non_ascii_utf8_path_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join("obj"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let path = root.join("café.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(path);
+        let changes = recorder.stage(&paths);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "café.rs");
+        assert_eq!(recorder.non_utf8_skips, 0);
     }
 
     // ---- D2: flock-based lock -----------------------------------------------
