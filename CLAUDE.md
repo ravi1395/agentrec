@@ -8,6 +8,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**D36 closed + repo truth-up (2026-07-17, `main`):** **D36 7-consecutive-green-nights torture
+streak is CLOSED** — 7 consecutive scheduled `nightly.yml` runs green 2026-07-11 → 2026-07-17
+(run ids in VERIFY-LEDGER "Closed here" row; wall-clock-derived per-night seeds, macOS + Ubuntu
+legs, 0 invariant violations). That was the last M3-era launch gate. Ledger updated accordingly.
+**Stale-note corrections after `gh` re-auth:** [PR #2](https://github.com/ravi1395/agentrec/pull/2)
+was in fact **squash-merged to `main` on 2026-07-12** (`7a83628`) — the "not pushed/PR'd, left on
+`feat/memory-v1` for the founder's call" notes in the two rounds below were already stale when
+written into history; `git diff main feat/memory-v1` shows **all F1–F10 code is in `main`**, the
+only real delta was the F8–F10 doc-reconcile (`9b09f15`: memory design-spec + plan edits), now
+ported onto `main`. Live dogfood observations (this repo, daemon recording since the post-publish
+re-init 2026-07-11: 832 agent turns, 0 recording gaps, daemon live): (a) `status` warns
+`rich-rate 45%` (<90% trailing-20) — distinguish genuinely-bare human/other-tool windows from a
+hook-coverage hole before trusting the warning; (b) **store 3.1 GiB over the 2.0 GiB budget yet
+eviction reports `0 B freed`** — keep-set/eviction interplay at real scale needs investigation
+(possible A5-residual class beyond the sole-turn case); (c) memory store holds 1 fact, now
+**stale** (its `cli/tests/torture.rs` pin drifted; `verify --replace-pin` candidate), 1 lifetime
+injection — the 1-week memory-dogfood ladder row is effectively not started. Docs-only round, no
+code changed.
+
 **Phase 2–3 design-spec round (2026-07-12, `main`, uncommitted):** Added
 `docs/superpowers/specs/2026-07-12-agentrec-phase-2-3-design.md`, grounding MCP/Codex/VS Code,
 PR reporting/signing, and Sutra rebase in current source plus current official Codex hooks/MCP
