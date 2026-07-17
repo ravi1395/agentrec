@@ -16,6 +16,12 @@ pub struct BlobStore {
     seq: AtomicU64,
 }
 
+/// True iff every byte is a lowercase-hex digit (`0-9a-f`). Shared by
+/// `list_hashes`' fan-out validation and mirrors `object_path`'s inline rule.
+fn is_hex(bytes: &[u8]) -> bool {
+    bytes.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// `sha256:<hex>` over raw bytes — the hash form used everywhere in the log.
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -191,6 +197,60 @@ impl BlobStore {
                 .sum()
         }
         walk(&self.dir)
+    }
+
+    /// Every well-formed blob currently on disk, as `sha256:` refs. Walks the
+    /// two-char fan-out dirs and reconstructs `sha256:<fan><rest>` for each
+    /// leaf whose name completes a valid 64-lowercase-hex hash. Anything that
+    /// isn't a proper `<2hex>/<62hex>` pair — a stray `.tmp.<pid>` write, a
+    /// non-hex file, an unexpected nesting depth — is silently skipped, never
+    /// returned as a blob (so `purge --orphans` can never archive it based on
+    /// a malformed name). Order is unspecified (directory order).
+    pub fn list_hashes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(fans) = fs::read_dir(&self.dir) else {
+            return out;
+        };
+        for fan in fans.filter_map(|e| e.ok()) {
+            let fan_name = fan.file_name();
+            let Some(fan_str) = fan_name.to_str() else {
+                continue;
+            };
+            if fan_str.len() != 2 || !is_hex(fan_str.as_bytes()) || !fan.path().is_dir() {
+                continue;
+            }
+            let Ok(rest_entries) = fs::read_dir(fan.path()) else {
+                continue;
+            };
+            for leaf in rest_entries.filter_map(|e| e.ok()) {
+                let leaf_name = leaf.file_name();
+                let Some(rest_str) = leaf_name.to_str() else {
+                    continue;
+                };
+                if rest_str.len() == 62 && is_hex(rest_str.as_bytes()) {
+                    out.push(format!("sha256:{fan_str}{rest_str}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// Move the blob at `hash` into `archive_dir`, preserving the same
+    /// `<fan>/<rest>` fan-out layout, and return the bytes moved (or `None`
+    /// if the hash is malformed or absent). A same-filesystem `rename`, so
+    /// this is cheap regardless of blob size — `purge --orphans` archives
+    /// (never deletes) reclaimable blobs, so a rewrite/undo mistake is always
+    /// recoverable by moving the archive dir back. Never used on the
+    /// write/read hot paths.
+    pub fn archive(&self, hash: &str, archive_dir: &std::path::Path) -> Option<u64> {
+        let src = self.object_path(hash)?;
+        let size = fs::metadata(&src).ok().map(|m| m.len())?;
+        let hex = hash.strip_prefix("sha256:")?;
+        let (fan, rest) = hex.split_at(2);
+        let dest_fan = archive_dir.join(fan);
+        fs::create_dir_all(&dest_fan).ok()?;
+        fs::rename(&src, dest_fan.join(rest)).ok()?;
+        Some(size)
     }
 
     /// `sha256:aabb...` → `<dir>/aa/bb...`, or `None` if `hash` isn't a
@@ -575,5 +635,50 @@ mod tests {
         let bogus_parent = std::path::Path::new("/nonexistent/agentrec-a7-probe-dir");
         let result = finish_stored("sha256:deadbeef".to_string(), bogus_parent);
         assert_eq!(result, PutResult::Stored("sha256:deadbeef".to_string()));
+    }
+
+    // list_hashes enumerates real blobs and NEVER returns a stray tmp write or
+    // a malformed (wrong-length / non-hex) file name — so `purge --orphans`
+    // can't archive garbage based on a bad name.
+    #[test]
+    fn list_hashes_enumerates_blobs_and_skips_tmp_and_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let a = store.put(b"alpha").unwrap();
+        let b = store.put(b"beta").unwrap();
+
+        // Litter: an in-flight tmp write in a fan dir, a wrong-length leaf,
+        // and a non-hex fan dir — none may appear in list_hashes.
+        let fan = &a.strip_prefix("sha256:").unwrap()[..2];
+        std::fs::write(tmp.path().join(fan).join(".tmp.9999.1"), b"x").unwrap();
+        std::fs::write(tmp.path().join(fan).join("short"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.path().join("zz")).unwrap();
+        std::fs::write(tmp.path().join("zz").join("z".repeat(62)), b"x").unwrap();
+
+        let mut got = store.list_hashes();
+        got.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(got, want, "only the two real blobs, no litter");
+    }
+
+    // archive() renames a blob into the archive dir (same fan-out) and reports
+    // its size; the source is gone, the archived copy exists.
+    #[test]
+    fn archive_moves_blob_preserving_fanout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let h = store.put(&[0x42u8; 16]).unwrap();
+        let archive = tmp.path().join("archived");
+
+        let moved = store.archive(&h, &archive);
+
+        assert_eq!(moved, Some(16));
+        assert!(!store.contains(&h), "source blob moved out");
+        let hex = h.strip_prefix("sha256:").unwrap();
+        assert!(
+            archive.join(&hex[..2]).join(&hex[2..]).exists(),
+            "blob preserved in archive with fan-out layout"
+        );
     }
 }

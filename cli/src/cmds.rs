@@ -269,12 +269,27 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     if size > budget {
         let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
         let evicted = agentrec_core::retention::enforce_budget(&store, &owned_turns, budget);
+        // Honesty (B): budget enforcement here only evicts turn-referenced
+        // snapshot blobs. Most store bloat is usually ORPHANED blobs —
+        // superseded intermediate snapshots the daemon `put` for crash
+        // recovery that no committed turn references — which eviction can't
+        // touch. Attribute that share explicitly and point at its only
+        // reclaim path, instead of claiming "snapshots evicted" when the
+        // freed figure is ~0.
+        let orphans = crate::purgecmd::orphan_bytes(root, &store);
         out.push_str(&format!(
-            "store {} over {} budget — oldest snapshots evicted ({} freed)\n",
+            "store {} over {} budget — snapshot eviction freed {}",
             human_bytes(size),
             human_bytes(budget),
             human_bytes(evicted.bytes)
         ));
+        if orphans > 0 {
+            out.push_str(&format!(
+                "; {} is unreferenced (superseded snapshots) — run `agentrec purge --orphans` to reclaim",
+                human_bytes(orphans)
+            ));
+        }
+        out.push('\n');
     }
 
     if state.snapshot_failures > 0 || state.non_utf8_path_skips > 0 {
@@ -692,10 +707,41 @@ mod tests {
 
         let out = status_report(root, 1_000).unwrap();
         assert!(out.contains("over"), "expected over-budget notice: {out}");
-        assert!(out.contains("evicted"), "expected eviction mention: {out}");
+        assert!(
+            out.contains("snapshot eviction freed"),
+            "expected eviction mention: {out}"
+        );
         assert!(
             !store.contains(&hash),
             "the only snapshot blob should have been evicted"
+        );
+    }
+
+    // Honesty (B): when the store is over budget AND holds unreferenced
+    // (orphan) blobs, the notice must attribute that bloat to superseded
+    // snapshots and point at `purge --orphans` — not just claim eviction.
+    #[test]
+    fn status_over_budget_attributes_orphan_bloat_and_names_reclaim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        // A referenced blob (kept) plus an unreferenced orphan blob.
+        let kept = store.put(&[0xAAu8; 400]).unwrap();
+        let _orphan = store.put(&[0xBBu8; 600]).unwrap();
+        let turn = turn_with_snapshot("t_ORPHANBLOAT0000000000001", "kept.bin", &kept);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        // Budget below total (1000 B) so the notice fires.
+        let out = status_report(root, 500).unwrap();
+        assert!(
+            out.contains("unreferenced (superseded snapshots)"),
+            "expected orphan attribution: {out}"
+        );
+        assert!(
+            out.contains("purge --orphans"),
+            "expected the reclaim command named: {out}"
         );
     }
 

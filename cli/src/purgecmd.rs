@@ -31,6 +31,7 @@ pub fn run(
     snapshots_before: Option<&str>,
     memories_retracted: bool,
     log_duplicates: bool,
+    orphans: bool,
 ) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = owned_turns(&records);
@@ -45,6 +46,9 @@ pub fn run(
     }
     if log_duplicates {
         purge_log_duplicates(root)?;
+    }
+    if orphans {
+        purge_orphans(root)?;
     }
     Ok(())
 }
@@ -737,6 +741,168 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
     }
 }
 
+// ---- purge --orphans (superseded-snapshot GC) ------------------------------
+//
+// The daemon `put`s a file's current content into the CAS on EVERY debounced
+// change (`daemon::Recorder::stage`) — load-bearing for crash recovery: a
+// kill-9 mid-turn must find the open turn's current content already durable in
+// the store so `recover_orphan` can reconstruct a valid `after` hash. But the
+// committed `TurnRecord` is coarse — it keeps only the turn's FIRST `before`
+// and LAST `after` per file. Every intermediate content state a file passed
+// through therefore leaves a blob no record references the instant the file
+// advances again. These "orphans" are the inevitable byproduct of continuous
+// crash-safe snapshotting — not a bug, not crash residue — and over a heavy
+// dogfood week they can dwarf the referenced set. Nothing else reclaims them
+// (budget eviction walks only turn-referenced snapshot blobs; TTL purge only
+// touches prompt blobs), so this is their sole reclaim path.
+//
+// SAFETY — deleting "by absence" is correct iff the reference set is COMPLETE:
+// a missed reference means a live blob wrongly reclaimed. Two guards keep the
+// ref-set complete in the safe (over-keep) direction:
+//
+//  (1) It is harvested by a raw `sha256:<64hex>` byte-scan of every file that
+//      can cite a CAS blob — ALL THREE: `log.jsonl` (snapshot `before`/`after`
+//      + `prompt_ref`), `open.json` (the in-flight crash-journal turn a future
+//      `recover_orphan` will resurrect), and `memory.jsonl` (a memory pin's
+//      `hash` is a file-content sha256 that `verify`'s `print_pin_diff` looks
+//      up as a CAS blob to render old content — a pinned version that was
+//      snapshotted then superseded would otherwise look orphaned). NEVER via
+//      `load_log`, which silently drops torn/unknown-type lines; a blob cited
+//      only by such a line would then look orphaned. The raw scan yields the
+//      hash whether or not the line parses, so it can only ever KEEP more than
+//      a structured read would, never less.
+//  (2) `daemon_is_running` refusal (the daemon appends blobs + turns
+//      continuously) plus a `pass_start` mtime guard skipping any blob written
+//      after the scan began — covering the narrow race where a manual `undo`
+//      (the only other blob writer) `put`s a blob an instant before appending
+//      the turn that references it. The residual TOCTOU is real but bounded:
+//      an `undo` whose `put` lands BEFORE `pass_start` yet whose turn append
+//      lands AFTER the log scan would archive that blob. It is archive-only
+//      (recoverable, never a delete) and the same honest "narrowed, not
+//      closed" posture as `purge_log_duplicates`' length-recheck — running an
+//      `undo` concurrently with a manual `purge --orphans` is the only way to
+//      hit it, and the fix is to move the archive dir back.
+//
+// Reclaimed blobs are archive-*renamed* into `.agentrec/objects.archived.<ts>/`
+// (same-fs, cheap, fan-out preserved) — never deleted — so "never delete user
+// data" holds trivially: moving the archive dir back under `objects/` fully
+// restores the pre-reclaim store.
+
+/// `purge --orphans`: archive every CAS blob referenced by no turn/prompt in
+/// `log.jsonl`, no in-flight turn in `open.json`, and no pin in `memory.jsonl`.
+/// See the module comment above for the completeness/safety argument.
+fn purge_orphans(root: &Path) -> Result<(), String> {
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before reclaiming orphans — \
+             the daemon appends new snapshot blobs and turns concurrently"
+                .to_string(),
+        );
+    }
+
+    let pass_start = SystemTime::now();
+    let store = BlobStore::new(objects_dir(root));
+    let referenced = referenced_hashes(root);
+
+    let all = store.list_hashes();
+    let scanned = all.len();
+    let archive_dir = objects_archive_path(root);
+
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for hash in all {
+        if referenced.contains(&hash) {
+            continue;
+        }
+        // (2) skip a blob written after this pass began — a racing `undo`
+        // may have `put` it just before appending its referencing turn.
+        if store.mtime(&hash).is_some_and(|m| m > pass_start) {
+            continue;
+        }
+        if let Some(size) = store.archive(&hash, &archive_dir) {
+            count += 1;
+            bytes += size;
+        }
+    }
+
+    if count == 0 {
+        println!("scanned {scanned} blob(s), 0 orphaned (superseded) — nothing to reclaim");
+    } else {
+        agentrec_core::perms::lock_dir(&archive_dir);
+        println!(
+            "reclaimed {count} orphaned (superseded) blob(s) of {scanned} scanned, {} freed — archived to {}",
+            human_bytes(bytes),
+            archive_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Every `sha256:<64hex>` ref cited by any file that can reference a CAS blob:
+/// `log.jsonl` (snapshots + prompts), `open.json` (the in-flight crash-journal
+/// turn), and `memory.jsonl` (pin hashes `verify`'s pin-diff resolves as
+/// blobs). A RAW byte-scan (never `load_log`) so a hash on a torn/unknown line
+/// still counts — see the module SAFETY note. Returns refs in `sha256:` form,
+/// matching `BlobStore::list_hashes`.
+pub(crate) fn referenced_hashes(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for path in [log_path(root), crate::open_path(root), memory_path(root)] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            harvest_refs(&text, &mut out);
+        }
+    }
+    out
+}
+
+/// Bytes currently held by orphaned (unreferenced) blobs — what
+/// `purge --orphans` would reclaim. Shared with `status`' over-budget notice
+/// so the trigger (total store size) and the honest remedy attribution use one
+/// definition of "orphan". Applies the same `pass_start` mtime guard as the
+/// command so a just-written (racing) blob isn't counted reclaimable.
+pub(crate) fn orphan_bytes(root: &Path, store: &BlobStore) -> u64 {
+    let pass_start = SystemTime::now();
+    let referenced = referenced_hashes(root);
+    store
+        .list_hashes()
+        .into_iter()
+        .filter(|h| !referenced.contains(h))
+        .filter(|h| store.mtime(h).is_none_or(|m| m <= pass_start))
+        .filter_map(|h| store.size(&h))
+        .sum()
+}
+
+/// Scan `text` for every `sha256:` followed by exactly 64 lowercase-hex
+/// chars, inserting each as a `sha256:<hex>` ref. Anchored on the literal
+/// `sha256:` prefix (not a bare 64-hex match) so an unrelated hex run can't
+/// fool it, yet oblivious to JSON structure so a torn line still yields its
+/// hashes.
+fn harvest_refs(text: &str, out: &mut HashSet<String>) {
+    const PREFIX: &[u8] = b"sha256:";
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + PREFIX.len() + 64 <= bytes.len() {
+        if &bytes[i..i + PREFIX.len()] == PREFIX {
+            let hex = &bytes[i + PREFIX.len()..i + PREFIX.len() + 64];
+            if hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                out.insert(format!("sha256:{}", std::str::from_utf8(hex).unwrap()));
+                i += PREFIX.len() + 64;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// `.agentrec/objects.archived.<unix_ts>/` — mirrors `memory_archive_path`'s
+/// naming; a directory (fan-out preserved) rather than a `.jsonl` file.
+fn objects_archive_path(root: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    agentrec_dir(root).join(format!("objects.archived.{ts}"))
+}
+
 /// Read `ttl_days` from `.agentrec/config.toml` via the shared
 /// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
 /// unparseable value all fall back to the documented default of 90.
@@ -854,5 +1020,140 @@ mod tests {
         );
         assert!(parse_date_cutoff("not-a-date").is_err());
         assert!(parse_date_cutoff("2024-13-01").is_err());
+    }
+
+    #[test]
+    fn harvest_refs_yields_hashes_from_torn_and_valid_lines() {
+        let a = format!("sha256:{}", "a".repeat(64));
+        let b = format!("sha256:{}", "b".repeat(64));
+        // second line is deliberately truncated (torn) JSON — its hash must
+        // still be harvested (raw scan is oblivious to parseability).
+        let text = format!("valid {{\"after\":\"{a}\"}}\n<torn json {b}");
+        let mut out = HashSet::new();
+        harvest_refs(&text, &mut out);
+        assert!(out.contains(&a) && out.contains(&b));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn harvest_refs_ignores_short_or_uppercase_hex() {
+        let short = format!("sha256:{}", "a".repeat(63));
+        let upper = format!("sha256:{}", "A".repeat(64));
+        let mut out = HashSet::new();
+        harvest_refs(
+            &format!("{short} {upper} tail padding padding padding"),
+            &mut out,
+        );
+        assert!(out.is_empty(), "63-hex and uppercase must not match");
+    }
+
+    // The load-bearing safety test: `purge --orphans` archives ONLY blobs no
+    // record references, and — critically — a blob referenced only by a TORN
+    // (unparseable) `log.jsonl` line is NOT reclaimed, because the ref-set is
+    // a raw byte-scan, not `load_log` (which would silently drop that line).
+    #[test]
+    fn purge_orphans_archives_only_unreferenced_and_spares_torn_line_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let ref_snap = store.put(b"snapshot content").unwrap();
+        let ref_prompt = store.put(b"prompt content").unwrap();
+        let pending = store.put(b"in-flight open turn content").unwrap();
+        let torn = store.put(b"referenced only by a torn line").unwrap();
+        let orphan = store.put(b"superseded intermediate state").unwrap();
+
+        // log.jsonl: one well-formed turn line citing ref_snap + ref_prompt,
+        // then a truncated (torn) line still citing `torn`.
+        let log = format!(
+            "{{\"v\":1,\"id\":\"t_X\",\"files\":[{{\"after\":\"{ref_snap}\"}}],\"prompt_ref\":\"{ref_prompt}\"}}\n\
+             {{\"v\":1,\"id\":\"t_TORN\",\"files\":[{{\"after\":\"{torn}\"\n"
+        );
+        std::fs::write(log_path(root), log).unwrap();
+        // open.json crash journal citing the pending blob.
+        std::fs::write(
+            crate::open_path(root),
+            format!("{{\"files\":[{{\"before_hash\":\"{pending}\"}}]}}"),
+        )
+        .unwrap();
+
+        purge_orphans(root).unwrap();
+
+        assert!(store.contains(&ref_snap), "snapshot-referenced blob kept");
+        assert!(store.contains(&ref_prompt), "prompt-referenced blob kept");
+        assert!(store.contains(&pending), "open.json pending blob kept");
+        assert!(
+            store.contains(&torn),
+            "blob cited only by a torn line kept (raw scan, not load_log)"
+        );
+        assert!(!store.contains(&orphan), "orphan archived out of the store");
+
+        // The orphan is preserved in the archive dir, never deleted.
+        let hex = orphan.strip_prefix("sha256:").unwrap();
+        let archived = std::fs::read_dir(agentrec_dir(root))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("objects.archived.")
+            })
+            .expect("archive dir created");
+        let arch_blob = archived.path().join(&hex[..2]).join(&hex[2..]);
+        assert!(
+            arch_blob.exists(),
+            "orphan preserved in archive (never deleted)"
+        );
+    }
+
+    // A memory pin's `hash` is a file-content sha256 that `verify`'s pin-diff
+    // resolves as a CAS blob. If that pinned version was snapshotted then
+    // superseded, it looks orphaned to a log-only ref-set — but memory.jsonl
+    // is in the ref-set, so it must be kept.
+    #[test]
+    fn purge_orphans_keeps_a_memory_pinned_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        // A blob referenced by NO turn — only by a memory pin.
+        let pinned = store
+            .put(b"a pinned file version, later superseded")
+            .unwrap();
+        std::fs::write(log_path(root), "").unwrap(); // no turns reference it
+        std::fs::write(
+            memory_path(root),
+            format!(
+                "{{\"v\":1,\"type\":\"memory\",\"id\":\"01AAA\",\"op\":\"assert\",\"fact\":\"x\",\"pins\":[{{\"path\":\"f.rs\",\"hash\":\"{pinned}\"}}],\"source_turns\":[],\"origin\":\"human\",\"ts\":1}}\n"
+            ),
+        )
+        .unwrap();
+
+        purge_orphans(root).unwrap();
+
+        assert!(
+            store.contains(&pinned),
+            "a memory-pinned blob must never be archived as an orphan"
+        );
+    }
+
+    #[test]
+    fn orphan_bytes_counts_only_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let kept = store.put(&[0xAAu8; 40]).unwrap();
+        let _orphan = store.put(&[0xBBu8; 25]).unwrap();
+        std::fs::write(
+            log_path(root),
+            format!("{{\"files\":[{{\"after\":\"{kept}\"}}]}}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(orphan_bytes(root, &store), 25, "only the 25-byte orphan");
     }
 }
