@@ -153,14 +153,19 @@ fn turn_range(turns: &[&TurnRecord]) -> String {
     };
     format!(
         "{}..{} ({} turns)",
-        short_id(&first.id),
-        short_id(&last.id),
+        fmt::short_id(&first.id),
+        fmt::short_id(&last.id),
         turns.len()
     )
 }
 
+/// `diff`'s one-line header: `turn <id> · <tool> · <files>`. A third
+/// turn-rendering shape (distinct from [`fmt::turn_list_line`]/
+/// [`fmt::turn_detail_header`] — `diff` wants the file count, not a
+/// timestamp or prompt), but it shares the same canonical [`fmt::SEP`] so
+/// the drift D-PD6 closed doesn't reopen here.
 fn header_line(t: &TurnRecord) -> String {
-    let id = short_id(&t.id);
+    let id = fmt::short_id(&t.id);
     let tool = t.tool.as_deref().unwrap_or("—");
     let n = t.files.len();
     let files = if n == 1 {
@@ -168,7 +173,7 @@ fn header_line(t: &TurnRecord) -> String {
     } else {
         format!("{n} files")
     };
-    format!("turn {id}  {tool}  {files}")
+    format!("turn {id}{sep}{tool}{sep}{files}", sep = fmt::SEP)
 }
 
 fn print_entry(store: &BlobStore, entry: &FileEntry) {
@@ -247,16 +252,6 @@ fn load_blob(store: &BlobStore, hash: Option<&str>) -> Result<Vec<u8>, ()> {
         None => Ok(Vec::new()),
         Some(h) => store.get(h).map_err(|_| ()),
     }
-}
-
-/// `t_<ULID>` → keep the prefix + last 4 chars for readability (mirrors
-/// `cmds::short_id`; kept separate since that one is private to its module).
-fn short_id(id: &str) -> String {
-    let body = id.strip_prefix("t_").unwrap_or(id);
-    if body.len() <= 8 {
-        return id.to_string();
-    }
-    format!("t_{}…{}", &body[..4], &body[body.len() - 4..])
 }
 
 /// "2026-07-05T14:03:11.000Z" → "14:03" (mirrors `cmds::hhmm`).
@@ -367,23 +362,11 @@ fn modified_since(turn: &TurnRecord, file: &str, current_hash: &Option<String>) 
     current_hash.as_deref() != entry_after.as_deref()
 }
 
-/// `<short-id> · <tool> · "<prompt>" · <hh:mm>` for a rich turn, or
-/// `<short-id> · bare turn · <hh:mm>` for a bare one — a bare turn never
-/// fabricates a tool or prompt (AC G3).
+/// Thin wrapper: computes `show`/`blame`'s caller-owned `hh:mm` field and
+/// hands off to the shared [`fmt::turn_detail_header`] renderer (D-PD6 —
+/// this used to be a fully independent implementation from `cmds::format_turn`).
 fn render_turn(t: &TurnRecord) -> String {
-    let id = short_id(&t.id);
-    let when = hhmm(&t.started);
-    if t.grade == "rich" {
-        let tool = t.tool.as_deref().unwrap_or("—");
-        let prompt = t
-            .prompt_excerpt
-            .as_deref()
-            .map(fmt::sanitize_terminal)
-            .unwrap_or_else(|| "—".to_string());
-        format!("{id} · {tool} · \"{prompt}\" · {when}")
-    } else {
-        format!("{id} · bare turn · {when}")
-    }
+    fmt::turn_detail_header(t, &hhmm(&t.started))
 }
 
 /// File-level blame (AC G1–G4, G6): report the last turn to touch `file`,
@@ -578,7 +561,7 @@ pub fn undo(
         if !unmatched.is_empty() {
             return Err(format!(
                 "--files names path(s) not in turn {}: {}",
-                short_id(&target.id),
+                fmt::short_id(&target.id),
                 unmatched.join(", ")
             ));
         }
@@ -625,7 +608,7 @@ pub fn undo(
     let guarded_paths: Vec<String> = revertible.iter().map(|p| p.entry.path.clone()).collect();
     write_undo_guard(root, &guarded_paths)?;
 
-    let short_target = short_id(&target.id);
+    let short_target = fmt::short_id(&target.id);
     let mut inverse_entries = Vec::with_capacity(revertible.len());
     let mut mutation_err: Option<String> = None;
     for plan in &revertible {
@@ -690,7 +673,7 @@ pub fn undo(
         files: inverse_entries,
     };
     let reverted_n = undo_record.files.len();
-    let new_short_id = short_id(&undo_record.id);
+    let new_short_id = fmt::short_id(&undo_record.id);
     agentrec_core::record::append_log(&log_path(root), &LogRecord::Turn(undo_record))?;
 
     finish_undo_guard(root);
@@ -913,7 +896,7 @@ fn has_gap_after(records: &[LogRecord], since: &str) -> bool {
 fn print_plan(target: &TurnRecord, plans: &[Plan]) {
     println!(
         "undo {} ({})",
-        short_id(&target.id),
+        fmt::short_id(&target.id),
         target.tool.as_deref().unwrap_or("—")
     );
     for p in plans {
