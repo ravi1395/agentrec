@@ -941,13 +941,33 @@ fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_t
 /// `AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS` is set (only ever done by that
 /// test), this sleeps for the given duration immediately after a candidate
 /// is durably persisted, holding the daemon inside the exact window the fix
-/// closes long enough for a deterministic external kill. A single env var
-/// read (no-op) when unset — no effect on production behavior or perf.
+/// closes long enough for a deterministic external kill. The env read is
+/// compiled out entirely in release builds (`#[cfg(not(debug_assertions))]`
+/// arm always returns `None` without touching the environment) — same
+/// fail-safe class as `agentrec_core::memory::test_slow_pin_read_delay`: a
+/// release/production daemon can never have an arbitrary sleep injected
+/// into its candidate-ingestion path. It stays active under
+/// `cfg(debug_assertions)`, which `cargo test` sets and which
+/// `cli/tests/hardening_daemon.rs`'s spawned `CARGO_BIN_EXE_agentrec`
+/// (always a debug build) inherits, so the seam still bites in the test
+/// suite.
+fn test_pause_after_candidate_persist_delay() -> Option<Duration> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 fn test_pause_after_candidate_persist() {
-    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            std::thread::sleep(Duration::from_millis(ms));
-        }
+    if let Some(delay) = test_pause_after_candidate_persist_delay() {
+        std::thread::sleep(delay);
     }
 }
 
@@ -1461,6 +1481,25 @@ fn watch_error(e: &notify::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`:
+    /// in a release build (`debug_assertions` off), the D-M6 pause seam must
+    /// return `None` even when the env var IS set — proves the
+    /// `#[cfg(not(debug_assertions))]` arm actually compiles out the env
+    /// read rather than merely being unreachable dead code. Only runs under
+    /// `cargo test --release` (the `debug_assertions`-on debug test build
+    /// never exercises this arm at all).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn pause_after_candidate_persist_delay_is_none_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS", "5000");
+        assert_eq!(
+            test_pause_after_candidate_persist_delay(),
+            None,
+            "release builds must never honor AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS"
+        );
+        std::env::remove_var("AGENTREC_TEST_PAUSE_AFTER_CANDIDATE_MS");
+    }
 
     // B+ / D29: nested `.gitignore` precedence follows git's rules — deeper
     // files override shallower ones, `!` re-includes, and a matched directory

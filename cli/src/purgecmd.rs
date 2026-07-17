@@ -327,13 +327,32 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
 /// (unlocked) code the same pause instead gives a concurrent writer a wide,
 /// reliable opening to land its append here — where it is invisible to the
 /// already-computed `survivor_lines` and gets silently clobbered by the
-/// rewrite that follows. A single env var read (no-op) when unset — no
-/// effect on production behavior.
+/// rewrite that follows. The env read is compiled out entirely in release
+/// builds (`#[cfg(not(debug_assertions))]` arm always returns `None` without
+/// touching the environment) — same fail-safe class as
+/// `agentrec_core::memory::test_slow_pin_read_delay`: a release/production
+/// binary can never have an arbitrary sleep injected into its purge path.
+/// It stays active under `cfg(debug_assertions)`, which `cargo test` sets
+/// and which `cli/tests/hardening_cli.rs`'s spawned `CARGO_BIN_EXE_agentrec`
+/// (always a debug build) inherits, so the seam still bites in the test
+/// suite.
+fn test_pause_before_memory_rewrite_delay() -> Option<std::time::Duration> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 fn test_pause_before_memory_rewrite() {
-    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
+    if let Some(delay) = test_pause_before_memory_rewrite_delay() {
+        std::thread::sleep(delay);
     }
 }
 
@@ -499,6 +518,25 @@ fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`:
+    /// in a release build (`debug_assertions` off), the F4 pause seam must
+    /// return `None` even when the env var IS set — proves the
+    /// `#[cfg(not(debug_assertions))]` arm actually compiles out the env
+    /// read rather than merely being unreachable dead code. Only runs under
+    /// `cargo test --release` (the `debug_assertions`-on debug test build
+    /// never exercises this arm at all).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn pause_before_memory_rewrite_delay_is_none_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS", "5000");
+        assert_eq!(
+            test_pause_before_memory_rewrite_delay(),
+            None,
+            "release builds must never honor AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS"
+        );
+        std::env::remove_var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS");
+    }
 
     #[test]
     fn ttl_days_defaults_when_missing() {
