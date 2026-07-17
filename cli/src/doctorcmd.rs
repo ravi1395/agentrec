@@ -285,7 +285,8 @@ fn check_degraded(root: &Path) -> Check {
     // DEGRADED" condition as a file-snapshot one — both mean a write the
     // daemon attempted silently didn't land. Checked together so `doctor`
     // can't false-PASS store health while either counter is nonzero.
-    if state.snapshot_failures > 0 || state.prompt_put_failures > 0 {
+    if state.snapshot_failures > 0 || state.prompt_put_failures > 0 || state.non_utf8_path_skips > 0
+    {
         let mut reasons = Vec::new();
         if state.snapshot_failures > 0 {
             reasons.push(format!(
@@ -297,6 +298,12 @@ fn check_degraded(root: &Path) -> Check {
             reasons.push(format!(
                 "{} prompt writes failed",
                 state.prompt_put_failures
+            ));
+        }
+        if state.non_utf8_path_skips > 0 {
+            reasons.push(format!(
+                "{} non-UTF8 paths skipped",
+                state.non_utf8_path_skips
             ));
         }
         Check::fail(
@@ -534,6 +541,26 @@ mod tests {
         let check = check_degraded(root);
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.remedy.unwrap().contains("2 snapshot"));
+    }
+
+    // Same false-PASS class as the prompt-put leg: a non-UTF8 path skip is a
+    // change the daemon saw but could not record — doctor's "store health"
+    // must not PASS while state.json's non_utf8_path_skips is nonzero and
+    // the other counters happen to be 0.
+    #[test]
+    fn non_utf8_skip_alone_fails_store_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":0,"signal_offset":0,"snapshot_failures":0,"io_failed":[],"non_utf8_path_skips":2}"#,
+        )
+        .unwrap();
+
+        let check = check_degraded(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("2 non-UTF8"));
     }
 
     // D35 gap closure: a prompt-put failure must ALSO fail "store health" —

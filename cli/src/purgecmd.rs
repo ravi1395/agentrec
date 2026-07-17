@@ -586,15 +586,30 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
 
 /// Test-only race-window widener, mirroring
 /// `test_pause_before_memory_rewrite`: when
-/// `AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS` is set, sleeps right after the
-/// archive fsync and right before the length recheck / atomic rewrite — the
-/// exact window a concurrent writer's append must be detected in. A single
-/// env var read (no-op) when unset — no effect on production behavior.
+/// `AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS` is set (only ever done by
+/// `cli/tests/hardening_cli.rs`), sleeps right after the archive fsync and
+/// right before the length recheck / atomic rewrite — the exact window a
+/// concurrent writer's append must be detected in. The env read is compiled
+/// out entirely in release builds (`#[cfg(not(debug_assertions))]` arm always
+/// returns `None` without touching the environment) — same fail-safe class
+/// as `test_pause_before_memory_rewrite_delay` above.
+fn test_pause_before_log_rewrite_delay() -> Option<std::time::Duration> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 fn test_pause_before_log_rewrite() {
-    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
+    if let Some(delay) = test_pause_before_log_rewrite_delay() {
+        std::thread::sleep(delay);
     }
 }
 
@@ -784,6 +799,18 @@ mod tests {
             "release builds must never honor AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS"
         );
         std::env::remove_var("AGENTREC_TEST_PAUSE_BEFORE_MEMORY_REWRITE_MS");
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn pause_before_log_rewrite_delay_is_none_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS", "5000");
+        assert_eq!(
+            test_pause_before_log_rewrite_delay(),
+            None,
+            "release builds must never honor AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS"
+        );
+        std::env::remove_var("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS");
     }
 
     #[test]
