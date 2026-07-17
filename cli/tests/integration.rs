@@ -3080,6 +3080,51 @@ fn log_no_color_env_suppresses_escapes() {
     );
 }
 
+// D-PD6: `log` and `show` used to render turn headers through two
+// independently-maintained functions (`cmds::format_turn` — double-space,
+// fixed-width columns — vs `readcmds::render_turn` — ` · `-separated) that
+// also each hand-rolled their own `short_id`. Both now route through the
+// shared `fmt::turn_list_line`/`fmt::turn_detail_header` renderers, so for
+// the same turn both must use the identical separator scheme and the
+// identical short-id truncation.
+#[test]
+fn log_and_show_render_turn_header_with_identical_formatting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = base_turn("t_HEADERUNIFY000000000001", vec![]);
+    seed_turn(root, &turn);
+
+    let log_out = agentrec(root, &["log"]);
+    assert!(log_out.status.success(), "log failed: {log_out:?}");
+    let log_stdout = String::from_utf8_lossy(&log_out.stdout);
+
+    let show_out = agentrec(root, &["show", &turn.id]);
+    assert!(show_out.status.success(), "show failed: {show_out:?}");
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+
+    // Same canonical separator (previously log used "  ", never " · ").
+    assert!(
+        log_stdout.contains(" · "),
+        "log must use the canonical ` · ` separator: {log_stdout:?}"
+    );
+    assert!(
+        show_stdout.contains(" · "),
+        "show must use the canonical ` · ` separator: {show_stdout:?}"
+    );
+
+    // Same short-id truncation for the same turn id (both derive it from the
+    // one canonical `fmt::short_id`, not two independent copies).
+    let body = turn.id.strip_prefix("t_").unwrap();
+    let short = format!("t_{}…{}", &body[..4], &body[body.len() - 4..]);
+    assert!(log_stdout.contains(&short), "log id format: {log_stdout:?}");
+    assert!(
+        show_stdout.contains(&short),
+        "show id format: {show_stdout:?}"
+    );
+}
+
 // --- Task 4: `agentrec remember` — manual pinned memories.
 
 #[test]

@@ -2,6 +2,34 @@
 //! terminal color gating, and the `--explain` glossary. Pure functions —
 //! callers inject the system clock / TTY / env state so these stay
 //! unit-testable without touching real I/O.
+//!
+//! Also the single home for turn-header rendering (D-PD6): `cmds::format_turn`
+//! (used by `log`) and `readcmds::render_turn` (used by `show`/`blame`) used
+//! to be two independently-maintained functions whose separators drifted —
+//! `log` used double-space, fixed-width columns while `show`/`blame` used
+//! ` · ` — and each hand-rolled its own copy of the turn-id truncation.
+//! [`turn_list_line`] and [`turn_detail_header`] are now the only two turn
+//! renderers, both built on the shared [`SEP`] and [`short_id`].
+
+use agentrec_core::record::TurnRecord;
+
+/// The one separator every turn-rendering call site (`log`, `show`,
+/// `blame`) uses between fields. Centralized so a third caller can't
+/// reintroduce the drift this module was created to close.
+pub const SEP: &str = " · ";
+
+/// `t_<ULID>` → `t_<first4>…<last4>` for display — the id is unambiguous per
+/// K+ (prefix-match resolves it against the full stored id), so this is
+/// purely a readability truncation. The single canonical definition for
+/// `TurnRecord` ids (memory-record ids use their own, differently-shaped
+/// `memorycmds::short_id` — not a turn id, deliberately not unified here).
+pub fn short_id(id: &str) -> String {
+    let body = id.strip_prefix("t_").unwrap_or(id);
+    if body.len() <= 8 {
+        return id.to_string();
+    }
+    format!("t_{}…{}", &body[..4], &body[body.len() - 4..])
+}
 
 /// Render `then_rfc3339` (a `TurnRecord.started`/`.ended` RFC 3339 UTC
 /// timestamp) relative to `now_unix_ms`: "just now" (<60s), "Nm ago" (<1h),
@@ -176,6 +204,50 @@ pub fn sanitize_terminal(s: &str) -> String {
         .collect()
 }
 
+/// `log`'s compact multi-row turn line:
+/// `<id> · <grade> · <tool> · <when> · <files>[ · "<prompt excerpt>"][ · (truncated)]`.
+///
+/// The grade (`rich`/`bare`) is always rendered as its own literal field —
+/// never folded into a "bare turn" phrase like [`turn_detail_header`] is —
+/// because `log --explain`'s glossary scan (D43, `glossary_for`) matches on
+/// the literal word "rich"/"bare" appearing in this invocation's rendered
+/// output; folding it away would silently break that AC. `when` and `files`
+/// are caller-computed (relative-vs-UTC time (D43), file count) so this stays
+/// a pure formatter. `id_color` gates ANSI on the id only (D42) — `log` is
+/// the only caller that has ever colorized turn output.
+pub fn turn_list_line(t: &TurnRecord, when: &str, files: &str, id_color: bool) -> String {
+    let id = paint(&short_id(&t.id), "36", id_color);
+    let tool = t.tool.as_deref().unwrap_or("—");
+    let mut line = format!("{id}{SEP}{}{SEP}{tool}{SEP}{when}{SEP}{files}", t.grade);
+    if let Some(excerpt) = t.prompt_excerpt.as_deref() {
+        line.push_str(&format!("{SEP}\"{}\"", sanitize_terminal(excerpt)));
+    }
+    if t.truncated {
+        line.push_str(&format!("{SEP}(truncated)"));
+    }
+    line
+}
+
+/// `show`'s bare header and `blame`'s per-file/per-line result line:
+/// `<id> · <tool> · "<prompt excerpt>" · <when>` for a rich turn, or
+/// `<id> · bare turn · <when>` for a bare one — a bare turn never fabricates
+/// a tool or prompt (AC G3). Callers append further clauses (e.g. `blame`'s
+/// " · deleted this file" / " · human-edited since") using the same [`SEP`].
+pub fn turn_detail_header(t: &TurnRecord, when: &str) -> String {
+    let id = short_id(&t.id);
+    if t.grade == "rich" {
+        let tool = t.tool.as_deref().unwrap_or("—");
+        let prompt = t
+            .prompt_excerpt
+            .as_deref()
+            .map(sanitize_terminal)
+            .unwrap_or_else(|| "—".to_string());
+        format!("{id}{SEP}{tool}{SEP}\"{prompt}\"{SEP}{when}")
+    } else {
+        format!("{id}{SEP}bare turn{SEP}{when}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +335,95 @@ mod tests {
     #[test]
     fn sanitize_terminal_noop_on_plain_text() {
         assert_eq!(sanitize_terminal("write g.rs — done"), "write g.rs — done");
+    }
+
+    fn turn(id: &str, grade: &str, tool: Option<&str>, excerpt: Option<&str>) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            id: id.to_string(),
+            grade: grade.to_string(),
+            truncated: false,
+            started: "2026-01-01T00:00:00.000Z".into(),
+            ended: "2026-01-01T00:00:01.000Z".into(),
+            tool: tool.map(String::from),
+            model: None,
+            session: None,
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: excerpt.map(String::from),
+            merges: vec![],
+            files: vec![],
+        }
+    }
+
+    // D-PD6: pins `turn_list_line`'s exact shape — the single separator, the
+    // literal grade word (needed for `--explain`'s glossary scan), and the
+    // optional excerpt/truncated suffixes.
+    #[test]
+    fn turn_list_line_rich_with_excerpt_and_truncated() {
+        let mut t = turn(
+            "t_ABCD00000000000000EFGH",
+            "rich",
+            Some("claude"),
+            Some("do the thing"),
+        );
+        t.truncated = true;
+        let line = turn_list_line(&t, "3m ago", "2 files", false);
+        assert_eq!(
+            line,
+            "t_ABCD…EFGH · rich · claude · 3m ago · 2 files · \"do the thing\" · (truncated)"
+        );
+    }
+
+    #[test]
+    fn turn_list_line_bare_no_tool_no_excerpt() {
+        let t = turn("t_ABCD00000000000000EFGH", "bare", None, None);
+        let line = turn_list_line(&t, "just now", "1 file", false);
+        assert_eq!(line, "t_ABCD…EFGH · bare · — · just now · 1 file");
+    }
+
+    #[test]
+    fn turn_list_line_colorizes_only_the_id() {
+        let t = turn("t_ABCD00000000000000EFGH", "rich", Some("claude"), None);
+        let line = turn_list_line(&t, "3m ago", "1 file", true);
+        assert!(line.starts_with("\x1b[36mt_ABCD…EFGH\x1b[0m"));
+        assert!(!line[line.find("rich").unwrap()..].contains('\x1b'));
+    }
+
+    // D-PD6: pins `turn_detail_header`'s exact shape — same separator as
+    // `turn_list_line`, but grade folded into "bare turn" for bare turns
+    // (AC G3: never fabricate a tool or quoted prompt for one) instead of a
+    // literal grade field.
+    #[test]
+    fn turn_detail_header_rich_quotes_excerpt() {
+        let t = turn(
+            "t_ABCD00000000000000EFGH",
+            "rich",
+            Some("claude"),
+            Some("do the thing"),
+        );
+        let line = turn_detail_header(&t, "14:03");
+        assert_eq!(line, "t_ABCD…EFGH · claude · \"do the thing\" · 14:03");
+    }
+
+    #[test]
+    fn turn_detail_header_bare_never_fabricates() {
+        let t = turn("t_ABCD00000000000000EFGH", "bare", None, None);
+        let line = turn_detail_header(&t, "14:03");
+        assert_eq!(line, "t_ABCD…EFGH · bare turn · 14:03");
+        assert!(!line.contains('"'));
+    }
+
+    // Both renderers must agree on the id truncation and the separator for
+    // the same turn — the RED/GREEN contract this module exists to enforce
+    // (D-PD6), mirrored at the unit level alongside the integration-level
+    // `log_and_show_render_turn_header_with_identical_formatting`.
+    #[test]
+    fn list_and_detail_renderers_share_id_format_and_separator() {
+        let t = turn("t_ABCD00000000000000EFGH", "rich", Some("claude"), None);
+        let list = turn_list_line(&t, "3m ago", "1 file", false);
+        let detail = turn_detail_header(&t, "14:03");
+        assert!(list.starts_with("t_ABCD…EFGH · "));
+        assert!(detail.starts_with("t_ABCD…EFGH · "));
     }
 }

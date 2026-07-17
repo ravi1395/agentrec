@@ -104,9 +104,10 @@ pub fn log(
     Ok(())
 }
 
+/// Thin wrapper: computes `log`'s caller-owned fields (relative/UTC time,
+/// file count) and hands off to the shared [`fmt::turn_list_line`] renderer
+/// (D-PD6 — this used to be a fully independent implementation).
 fn format_turn(t: &TurnRecord, now_ms: u64, utc: bool, color: bool) -> String {
-    let id = fmt::paint(&short_id(&t.id), "36", color);
-    let tool = t.tool.as_deref().unwrap_or("—");
     let when = if utc {
         t.started.clone()
     } else {
@@ -118,16 +119,7 @@ fn format_turn(t: &TurnRecord, now_ms: u64, utc: bool, color: bool) -> String {
     } else {
         format!("{n} files")
     };
-    let excerpt = t
-        .prompt_excerpt
-        .as_deref()
-        .map(|e| format!("  \"{}\"", fmt::sanitize_terminal(e)))
-        .unwrap_or_default();
-    let trunc = if t.truncated { " (truncated)" } else { "" };
-    format!(
-        "{id}  {:5}  {tool:12}  {when}  {files}{excerpt}{trunc}",
-        t.grade
-    )
+    fmt::turn_list_line(t, &when, &files, color)
 }
 
 /// `status`: store size, recording gaps, and rich-rate (the health stat that
@@ -569,16 +561,6 @@ fn count_gaps(records: &[LogRecord]) -> usize {
         }
     }
     gaps
-}
-
-fn short_id(id: &str) -> String {
-    // `t_<ULID>` → keep the prefix + last 4 chars for readability; prefix-match
-    // on the full id is unambiguous per K+.
-    let body = id.strip_prefix("t_").unwrap_or(id);
-    if body.len() <= 8 {
-        return id.to_string();
-    }
-    format!("t_{}…{}", &body[..4], &body[body.len() - 4..])
 }
 
 fn human_bytes(n: u64) -> String {
