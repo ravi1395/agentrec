@@ -58,7 +58,23 @@ jobs:
         # cargo stops at the first failing binary, so a failure in `integration`
         # masks one in `torture` entirely (torture_smoke never runs) — every
         # such collision costs a CI round-trip. See CLAUDE.md "PR #2 CI-red fix".
-        run: cargo test --workspace --all-features --no-fail-fast
+        #
+        # --test-threads=3: `cli/tests/integration.rs` spawns real `agentrec
+        # record` daemons (each arms its own notify/FSEvents watch) from many
+        # tests; at full default parallelism (== runner CPU count) roughly 6
+        # of those daemon-heavy tests contend on FSEvents and flake together
+        # — a known, pre-existing, environmental flake (see CLAUDE.md "agentrec
+        # daemon-test FSEvents contention"), not a regression. `-- --test-
+        # threads=N` is forwarded to every test binary cargo runs in this one
+        # invocation, so it's a single-line, workspace-wide cap rather than
+        # splitting `integration` into its own step — the lighter suites
+        # (core unit tests, hardening_*, torture_smoke) are cheap enough that
+        # capping their internal parallelism too costs negligible wall time,
+        # and a flat cap can't silently drop a future test target the way an
+        # explicit `--test <name>` allowlist would. 3 matches macOS-14
+        # runners' actual core count (so no regression there) and only
+        # trims Ubuntu's headroom by one thread.
+        run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=3
 
   inotify-low-watches:
     name: doctor inotify headroom (induced low watches, AC Y++2)

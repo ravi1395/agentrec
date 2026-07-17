@@ -48,6 +48,17 @@ pub struct State {
     /// visible evidence it happened.
     #[serde(default)]
     pub non_utf8_path_skips: u64,
+    /// Count of genuine I/O failures storing a turn's PROMPT blob (D35 gap
+    /// closure — the taxonomy originally covered only file snapshots).
+    /// Deliberately a SEPARATE counter from `snapshot_failures`/`io_failed`:
+    /// those are file-scoped (a path can be named and refused at undo time),
+    /// a prompt failure is turn-scoped and has no file path to track. A
+    /// failed prompt put leaves `prompt_ref: null` on the closed turn —
+    /// indistinguishable on the wire from a turn that simply had no prompt
+    /// — so this counter (plus the `status` DEGRADED banner) is the only
+    /// evidence the write was attempted and failed, not silently absent.
+    #[serde(default)]
+    pub prompt_put_failures: u64,
 }
 
 pub fn read_state(root: &Path) -> State {
@@ -92,6 +103,14 @@ pub fn record_non_utf8_path_skip(state: &mut State) {
     state.non_utf8_path_skips += 1;
 }
 
+/// Record a genuine PROMPT blob I/O failure (D35 gap closure). Bumps its own
+/// counter — never `record_io_failure`'s — so a prompt-store failure and a
+/// file-snapshot failure are never conflated in `status`'s DEGRADED banner
+/// or in `doctor`'s reading of the same state.
+pub fn record_prompt_put_failure(state: &mut State) {
+    state.prompt_put_failures += 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +152,7 @@ mod tests {
         assert_eq!(state.snapshot_failures, 0);
         assert!(state.io_failed.is_empty());
         assert_eq!(state.non_utf8_path_skips, 0);
+        assert_eq!(state.prompt_put_failures, 0);
     }
 
     #[test]
@@ -144,5 +164,28 @@ mod tests {
         let text = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&text).unwrap();
         assert_eq!(back.non_utf8_path_skips, 2);
+    }
+
+    // D35 gap closure: a prompt-put failure must bump its OWN counter, never
+    // the file-scoped `snapshot_failures`/`io_failed` — the two failure
+    // modes are unrelated causes with unrelated remedies (undo per-file vs.
+    // "this turn's attribution excerpt has no full-text backing").
+    #[test]
+    fn record_prompt_put_failure_increments_its_own_counter_only() {
+        let mut state = State::default();
+        record_prompt_put_failure(&mut state);
+        record_prompt_put_failure(&mut state);
+        assert_eq!(state.prompt_put_failures, 2);
+        assert_eq!(state.snapshot_failures, 0);
+        assert!(state.io_failed.is_empty());
+    }
+
+    #[test]
+    fn prompt_put_failures_round_trips_through_serde() {
+        let mut state = State::default();
+        record_prompt_put_failure(&mut state);
+        let text = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.prompt_put_failures, 1);
     }
 }

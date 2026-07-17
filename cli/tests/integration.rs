@@ -323,6 +323,95 @@ fn recovers_orphaned_open_turn_from_journal() {
     assert!(!root.join(".agentrec/open.json").exists());
 }
 
+// D35 gap closure (crash-recovery leg): `recover_orphan`'s prompt store call
+// gets the identical IoError-vs-OverCap fix as `persist` — this proves it
+// end-to-end, not just "it compiled and the unattributed-recovery test still
+// passes". A "bracket" journal source recovers `rich` with attribution kept
+// (source-aware recovery, see `recover_orphan`), which is the ONLY path that
+// even attempts a prompt store — a "quiet"/bare orphan (the test above)
+// never touches this code at all. `.agentrec/objects/` is locked down
+// BEFORE the daemon starts, since recovery runs at startup before the watch
+// loop (confirmed by `recovers_orphaned_open_turn_from_journal`'s comment).
+#[cfg(unix)]
+#[test]
+fn recover_orphan_degraded_on_real_prompt_put_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let journal = format!(
+        r#"{{"source":"bracket","tool":"claude","prompt":"unique recovery prompt marker 4f1e","session":"s_recover","opened_wall_ms":1783296000000,"last_change_wall_ms":1783296005000,"root":"{}","files":[{{"path":"recovered.rs","before":null,"after":"sha256:deadbeef","op":"create"}}]}}"#,
+        root.display()
+    );
+    std::fs::write(root.join(".agentrec/open.json"), journal).unwrap();
+
+    let objects = root.join(".agentrec/objects");
+    let mut perms = std::fs::metadata(&objects).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&objects, perms).unwrap();
+
+    let mut daemon = spawn_record(root);
+    let turn = poll_until(Duration::from_secs(10), || {
+        turns(root).into_iter().find(|t| {
+            t.get("files")
+                .and_then(|f| f.as_array())
+                .map(|fs| {
+                    fs.iter()
+                        .any(|f| f.get("path").and_then(|p| p.as_str()) == Some("recovered.rs"))
+                })
+                .unwrap_or(false)
+        })
+    });
+    let state_ok = poll_until(Duration::from_secs(10), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        (v.get("prompt_put_failures")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0)
+            > 0)
+        .then_some(())
+    });
+
+    // Restore perms before further assertions/process exit so the tempdir
+    // can always be cleaned up, even on assertion failure below.
+    let mut perms = std::fs::metadata(&objects).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&objects, perms).unwrap();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        state_ok.is_some(),
+        "state.json never recorded a real prompt-put I/O failure during crash recovery"
+    );
+    let turn = turn.expect(
+        "recovered turn touching recovered.rs was persisted despite the prompt-put failure",
+    );
+    assert_eq!(
+        turn.get("grade").and_then(|g| g.as_str()),
+        Some("rich"),
+        "a 'bracket'-source journal recovers rich (attribution kept): {turn}"
+    );
+    assert_eq!(turn.get("tool").and_then(|t| t.as_str()), Some("claude"));
+    assert!(
+        turn.get("prompt_ref").map(|r| r.is_null()).unwrap_or(true),
+        "prompt_ref must be null when the blob write failed: {turn}"
+    );
+    assert!(
+        turn.get("prompt_excerpt")
+            .and_then(|e| e.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "prompt_excerpt must still be populated — derived pre-store, independent of the put outcome: {turn}"
+    );
+    assert!(
+        !root.join(".agentrec/open.json").exists(),
+        "journal must still be consumed even though the prompt write failed"
+    );
+}
+
 // D35 / AC M+: a persisted snapshot-failure count surfaces as a DEGRADED
 // banner in `status`, and `status --ack-degraded` clears it. Inducing a real
 // disk-full write failure is impractical in a portable test, so this drives
@@ -350,6 +439,48 @@ fn status_shows_degraded_banner_and_ack_clears() {
     assert!(out.status.success(), "ack failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("acknowledged"), "stdout: {stdout}");
+
+    let out = agentrec(root, &["status"]);
+    assert!(out.status.success(), "status failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("DEGRADED"), "stdout: {stdout}");
+}
+
+// D35 gap closure: `prompt_put_failures` gets its OWN DEGRADED line
+// (distinct wording from the file-snapshot banner, no `io_failed`-style path
+// list — a prompt failure is turn-scoped, not file-scoped) and
+// `--ack-degraded` clears it too, not just `snapshot_failures`. Planted
+// state.json (like the sibling test above) — the real-daemon fault
+// injection lives in `degraded_on_real_prompt_put_failure` /
+// `recover_orphan_degraded_on_real_prompt_put_failure`.
+#[test]
+fn status_shows_prompt_degraded_banner_and_ack_clears_it_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":0,"signal_offset":0,"snapshot_failures":0,"io_failed":[],"prompt_put_failures":4}"#,
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["status"]);
+    assert!(out.status.success(), "status failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("DEGRADED"), "stdout: {stdout}");
+    assert!(stdout.contains("4 prompt"), "stdout: {stdout}");
+
+    let out = agentrec(root, &["status", "--ack-degraded"]);
+    assert!(out.status.success(), "ack failed: {out:?}");
+
+    let state_text = std::fs::read_to_string(root.join(".agentrec/state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_str(&state_text).unwrap();
+    assert_eq!(
+        state.get("prompt_put_failures").and_then(|n| n.as_u64()),
+        Some(0),
+        "ack must clear prompt_put_failures too, not just snapshot_failures: {state}"
+    );
 
     let out = agentrec(root, &["status"]);
     assert!(out.status.success(), "status failed: {out:?}");
@@ -1897,6 +2028,192 @@ fn degraded_on_real_snapshot_io_failure() {
 
     sigkill(&daemon);
     let _ = daemon.wait();
+}
+
+// --- D35 gap closure (prompt-put-failure leg): a REAL daemon-side PROMPT
+// blob I/O failure — not a planted state.json — must (a) bump its OWN
+// `prompt_put_failures` counter, NEVER `snapshot_failures`/`io_failed`
+// (those are file-scoped and must stay unaffected), (b) leave the turn
+// record intact (`prompt_ref: null`, `prompt_excerpt` still populated — the
+// daemon still closes the turn), and (c) surface in `status`'s DEGRADED
+// banner. Unlike `degraded_on_real_snapshot_io_failure`, the file write
+// happens and is snapshotted successfully BEFORE `.agentrec/objects/` is
+// locked down — isolating the failure to the later prompt-store call in
+// `persist` and proving the two counters are genuinely independent, not
+// coincidentally equal.
+#[cfg(unix)]
+#[test]
+fn degraded_on_real_prompt_put_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = spawn_record(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Unique content so the file's own snapshot can never dedup to a
+    // pre-existing blob — it must genuinely write while objects/ is still
+    // writable.
+    std::fs::write(
+        root.join("prompt_victim.rs"),
+        "fn prompt_victim_unique_marker_7b2c() {}",
+    )
+    .unwrap();
+    poll_until(Duration::from_secs(15), || {
+        root.join(".agentrec/open.json").exists().then_some(())
+    })
+    .expect("turn opened for prompt_victim.rs");
+    // Give the debounced burst time to settle and actually snapshot the
+    // file while objects/ is still writable, before locking it down below.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let objects = root.join(".agentrec/objects");
+    let mut perms = std::fs::metadata(&objects).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&objects, perms).unwrap();
+
+    let payload = r#"{"hook_event_name":"Stop","session_id":"s_prompt_fail","prompt":"unique prompt marker for the put-failure regression"}"#;
+    send_hook(root, payload);
+
+    let state_ok = poll_until(Duration::from_secs(15), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let prompt_failures = v
+            .get("prompt_put_failures")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        (prompt_failures > 0).then_some(())
+    });
+
+    let turn = poll_until(Duration::from_secs(15), || {
+        turns(root).into_iter().find(|t| {
+            t.get("files")
+                .and_then(|f| f.as_array())
+                .map(|fs| {
+                    fs.iter()
+                        .any(|f| f.get("path").and_then(|p| p.as_str()) == Some("prompt_victim.rs"))
+                })
+                .unwrap_or(false)
+        })
+    });
+
+    // Restore perms before further assertions/process exit so the tempdir
+    // can always be cleaned up, even on assertion failure below.
+    let mut perms = std::fs::metadata(&objects).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&objects, perms).unwrap();
+
+    assert!(
+        state_ok.is_some(),
+        "state.json never recorded a real prompt-put I/O failure"
+    );
+
+    let state_text = std::fs::read_to_string(root.join(".agentrec/state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_str(&state_text).unwrap();
+    assert_eq!(
+        state.get("snapshot_failures").and_then(|n| n.as_u64()),
+        Some(0),
+        "the file snapshot succeeded before lockdown — snapshot_failures must stay 0: {state}"
+    );
+    assert!(
+        state
+            .get("io_failed")
+            .and_then(|f| f.as_array())
+            .map(|fs| fs.is_empty())
+            .unwrap_or(false),
+        "io_failed is file-scoped and must stay empty for a prompt-only failure: {state}"
+    );
+
+    let turn =
+        turn.expect("turn touching prompt_victim.rs was recorded despite the prompt-put failure");
+    assert!(
+        turn.get("prompt_ref").map(|r| r.is_null()).unwrap_or(true),
+        "prompt_ref must be null when the blob write failed: {turn}"
+    );
+    assert!(
+        turn.get("prompt_excerpt")
+            .and_then(|e| e.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "prompt_excerpt must still be populated — it's derived pre-store, independent of the put outcome: {turn}"
+    );
+    let victim_file = turn
+        .get("files")
+        .and_then(|f| f.as_array())
+        .unwrap()
+        .iter()
+        .find(|f| f.get("path").and_then(|p| p.as_str()) == Some("prompt_victim.rs"))
+        .unwrap();
+    // `skipped` is omitted from the wire JSON entirely when false
+    // (`#[serde(skip_serializing_if = "std::ops::Not::not")]`) — absence
+    // means the same thing as an explicit `false`.
+    assert!(
+        !victim_file
+            .get("skipped")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false),
+        "the file itself was snapshotted successfully before lockdown: {victim_file}"
+    );
+
+    let out = agentrec(root, &["status"]);
+    assert!(out.status.success(), "status failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("DEGRADED"), "stdout: {stdout}");
+
+    // `show --prompt` on this exact turn must give the honest, distinct
+    // message — never fabricate "no prompt attached" for a turn that
+    // plainly had one attached.
+    let turn_id = turn.get("id").and_then(|i| i.as_str()).unwrap();
+    let show_out = agentrec(root, &["show", turn_id, "--prompt"]);
+    assert_eq!(
+        show_out.status.code(),
+        Some(1),
+        "show --prompt: {show_out:?}"
+    );
+    let show_stderr = String::from_utf8_lossy(&show_out.stderr).to_lowercase();
+    assert!(
+        show_stderr.contains("write failed at record time"),
+        "stderr: {show_stderr}"
+    );
+    assert!(
+        !show_stderr.contains("no prompt attached"),
+        "must not fabricate 'no prompt attached' for a turn that had one: {show_stderr}"
+    );
+
+    sigkill(&daemon);
+    let _ = daemon.wait();
+}
+
+// D35 gap closure: `show --prompt` must distinguish a turn that genuinely
+// never had a prompt from one whose prompt blob failed to store, using only
+// data already on the wire (`prompt_excerpt`'s presence) — no protocol
+// change. This isolates the message logic from the full daemon-fault-
+// injection test above, which additionally proves the real write path.
+#[test]
+fn show_prompt_put_failure_distinct_from_no_prompt_attached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut turn = base_turn("t_SHOWPUTFAILED0000000001", vec![]);
+    turn.prompt_excerpt = Some("had a prompt, blob write failed".to_string());
+    // prompt_ref stays None (base_turn's default) — the put-failure shape.
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["show", &turn.id, "--prompt"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    assert!(out.stdout.is_empty(), "stdout must be empty on failure");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("write failed at record time"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no prompt attached"),
+        "must not fabricate 'no prompt attached' for a turn with a prompt_excerpt: {stderr}"
+    );
 }
 
 // --- AC Z+1 (gap closure): panic-mode undo (no turn arg, no --confirm) must

@@ -61,7 +61,19 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
     }
 
     let Some(prompt_ref) = turn.prompt_ref.as_deref() else {
-        return Err("no prompt attached — this turn has no recorded prompt".to_string());
+        // D35 gap closure: `prompt_ref: None` is ambiguous on the wire alone
+        // — it's identical whether this turn never had a prompt, or had one
+        // whose blob write failed at record time (`state.json`'s
+        // `prompt_put_failures`, never a wire/protocol field). `prompt_excerpt`
+        // is populated whenever `turn.prompt` was `Some(..)` regardless of
+        // store outcome (see `persist` in daemon.rs), so its presence here
+        // is the honest discriminator — never fabricate "no prompt" for a
+        // turn that plainly had one.
+        return Err(if turn.prompt_excerpt.is_some() {
+            "prompt blob missing — write failed at record time (see `agentrec status`)".to_string()
+        } else {
+            "no prompt attached — this turn has no recorded prompt".to_string()
+        });
     };
 
     let store = BlobStore::new(objects_dir(root));

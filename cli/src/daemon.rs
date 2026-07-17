@@ -9,7 +9,10 @@
 //! sane (end >= start) regardless of clock changes.
 
 use crate::cmds::wall_now_ms;
-use crate::state::{read_state, record_io_failure, record_non_utf8_path_skip, write_state, State};
+use crate::state::{
+    read_state, record_io_failure, record_non_utf8_path_skip, record_prompt_put_failure,
+    write_state, State,
+};
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
@@ -1163,7 +1166,29 @@ fn persist(
             Some(text) => {
                 let excerpt = scrub::excerpt(text);
                 let full = scrub::scrub(text);
-                (recorder.store.put(full.as_bytes()), Some(excerpt))
+                // D35 gap closure: distinguish a genuine I/O failure from an
+                // over-cap prompt (both leave prompt_ref: None on the wire,
+                // same as `BlobStore::put`) so it can be counted separately
+                // from file-snapshot failures — see `prompt_put_failures`.
+                let prompt_ref = match recorder.store.put_result(full.as_bytes()) {
+                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::OverCap => None,
+                    PutResult::IoError(cause) => {
+                        let mut state = read_state(root);
+                        record_prompt_put_failure(&mut state);
+                        if let Err(e) = write_state(root, &state) {
+                            eprintln!(
+                                "agentrec: warning: failed to persist prompt-failure state: {e}"
+                            );
+                        }
+                        eprintln!(
+                            "agentrec: prompt write failed for turn {}: {cause}",
+                            turn.id
+                        );
+                        None
+                    }
+                };
+                (prompt_ref, Some(excerpt))
             }
             None => (None, None),
         };
@@ -1314,11 +1339,32 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         (None, None, None, None)
     } else {
         let store = BlobStore::new(objects_dir(root));
+        // D35 gap closure: same IoError-vs-OverCap distinction as the
+        // steady-state `persist` path — a crash-recovery prompt write can
+        // fail for the same real-world reasons (disk full, permissions).
         let (prompt_ref, excerpt) = match &journal.prompt {
-            Some(text) => (
-                store.put(scrub::scrub(text).as_bytes()),
-                Some(scrub::excerpt(text)),
-            ),
+            Some(text) => {
+                let scrubbed = scrub::scrub(text);
+                let prompt_ref = match store.put_result(scrubbed.as_bytes()) {
+                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::OverCap => None,
+                    PutResult::IoError(cause) => {
+                        let mut state = read_state(root);
+                        record_prompt_put_failure(&mut state);
+                        if let Err(e) = write_state(root, &state) {
+                            eprintln!(
+                                "agentrec: warning: failed to persist prompt-failure state: {e}"
+                            );
+                        }
+                        eprintln!(
+                            "agentrec: prompt write failed recovering orphaned turn {}: {cause}",
+                            journal.id
+                        );
+                        None
+                    }
+                };
+                (prompt_ref, Some(scrub::excerpt(text)))
+            }
             None => (None, None),
         };
         (

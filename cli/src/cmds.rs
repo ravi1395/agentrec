@@ -131,6 +131,11 @@ pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
         state.snapshot_failures = 0;
         state.io_failed.clear();
         state.non_utf8_path_skips = 0;
+        // D35 gap closure: the prompt-put-failure counter is a distinct
+        // DEGRADED cause but the same acknowledgement gesture — one
+        // `--ack-degraded` clears every "a write silently didn't happen"
+        // counter, not just the file-scoped one.
+        state.prompt_put_failures = 0;
         // D2: state.json is a real persistence path now (its tmp file can
         // fail to write/rename, e.g. disk full) — a swallowed error here
         // would print "cleared" while the DEGRADED counter is still on disk.
@@ -295,6 +300,23 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
                 state.non_utf8_path_skips
             ));
         }
+    }
+    // D35 gap closure: a prompt-blob write failure is a SEPARATE line from
+    // the file-snapshot banner above — deliberately not folded into the
+    // same counter, since the remedy differs (there's no per-file undo
+    // refusal for a prompt; the loss is that turn's full-text prompt, the
+    // excerpt is unaffected). `--ack-degraded` clears both counters
+    // together (see `status`) since they're the same operational concept —
+    // "the daemon knows a write silently didn't happen" — just different
+    // failure sites.
+    if state.prompt_put_failures > 0 {
+        out.push('\n');
+        out.push_str(&format!(
+            "DEGRADED — {} prompt write(s) failed (likely disk full or permissions); \
+             `show --prompt` on affected turns has no full-text prompt (the excerpt is unaffected). \
+             Run `agentrec status --ack-degraded` to acknowledge.\n",
+            state.prompt_put_failures
+        ));
     }
     Ok(out)
 }

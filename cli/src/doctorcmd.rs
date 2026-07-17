@@ -281,12 +281,29 @@ fn newest_jsonl_mtime(dir: &Path) -> Option<SystemTime> {
 
 fn check_degraded(root: &Path) -> Check {
     let state = read_state(root);
-    if state.snapshot_failures > 0 {
+    // D35 gap closure: a prompt-blob write failure is just as much a "store
+    // DEGRADED" condition as a file-snapshot one — both mean a write the
+    // daemon attempted silently didn't land. Checked together so `doctor`
+    // can't false-PASS store health while either counter is nonzero.
+    if state.snapshot_failures > 0 || state.prompt_put_failures > 0 {
+        let mut reasons = Vec::new();
+        if state.snapshot_failures > 0 {
+            reasons.push(format!(
+                "{} snapshot writes failed",
+                state.snapshot_failures
+            ));
+        }
+        if state.prompt_put_failures > 0 {
+            reasons.push(format!(
+                "{} prompt writes failed",
+                state.prompt_put_failures
+            ));
+        }
         Check::fail(
             "store health",
             format!(
-                "store DEGRADED — {} snapshot writes failed; investigate disk/permissions, then `agentrec status --ack-degraded`",
-                state.snapshot_failures
+                "store DEGRADED — {}; investigate disk/permissions, then `agentrec status --ack-degraded`",
+                reasons.join(", ")
             ),
         )
     } else {
@@ -517,6 +534,25 @@ mod tests {
         let check = check_degraded(root);
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.remedy.unwrap().contains("2 snapshot"));
+    }
+
+    // D35 gap closure: a prompt-put failure must ALSO fail "store health" —
+    // doctor must not false-PASS while state.json's prompt_put_failures is
+    // nonzero just because snapshot_failures happens to be 0.
+    #[test]
+    fn prompt_put_failure_alone_fails_store_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":0,"signal_offset":0,"snapshot_failures":0,"io_failed":[],"prompt_put_failures":3}"#,
+        )
+        .unwrap();
+
+        let check = check_degraded(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("3 prompt"));
     }
 
     // D2/D6: `check_daemon` used to trust `state.pid` liveness alone, which
