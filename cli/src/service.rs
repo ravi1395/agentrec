@@ -130,12 +130,16 @@ WantedBy=default.target\n",
 }
 
 /// XDG Base Directory config home: `$XDG_CONFIG_HOME` if set to a non-empty
-/// value, else `$HOME/.config` (the XDG basedir spec's documented fallback).
-/// Linux-only call site — launchd's `~/Library/LaunchAgents` is not an XDG
-/// path and must never route through this helper.
+/// ABSOLUTE value, else `$HOME/.config` (the XDG basedir spec's documented
+/// fallback). Per the spec, an empty value is treated as unset, and a relative
+/// value "should be considered invalid and ignored" — a relative unit path
+/// would otherwise be resolved against the CWD of whichever process ran
+/// `install`/`uninstall`. Linux-only call site — launchd's
+/// `~/Library/LaunchAgents` is not an XDG path and must never route through
+/// this helper.
 fn config_home() -> Result<PathBuf, String> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
+        if !xdg.is_empty() && Path::new(&xdg).is_absolute() {
             return Ok(PathBuf::from(xdg));
         }
     }
@@ -535,6 +539,33 @@ mod tests {
 
         assert_eq!(unset_result, Ok(expected.clone()));
         assert_eq!(empty_result, Ok(expected));
+    }
+
+    // Review finding #2 / XDG basedir spec: "If an implementation encounters a
+    // relative path ... it should consider the path invalid and ignore it."
+    // A relative XDG_CONFIG_HOME must fall back to $HOME/.config, not produce a
+    // CWD-relative systemd unit path that `install`/`uninstall` would write to
+    // wherever the command happened to run.
+    #[test]
+    fn config_home_ignores_relative_xdg_config_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        let home = std::env::var("HOME").expect("HOME must be set to run this test");
+        let expected = PathBuf::from(&home).join(".config");
+
+        std::env::set_var("XDG_CONFIG_HOME", "relcfg");
+        let relative_result = config_home();
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert_eq!(
+            relative_result,
+            Ok(expected),
+            "a relative XDG_CONFIG_HOME must be ignored per the XDG basedir spec"
+        );
     }
 
     // unit_path itself (not just the config_home helper) must actually route
