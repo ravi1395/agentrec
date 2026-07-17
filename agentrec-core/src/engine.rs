@@ -300,7 +300,7 @@ impl TurnEngine {
                     let turn = match open.source {
                         Source::Git => self.finish(open, now, "git", "rich", false),
                         Source::Bracket => self.finish(open, now, "timeout", "rich", true),
-                        Source::Quiet => {
+                        Source::Quiet if now.saturating_sub(open.opened_at) <= FOLD_WINDOW_MS => {
                             // Stop-only emitter: the open unattributed turn IS
                             // this tool's turn — attribute and close rich.
                             let mut turn = self.finish(open, now, "stop-only", "rich", false);
@@ -311,6 +311,21 @@ impl TurnEngine {
                             self.last_rich_closed_at = now;
                             closed.push(turn);
                             return closed;
+                        }
+                        Source::Quiet => {
+                            // Pre-turn bound (fabricated-attribution guard):
+                            // this open window has run longer than
+                            // FOLD_WINDOW_MS with no start bracket — a
+                            // continuously-active Quiet turn has no timeout
+                            // analogous to MAX_BRACKET_MS, so an unbounded
+                            // stop-only conversion could attribute an
+                            // arbitrarily long span of genuinely
+                            // unattributed activity to a stray/late stop.
+                            // Close it bare instead (never offered to
+                            // `recent_bare` — same posture as a pre-bracket
+                            // bare, C1) and fall through to record the
+                            // stop's own (possibly empty) rich turn below.
+                            self.finish(open, now, "quiet", "bare", false)
                         }
                     };
                     closed.push(turn);
@@ -409,7 +424,19 @@ impl TurnEngine {
             .recent_bare
             .drain(..)
             .filter(|b| {
+                // `closed_at >= cutoff` bounds how recently the fragment
+                // closed (the pre-existing check, for daemon-restart
+                // fragments). That alone is not a pre-turn bound: a Quiet
+                // turn kept alive by continuous sub-QUIET_MS-gap activity
+                // can sit open for hours before it finally closes, so its
+                // `closed_at` can be "recent" while its own `opened_at`
+                // reaches arbitrarily far into the past. `opened_at >=
+                // cutoff` closes that gap — a fragment whose own start
+                // predates the fold window is never folded, however
+                // recently it happened to close (item 1, fabricated-
+                // attribution guard).
                 b.closed_at >= cutoff
+                    && b.opened_at >= cutoff
                     && b.closed_at >= self.last_rich_closed_at
                     && (!is_bracket || b.closed_at >= opened_at)
             })
@@ -898,5 +925,97 @@ mod tests {
         assert_eq!(t.grade, "rich");
         assert_eq!(t.boundary, "timeout");
         assert_eq!(t.closed_at, 500);
+    }
+
+    // Item 1 (stop-only fold pre-turn bound): a bare fragment can close
+    // recently (satisfying the existing closed_at-based cutoff) while its
+    // OWN opened_at reaches arbitrarily far into the past — e.g. a
+    // continuously-active Quiet turn that stayed open for a long time
+    // before finally hitting a real gap. Without a bound on the fragment's
+    // own start, folding it in pulls the rich turn's `opened_at` back to
+    // that ancient time, fabricating attribution for activity far outside
+    // any reasonable "this stop covers recent unattributed work" window.
+    // Table test: a fragment whose opened_at sits just INSIDE the
+    // FOLD_WINDOW_MS-before-stop cutoff is folded; one whose opened_at
+    // sits just OUTSIDE stays bare, forever unattributed.
+    #[test]
+    fn fold_excludes_bare_whose_own_start_predates_the_window() {
+        let stop_at = 1_000_000u64;
+        let cutoff = stop_at.saturating_sub(FOLD_WINDOW_MS); // = 100_000
+
+        // "outside": opened just before cutoff, closes shortly after via the
+        // ordinary quiet window — a completely normal short bare fragment,
+        // just positioned early.
+        let mut e = TurnEngine::new();
+        e.observe_changes(cutoff - 1, &[obs("outside.rs")]);
+        let outside_bare = e.tick(cutoff - 1 + QUIET_MS + 1);
+        assert_eq!(outside_bare[0].grade, "bare");
+        assert_eq!(outside_bare[0].opened_at, cutoff - 1);
+
+        // "inside": opened just at/after cutoff, same short lifetime.
+        e.observe_changes(cutoff + 1, &[obs("inside.rs")]);
+        let inside_bare = e.tick(cutoff + 1 + QUIET_MS + 1);
+        assert_eq!(inside_bare[0].grade, "bare");
+        assert_eq!(inside_bare[0].opened_at, cutoff + 1);
+        let inside_id = inside_bare[0].id.clone();
+
+        // A stray stop-only signal lands at `stop_at`, long after both
+        // fragments closed but well within FOLD_WINDOW_MS of their
+        // closed_at (the pre-existing bound) — only the opened_at bound
+        // distinguishes them now.
+        let closed = e.observe_stop(stop_at, "codex", None, None);
+        assert_eq!(closed.len(), 1);
+        let t = &closed[0];
+        assert_eq!(
+            t.merges,
+            vec![inside_id],
+            "only the in-window fragment folds"
+        );
+        let paths: Vec<&str> = t.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["inside.rs"],
+            "the outside fragment's files never attribute"
+        );
+    }
+
+    // Item 1: the direct stop-only conversion of a still-OPEN Quiet turn
+    // (no start bracket, no intervening close) is the sharper version of
+    // the same fabricated-attribution risk — a Quiet turn kept alive by
+    // continuous sub-QUIET_MS-gap activity has no timeout analogous to
+    // MAX_BRACKET_MS, so without a bound a stray/late stop could attribute
+    // an arbitrarily long span of genuinely unattributed activity to
+    // whichever tool happened to emit the stop. Past the FOLD_WINDOW_MS
+    // bound, the open turn must close bare (never attributed) instead.
+    #[test]
+    fn stop_only_does_not_attribute_a_quiet_turn_open_past_the_fold_window() {
+        let mut e = TurnEngine::new();
+        // Continuous activity every 5s (well under QUIET_MS) keeps a single
+        // Quiet turn open past FOLD_WINDOW_MS without ever hitting the
+        // quiet-window close.
+        let mut t = 0u64;
+        while t <= FOLD_WINDOW_MS + 10_000 {
+            e.observe_changes(t, &[obs("continuous.rs")]);
+            t += 5_000;
+        }
+        let last_change = t - 5_000;
+        assert!(e.has_open_turn(), "still open: gaps never exceed QUIET_MS");
+
+        let stop_at = last_change + 1_000; // stray stop, well past FOLD_WINDOW_MS since t=0
+        let closed = e.observe_stop(stop_at, "codex", None, None);
+        // The ancient continuous activity must never appear attributed to
+        // "codex" — it closes bare (unattributed) instead.
+        let attributed_continuous = closed.iter().any(|c| {
+            c.tool.as_deref() == Some("codex") && c.files.iter().any(|f| f.path == "continuous.rs")
+        });
+        assert!(
+            !attributed_continuous,
+            "activity spanning > FOLD_WINDOW_MS must never be fabricated into one attributed turn"
+        );
+        let bare = closed
+            .iter()
+            .find(|c| c.grade == "bare" && c.files.iter().any(|f| f.path == "continuous.rs"))
+            .expect("the ancient activity closes bare instead");
+        assert_eq!(bare.opened_at, 0);
     }
 }
