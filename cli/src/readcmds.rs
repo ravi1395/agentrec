@@ -159,6 +159,11 @@ fn turn_range(turns: &[&TurnRecord]) -> String {
     )
 }
 
+/// `diff`'s one-line header: `turn <id> · <tool> · <files>`. A third
+/// turn-rendering shape (distinct from [`fmt::turn_list_line`]/
+/// [`fmt::turn_detail_header`] — `diff` wants the file count, not a
+/// timestamp or prompt), but it shares the same canonical [`fmt::SEP`] so
+/// the drift D-PD6 closed doesn't reopen here.
 fn header_line(t: &TurnRecord) -> String {
     let id = fmt::short_id(&t.id);
     let tool = t.tool.as_deref().unwrap_or("—");
@@ -168,7 +173,7 @@ fn header_line(t: &TurnRecord) -> String {
     } else {
         format!("{n} files")
     };
-    format!("turn {id}  {tool}  {files}")
+    format!("turn {id}{sep}{tool}{sep}{files}", sep = fmt::SEP)
 }
 
 fn print_entry(store: &BlobStore, entry: &FileEntry) {

@@ -30,9 +30,9 @@ Nothing about the agent workflow changes — the developer runs Claude Code, Cur
 
 ```
 $ agentrec log                    # git turns hidden by default; --all shows them
-t_…R8MB  rich  claude-code  15:12  1 file   "tighten retry backoff"
-t_…Q2KX  bare  (unattributed window) 15:03  3 files
-t_…N4VD  rich  claude-code  14:47  6 files  "migrate auth middleware to tok…"
+t_…R8MB · rich · claude-code · 15:12 · 1 file · "tighten retry backoff"
+t_…Q2KX · bare · — · 15:03 · 3 files
+t_…N4VD · rich · claude-code · 14:47 · 6 files · "migrate auth middleware to tok…"
 
 $ agentrec blame src/auth.ts:42
 t_…N4VD · claude-code · "migrate auth middleware to tokens" · edited since (human)
