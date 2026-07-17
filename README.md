@@ -94,7 +94,7 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec blame <file>[:line]` | Which turn last touched a file, or introduced a current line |
 | `agentrec show <turn> [--prompt]` | Print a turn's header (excerpt discipline: no full prompt without the flag); `--prompt` prints the full post-scrub prompt text |
 | `agentrec undo [turn]` | Revert a turn's changes, per file. Preview-only unless `--confirm`. `--allow-modified`, `--files a,b,c`. Omit `turn` for panic mode: targets the most recent non-git rich turn |
-| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot failures. `--ack-degraded` clears it |
+| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot or prompt-blob write failures. `--ack-degraded` clears both |
 | `agentrec doctor` | One-shot diagnosis of the whole recording chain: daemon liveness, hooks, signal freshness, store health, permissions, (Linux) inotify headroom. `--json` |
 | `agentrec purge` | Delete blob objects: expired prompts by default (TTL from `config.toml`). `--all-prompts`, `--snapshots-before <DATE>`, `--memories-retracted` (archives expired retracted memory chains, never deletes) |
 | `agentrec uninstall` | Remove hooks + service unit, archive `.agentrec/` to a sibling directory. Nothing is ever deleted. `--no-service` |
