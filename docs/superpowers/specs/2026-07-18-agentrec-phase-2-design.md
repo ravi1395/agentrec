@@ -188,6 +188,25 @@ tests over the existing integration corpus); typed-interface tests cover current
 ACs. Then add `--json` to `diff`, `blame`, and `status` as adapters over the typed
 values — stable machine-readable contracts that MCP tools mirror exactly (P2).
 
+Extraction constraints surfaced by the 2026-07-18 code audit:
+
+- Gap/epoch interpretation exists in three independent implementations
+  (`readcmds::has_recording_gap`/`has_gap_after`, `cmds::count_gaps`). Extraction
+  MUST unify them into one primitive inside `RepositoryView` — relocating three
+  copies is not extraction.
+- `resolve_turn` + `same_revert` (duplicate-id collapse) is the single
+  correctness-critical lookup choke point; it moves into `RepositoryView` and no
+  adapter reimplements it.
+- **Known behavior change, deliberate:** today's `status` report *mutates* the
+  store (over-budget eviction runs inside the read path). Phase 2.0 splits a pure
+  `health()` read from an explicit enforcement call; `agentrec status` keeps
+  today's user-visible behavior by calling both, but MCP `agentrec_status` and
+  `status --json` are strictly read-only. This is the one place byte-equivalence
+  is not the whole story — the side effect moves, and a test pins that
+  `agentrec_status` never evicts.
+- `Page<T>`/cursor types are defined in Phase 2.0 (MCP consumes them in 2.2), but
+  the CLI adapters may pass unpaginated queries.
+
 ### Protocol 1.0 freeze + conformance fixtures (N)
 
 All schema changes since v0.2 folded in — including this phase's additive fields
@@ -199,17 +218,41 @@ internal consumer test against. After freeze: additive changes only.
 Additive protocol changes shipped with the freeze:
 
 - Signal §4: optional `emitter_turn` (Codex idempotency, below).
-- Turn record §5 file-entry/turn-level: `imported: true` marker for backfilled
-  turns; imported entries with unreconstructable `before` are never revertible.
+- Turn record §5: turn-level `imported: true` marker for backfilled turns and
+  `files_complete: false` (imported file lists are non-exhaustive — see import
+  honesty model below); imported entries with unreconstructable `before` are
+  never revertible. File-entry `baseline_unknown` is NOT reused for
+  import-missing-before — it keeps its live-recording first-observation meaning.
 - MCP §8: add `agentrec_status` to the tool table (already shipped: `agentrec_recall`).
 
 ### `import claude` (K-series ACs)
 
 Backfill from `~/.claude/projects/*.jsonl`. Honesty model is the load-bearing
-design rule: historical transcripts rarely contain arbitrary before/after bytes.
-Import distinguishes **reconstructible** turns (before hashes recovered from git
-history) from **provenance-only** turns (`before: null` + `imported: true`,
-refused by undo with explanation). Import never fabricates a revertible snapshot.
+design rule, refined by the 2026-07-18 corpus audit (real transcripts, this
+machine):
+
+**Before-bytes come from a best-effort source ladder**, per file entry:
+
+1. Transcript `toolUseResult.originalFile` — Claude Code embeds the full pre-edit
+   file content on Edit/Write results, but **unreliably** (~30% of edit results
+   in the audited corpus, varying 4–70% per session with no version correlation).
+   Opportunistic, never assumed.
+2. Git history blob (commit-time reconstruction) when the repo's git log covers
+   the file at the turn's timestamp.
+3. Neither → `before: null` + provenance-only; refused by undo with an explicit
+   imported-history reason. Import never fabricates a revertible snapshot.
+
+**File lists are structurally incomplete** — the deeper honesty problem. In the
+audited corpus, Bash tool calls outnumber Edit+Write ~2:1, and Bash and subagent
+(`Agent`) results name no touched files at all: a turn that ran `cargo fmt` or
+delegated edits to a subagent mutated files the transcript never lists. Therefore
+every imported turn carries additive `files_complete: false`: its listed files
+are genuinely agent-touched, but absence of a file from an imported turn proves
+nothing. Consumers MUST NOT treat imported turns as exhaustive coverage — in
+particular, the display-level human-edited-since predicate may over-report
+"possibly human" across imported history (safe direction: never fabricates agent
+attribution), and renderers say "partial file list (imported)". Sidechain
+(subagent) transcript lines are skipped, not imported as top-level turns.
 
 - Session→repo mapping by transcript `cwd`; only sessions inside the target root.
 - Idempotent (session id + turn index); interrupted import resumes cleanly.
