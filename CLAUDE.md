@@ -8,6 +8,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Phase 2 spec finalized (2026-07-18, `main`, docs-only):** Ironed out the P2 spec —
+new `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` supersedes the P2 half of
+the 2026-07-12 draft (P3 half stays draft). **Four founder decisions locked:** (1) VS Code
+DEFERRED out of P2 (demand-driven return; "v2 done" = O+P+Q); (2) PR↔turn association
+exact-only (trailers/export, no heuristic mode ever); (3) Sutra = external agentrec recorder +
+`.sutra` sidecar (no embedded second recorder); (4) ROADMAP Phase-1 truth substrate folded in
+as **Phase 2.0 at full scope** — `import claude` (K) + `import aider` (L) + git trailers +
+`git-agentrec` shim (M) + Protocol 1.0 freeze + conformance fixtures (N) + npm/mise wrappers
+(Z2) + RepositoryView/UndoCoordinator seam extraction + `diff`/`blame`/`status --json`.
+Entry-gate reality check that forced 2.0: 0/4 built today (no import, no trailer code, no
+fixtures, `--json` only on log/doctor/memory verbs). Phases 2.0→2.4 risk-ordered (substrate →
+Codex spike-first → MCP read → MCP destructive → setup/packaging), self-healing E2E = 2.3 exit,
+≥90%-real-transcript import gate = hard stop. Additive protocol changes queued for the freeze:
+§4 `emitter_turn`, §5 `imported`, §8 `agentrec_status`. Companion edits (PROTOCOL/IMPLEMENTATION
+/ROADMAP) deferred to the commits that ship the code. Next: `/phases` plan off the new spec.
+
 **Memory-dogfood prep + orphan-GC round (2026-07-17, branch `fix/purge-orphans-gc`, commit `c881cfe`):**
 Prepped this repo's live store for the 1-week memory dogfood and closed the store-bloat mystery
 from the D36 round's dogfood observations. **The "eviction bug (3.1 GiB over budget, 0 B freed)"
