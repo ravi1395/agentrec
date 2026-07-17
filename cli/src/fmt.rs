@@ -187,19 +187,23 @@ fn contains_word(text: &str, word: &str) -> bool {
         .any(|tok| tok.eq_ignore_ascii_case(word))
 }
 
-/// Strip terminal control characters (C0 controls `0x00`-`0x1F` and DEL
-/// `0x7F`) from text about to be printed to a real terminal (E7): a prompt
-/// excerpt is user-authored text that reaches stdout verbatim, so an
-/// embedded escape sequence (e.g. an OSC "set terminal title" or a cursor
-/// move) must never survive to the terminal. Printable text — including
-/// non-ASCII UTF-8 — passes through unchanged; this is display-only and
-/// never touches what's persisted (the scrub/excerpt pipeline in
+/// Strip terminal control characters — C0 controls `0x00`-`0x1F`, DEL
+/// `0x7F`, and C1 controls `U+0080`-`U+009F` — from text about to be
+/// printed to a real terminal (E7): a prompt excerpt is user-authored text
+/// that reaches stdout verbatim, so an embedded escape sequence (e.g. an
+/// OSC "set terminal title" or a cursor move) must never survive to the
+/// terminal. C1 is included because some terminals honor its single-byte
+/// forms as escape introducers in their own right — CSI (U+009B) and OSC
+/// (U+009D) chief among them — not just the ESC-prefixed 7-bit equivalents
+/// C0 already covers. Printable text — including non-ASCII UTF-8 outside
+/// the C1 range — passes through unchanged; this is display-only and never
+/// touches what's persisted (the scrub/excerpt pipeline in
 /// `agentrec_core::scrub` already ran before this text ever reaches here).
 pub fn sanitize_terminal(s: &str) -> String {
     s.chars()
         .filter(|c| {
             let cp = *c as u32;
-            cp >= 0x20 && cp != 0x7f
+            cp >= 0x20 && cp != 0x7f && !(0x80..=0x9f).contains(&cp)
         })
         .collect()
 }
@@ -251,6 +255,21 @@ pub fn turn_detail_header(t: &TurnRecord, when: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C1 controls (U+0080-U+009F) — CSI (U+009B) and OSC (U+009D) among
+    // them — must never survive sanitize_terminal either: some terminals
+    // honor them as escape introducers just like their C0/ESC-prefixed
+    // equivalents. RED before the fix: the pre-fix filter only excluded C0
+    // (0x00-0x1F) + DEL (0x7F), so both codepoints pass through unchanged.
+    #[test]
+    fn sanitize_terminal_strips_c1_controls_keeps_text() {
+        let evil = "hello \u{9b}31m \u{9d}evil\u{9c} world";
+        let clean = sanitize_terminal(evil);
+        assert!(!clean.contains('\u{9b}'));
+        assert!(!clean.contains('\u{9d}'));
+        assert!(!clean.contains('\u{9c}'));
+        assert_eq!(clean, "hello 31m evil world");
+    }
 
     // AC-Z+2 golden tests: exact strings for each relative-time bucket.
     #[test]

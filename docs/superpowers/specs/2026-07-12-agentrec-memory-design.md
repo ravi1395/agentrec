@@ -241,6 +241,11 @@ store stays readable.
 - Injection is local stdout into a local hook — no new trust surface. Existing
   terminal-escape sanitization applies to fact rendering.
 - No network code added anywhere.
+- `.agentrec/memory.lock` (coordinating `remember`/`verify`/`forget`/candidate
+  ingestion/`purge --memories-retracted`) is an advisory flock: it only
+  serializes agentrec's own writers. A hand-rolled process that appends to
+  `memory.jsonl` directly, bypassing the lock, is not protected — accepted as
+  out of scope for a local single-user tool.
 
 ## Testing / acceptance
 
