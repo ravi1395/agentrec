@@ -435,6 +435,17 @@ impl TurnEngine {
                 // predates the fold window is never folded, however
                 // recently it happened to close (item 1, fabricated-
                 // attribution guard).
+                //
+                // Both cutoff bounds live in this shared helper, so they also
+                // constrain the BRACKET fold path (the `b3ceb84` commit
+                // message's "bracketed merging is unchanged" is imprecise on
+                // this point). Intentional and strictly safe-direction: the
+                // bound can only EXCLUDE a fragment from a merge — leaving it
+                // as its own already-emitted bare turn — never fabricate
+                // attribution. Realistic brackets are unaffected (a bare that
+                // closes within FOLD_WINDOW_MS of the stop passes both
+                // bounds); only a >15-min-spanning fragment adjacent to a long
+                // bracket is held out, the same guard applied consistently.
                 b.closed_at >= cutoff
                     && b.opened_at >= cutoff
                     && b.closed_at >= self.last_rich_closed_at
