@@ -674,7 +674,7 @@ pub fn undo(
                 merges: vec![],
                 files: inverse_entries,
             };
-            let _ = agentrec_core::record::append_log(&log_path(root), &LogRecord::Turn(partial));
+            let _ = crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(partial));
         }
         // Any entries already reverted are real writes a concurrent daemon
         // must still not misattribute, so this waits out the same linger as
@@ -702,7 +702,7 @@ pub fn undo(
     };
     let reverted_n = undo_record.files.len();
     let new_short_id = fmt::short_id(&undo_record.id);
-    agentrec_core::record::append_log(&log_path(root), &LogRecord::Turn(undo_record))?;
+    crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(undo_record))?;
 
     finish_undo_guard(root);
 

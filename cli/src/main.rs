@@ -6,6 +6,7 @@ mod daemon;
 mod doctorcmd;
 mod fmt;
 mod initcmd;
+mod loglock;
 mod memlock;
 mod memorycmds;
 mod purgecmd;

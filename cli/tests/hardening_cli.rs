@@ -1739,3 +1739,113 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
         "the concurrent writer's own append must never be lost: {after_text}"
     );
 }
+
+/// Finding #3: a REAL `undo --confirm` racing `purge --log-duplicates` must
+/// lose nothing. `undo` takes `log.lock` (loglock.rs) blocking around its
+/// append and `purge` holds the same lock across its rewrite, so the undo
+/// waits for purge's rename and then lands on the rewritten file. Post-fix
+/// purge therefore SUCCEEDS (the undo never grew the file mid-window) and both
+/// the collapsed duplicate and the undo's own turn survive. Pre-fix (no lock)
+/// the undo appended during purge's pause, growing the file, and the length
+/// recheck ABORTED the purge — so `purge succeeds` is the RED assertion this
+/// test is built around (distinct from `aborts_on_concurrent_growth` above,
+/// whose raw-`append_log` writer stands in for a lock-less daemon and still
+/// trips the recheck).
+#[test]
+fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // A real duplicate, so purge reaches the pause + rewrite.
+    let dup_id = "t_LOGUNDODUP00000000000000001";
+    let dup = base_turn(
+        dup_id,
+        vec![FileEntry {
+            path: "dup.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &dup);
+    seed_turn(root, &dup);
+
+    // A separate, genuinely revertible turn for `undo --confirm` to act on.
+    let before = store.put(b"BEFORE\n").unwrap();
+    let after = store.put(b"AFTER\n").unwrap();
+    std::fs::write(root.join("u.rs"), b"AFTER\n").unwrap();
+    let undo_target_id = "t_LOGUNDOTGT00000000000000001";
+    let target = base_turn(
+        undo_target_id,
+        vec![FileEntry {
+            path: "u.rs".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &target);
+
+    // Start purge paused right before its rewrite (holding log.lock).
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--log-duplicates"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS", "3000")],
+    );
+
+    // Observable proof purge archived and is now paused, holding the lock.
+    poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("log.archived."))
+            .map(|e| e.path())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // Concurrent real undo: with the lock it BLOCKS on its append until
+    // purge's rename completes.
+    let mut undo = spawn_agentrec_with_env(root, &["undo", undo_target_id, "--confirm"], &[]);
+
+    let purge_status = purge.wait().expect("purge exited");
+    let undo_status = undo.wait().expect("undo exited");
+
+    assert!(
+        purge_status.success(),
+        "purge must SUCCEED — the racing undo blocks on log.lock instead of \
+         growing the file inside the recheck window (pre-fix this aborted)"
+    );
+    assert!(
+        undo_status.success(),
+        "undo must succeed once purge releases the lock"
+    );
+
+    let text = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).unwrap();
+    assert_eq!(
+        text.lines().filter(|l| l.contains(dup_id)).count(),
+        1,
+        "the duplicate must be collapsed to exactly one copy: {text}"
+    );
+    assert!(
+        text.contains("\"tool\":\"agentrec\""),
+        "the undo's own turn (tool agentrec) must survive in the rewritten log: {text}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("u.rs")).unwrap(),
+        b"BEFORE\n",
+        "u.rs must be reverted to its pre-turn content"
+    );
+}

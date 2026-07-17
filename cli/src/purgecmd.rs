@@ -484,21 +484,27 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// refusal, archive-before-touch, atomic tmp+fsync+rename+dir-fsync. Two
 /// differences, both load-bearing:
 ///
-/// (a) `memory.jsonl` has a dedicated per-writer lock (`memlock.rs`) because
-///     it has multiple routine concurrent writers. `log.jsonl`'s only
-///     non-daemon writer is `undo --confirm`, which appends via a single
-///     `O_APPEND` write — routing it through a new lock here would be a
-///     daemon/undo hot-path change, out of scope for a repair command. This
-///     function instead re-checks the file's byte length immediately before
-///     the destructive rename: `log.jsonl` is append-only, so any concurrent
-///     writer (a daemon that starts mid-repair, or a racing `undo`) can only
-///     grow it. Growth since our initial read means we might be about to
-///     silently drop that write, so the rewrite is aborted entirely (tmp
-///     discarded, original untouched) rather than risk it. This narrows, but
-///     does not fully close, the TOCTOU window — the same honest posture as
-///     `purge_prompts`'s A3(b) reload-before-delete comment above; a writer
-///     landing in the few microseconds between this check and the rename is
-///     still theoretically possible.
+/// (a) TWO overlapping guards cover TWO different concurrent writers of
+///     `log.jsonl`:
+///       * `undo --confirm` (the only non-daemon writer) takes `log.lock`
+///         (`loglock.rs`) BLOCKING around its append; this function takes the
+///         same lock NONBLOCKING and holds it across the whole
+///         archive+recheck+rewrite+rename sequence. An undo racing the repair
+///         therefore waits until the rename completes and then appends to the
+///         rewritten file — never lost. This closes the microsecond
+///         recheck->rename window that a length check alone cannot (finding
+///         #3).
+///       * a daemon that STARTS after the liveness refusal above (and so does
+///         NOT hold `log.lock` — the daemon's per-turn append is a hot path
+///         kept off this lock) is still caught by the length recheck: this
+///         function re-reads the file's byte length immediately before the
+///         destructive rename, and `log.jsonl` being append-only, any such
+///         writer can only grow it. Growth since the initial read aborts the
+///         rewrite entirely (tmp discarded, original untouched) rather than
+///         risk clobbering it. Between the two, the only residual is a daemon
+///         that both starts mid-repair AND lands its write in the
+///         sub-recheck-to-rename window — vanishingly narrow and requires
+///         defeating the liveness guard, documented rather than fully closed.
 /// (b) the archive holds the WHOLE original file, not just the removed
 ///     lines — simpler to verify ("never delete user data" trivially holds:
 ///     the archive alone reconstructs the pre-repair state) and cheap, since
@@ -514,6 +520,15 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    // Finding #3: hold `log.lock` (NONBLOCKING) for the whole read -> archive
+    // -> recheck -> rewrite -> rename sequence. `undo --confirm` takes the
+    // same lock BLOCKING around its append, so an undo racing this repair
+    // waits until the rename completes and then lands on the rewritten file —
+    // closing the microsecond recheck->rename window that the length recheck
+    // below cannot. Refuse loudly if an undo is mid-append rather than proceed
+    // unlocked. `_log_lock` must live to the end of this function.
+    let _log_lock = crate::loglock::try_acquire(root)?;
 
     let path = log_path(root);
     let Ok(original) = std::fs::read_to_string(&path) else {
