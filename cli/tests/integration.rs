@@ -2216,6 +2216,39 @@ fn show_prompt_put_failure_distinct_from_no_prompt_attached() {
     );
 }
 
+// Regression (review finding #1): an `undo` turn is minted by agentrec itself
+// (`tool: "agentrec"`) with a synthetic `prompt_excerpt` ("undo of <id>") and
+// `prompt_ref: None` — it never had a real prompt blob. Keying the put-failure
+// message on excerpt-presence alone misclassifies EVERY undo turn as a failed
+// prompt write and points the user at a `status` that shows no such failure.
+// `show --prompt` on a synthetic (agentrec/git) turn must report "no prompt
+// attached", never a fabricated put-failure.
+#[test]
+fn show_prompt_on_undo_turn_is_not_a_false_put_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut turn = base_turn("t_UNDOSHOWPROMPT000000001", vec![]);
+    turn.tool = Some("agentrec".to_string());
+    turn.prompt_excerpt = Some("undo of abcd1234".to_string());
+    // prompt_ref stays None (base_turn default) — the undo-turn shape.
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["show", &turn.id, "--prompt"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    assert!(out.stdout.is_empty(), "stdout must be empty on failure");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("no prompt attached"),
+        "an undo turn has no recorded prompt: {stderr}"
+    );
+    assert!(
+        !stderr.contains("write failed"),
+        "must not fabricate a put-failure for a synthetic undo turn: {stderr}"
+    );
+}
+
 // --- AC Z+1 (gap closure): panic-mode undo (no turn arg, no --confirm) must
 // skip a git turn even when it is the newest record, targeting the most
 // recent non-git rich turn instead. `resolve_panic_target` in readcmds.rs

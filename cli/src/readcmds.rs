@@ -65,12 +65,23 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
         // — it's identical whether this turn never had a prompt, or had one
         // whose blob write failed at record time (`state.json`'s
         // `prompt_put_failures`, never a wire/protocol field). `prompt_excerpt`
-        // is populated whenever `turn.prompt` was `Some(..)` regardless of
-        // store outcome (see `persist` in daemon.rs), so its presence here
-        // is the honest discriminator — never fabricate "no prompt" for a
-        // turn that plainly had one.
-        return Err(if turn.prompt_excerpt.is_some() {
-            "prompt blob missing — write failed at record time (see `agentrec status`)".to_string()
+        // presence is the discriminator — BUT only for turns that could have
+        // carried a real prompt. Synthetic turns minted by agentrec itself
+        // (`undo` → `tool: "agentrec"`) and git turns (`tool: "git"`) always
+        // populate an excerpt ("undo of <id>", etc.) yet never had a prompt
+        // blob, so keying on excerpt alone falsely reports "write failed" for
+        // every undo turn and sends the user to a `status` that shows no such
+        // failure. Exclude those; a real put-failure is a non-synthetic turn
+        // with an excerpt but no ref.
+        let synthetic = matches!(turn.tool.as_deref(), Some("agentrec") | Some("git"));
+        return Err(if turn.prompt_excerpt.is_some() && !synthetic {
+            // Hedged wording: the same ref-None + excerpt shape also results
+            // from an over-cap (>10 MiB) prompt (`PutResult::OverCap`), which
+            // is deliberately NOT counted as DEGRADED — so name both causes
+            // rather than asserting a failure the `status` banner may not
+            // corroborate.
+            "prompt not stored — write failed at record time or over size cap (see `agentrec status`)"
+                .to_string()
         } else {
             "no prompt attached — this turn has no recorded prompt".to_string()
         });
