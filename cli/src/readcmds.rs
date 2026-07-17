@@ -135,7 +135,12 @@ fn resolve_turn<'a>(turns: &[&'a TurnRecord], turn_ref: &str) -> Result<&'a Turn
 /// wrongly refuse to collapse a real duplicate. Conversely, two records whose
 /// `before`/`after` differ would revert to DIFFERENT content, so they are left
 /// ambiguous rather than silently collapsed to an arbitrary one.
-fn same_revert(a: &TurnRecord, b: &TurnRecord) -> bool {
+///
+/// `pub(crate)`: also the discriminator for `purgecmd::purge_log_duplicates`
+/// (the store-level repair of this same class of duplicate) — a single choke
+/// point for "these two turn records are the same duplicate", never
+/// reimplemented at the second call site.
+pub(crate) fn same_revert(a: &TurnRecord, b: &TurnRecord) -> bool {
     if a.id != b.id || a.files.len() != b.files.len() {
         return false;
     }

@@ -143,6 +143,15 @@ enum Command {
         /// never lost).
         #[arg(long = "memories-retracted")]
         memories_retracted: bool,
+        /// Repair a log.jsonl that a pre-fix daemon (PR #2's kill-9 window)
+        /// wrote a same-id duplicate turn into: archives the whole file
+        /// (never delete) to `.agentrec/log.archived.<ts>.jsonl`, then
+        /// rewrites log.jsonl dropping only lines that are exact
+        /// `same_revert` duplicates of an earlier same-id record — a
+        /// genuinely ambiguous same-id pair (different files) is left
+        /// untouched. Refuses while the daemon is recording.
+        #[arg(long = "log-duplicates")]
+        log_duplicates: bool,
     },
     /// Record a manual, human-authored pinned memory.
     Remember {
@@ -270,11 +279,13 @@ fn main() {
             all_prompts,
             snapshots_before,
             memories_retracted,
+            log_duplicates,
         } => purgecmd::run(
             &root,
             all_prompts,
             snapshots_before.as_deref(),
             memories_retracted,
+            log_duplicates,
         ),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
         Command::Recall {

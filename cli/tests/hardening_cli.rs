@@ -1369,3 +1369,373 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
         "must still surface the genuine collision: {stderr}"
     );
 }
+
+// ---- purge --log-duplicates: store-level repair (the deferred "Option 2" --
+// read-side migration/repair chip from the PR #2 follow-ups). The engine fix
+// stops NEW same-id duplicates; `readcmds::same_revert` CURES the read path
+// (diff/show/undo collapse on the fly) — but `log.jsonl` itself still carries
+// the dup forever until this repair rewrites it.
+
+fn append_raw_line(root: &Path, line: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join(".agentrec/log.jsonl"))
+        .expect("open log.jsonl for raw append");
+    writeln!(f, "{line}").expect("append raw line");
+}
+
+fn count_log_archives(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("log.archived."))
+        .count()
+}
+
+#[test]
+fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
+    use agentrec_core::record::FileEntry;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // (a) a TRUE same_revert duplicate: same id, identical FileEntry set,
+    // but drifted `ended`/`model`/`truncated` — exactly the shape a pre-fix
+    // daemon's orphan recovery re-emitted (see readcmds.rs's own dup test).
+    let dup_id = "t_LOGDUP0000000000000000001";
+    let dup_files = vec![FileEntry {
+        path: "a.rs".into(),
+        before: Some(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        ),
+        after: Some(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        ),
+        op: "modify".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+    }];
+    let mut turn1 = base_turn(dup_id, dup_files);
+    turn1.model = Some("claude-opus-4".into());
+    turn1.truncated = false;
+    seed_turn(root, &turn1);
+    let mut turn2 = turn1.clone();
+    turn2.ended = "2026-07-06T00:00:09.000Z".into();
+    turn2.model = None;
+    turn2.truncated = true;
+    seed_turn(root, &turn2);
+
+    // (b) a same-id pair with DIFFERENT file sets — a genuine id collision,
+    // not a recovery double-emit. Must stay untouched (never silently pick
+    // one side).
+    let collide_id = "t_LOGCOLLIDE000000000000001";
+    let turn_c1 = base_turn(
+        collide_id,
+        vec![FileEntry {
+            path: "one.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    let turn_c2 = base_turn(
+        collide_id,
+        vec![FileEntry {
+            path: "two.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn_c1);
+    seed_turn(root, &turn_c2);
+
+    // (c) an epoch line, plus a turn-SHAPED unknown-`type` line appended
+    // TWICE with byte-identical content — the classification trap: this
+    // repair must recognize the `type` field and never treat these as
+    // removable turn duplicates just because a naive `TurnRecord` parse
+    // (which ignores unrecognized `type`) would find them "identical".
+    seed_epoch(root, "start", "2026-07-06T00:00:00.000Z");
+    let future_line = concat!(
+        "{\"type\":\"future_thing\",\"id\":\"t_FUTURE0000000000000000001\",\"grade\":\"rich\",",
+        "\"started\":\"2026-07-06T00:00:00.000Z\",\"ended\":\"2026-07-06T00:00:01.000Z\",",
+        "\"root\":\"/repo\",\"files\":[]}"
+    );
+    append_raw_line(root, future_line);
+    append_raw_line(root, future_line);
+
+    let log_path = root.join(".agentrec/log.jsonl");
+    let before_bytes = std::fs::read(&log_path).unwrap();
+
+    let out = agentrec(root, &["purge", "--log-duplicates"]);
+    assert!(out.status.success(), "purge should succeed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed 1 duplicate"),
+        "expected exactly 1 dup removed: {stdout}"
+    );
+
+    let after_bytes = std::fs::read(&log_path).unwrap();
+    let after_text = String::from_utf8_lossy(&after_bytes).into_owned();
+    let after_lines: Vec<&str> = after_text.lines().collect();
+
+    // (a) collapsed to exactly one line for dup_id.
+    assert_eq!(
+        after_lines.iter().filter(|l| l.contains(dup_id)).count(),
+        1,
+        "true duplicate must collapse to one line: {after_text}"
+    );
+
+    // (b) both collide_id lines survive untouched.
+    assert_eq!(
+        after_lines
+            .iter()
+            .filter(|l| l.contains(collide_id))
+            .count(),
+        2,
+        "distinct same-id turns must NOT be collapsed: {after_text}"
+    );
+
+    // (c) epoch + BOTH unknown-type lines preserved byte-identical.
+    assert_eq!(
+        after_lines
+            .iter()
+            .filter(|l| l.contains("\"type\":\"epoch\""))
+            .count(),
+        1,
+        "epoch line must be preserved: {after_text}"
+    );
+    assert_eq!(
+        after_lines
+            .iter()
+            .filter(|l| l.contains("future_thing"))
+            .count(),
+        2,
+        "unknown-type turn-shaped lines must never be treated as turn duplicates: {after_text}"
+    );
+    assert!(
+        after_text.contains(future_line),
+        "unknown-type line must be byte-preserved: {after_text}"
+    );
+
+    // Archive exists and holds the exact pre-repair original.
+    let archive = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("log.archived."))
+        .expect("archive file must exist");
+    let archived_bytes = std::fs::read(archive.path()).unwrap();
+    assert_eq!(
+        archived_bytes, before_bytes,
+        "archive must hold the exact pre-repair original"
+    );
+
+    // Second run: no-op, no new archive, log.jsonl byte-identical.
+    let archive_count_before = count_log_archives(root);
+    let out2 = agentrec(root, &["purge", "--log-duplicates"]);
+    assert!(out2.status.success(), "second run should succeed: {out2:?}");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("0 duplicate"),
+        "second run must be a no-op: {stdout2}"
+    );
+    assert_eq!(
+        std::fs::read(&log_path).unwrap(),
+        after_bytes,
+        "second run must not touch log.jsonl"
+    );
+    assert_eq!(
+        count_log_archives(root),
+        archive_count_before,
+        "second run must not create another archive"
+    );
+}
+
+#[test]
+fn purge_log_duplicates_refuses_while_daemon_running() {
+    use agentrec_core::record::FileEntry;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let dup_id = "t_LOGDUPRUN0000000000000001";
+    let files = vec![FileEntry {
+        path: "r.rs".into(),
+        before: None,
+        after: Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into()),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+    }];
+    let turn = base_turn(dup_id, files);
+    // Exact identical dup — WOULD be removed if the daemon-liveness guard
+    // weren't there, so a passing test proves the refusal, not an empty
+    // candidate set.
+    seed_turn(root, &turn);
+    seed_turn(root, &turn);
+
+    let log_path = root.join(".agentrec/log.jsonl");
+
+    let mut daemon = spawn_record(root);
+    // Wait until the daemon has actually taken its flock (start epoch appended).
+    let up = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(&log_path).ok()?;
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("epoch")
+                    && v.get("event").and_then(|e| e.as_str()) == Some("start")
+            })
+            .then_some(())
+    });
+    assert!(up.is_some(), "daemon never came up");
+
+    let out = agentrec(root, &["purge", "--log-duplicates"]);
+
+    // Tear the daemon down before any assertion can early-return and leak it.
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge must exit non-zero while the daemon is recording: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("recording") || stderr.contains("running"),
+        "stderr must name the running-daemon reason: {stderr}"
+    );
+
+    // Both duplicate lines must remain — refusal happened before any read of
+    // the file for repair purposes.
+    let after = std::fs::read_to_string(&log_path).unwrap();
+    let dup_count = after.lines().filter(|l| l.contains(dup_id)).count();
+    assert_eq!(
+        dup_count, 2,
+        "daemon refusal must leave both duplicate lines untouched: {after}"
+    );
+
+    // No archive file created.
+    assert_eq!(
+        count_log_archives(root),
+        0,
+        "no archive file must be created on refusal"
+    );
+}
+
+/// `log.jsonl`'s only non-daemon writer is `undo --confirm` (no dedicated
+/// lock guards it — see purgecmd.rs's `purge_log_duplicates` doc comment for
+/// why not). The length-recheck-before-rename guard is what actually closes
+/// that TOCTOU window: `AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS` widens the
+/// gap between purge's archive-fsync and its rewrite long enough to land a
+/// real concurrent append inside it, using the archive file's appearance as
+/// the observable "paused right before rewrite" marker (same technique as
+/// `purge_rewrite_never_loses_concurrent_append` above).
+#[test]
+fn purge_log_duplicates_aborts_on_concurrent_growth() {
+    use agentrec_core::record::FileEntry;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let dup_id = "t_LOGGROW0000000000000000001";
+    let files = vec![FileEntry {
+        path: "g.rs".into(),
+        before: None,
+        after: Some("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into()),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+    }];
+    let turn = base_turn(dup_id, files);
+    seed_turn(root, &turn);
+    seed_turn(root, &turn); // real duplicate, so purge actually reaches the pause
+
+    let log_path = root.join(".agentrec/log.jsonl");
+    let original_bytes = std::fs::read(&log_path).unwrap();
+
+    let mut purge = spawn_agentrec_with_env(
+        root,
+        &["purge", "--log-duplicates"],
+        &[("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS", "3000")],
+    );
+
+    // Observable proof purge has read + archived and is now paused
+    // immediately before the length recheck + rewrite.
+    poll_until(Duration::from_secs(5), || {
+        std::fs::read_dir(root.join(".agentrec"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("log.archived."))
+            .map(|e| e.path())
+    })
+    .expect("purge never archived — never reached the pause");
+
+    // While purge is paused, a concurrent writer (standing in for a racing
+    // `undo --confirm` or a daemon that starts mid-repair) appends a new
+    // line directly.
+    let extra_id = "t_EXTRAWRITE0000000000000001";
+    let extra_turn = base_turn(
+        extra_id,
+        vec![FileEntry {
+            path: "extra.rs".into(),
+            before: None,
+            after: Some(
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+            ),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &extra_turn);
+    let grown_bytes = std::fs::read(&log_path).unwrap();
+    assert!(
+        grown_bytes.len() > original_bytes.len(),
+        "concurrent append must have actually grown the file before purge resumes"
+    );
+
+    let status = purge.wait().expect("purge exited");
+    assert!(
+        !status.success(),
+        "purge must abort when the file grew underneath it"
+    );
+
+    // log.jsonl must be untouched — still exactly the pre-rewrite content
+    // plus the concurrent writer's append; the duplicate is STILL present
+    // because the rewrite never happened.
+    let after_bytes = std::fs::read(&log_path).unwrap();
+    assert_eq!(
+        after_bytes, grown_bytes,
+        "aborted purge must leave log.jsonl exactly as the concurrent writer left it"
+    );
+    let after_text = String::from_utf8_lossy(&after_bytes);
+    assert_eq!(
+        after_text.lines().filter(|l| l.contains(dup_id)).count(),
+        2,
+        "duplicate must still be present — the rewrite was aborted, not silently lost: {after_text}"
+    );
+    assert!(
+        after_text.contains(extra_id),
+        "the concurrent writer's own append must never be lost: {after_text}"
+    );
+}

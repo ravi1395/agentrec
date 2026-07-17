@@ -6,7 +6,11 @@
 //! is shared across turns — is never deleted. `log`/`blame` are unaffected
 //! (they render `prompt_excerpt`, never the blob); `diff`/`undo` are
 //! unaffected by the default (prompt-only) purge, since snapshot blobs are a
-//! disjoint set only touched by `--snapshots-before`.
+//! disjoint set only touched by `--snapshots-before`. `--memories-retracted`
+//! archives+rewrites `memory.jsonl`; `--log-duplicates` archives+rewrites
+//! `log.jsonl` to repair a pre-fix daemon's same-id duplicate `TurnRecord`s
+//! (the read-side migration/repair deferred after PR #2's curative
+//! `readcmds::same_revert` dedup — see that module for the underlying bug).
 
 use crate::cmds::wall_now_ms;
 use crate::{agentrec_dir, log_path, objects_dir};
@@ -26,6 +30,7 @@ pub fn run(
     all_prompts: bool,
     snapshots_before: Option<&str>,
     memories_retracted: bool,
+    log_duplicates: bool,
 ) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = owned_turns(&records);
@@ -37,6 +42,9 @@ pub fn run(
     }
     if memories_retracted {
         purge_memories_retracted(root)?;
+    }
+    if log_duplicates {
+        purge_log_duplicates(root)?;
     }
     Ok(())
 }
@@ -457,6 +465,246 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+// ---- purge --log-duplicates (read-side migration/repair, Option 2) --------
+//
+// A pre-fix daemon (PR #2's kill-9 window between `persist` and the journal
+// clear) could write two `TurnRecord`s sharing one turn id into `log.jsonl`.
+// The engine fix stops NEW duplicates; `readcmds::resolve_turn`/`same_revert`
+// CURES the read path (diff/show/undo collapse the pair on the fly) — but
+// the file itself still carries the dup forever, and any future consumer
+// that reads `log.jsonl` directly (not through `resolve_turn`) still sees
+// two records. This is the store-level repair: archive the file, then
+// rewrite it dropping only lines that are exact `same_revert` duplicates of
+// an earlier same-id record.
+
+/// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape (the
+/// only other sanctioned rewrite in this codebase) — daemon-liveness
+/// refusal, archive-before-touch, atomic tmp+fsync+rename+dir-fsync. Two
+/// differences, both load-bearing:
+///
+/// (a) `memory.jsonl` has a dedicated per-writer lock (`memlock.rs`) because
+///     it has multiple routine concurrent writers. `log.jsonl`'s only
+///     non-daemon writer is `undo --confirm`, which appends via a single
+///     `O_APPEND` write — routing it through a new lock here would be a
+///     daemon/undo hot-path change, out of scope for a repair command. This
+///     function instead re-checks the file's byte length immediately before
+///     the destructive rename: `log.jsonl` is append-only, so any concurrent
+///     writer (a daemon that starts mid-repair, or a racing `undo`) can only
+///     grow it. Growth since our initial read means we might be about to
+///     silently drop that write, so the rewrite is aborted entirely (tmp
+///     discarded, original untouched) rather than risk it. This narrows, but
+///     does not fully close, the TOCTOU window — the same honest posture as
+///     `purge_prompts`'s A3(b) reload-before-delete comment above; a writer
+///     landing in the few microseconds between this check and the rename is
+///     still theoretically possible.
+/// (b) the archive holds the WHOLE original file, not just the removed
+///     lines — simpler to verify ("never delete user data" trivially holds:
+///     the archive alone reconstructs the pre-repair state) and cheap, since
+///     duplicates are a rare one-shot artifact here, unlike memory's routine
+///     TTL churn.
+fn purge_log_duplicates(root: &Path) -> Result<(), String> {
+    // Same belt-and-suspenders posture as purge_memories_retracted: refuse
+    // outright while the daemon holds its own flock, before reading anything.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before repairing log.jsonl — \
+             the daemon appends turns concurrently"
+                .to_string(),
+        );
+    }
+
+    let path = log_path(root);
+    let Ok(original) = std::fs::read_to_string(&path) else {
+        println!("scanned 0 turn record(s), 0 duplicate(s) removed — no log.jsonl yet");
+        return Ok(());
+    };
+
+    // Tolerant classify-and-fold over RAW lines (never `load_log`, which
+    // silently drops torn lines and any record type it doesn't recognize —
+    // this repair must preserve exactly what's on disk except the specific
+    // duplicates it's authorized to remove).
+    let mut survivors: Vec<&str> = Vec::new();
+    let mut kept_turns: Vec<TurnRecord> = Vec::new();
+    let mut scanned = 0usize;
+    let mut removed = 0usize;
+
+    for line in original.lines() {
+        if line.trim().is_empty() {
+            survivors.push(line);
+            continue;
+        }
+        match classify_turn_line(line) {
+            Some(t) => {
+                scanned += 1;
+                let is_duplicate = kept_turns
+                    .iter()
+                    .any(|kept| crate::readcmds::same_revert(kept, &t));
+                if is_duplicate {
+                    removed += 1;
+                } else {
+                    kept_turns.push(t);
+                    survivors.push(line);
+                }
+            }
+            None => survivors.push(line), // epoch, unknown type, or garbage — always kept
+        }
+    }
+
+    if removed == 0 {
+        println!("scanned {scanned} turn record(s), 0 duplicate(s) removed — log.jsonl unchanged");
+        return Ok(());
+    }
+
+    // Archive the WHOLE original file, fsynced, BEFORE the source is touched.
+    let archive_path = log_archive_path(root);
+    write_full_file_synced(&archive_path, &original)?;
+    agentrec_core::perms::lock_file(&archive_path);
+
+    test_pause_before_log_rewrite();
+
+    // (a) above: re-check length right before the destructive rewrite.
+    let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if current_len as usize > original.len() {
+        return Err(
+            "log.jsonl changed during repair (a concurrent writer landed) — \
+             no changes made; rerun `agentrec purge --log-duplicates`"
+                .to_string(),
+        );
+    }
+
+    rewrite_log_atomic(&path, &survivors)?;
+    agentrec_core::perms::lock_file(&path);
+
+    println!(
+        "scanned {scanned} turn record(s), removed {removed} duplicate(s) — archived original to {}",
+        archive_path.display()
+    );
+    Ok(())
+}
+
+/// Test-only race-window widener, mirroring
+/// `test_pause_before_memory_rewrite`: when
+/// `AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS` is set, sleeps right after the
+/// archive fsync and right before the length recheck / atomic rewrite — the
+/// exact window a concurrent writer's append must be detected in. A single
+/// env var read (no-op) when unset — no effect on production behavior.
+fn test_pause_before_log_rewrite() {
+    if let Ok(ms) = std::env::var("AGENTREC_TEST_PAUSE_BEFORE_LOG_REWRITE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+}
+
+/// Classify one raw `log.jsonl` line as a turn (`Some`) or not (`None`),
+/// mirroring `agentrec_core::record::load_log`'s exact turn-recognition rule
+/// — this MUST stay in sync with that function, or this repair can
+/// misclassify data:
+///
+/// a line is a turn iff it parses as a tagged `LogRecord::Turn`, OR it has
+/// NO `type` field at all and parses as a bare legacy `TurnRecord`. A line
+/// like `{"type":"future_thing", ...turn-shaped fields...}` must NOT be
+/// treated as a turn just because `TurnRecord`'s deserializer would ignore
+/// the unrecognized `type` field if asked naively — that would let an
+/// unknown-type record be candidate-matched and silently removed as a "dup"
+/// by the fold above. Anything not positively recognized as a turn (epoch,
+/// unknown type, torn/garbage JSON) returns `None` and is always preserved
+/// byte-exact by the caller.
+fn classify_turn_line(line: &str) -> Option<TurnRecord> {
+    if let Ok(rec) = serde_json::from_str::<LogRecord>(line) {
+        return match rec {
+            LogRecord::Turn(t) => Some(t),
+            LogRecord::Epoch(_) => None,
+        };
+    }
+    let has_type_field = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("type")))
+        .unwrap_or(false);
+    if has_type_field {
+        return None;
+    }
+    serde_json::from_str::<TurnRecord>(line).ok()
+}
+
+/// `.agentrec/log.archived.<unix_ts>.jsonl` — mirrors `memory_archive_path`'s
+/// naming (whole-seconds unix timestamp).
+fn log_archive_path(root: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    agentrec_dir(root).join(format!("log.archived.{ts}.jsonl"))
+}
+
+/// Write `content` verbatim to `path` (creating it, truncating any stale
+/// content at that exact path), then fsync the file handle before
+/// returning — callers must be able to trust the archive is durable before
+/// the source rewrite starts. `path` is always a freshly-minted, per-run
+/// timestamped name, so truncate-on-open never discards a previous archive.
+fn write_full_file_synced(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Rewrite `log.jsonl` to contain exactly `lines` (verbatim bytes, one per
+/// line), atomically: per-process-unique tmp file in the same directory,
+/// fsync it, rename over `log_path`, then fsync the parent dir — the same
+/// tmp+fsync+rename+dir-fsync shape as `rewrite_memory_atomic` above.
+///
+/// Deliberately NOT unified with `rewrite_memory_atomic` into one shared
+/// helper: `log.jsonl` is the durability-critical append-only ledger
+/// (fsynced turn/epoch closes, D34) with its own hardened test suite: a
+/// shared helper would mean any future change to the memory-purge rewrite
+/// shape risks the log-repair path (and vice versa) without either call
+/// site's tests naming the coupling. Kept as a deliberate near-duplicate,
+/// same rationale F6 already used for skipping `put_result` reuse above.
+fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
+    let parent = log_path
+        .parent()
+        .ok_or_else(|| "log.jsonl has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(
+        ".log.jsonl.tmp.{}.{}",
+        std::process::id(),
+        wall_now_ms()
+    ));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut file = create_tmp_file(&tmp)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, log_path)?;
+        Ok(())
+    })();
+
+    match write {
+        Ok(()) => {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("failed to rewrite log.jsonl: {e}"))
+        }
+    }
 }
 
 /// Read `ttl_days` from `.agentrec/config.toml` via the shared
