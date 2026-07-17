@@ -8,6 +8,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Memory-dogfood prep + orphan-GC round (2026-07-17, branch `fix/purge-orphans-gc`, commit `c881cfe`):**
+Prepped this repo's live store for the 1-week memory dogfood and closed the store-bloat mystery
+from the D36 round's dogfood observations. **The "eviction bug (3.1 GiB over budget, 0 B freed)"
+was NOT a bug** — root-caused: of the 3.29 GiB store, only **0.74 GiB was turn-referenced
+snapshots** (< 2 GiB budget → `retention::enforce_budget`'s "0 freed" was *correct*); the real
+bloat was **2.55 GiB / 5644 ORPHANED blobs** — superseded intermediate snapshots the daemon
+`put`s into the CAS on **every** debounced batch (`Recorder::stage`, load-bearing for kill-9
+crash recovery) that the coarse first-`before`/last-`after` `TurnRecord` never references. Nothing
+reclaimed them (budget eviction walks only turn-referenced snapshots; TTL purge only prompts).
+Completeness verified before any delete (greedy raw-hex grep matched structured extraction; 0/10
+orphans in raw log). **Shipped `purge --orphans`** (founder chose the durable fix over one-time
+reclaim): archive-*renames* (never deletes) every CAS blob no `log.jsonl` turn/prompt, no
+in-flight `open.json`, and no `memory.jsonl` pin references, into `.agentrec/objects.archived.<ts>/`;
+daemon-liveness refusal + `pass_start` mtime guard (undo race). **The load-bearing safety choice:
+the ref-set is a raw `sha256:` byte-scan, NEVER `load_log`** — a blob cited only by a torn/unknown
+log line is never mistaken for an orphan (RED-proven: the torn-line test fails under a parse-drop
+ref-set). Also fixed the **dishonest status message** (was "oldest snapshots evicted" on a
+total-size trigger even when ~0 freed → now attributes bloat to unreferenced blobs + names
+`purge --orphans`). New: `BlobStore::list_hashes`/`archive`. **343 tests, 0 failed** (+10),
+clippy `-D warnings` + fmt clean. **Binding skeptical-reviewer done-gate in an isolated worktree:
+GATE PASS** (all 5 ACs MET; refuted AC1 twice by neutering — drop-torn-lines and drop-open.json —
+each RED then restored byte-identical). **Post-gate fixes** (skeptic-surfaced): (a) real defect —
+`memory.jsonl` pins also cite CAS blobs (`verify`'s pin-diff `store.get`s them), so added
+memory.jsonl to `referenced_hashes` + corrected the "complete citer set" comment (RED-proven the
+pin blob is now kept — and confirmed in production: the reclaim below preserved the drifted
+torture pin's old blob so `verify`'s diff still rendered); (b) permanent test for the status
+orphan-attribution clause; (c) undo/purge microsecond TOCTOU documented (archive-only, "narrowed
+not closed" like `purge_log_duplicates`). **Live dogfood-baseline prep executed** (release binary,
+launchd service `com.agentrec.bfa6bde6eaa4` cleanly stopped→reclaim→restarted, new pid healthy):
+killed 4 leaked scratchpad/worktree daemons; **`purge --orphans` reclaimed 5835 blobs / 2.6 GiB →
+store 3.4 GiB → 775 MiB (under budget, `status` over-budget notice gone, `gaps: 0`)**; re-pinned
+the 1 drifted fact (`verify --replace-pin`, torture.rs `5729ba1f`→`7a0f3f8c`, reverify appended,
+original preserved) → **memory 1 stale → 3 fresh** after seeding 2 genuine file-grounded dogfood
+facts (recall verified: both queries return the right fresh fact + pins); installed the
+`agentrec-memory` SKILL to `.claude/skills/` (candidate emission now enabled — was staged-only,
+the reason 0 candidates had ever been emitted); **`doctor` all-pass exit 0** (incl. `hook presence
+pass`). **rich-rate warning diagnosed as honest-bare, not a hook hole** — the hook fires (all 217
+lifetime rich turns are `tool=claude`; `doctor` hook-presence pass), the low trailing-20 rate is
+genuine non-Claude churn (worktree build-agents in-tree, git ops, torture harness, and this
+session's own cargo rebuilds); trust trailing-20 during a quiet single-session dogfood week, not
+the lifetime rate. **Two stale launchd services** (`com.agentrec.6c11f4b457d4` status 1,
+`com.agentrec.848b7acb02a1` status 78 — prior worktree/temp inits, not running) left in place —
+cruft, not harming the dogfood; flag for a cleanup pass. Debugging gotcha this round: a rapid
+`sed`-neuter/`mv`-restore cycle produced a **stale-build false-RED** (test failed on restored code
+until a clean rebuild) — always let cargo settle between RED/GREEN, verify the source with `grep`.
+**Not merged/pushed** (no ask) — branch `fix/purge-orphans-gc` at `c881cfe`; the 2.6 GiB
+`objects.archived.<ts>/` is retained (reversible) pending the founder's confidence to `rm` it.
+The 1-week memory-dogfood ladder clock can now start on a clean, under-budget, 3-fresh-fact store.
+
 **Review-findings fix round (2026-07-17, branch `fix/review-findings-043c749`, commits `1b638c6..eda01b5`):** Skeptical review of `1e3c63b..043c749` (14 commits/~1.9k lines, fanned out to 4 concern-scoped skeptics + firsthand merge-resolution/cross-seam checks) surfaced 5 findings; all 5 fixed this round, binding **skeptical-reviewer** done-gate verdict **GATE PASS** (refuted #1/#2/#3 by neutering → RED → restore; #4/#5 confirmed comment-only via diff filter; no new defects; tree restored clean). **336 tests, 0 failed, 1 ignored** (+3), clippy `-D warnings` + fmt clean, serial `--test-threads=3`. Findings: **#1 (MED, common-path)** `1b638c6` — `show <undo> --prompt` mislabeled every undo turn (`tool:agentrec`, synthetic `"undo of <id>"` excerpt, `prompt_ref:None`) as `"write failed at record time"` + exit 1 while `status` showed no DEGRADED, because the D35 discriminator keyed on `prompt_excerpt.is_some()` alone; fix excludes synthetic turns (`tool` agentrec/git) from the put-failure branch and hedges the message to cover the over-cap shape too. **#2 (LOW)** `473f62b` — `config_home()` accepted a relative `XDG_CONFIG_HOME` (→ CWD-relative systemd unit path); now requires `Path::is_absolute()` per XDG basedir spec. **#3 (LOW→data-safety)** `cb3386d` — new `cli/src/loglock.rs` (`log.lock`, mirrors `memlock.rs`): `undo --confirm` (sole non-daemon writer) takes it BLOCKING around both appends via `append_log_locked`, `purge --log-duplicates` holds it NONBLOCKING across archive+recheck+rewrite+rename — closes the microsecond recheck→rename TOCTOU where a racing undo append was lost from both `log.jsonl` and the archive; daemon persist stays off the lock (hot path, excluded by liveness refusal + length recheck). **#4 (LOW, docs)** `0fe3c17` — ci.yml `--test-threads=3` comment corrected: it's a no-op on 3-vCPU macos-14 (the named FSEvents platform), only trims Ubuntu 4→3, and the workflow is unpushed/never-CI-run. **#5 (INFO, docs)** `eda01b5` — engine `fold_recent_bares` comment now notes `opened_at >= cutoff` also bounds the bracket path (b3ceb84 msg imprecise), strictly safe-direction (excludes only, never fabricates). **Known residuals (documented, not closable in-session):** #3 sub-recheck→rename window vs a daemon defeating the liveness guard (advisory flock, single-user scope); #4 needs a real GitHub CI run to verify; #1 over-cap sub-case still points at a silent `status` (near-unreachable >10 MiB). Not pushed/PR'd (branch only). The `1e3c63b..043c749` range itself reviewed clean otherwise (engine trio, purge log-repair, merge resolutions, state.json + pathenc×sanitize cross-seams all PASS); memory dogfood untouched by the range and still cold (1 stale fact — `verify --replace-pin` candidate — + 1 injection).
 
 **Debt-burn round (2026-07-17, `main`, `ed21bc8..4da51b5`):** 5 parallel **Sonnet** worktree
