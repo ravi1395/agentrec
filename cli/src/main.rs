@@ -153,6 +153,13 @@ enum Command {
         /// untouched. Refuses while the daemon is recording.
         #[arg(long = "log-duplicates")]
         log_duplicates: bool,
+        /// Archive (never delete) orphaned CAS blobs — content snapshotted for
+        /// crash recovery that no committed turn or in-flight open turn
+        /// references (superseded intermediate states). Renames them into
+        /// `.agentrec/objects.archived.<ts>/`. Refuses while the daemon is
+        /// recording. This is the only path that reclaims that space.
+        #[arg(long = "orphans")]
+        orphans: bool,
     },
     /// Record a manual, human-authored pinned memory.
     Remember {
@@ -281,12 +288,14 @@ fn main() {
             snapshots_before,
             memories_retracted,
             log_duplicates,
+            orphans,
         } => purgecmd::run(
             &root,
             all_prompts,
             snapshots_before.as_deref(),
             memories_retracted,
             log_duplicates,
+            orphans,
         ),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
         Command::Recall {

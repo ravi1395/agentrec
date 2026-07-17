@@ -1849,3 +1849,120 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
         "u.rs must be reverted to its pre-turn content"
     );
 }
+
+// ---- purge --orphans (superseded-snapshot GC) -------------------------------
+
+/// End-to-end: a blob referenced by no turn (a superseded intermediate
+/// snapshot) is archived out of `objects/` and preserved under
+/// `objects.archived.<ts>/`, while a blob a turn DOES reference is left in
+/// place. Exit 0, a "reclaimed" line on stdout.
+#[test]
+fn purge_orphans_archives_unreferenced_and_keeps_referenced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+    let referenced = store.put(b"content a committed turn keeps").unwrap();
+    let orphan = store.put(b"a superseded intermediate state").unwrap();
+
+    // A committed turn that references only `referenced`.
+    let turn = base_turn(
+        "t_ORPHANTEST0000000000000001",
+        vec![agentrec_core::record::FileEntry {
+            path: "kept.rs".into(),
+            before: None,
+            after: Some(referenced.clone()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["purge", "--orphans"]);
+    assert!(out.status.success(), "purge --orphans must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("reclaimed 1 orphaned"),
+        "expected a reclaim line: {stdout}"
+    );
+
+    assert!(
+        object_path(root, &referenced).exists(),
+        "the turn-referenced blob must remain in objects/"
+    );
+    assert!(
+        !object_path(root, &orphan).exists(),
+        "the orphan blob must be moved out of objects/"
+    );
+
+    // The orphan is preserved in the archive dir, never deleted.
+    let hex = orphan.strip_prefix("sha256:").unwrap();
+    let archive_dir = std::fs::read_dir(root.join(".agentrec"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("objects.archived.")
+        })
+        .expect("archive dir created");
+    assert!(
+        archive_dir.path().join(&hex[..2]).join(&hex[2..]).exists(),
+        "orphan preserved under objects.archived/ (never deleted)"
+    );
+}
+
+/// The daemon `put`s new snapshot blobs and appends turns continuously, so an
+/// orphan reclaim racing it could archive a blob a turn is about to reference.
+/// While the daemon holds its flock, `purge --orphans` must refuse (exit 1)
+/// and archive nothing.
+#[test]
+fn purge_orphans_refuses_while_daemon_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // An orphan that WOULD be reclaimed if the guard weren't there.
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+    let orphan = store.put(b"would-be reclaimed if unguarded").unwrap();
+
+    let mut daemon = spawn_record(root);
+    let up = poll_until(Duration::from_secs(5), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).ok()?;
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("epoch")
+                    && v.get("event").and_then(|e| e.as_str()) == Some("start")
+            })
+            .then_some(())
+    });
+    assert!(up.is_some(), "daemon never came up");
+
+    let out = agentrec(root, &["purge", "--orphans"]);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        !out.status.success(),
+        "purge --orphans must exit non-zero while the daemon records: {out:?}"
+    );
+    assert!(
+        object_path(root, &orphan).exists(),
+        "the orphan must be untouched while the daemon is up"
+    );
+    assert!(
+        std::fs::read_dir(root.join(".agentrec"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("objects.archived.")),
+        "no archive dir may be created on refusal"
+    );
+}
