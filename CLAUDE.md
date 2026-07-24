@@ -8,6 +8,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Store bloat has TWO classes — correction (2026-07-25, `main`, docs-only):** the 2026-07-17
+round below is right that *its* 2.55 GiB was orphaned superseded snapshots, but it reads as if
+that is the only bloat class. It is not, and reaching for `purge --orphans` on the wrong class
+reclaims ~nothing. **Class 1 — orphaned superseded snapshots:** blobs no turn references
+(daemon `put`s every debounced batch for kill-9 recovery; the coarse `TurnRecord` cites only
+first `before`/last `after`). `--orphans` archive-renames them; over-budget-with-0-freed is the
+tell. **Class 2 — referenced churn from unfiltered paths:** blobs turns legitimately cite, from
+directories that should never have been recorded (D29 gitignore self-match — a dir whose own
+`.gitignore` is `*`). Measured live here 2026-07-25: of a **784.8 MiB** live store, **767.7 MiB
+(97.8%) was churn-only** (`.remember` 567.1 + `.code-review-graph` 200.6, both self-matching
+`.gitignore`), against **2.1 MiB actually unreferenced** — i.e. `--orphans` is structurally
+blind to it, by design (it finds garbage *by absence* from the ref-set, which is exactly what
+makes it torn-line safe). Prevention for class 2 is the merged D29 fix
+([#6](https://github.com/ravi1395/agentrec/pull/6), `4201538`) — leak confirmed halted (recent
+turns show zero churn paths). Reclaim has **no precise tool**: only `purge --snapshots-before
+<DATE>`, which is date- not path-scoped and — unlike `--orphans` — **hard-deletes**
+(`store.remove` → `fs::remove_file`, no archive). Gates checked before recommending it: blobs
+content-shared between churn and source paths = **1, 0.0 MiB** (no cross-kill), and missing-blob
+degradation is honest — `undo` refuses per-file in `build_plan` *before any mutation* (no partial
+revert), `diff` prints `(snapshot unavailable — purged or missing)`. Collateral is ~14 MiB of
+legit source snapshots that git already holds. **Known residual, not byte-reclaimable:**
+archiving/deleting blobs does not clean `log.jsonl` — the 9602 `.remember` file entries survive
+and those turns keep rendering as churn blasts in `log`/`show`; removing them would be a third
+sanctioned append-only rewrite class. **`purge --paths` deliberately NOT built:** path
+attribution requires *parsing* log lines, which is precisely what `--orphans` refuses (a torn
+line's refs must still count as keep, and a torn line cannot be path-attributed at all) — its
+safety argument is strictly harder than `--orphans`'. Also un-counted by every prior note: the
+retained archives `.agentrec/objects.archived.1784328469` (**2.6 GiB**) + `.1784934498` (15 MiB)
+are the largest items on disk and need only an `rm` — no code, founder call pending.
+
 **Phase 2 spec finalized (2026-07-18, `main`, docs-only):** Ironed out the P2 spec —
 new `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` supersedes the P2 half of
 the 2026-07-12 draft (P3 half stays draft). **Four founder decisions locked:** (1) VS Code
