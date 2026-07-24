@@ -1,7 +1,11 @@
 # agentrec Phase 2–3 — agents use the record; reviewers see it
 
 Date: 2026-07-12
-Status: draft for founder review
+Status: Phase 2 content SUPERSEDED by `2026-07-18-agentrec-phase-2-design.md`
+(founder decisions 2026-07-18: VS Code deferred out of Phase 2; exact-only PR
+association; Sutra external-recorder ownership; entry-gate truth substrate folded
+in as Phase 2.0). Phase 3 content (PR report Action, signing, Sutra rebase)
+remains the current draft.
 Owner: Ravi
 Companions: `PROTOCOL.md` (normative wire format), `IMPLEMENTATION.md` (AC register),
 `INTEGRATIONS.md` (integration thesis), `ROADMAP.md` (release gates)

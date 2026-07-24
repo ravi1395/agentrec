@@ -8,6 +8,125 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**P2.0 entry-gate measured + self-matching-gitignore fix (2026-07-24, branch
+`fix/gitignore-self-match`, commit `049a4aa`):** Ran the Phase 2.0 hard gate against the real
+corpus (`~/.claude/projects`, 1860 files / 515 MB) before planning any P2 work, and the store
+audit that rode along found a live P1. **GATE PASSES: 99.1%** (1266/1277 top-level sessions;
+floor is 90%). The naive denominator reads 68% — 583 of the 1860 files are
+`subagents/agent-*.jsonl`, sidechains the spec already excludes; they carry no `cwd` and are
+correctly unimportable. **Spec edit owed:** sidechains are now *separate files*, not only inline
+`isSidechain` lines, so the importer must exclude by path too. 0 unparseable lines / 106,311;
+37 MB peak RSS over 515 MB (500/500 target met with 13x margin). **Before-bytes ladder gains an
+undocumented 4th tier:** `~/.claude/file-history/<session>/<hash>@<vN>` holds verbatim pre-edit
+bytes referenced by `file-history-snapshot` records — 508/508 referenced backups resolved on
+disk, 25.3% of file entries. Retention-limited (~30 days, 102/1277 sessions) so import fidelity
+**degrades with age**; opportunistic like T1, never a guarantee — spec amendment, rides the
+importer commit. Measured ladder: T1 42.5% / **T1.5 25.3%** / T2 24.5% / T3 7.7% →
+**67.9% reconstructible without git**. Do NOT quote the 92.3% figure: T2 is an upper bound
+(git holds committed states only, so mid-session intermediate edits were never in git).
+Opaque:naming **2.49:1** — 71% of tool calls can mutate files while naming none, confirming
+`files_complete:false` as mandatory. **The P1: `IgnoreSet::build` did not honor a `.gitignore`
+whose own rules match itself.** It collected ignore files from the results of a gitignore-aware
+walk, so a `.gitignore` containing `*` (what tool-generated cache dirs ship) filtered itself out
+of the walk → no matcher for that directory → nothing beneath it ever filtered, contrary to
+SPEC.md:51 and D29. Live cost in this repo's own store: **7419 file entries / 764.6 MiB across
+`.remember/` + `.code-review-graph/` = 98.2% of referenced store bytes** (real repo content:
+14.2 MiB), incl. 64 snapshots of a 9 MiB SQLite and 1142 of a PID file; most recent leaked
+snapshot `2026-07-24T21:41Z` — live, not historical. Fix probes each directory the walk reaches
+for its own `.gitignore` instead of waiting for the walk to yield it; traversal pruning retained
+(still no node_modules descent), and directories the walk prunes are already excluded by an
+ancestor rule or the denylist so coverage is unchanged. **Verified against the real repo:
+matchers 1→4, all 5 leaked paths now filtered, 0/68 git-tracked files change verdict.**
+**347 passed, 0 failed, 1 ignored observed this round** (prior note said 343; the +1 arithmetic
+does not reconcile, so treat 347 as this round's observation, not a corrected baseline), clippy
+`-D warnings` + fmt clean. **DEPLOYED AND PROVEN IN PRODUCTION (2026-07-25).** The leak was
+live throughout the fix round — the service (`com.agentrec.bfa6bde6eaa4`, pid 1484, started
+07-22) ran the `~/.local/bin/agentrec` binary dated 07-12, and the store grew 789.3 → 798.6 MiB
+during the session itself. Deployed: release build → old binary backed up to
+`~/.local/bin/agentrec.bak-2026-07-12` → installed by atomic rename (a running executable cannot
+be overwritten in place) → `launchctl kickstart -k` → new pid, `doctor` all-pass exit 0.
+**Real-behavior proof, with a positive control so "absent" could not mean "daemon dead":** wrote
+`.remember/leak-check.tmp` + `.remember/tmp/leak-check.pid` + `verify-scratch.txt`, waited past
+the debounce and the 10s quiet window → exactly one new turn, `files=['verify-scratch.txt']`,
+**zero `.remember/` paths**. Leak stopped. Clean stop→purge→restart cycle recorded epochs
+correctly (`gaps: 0`). **Correction to this entry's earlier claim — `purge --orphans` does NOT
+reclaim the churn.** It freed only 285 blobs / 13.9 MiB. The 768.4 MiB of churn is **referenced
+by real historical turns** (the daemon recorded them as genuine file entries), so those blobs are
+not orphans and never become orphans; the earlier "they orphan once recording stops touching
+those paths" was wrong. Store is now 784.7 MiB = 768.4 MiB churn history + **14.3 MiB of actual
+repo content**. The only reclaim path is `purge --snapshots-before <DATE>`, which **deletes**
+snapshot blobs for every turn before that date — legitimate source history included, not just
+churn — so it is a deliberate founder decision, deliberately NOT taken here. Also still on disk:
+`objects.archived.1784328469` (2.6 GiB, last round) and `objects.archived.1784934498` (15 MiB,
+this round); both are archives, safe to `rm` at the founder's discretion. **Debugging gotcha,
+now recorded in the test:** the first repro REFUTED the hypothesis because the fixture tempdir
+was not a git repo — `ignore::WalkBuilder::require_git` defaults true, so no ignore rules applied
+and the fixture tested nothing; `git init` flipped it to a clean RED. The pre-existing
+`nested_gitignore_precedence` test has exactly this gap and passes vacuously. **Corrected by the
+done-gate — an earlier draft of this entry claimed `IgnoreSet::build` "runs once at startup and
+never refreshes". That was FALSE:** `daemon.rs:142` computes `gitignore_touched` from `pending`
+and `daemon.rs:162` rebuilds the set, so a newly created `.gitignore` IS honored without a
+restart. The real, narrower defect is the opposite and **this round introduced it**: after the
+fix a self-matching `.gitignore` classifies `Ignore`, so it never enters `pending`, so the
+rebuild never fires *for that file* — editing `.remember/.gitignore` (e.g. adding `!keep.log`)
+was unhonored until daemon restart, where pre-fix it was picked up. Direction was
+fail-toward-ignore (never over-records), hence LOW. **Both gate findings are now FIXED
+(`e453e86`), not merely recorded.** (a) The rebuild trigger is set at event-ingest time in
+`apply_watch_result`, independent of the classification result, and cleared after the rebuild —
+a `.gitignore` is filter *configuration*, not watched content, so the trigger must not depend on
+its own ignore verdict. The `.gitignore` still never enters `pending`, so no churn returns.
+(b) The disclosed unit-only coverage gap is closed by a real-daemon integration test. Both tests
+are refutation-proven: neutering the ingest-time flag reds the unit test; reverting
+`IgnoreSet::build` to its pre-`049a4aa` form reds the integration test; source restored
+byte-identically after each (sha256 `a2b11d46…`). The unit test asserts its own precondition
+(that the file classifies `Ignore`) so it cannot pass for the wrong reason. **349 passed,
+0 failed, 1 ignored** (+2 from 347), clippy `-D warnings` + fmt clean. Note the existing
+`records_rich_turn_..._filters_ignored` integration test only ever exercised a **root-level,
+non-self-matching** `.gitignore` — that, plus `nested_gitignore_precedence` passing vacuously in
+a non-git tempdir, is why two green gitignore tests coexisted with a 764 MiB leak. Both claims
+declared **before** implementing under the newly-adopted claimd protocol
+(`clm_0PW9CEDK…`, `clm_5SQ4C1F5…`), now EVIDENCED.
+**Binding skeptical-reviewer done-gate ran in an isolated worktree at `c8ac73e`: GATE FAIL on
+documentation accuracy only, code PASS.** AC1–AC5 + AC7 all PASS, refutation-proven in three
+independent channels: unit RED/GREEN (neutered `build` → named test FAILED → restored
+byte-identically, sha256 verified); a dual-implementation harness over the real repo
+(`old_matchers=1` → `new_matchers=4`, `tracked=71 tracked_flips=0`, full-tree
+`walked=525 newly_ignored=118 newly_watched=0`); and a **live-daemon E2E** the skeptic built
+(old build records `.remember/session.log` + `.remember/session.pid`, new build records only
+`src/main.rs`) — proving the fix at the recording path, not just at `is_ignored`. Also
+independently corroborated the store audit from the raw log: `98.2%` leak share exactly as
+claimed, 767.2 MiB (grown from 764.6 — consistent with a still-live leak), 0 unparseable lines.
+Vacuity check confirmed load-bearing: old build + `git init` deleted → test passes. The sole
+FAIL was the false "never refreshes" claim above, now corrected. Skeptic's other findings, all
+accepted as recorded-not-fixed: root-level self-matching `*` would hide force-added tracked
+source (INFO, 0/71 here); `dir.join(".gitignore")` resolves `.GITIGNORE` on case-insensitive
+APFS, a new macOS/Linux divergence that matches git-on-that-filesystem (INFO); `.claims/` is
+itself now recorded content — same class as the bug just fixed, negligible magnitude (INFO).
+True prior-baseline test count is **346** at `5003ae1` (347 − the 1 added test; the "343" note
+came from the unmerged `fix/purge-orphans-gc` branch, not `main`). **Reframes last round:** the 2.55 GiB
+of orphans reclaimed 2026-07-17 were almost certainly this same churn, so `purge --orphans` was
+a workaround that masked this bug for a week rather than "the durable fix" it was recorded as
+(the feature is still correct — intermediate snapshots genuinely orphan). Store not yet
+re-measured post-fix; the 19.5x blob-compression figure from this round was measured **on the
+churn** and will not hold against a 14 MiB source-only store — re-measure before acting on it.
+Not pushed/PR'd (no ask). Full findings + scripts in the session scratchpad `GATE-FINDINGS.md`.
+
+**Phase 2 spec finalized (2026-07-18, `main`, docs-only):** Ironed out the P2 spec —
+new `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` supersedes the P2 half of
+the 2026-07-12 draft (P3 half stays draft). **Four founder decisions locked:** (1) VS Code
+DEFERRED out of P2 (demand-driven return; "v2 done" = O+P+Q); (2) PR↔turn association
+exact-only (trailers/export, no heuristic mode ever); (3) Sutra = external agentrec recorder +
+`.sutra` sidecar (no embedded second recorder); (4) ROADMAP Phase-1 truth substrate folded in
+as **Phase 2.0 at full scope** — `import claude` (K) + `import aider` (L) + git trailers +
+`git-agentrec` shim (M) + Protocol 1.0 freeze + conformance fixtures (N) + npm/mise wrappers
+(Z2) + RepositoryView/UndoCoordinator seam extraction + `diff`/`blame`/`status --json`.
+Entry-gate reality check that forced 2.0: 0/4 built today (no import, no trailer code, no
+fixtures, `--json` only on log/doctor/memory verbs). Phases 2.0→2.4 risk-ordered (substrate →
+Codex spike-first → MCP read → MCP destructive → setup/packaging), self-healing E2E = 2.3 exit,
+≥90%-real-transcript import gate = hard stop. Additive protocol changes queued for the freeze:
+§4 `emitter_turn`, §5 `imported`, §8 `agentrec_status`. Companion edits (PROTOCOL/IMPLEMENTATION
+/ROADMAP) deferred to the commits that ship the code. Next: `/phases` plan off the new spec.
+
 **Memory-dogfood prep + orphan-GC round (2026-07-17, branch `fix/purge-orphans-gc`, commit `c881cfe`):**
 Prepped this repo's live store for the 1-week memory dogfood and closed the store-bloat mystery
 from the D36 round's dogfood observations. **The "eviction bug (3.1 GiB over budget, 0 B freed)"
