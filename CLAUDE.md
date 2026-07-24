@@ -37,7 +37,15 @@ for its own `.gitignore` instead of waiting for the walk to yield it; traversal 
 (still no node_modules descent), and directories the walk prunes are already excluded by an
 ancestor rule or the denylist so coverage is unchanged. **Verified against the real repo:
 matchers 1→4, all 5 leaked paths now filtered, 0/68 git-tracked files change verdict.**
-**347 passed, 0 failed, 1 ignored** (+1), clippy `-D warnings` + fmt clean. **Debugging gotcha,
+**347 passed, 0 failed, 1 ignored observed this round** (prior note said 343; the +1 arithmetic
+does not reconcile, so treat 347 as this round's observation, not a corrected baseline), clippy
+`-D warnings` + fmt clean. **NOT YET EFFECTIVE ON THIS MACHINE:** the running launchd service
+(`com.agentrec.bfa6bde6eaa4`) holds the old binary and its `matchers` were built at start, so
+the leak continues until a release rebuild + service restart. Fix has landed in source; it is
+not yet in effect. Real-behavior proof still owed: after restart, write under `.remember/` and
+assert no new turn entry names it. Sequence `purge --orphans` AFTER the restart (the 764.6 MiB
+of churn blobs orphan once recording stops touching those paths; reclaiming first just lets the
+old daemon re-create them). **Debugging gotcha,
 now recorded in the test:** the first repro REFUTED the hypothesis because the fixture tempdir
 was not a git repo — `ignore::WalkBuilder::require_git` defaults true, so no ignore rules applied
 and the fixture tested nothing; `git init` flipped it to a clean RED. The pre-existing
@@ -46,7 +54,12 @@ deliberately NOT done:** (a) `IgnoreSet::build` runs once at daemon startup and 
 (`daemon.rs`), so a `.gitignore` created after the daemon starts is unhonored until restart —
 second, independent hole in the same function, needs its own fix + test; (b) no
 `skeptical-reviewer` done-gate this round (session constraint barred subagents) — the binding
-adversarial gate is still owed before this is called done. **Reframes last round:** the 2.55 GiB
+adversarial gate is still owed before this is called done; (c) **no integration-level test** —
+the new test covers `is_ignored`, not `classify` → daemon → no snapshot. The test that would
+have caught this originally starts a real daemon in a temp git repo with a self-ignoring
+`.gitignore`, writes beneath it, and asserts no turn names the file. That
+`nested_gitignore_precedence` existed and passed *vacuously* for months is the evidence that
+unit-level coverage here was never sufficient; add the integration leg before the done-gate. **Reframes last round:** the 2.55 GiB
 of orphans reclaimed 2026-07-17 were almost certainly this same churn, so `purge --orphans` was
 a workaround that masked this bug for a week rather than "the durable fix" it was recorded as
 (the feature is still correct — intermediate snapshots genuinely orphan). Store not yet
