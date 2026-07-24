@@ -465,8 +465,17 @@ fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
 impl IgnoreSet {
     fn build(root: &Path) -> Self {
         let mut matchers = vec![];
-        // The walk itself prunes ignored dirs, so we never descend into (e.g.)
-        // node_modules to collect a stray `.gitignore`.
+        // Probe each directory the walk reaches for its own `.gitignore`, rather
+        // than waiting for the walk to *yield* that file. The walk applies
+        // gitignore rules to its own results, so a `.gitignore` whose rules match
+        // itself (`*` — what tool-generated cache dirs ship) was filtered out of
+        // the walk, no matcher was built for its directory, and nothing beneath
+        // it was ever filtered.
+        //
+        // Directories the walk prunes are already excluded by an ancestor rule or
+        // the `.git`/`.agentrec` denylist, so probing only reached directories
+        // loses no coverage — and still never descends into (e.g.) node_modules
+        // to collect a stray `.gitignore`.
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .parents(false)
@@ -474,14 +483,18 @@ impl IgnoreSet {
             .build()
             .flatten()
         {
-            if entry.file_name() != std::ffi::OsStr::new(".gitignore") {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let dir = entry.path().parent().unwrap_or(root).to_path_buf();
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&dir);
-            if builder.add(entry.path()).is_none() {
+            let dir = entry.path();
+            let gitignore = dir.join(".gitignore");
+            if !gitignore.is_file() {
+                continue;
+            }
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+            if builder.add(&gitignore).is_none() {
                 if let Ok(gi) = builder.build() {
-                    matchers.push((dir, gi));
+                    matchers.push((dir.to_path_buf(), gi));
                 }
             }
         }
@@ -1613,6 +1626,56 @@ mod tests {
             ig("sub/other.log", false),
             "root *.log still applies in sub"
         );
+    }
+
+    // D29 regression: a `.gitignore` whose own rules match itself (`*`, the
+    // pattern every tool-generated cache dir ships — `.remember/`,
+    // `.code-review-graph/`, …) must still filter its directory.
+    //
+    // `IgnoreSet::build` collects `.gitignore` files with a gitignore-aware
+    // walk, so a self-matching file hid itself from the walk: no matcher was
+    // built for that directory and NOTHING beneath it was ever filtered. In
+    // this repo's own live store that leaked 7419 file entries / 764 MiB —
+    // 98% of referenced store bytes — including 64 snapshots of a 9 MiB SQLite.
+    //
+    // `git init` is load-bearing: `ignore::WalkBuilder::require_git` defaults to
+    // true, so without a real repo NO ignore rules apply during the walk, every
+    // `.gitignore` is yielded, and this test passes vacuously against the bug.
+    #[test]
+    fn self_matching_gitignore_still_filters_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        // Self-matching: `*` matches `.gitignore` itself.
+        std::fs::create_dir_all(root.join("cache/logs")).unwrap();
+        std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+        // Control: a nested ignore that does NOT match itself.
+        std::fs::create_dir_all(root.join("normal")).unwrap();
+        std::fs::write(root.join("normal/.gitignore"), "*.log\n").unwrap();
+
+        let set = IgnoreSet::build(root);
+        let ig = |p: &str, is_dir: bool| set.is_ignored(&root.join(p), is_dir);
+
+        assert!(
+            ig("cache/logs/memory.log", false),
+            "self-matching `*` must filter nested files"
+        );
+        assert!(
+            ig("cache/session.pid", false),
+            "self-matching `*` must filter direct children"
+        );
+        assert!(
+            ig("normal/a.log", false),
+            "control: non-self-matching nested ignore still works"
+        );
+        assert!(!ig("src.rs", false), "unignored source must stay watched");
     }
 
     #[test]
