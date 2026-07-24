@@ -8,6 +8,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**P2.0 entry-gate measured + self-matching-gitignore fix (2026-07-24, branch
+`fix/gitignore-self-match`, commit `049a4aa`):** Ran the Phase 2.0 hard gate against the real
+corpus (`~/.claude/projects`, 1860 files / 515 MB) before planning any P2 work, and the store
+audit that rode along found a live P1. **GATE PASSES: 99.1%** (1266/1277 top-level sessions;
+floor is 90%). The naive denominator reads 68% — 583 of the 1860 files are
+`subagents/agent-*.jsonl`, sidechains the spec already excludes; they carry no `cwd` and are
+correctly unimportable. **Spec edit owed:** sidechains are now *separate files*, not only inline
+`isSidechain` lines, so the importer must exclude by path too. 0 unparseable lines / 106,311;
+37 MB peak RSS over 515 MB (500/500 target met with 13x margin). **Before-bytes ladder gains an
+undocumented 4th tier:** `~/.claude/file-history/<session>/<hash>@<vN>` holds verbatim pre-edit
+bytes referenced by `file-history-snapshot` records — 508/508 referenced backups resolved on
+disk, 25.3% of file entries. Retention-limited (~30 days, 102/1277 sessions) so import fidelity
+**degrades with age**; opportunistic like T1, never a guarantee — spec amendment, rides the
+importer commit. Measured ladder: T1 42.5% / **T1.5 25.3%** / T2 24.5% / T3 7.7% →
+**67.9% reconstructible without git**. Do NOT quote the 92.3% figure: T2 is an upper bound
+(git holds committed states only, so mid-session intermediate edits were never in git).
+Opaque:naming **2.49:1** — 71% of tool calls can mutate files while naming none, confirming
+`files_complete:false` as mandatory. **The P1: `IgnoreSet::build` did not honor a `.gitignore`
+whose own rules match itself.** It collected ignore files from the results of a gitignore-aware
+walk, so a `.gitignore` containing `*` (what tool-generated cache dirs ship) filtered itself out
+of the walk → no matcher for that directory → nothing beneath it ever filtered, contrary to
+SPEC.md:51 and D29. Live cost in this repo's own store: **7419 file entries / 764.6 MiB across
+`.remember/` + `.code-review-graph/` = 98.2% of referenced store bytes** (real repo content:
+14.2 MiB), incl. 64 snapshots of a 9 MiB SQLite and 1142 of a PID file; most recent leaked
+snapshot `2026-07-24T21:41Z` — live, not historical. Fix probes each directory the walk reaches
+for its own `.gitignore` instead of waiting for the walk to yield it; traversal pruning retained
+(still no node_modules descent), and directories the walk prunes are already excluded by an
+ancestor rule or the denylist so coverage is unchanged. **Verified against the real repo:
+matchers 1→4, all 5 leaked paths now filtered, 0/68 git-tracked files change verdict.**
+**347 passed, 0 failed, 1 ignored** (+1), clippy `-D warnings` + fmt clean. **Debugging gotcha,
+now recorded in the test:** the first repro REFUTED the hypothesis because the fixture tempdir
+was not a git repo — `ignore::WalkBuilder::require_git` defaults true, so no ignore rules applied
+and the fixture tested nothing; `git init` flipped it to a clean RED. The pre-existing
+`nested_gitignore_precedence` test has exactly this gap and passes vacuously. **Two items
+deliberately NOT done:** (a) `IgnoreSet::build` runs once at daemon startup and never refreshes
+(`daemon.rs`), so a `.gitignore` created after the daemon starts is unhonored until restart —
+second, independent hole in the same function, needs its own fix + test; (b) no
+`skeptical-reviewer` done-gate this round (session constraint barred subagents) — the binding
+adversarial gate is still owed before this is called done. **Reframes last round:** the 2.55 GiB
+of orphans reclaimed 2026-07-17 were almost certainly this same churn, so `purge --orphans` was
+a workaround that masked this bug for a week rather than "the durable fix" it was recorded as
+(the feature is still correct — intermediate snapshots genuinely orphan). Store not yet
+re-measured post-fix; the 19.5x blob-compression figure from this round was measured **on the
+churn** and will not hold against a 14 MiB source-only store — re-measure before acting on it.
+Not pushed/PR'd (no ask). Full findings + scripts in the session scratchpad `GATE-FINDINGS.md`.
+
 **Phase 2 spec finalized (2026-07-18, `main`, docs-only):** Ironed out the P2 spec —
 new `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` supersedes the P2 half of
 the 2026-07-12 draft (P3 half stays draft). **Four founder decisions locked:** (1) VS Code
