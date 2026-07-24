@@ -40,8 +40,9 @@ matchers 1→4, all 5 leaked paths now filtered, 0/68 git-tracked files change v
 **347 passed, 0 failed, 1 ignored observed this round** (prior note said 343; the +1 arithmetic
 does not reconcile, so treat 347 as this round's observation, not a corrected baseline), clippy
 `-D warnings` + fmt clean. **NOT YET EFFECTIVE ON THIS MACHINE:** the running launchd service
-(`com.agentrec.bfa6bde6eaa4`) holds the old binary and its `matchers` were built at start, so
-the leak continues until a release rebuild + service restart. Fix has landed in source; it is
+(`com.agentrec.bfa6bde6eaa4`, pid 1484, started 2026-07-22) executes the `~/.local/bin/agentrec`
+binary dated 2026-07-12, so the leak continues until a release rebuild + service restart —
+gate-confirmed still leaking at `2026-07-24T22:47:14Z`. Fix has landed in source; it is
 not yet in effect. Real-behavior proof still owed: after restart, write under `.remember/` and
 assert no new turn entry names it. Sequence `purge --orphans` AFTER the restart (the 764.6 MiB
 of churn blobs orphan once recording stops touching those paths; reclaiming first just lets the
@@ -49,17 +50,41 @@ old daemon re-create them). **Debugging gotcha,
 now recorded in the test:** the first repro REFUTED the hypothesis because the fixture tempdir
 was not a git repo — `ignore::WalkBuilder::require_git` defaults true, so no ignore rules applied
 and the fixture tested nothing; `git init` flipped it to a clean RED. The pre-existing
-`nested_gitignore_precedence` test has exactly this gap and passes vacuously. **Two items
-deliberately NOT done:** (a) `IgnoreSet::build` runs once at daemon startup and never refreshes
-(`daemon.rs`), so a `.gitignore` created after the daemon starts is unhonored until restart —
-second, independent hole in the same function, needs its own fix + test; (b) no
-`skeptical-reviewer` done-gate this round (session constraint barred subagents) — the binding
-adversarial gate is still owed before this is called done; (c) **no integration-level test** —
-the new test covers `is_ignored`, not `classify` → daemon → no snapshot. The test that would
-have caught this originally starts a real daemon in a temp git repo with a self-ignoring
-`.gitignore`, writes beneath it, and asserts no turn names the file. That
-`nested_gitignore_precedence` existed and passed *vacuously* for months is the evidence that
-unit-level coverage here was never sufficient; add the integration leg before the done-gate. **Reframes last round:** the 2.55 GiB
+`nested_gitignore_precedence` test has exactly this gap and passes vacuously. **Corrected by the
+done-gate — an earlier draft of this entry claimed `IgnoreSet::build` "runs once at startup and
+never refreshes". That was FALSE:** `daemon.rs:142` computes `gitignore_touched` from `pending`
+and `daemon.rs:162` rebuilds the set, so a newly created `.gitignore` IS honored without a
+restart. The real, narrower defect is the opposite and **this round introduced it**: after the
+fix a self-matching `.gitignore` classifies `Ignore`, so it never enters `pending`, so the
+rebuild never fires *for that file* — editing `.remember/.gitignore` (e.g. adding `!keep.log`)
+is now unhonored until daemon restart, where pre-fix it was picked up. Direction is
+fail-toward-ignore (never over-records), hence LOW, but it is a genuine regression and the
+rebuild-on-touch path has **zero** suite coverage. Candidate fix: treat `.gitignore` as a
+filter-control file that always reaches `pending` regardless of ignore verdict. **Two items
+deliberately NOT done:** (a) that rebuild-narrowing regression is recorded, not fixed;
+(b) **no integration-level test** — the new test covers `is_ignored`, not `classify` → daemon →
+no snapshot. The test that would have caught this originally starts a real daemon in a temp git
+repo with a self-ignoring `.gitignore`, writes beneath it, and asserts no turn names the file.
+That `nested_gitignore_precedence` existed and passed *vacuously* for months is the evidence
+that unit-level coverage here was never sufficient; add the integration leg before merge.
+**Binding skeptical-reviewer done-gate ran in an isolated worktree at `c8ac73e`: GATE FAIL on
+documentation accuracy only, code PASS.** AC1–AC5 + AC7 all PASS, refutation-proven in three
+independent channels: unit RED/GREEN (neutered `build` → named test FAILED → restored
+byte-identically, sha256 verified); a dual-implementation harness over the real repo
+(`old_matchers=1` → `new_matchers=4`, `tracked=71 tracked_flips=0`, full-tree
+`walked=525 newly_ignored=118 newly_watched=0`); and a **live-daemon E2E** the skeptic built
+(old build records `.remember/session.log` + `.remember/session.pid`, new build records only
+`src/main.rs`) — proving the fix at the recording path, not just at `is_ignored`. Also
+independently corroborated the store audit from the raw log: `98.2%` leak share exactly as
+claimed, 767.2 MiB (grown from 764.6 — consistent with a still-live leak), 0 unparseable lines.
+Vacuity check confirmed load-bearing: old build + `git init` deleted → test passes. The sole
+FAIL was the false "never refreshes" claim above, now corrected. Skeptic's other findings, all
+accepted as recorded-not-fixed: root-level self-matching `*` would hide force-added tracked
+source (INFO, 0/71 here); `dir.join(".gitignore")` resolves `.GITIGNORE` on case-insensitive
+APFS, a new macOS/Linux divergence that matches git-on-that-filesystem (INFO); `.claims/` is
+itself now recorded content — same class as the bug just fixed, negligible magnitude (INFO).
+True prior-baseline test count is **346** at `5003ae1` (347 − the 1 added test; the "343" note
+came from the unmerged `fix/purge-orphans-gc` branch, not `main`). **Reframes last round:** the 2.55 GiB
 of orphans reclaimed 2026-07-17 were almost certainly this same churn, so `purge --orphans` was
 a workaround that masked this bug for a week rather than "the durable fix" it was recorded as
 (the feature is still correct — intermediate snapshots genuinely orphan). Store not yet
