@@ -7,7 +7,7 @@
     "ignore": [
       "CLAUDE.md",
       "VERIFY-LEDGER.md",
-      "docs/superpowers/specs/**"
+      "docs/**"
     ],
     "denylist": [
       "true",
