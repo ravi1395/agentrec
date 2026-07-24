@@ -39,14 +39,26 @@ ancestor rule or the denylist so coverage is unchanged. **Verified against the r
 matchers 1→4, all 5 leaked paths now filtered, 0/68 git-tracked files change verdict.**
 **347 passed, 0 failed, 1 ignored observed this round** (prior note said 343; the +1 arithmetic
 does not reconcile, so treat 347 as this round's observation, not a corrected baseline), clippy
-`-D warnings` + fmt clean. **NOT YET EFFECTIVE ON THIS MACHINE:** the running launchd service
-(`com.agentrec.bfa6bde6eaa4`, pid 1484, started 2026-07-22) executes the `~/.local/bin/agentrec`
-binary dated 2026-07-12, so the leak continues until a release rebuild + service restart —
-gate-confirmed still leaking at `2026-07-24T22:47:14Z`. Fix has landed in source; it is
-not yet in effect. Real-behavior proof still owed: after restart, write under `.remember/` and
-assert no new turn entry names it. Sequence `purge --orphans` AFTER the restart (the 764.6 MiB
-of churn blobs orphan once recording stops touching those paths; reclaiming first just lets the
-old daemon re-create them). **Debugging gotcha,
+`-D warnings` + fmt clean. **DEPLOYED AND PROVEN IN PRODUCTION (2026-07-25).** The leak was
+live throughout the fix round — the service (`com.agentrec.bfa6bde6eaa4`, pid 1484, started
+07-22) ran the `~/.local/bin/agentrec` binary dated 07-12, and the store grew 789.3 → 798.6 MiB
+during the session itself. Deployed: release build → old binary backed up to
+`~/.local/bin/agentrec.bak-2026-07-12` → installed by atomic rename (a running executable cannot
+be overwritten in place) → `launchctl kickstart -k` → new pid, `doctor` all-pass exit 0.
+**Real-behavior proof, with a positive control so "absent" could not mean "daemon dead":** wrote
+`.remember/leak-check.tmp` + `.remember/tmp/leak-check.pid` + `verify-scratch.txt`, waited past
+the debounce and the 10s quiet window → exactly one new turn, `files=['verify-scratch.txt']`,
+**zero `.remember/` paths**. Leak stopped. Clean stop→purge→restart cycle recorded epochs
+correctly (`gaps: 0`). **Correction to this entry's earlier claim — `purge --orphans` does NOT
+reclaim the churn.** It freed only 285 blobs / 13.9 MiB. The 768.4 MiB of churn is **referenced
+by real historical turns** (the daemon recorded them as genuine file entries), so those blobs are
+not orphans and never become orphans; the earlier "they orphan once recording stops touching
+those paths" was wrong. Store is now 784.7 MiB = 768.4 MiB churn history + **14.3 MiB of actual
+repo content**. The only reclaim path is `purge --snapshots-before <DATE>`, which **deletes**
+snapshot blobs for every turn before that date — legitimate source history included, not just
+churn — so it is a deliberate founder decision, deliberately NOT taken here. Also still on disk:
+`objects.archived.1784328469` (2.6 GiB, last round) and `objects.archived.1784934498` (15 MiB,
+this round); both are archives, safe to `rm` at the founder's discretion. **Debugging gotcha,
 now recorded in the test:** the first repro REFUTED the hypothesis because the fixture tempdir
 was not a git repo — `ignore::WalkBuilder::require_git` defaults true, so no ignore rules applied
 and the fixture tested nothing; `git init` flipped it to a clean RED. The pre-existing
