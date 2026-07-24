@@ -269,6 +269,82 @@ fn records_rich_turn_with_transcript_prompt_and_model_and_filters_ignored() {
     assert!(!mentions_ignored, "gitignored file leaked into a turn");
 }
 
+// D29 at the RECORDING path, not just `IgnoreSet::is_ignored`.
+//
+// A directory whose only `.gitignore` matches itself (`*` — what tool-generated
+// cache dirs like `.remember/` and `.code-review-graph/` ship) was watched in
+// full: `IgnoreSet::build` collected ignore files from the results of a
+// gitignore-aware walk, so the self-matching file hid itself and no matcher was
+// ever built for its directory. In this repo's own store that leaked 7419 file
+// entries / 764 MiB, including 64 snapshots of a 9 MiB SQLite database.
+//
+// The unit test covers the predicate; this covers what the user actually cares
+// about — that a real daemon does not snapshot those files. `records_rich_turn_
+// ...filters_ignored` above only exercises a root-level, non-self-matching
+// `.gitignore`, which is why it never caught this.
+#[test]
+fn self_ignoring_gitignore_dir_is_not_recorded_by_a_real_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // The exact shape that leaked: nested dir, `.gitignore` whose sole rule
+    // matches every entry including itself.
+    std::fs::create_dir_all(root.join("cache/logs")).unwrap();
+    std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+
+    let mut daemon = spawn_record(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Churn under the self-ignoring dir, plus one real source file. The source
+    // file is the synchronisation point: once a turn names it, the daemon has
+    // demonstrably processed this batch, so an absent cache path is a real
+    // absence rather than a race.
+    std::fs::write(root.join("cache/logs/memory.log"), "noise").unwrap();
+    std::fs::write(root.join("cache/session.pid"), "4242").unwrap();
+    std::fs::write(root.join("real.rs"), "fn main() {}").unwrap();
+
+    let saw_real = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter()
+                            .any(|f| f.get("path").and_then(|p| p.as_str()) == Some("real.rs"))
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    saw_real.expect("daemon must record the un-ignored source file");
+
+    let leaked: Vec<String> = turns(root)
+        .iter()
+        .flat_map(|t| {
+            t.get("files")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|f| {
+            f.get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|p| p.starts_with("cache/"))
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "files under a self-ignoring .gitignore leaked into turns: {leaked:?}"
+    );
+}
+
 #[test]
 fn second_record_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

@@ -98,6 +98,9 @@ pub fn run(root: &Path) -> Result<(), String> {
     let mut last_event: Option<Instant> = None;
     let mut first_event: Option<Instant> = None;
     let mut git_hit = false;
+    // Set whenever a `.gitignore` event is observed, regardless of its own
+    // ignore verdict; cleared after the ignore set is rebuilt.
+    let mut gitignore_dirty = false;
 
     loop {
         // D9: block for the first message, then drain everything already
@@ -114,6 +117,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             &mut last_event,
             &mut first_event,
             &mut git_hit,
+            &mut gitignore_dirty,
         ) {
             break; // channel disconnected — the watcher thread is gone
         }
@@ -139,9 +143,10 @@ pub fn run(root: &Path) -> Result<(), String> {
             .unwrap_or(false);
         if settled || capped {
             // A touched `.gitignore` changes the filter — rebuild after staging.
-            let gitignore_touched = pending
-                .iter()
-                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some(".gitignore"));
+            // The flag is set at event-ingest time, NOT derived from `pending`:
+            // `pending` holds watched content only, and a `.gitignore` may
+            // legitimately be ignored by its own rules.
+            let gitignore_touched = gitignore_dirty;
             // H7: exclude paths a concurrent `undo --confirm` is writing to —
             // those are undo's own mutation, not agent/human activity, and
             // must never mint a spurious bare turn.
@@ -161,6 +166,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             first_event = None;
             if gitignore_touched {
                 ignore_set = IgnoreSet::build(&root);
+                gitignore_dirty = false;
             }
         }
 
@@ -311,6 +317,7 @@ fn drain_watch_events(
     last_event: &mut Option<Instant>,
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
+    gitignore_dirty: &mut bool,
 ) -> bool {
     match rx.recv_timeout(POLL) {
         Ok(res) => apply_watch_result(
@@ -321,6 +328,7 @@ fn drain_watch_events(
             last_event,
             first_event,
             git_hit,
+            gitignore_dirty,
         ),
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => return true,
@@ -335,6 +343,7 @@ fn drain_watch_events(
                 last_event,
                 first_event,
                 git_hit,
+                gitignore_dirty,
             ),
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => return true,
@@ -351,10 +360,20 @@ fn apply_watch_result(
     last_event: &mut Option<Instant>,
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
+    gitignore_dirty: &mut bool,
 ) {
     match res {
         Ok(event) => {
             for path in event.paths {
+                // A `.gitignore` is filter *configuration*, not watched content,
+                // so the rebuild trigger must not depend on its own ignore
+                // verdict. Deriving it from `pending` (Watch-only) meant a
+                // self-matching `.gitignore` — which correctly classifies
+                // `Ignore` — could never announce its own edit, so changing it
+                // (e.g. adding `!keep.log`) went unhonored until a restart.
+                if path.file_name().and_then(|n| n.to_str()) == Some(".gitignore") {
+                    *gitignore_dirty = true;
+                }
                 match classify(root, &path, ignore_set) {
                     Class::GitRef => *git_hit = true,
                     Class::Watch => {
@@ -465,8 +484,17 @@ fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
 impl IgnoreSet {
     fn build(root: &Path) -> Self {
         let mut matchers = vec![];
-        // The walk itself prunes ignored dirs, so we never descend into (e.g.)
-        // node_modules to collect a stray `.gitignore`.
+        // Probe each directory the walk reaches for its own `.gitignore`, rather
+        // than waiting for the walk to *yield* that file. The walk applies
+        // gitignore rules to its own results, so a `.gitignore` whose rules match
+        // itself (`*` — what tool-generated cache dirs ship) was filtered out of
+        // the walk, no matcher was built for its directory, and nothing beneath
+        // it was ever filtered.
+        //
+        // Directories the walk prunes are already excluded by an ancestor rule or
+        // the `.git`/`.agentrec` denylist, so probing only reached directories
+        // loses no coverage — and still never descends into (e.g.) node_modules
+        // to collect a stray `.gitignore`.
         for entry in ignore::WalkBuilder::new(root)
             .hidden(false)
             .parents(false)
@@ -474,14 +502,18 @@ impl IgnoreSet {
             .build()
             .flatten()
         {
-            if entry.file_name() != std::ffi::OsStr::new(".gitignore") {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let dir = entry.path().parent().unwrap_or(root).to_path_buf();
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&dir);
-            if builder.add(entry.path()).is_none() {
+            let dir = entry.path();
+            let gitignore = dir.join(".gitignore");
+            if !gitignore.is_file() {
+                continue;
+            }
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+            if builder.add(&gitignore).is_none() {
                 if let Ok(gi) = builder.build() {
-                    matchers.push((dir, gi));
+                    matchers.push((dir.to_path_buf(), gi));
                 }
             }
         }
@@ -1615,6 +1647,56 @@ mod tests {
         );
     }
 
+    // D29 regression: a `.gitignore` whose own rules match itself (`*`, the
+    // pattern every tool-generated cache dir ships — `.remember/`,
+    // `.code-review-graph/`, …) must still filter its directory.
+    //
+    // `IgnoreSet::build` collects `.gitignore` files with a gitignore-aware
+    // walk, so a self-matching file hid itself from the walk: no matcher was
+    // built for that directory and NOTHING beneath it was ever filtered. In
+    // this repo's own live store that leaked 7419 file entries / 764 MiB —
+    // 98% of referenced store bytes — including 64 snapshots of a 9 MiB SQLite.
+    //
+    // `git init` is load-bearing: `ignore::WalkBuilder::require_git` defaults to
+    // true, so without a real repo NO ignore rules apply during the walk, every
+    // `.gitignore` is yielded, and this test passes vacuously against the bug.
+    #[test]
+    fn self_matching_gitignore_still_filters_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        // Self-matching: `*` matches `.gitignore` itself.
+        std::fs::create_dir_all(root.join("cache/logs")).unwrap();
+        std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+        // Control: a nested ignore that does NOT match itself.
+        std::fs::create_dir_all(root.join("normal")).unwrap();
+        std::fs::write(root.join("normal/.gitignore"), "*.log\n").unwrap();
+
+        let set = IgnoreSet::build(root);
+        let ig = |p: &str, is_dir: bool| set.is_ignored(&root.join(p), is_dir);
+
+        assert!(
+            ig("cache/logs/memory.log", false),
+            "self-matching `*` must filter nested files"
+        );
+        assert!(
+            ig("cache/session.pid", false),
+            "self-matching `*` must filter direct children"
+        );
+        assert!(
+            ig("normal/a.log", false),
+            "control: non-self-matching nested ignore still works"
+        );
+        assert!(!ig("src.rs", false), "unignored source must stay watched");
+    }
+
     #[test]
     fn ignoreset_empty_when_no_gitignore() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2183,12 +2265,74 @@ mod tests {
             &mut last_event,
             &mut first_event,
             &mut git_hit,
+            &mut false,
         );
 
         assert!(git_hit, "a packed-refs transition must set git_hit");
         assert!(
             pending.is_empty(),
             "a GitRef signal is not itself a watched mutation"
+        );
+    }
+
+    // A `.gitignore` is filter *configuration*, not watched content. The
+    // rebuild trigger used to be derived from `pending`, which holds watched
+    // content only — so a `.gitignore` whose own rules match it (`*`) classified
+    // `Ignore`, never entered `pending`, and could never announce its own edit.
+    // Editing it (adding `!keep.log`) went unhonored until a daemon restart.
+    //
+    // Regression introduced alongside the self-matching-gitignore fix and caught
+    // by the done-gate. Fails if the trigger is derived from `pending` again.
+    #[test]
+    fn self_matching_gitignore_edit_still_flags_a_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        // Precondition: this is exactly the file that classifies `Ignore`, so a
+        // `pending`-derived trigger cannot see it.
+        let gi = root.join("cache/.gitignore");
+        assert!(
+            matches!(classify(&root, &gi, &ignore_set), Class::Ignore),
+            "a self-matching .gitignore must classify Ignore (else this test proves nothing)"
+        );
+
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        tx.send(Ok(notify::Event::default().add_path(gi))).unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut gitignore_dirty = false;
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut gitignore_dirty,
+        );
+
+        assert!(
+            gitignore_dirty,
+            "editing a self-matching .gitignore must flag an ignore-set rebuild"
+        );
+        assert!(
+            pending.is_empty(),
+            "the .gitignore itself is still not recorded as watched content"
         );
     }
 
@@ -2223,6 +2367,7 @@ mod tests {
             &mut last_event,
             &mut first_event,
             &mut git_hit,
+            &mut false,
         );
 
         assert!(!disconnected);
@@ -2256,6 +2401,7 @@ mod tests {
             &mut last_event,
             &mut first_event,
             &mut git_hit,
+            &mut false,
         );
         assert!(disconnected);
     }
