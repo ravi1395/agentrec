@@ -57,16 +57,23 @@ and `daemon.rs:162` rebuilds the set, so a newly created `.gitignore` IS honored
 restart. The real, narrower defect is the opposite and **this round introduced it**: after the
 fix a self-matching `.gitignore` classifies `Ignore`, so it never enters `pending`, so the
 rebuild never fires *for that file* — editing `.remember/.gitignore` (e.g. adding `!keep.log`)
-is now unhonored until daemon restart, where pre-fix it was picked up. Direction is
-fail-toward-ignore (never over-records), hence LOW, but it is a genuine regression and the
-rebuild-on-touch path has **zero** suite coverage. Candidate fix: treat `.gitignore` as a
-filter-control file that always reaches `pending` regardless of ignore verdict. **Two items
-deliberately NOT done:** (a) that rebuild-narrowing regression is recorded, not fixed;
-(b) **no integration-level test** — the new test covers `is_ignored`, not `classify` → daemon →
-no snapshot. The test that would have caught this originally starts a real daemon in a temp git
-repo with a self-ignoring `.gitignore`, writes beneath it, and asserts no turn names the file.
-That `nested_gitignore_precedence` existed and passed *vacuously* for months is the evidence
-that unit-level coverage here was never sufficient; add the integration leg before merge.
+was unhonored until daemon restart, where pre-fix it was picked up. Direction was
+fail-toward-ignore (never over-records), hence LOW. **Both gate findings are now FIXED
+(`e453e86`), not merely recorded.** (a) The rebuild trigger is set at event-ingest time in
+`apply_watch_result`, independent of the classification result, and cleared after the rebuild —
+a `.gitignore` is filter *configuration*, not watched content, so the trigger must not depend on
+its own ignore verdict. The `.gitignore` still never enters `pending`, so no churn returns.
+(b) The disclosed unit-only coverage gap is closed by a real-daemon integration test. Both tests
+are refutation-proven: neutering the ingest-time flag reds the unit test; reverting
+`IgnoreSet::build` to its pre-`049a4aa` form reds the integration test; source restored
+byte-identically after each (sha256 `a2b11d46…`). The unit test asserts its own precondition
+(that the file classifies `Ignore`) so it cannot pass for the wrong reason. **349 passed,
+0 failed, 1 ignored** (+2 from 347), clippy `-D warnings` + fmt clean. Note the existing
+`records_rich_turn_..._filters_ignored` integration test only ever exercised a **root-level,
+non-self-matching** `.gitignore` — that, plus `nested_gitignore_precedence` passing vacuously in
+a non-git tempdir, is why two green gitignore tests coexisted with a 764 MiB leak. Both claims
+declared **before** implementing under the newly-adopted claimd protocol
+(`clm_0PW9CEDK…`, `clm_5SQ4C1F5…`), now EVIDENCED.
 **Binding skeptical-reviewer done-gate ran in an isolated worktree at `c8ac73e`: GATE FAIL on
 documentation accuracy only, code PASS.** AC1–AC5 + AC7 all PASS, refutation-proven in three
 independent channels: unit RED/GREEN (neutered `build` → named test FAILED → restored
