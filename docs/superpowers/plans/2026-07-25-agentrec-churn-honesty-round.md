@@ -326,9 +326,13 @@ consult, ingest-time dirty flag, per-tick rebuild), `cli/src/main.rs` (mech — 
   derive from `last_event`/`first_event`, which only Watch-class events set. So with only-ignored
   activity the rebuild never fires — for `.gitignore` today that is fail-toward-stale-filter; for
   `ignore_globs` it means **removing a glob never resumes recording**. The rebuild moves to the
-  loop tick, gated on the dirty flag, independent of pending/flush. Fix the `.gitignore` trigger the
-  same way in the same commit. The one-batch stale-classification window (classify runs at ingest,
-  rebuild after) is inherent and gets documented, not papered over.
+  loop tick, gated on the dirty flag, independent of pending/flush. The one-batch
+  stale-classification window (classify runs at ingest, rebuild after) is inherent and gets
+  documented, not papered over.
+  **Pulled out and now owned by `docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`**
+  (it is a defect in already-merged code and ships on its own). If that plan has landed, this phase
+  reuses the corrected loop placement and adds only the `config.toml` trigger; if it has not, this
+  phase must not re-fix it in parallel.
 - Mid-turn glob change: entries already staged in the open turn (and in `open.json`) **persist
   unchanged at close**. Never re-filter in `Recorder::resolve`/`persist` — that orphans already-`put`
   blobs, makes the turn record lie by omission, and makes `recover_orphan` diverge from steady state.
