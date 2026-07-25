@@ -8,6 +8,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Blame-honesty + skipped_reason + noise folding — GATE VERDICT PENDING, NOT DONE (2026-07-25,
+branch `fix/blame-attribution-and-noise-folding`, `17657d9..7be9e4d`, not pushed):** Three changes
+landed off a 4-lens adversarial redteam of store churn. **The binding done-gate has NOT returned
+PASS** — round 1 was **GATE FAIL**, the finding was fixed, and **round 2 died on an API session
+limit before reaching a verdict**. Do not treat this round as complete; re-run the gate at
+`7be9e4d` first. **349 → 386 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt clean,
+verified by the orchestrator independently of every implementer. **(A) `17657d9` blame
+over-attribution — a real, live correctness bug in the product's core claim:** `load_text` swallowed
+both `StoreError::Missing` and `Corrupt` into `""`, and `added_or_changed_lines("", after)` returns
+*every* line of `after`, so a turn whose `before` blob did not resolve claimed authorship of **any
+line queried**; the mirror direction produced a confident false `"before recording began"`. Fires
+today — TTL purge, budget eviction and `purge --snapshots-before` all remove blobs by design. Fixed
+by `load_text → Option<String>` plus a poisoning rule mirroring `has_gap_after`: report
+`responsible` only when no *unresolvable* candidate is newer. The `before == None` create case is
+preserved (empty is legitimate there) and pinned. **(B) `8216747` `skipped_reason`** — additive
+`FileEntry` field, open enum (`over_cap`/`io_failed`/`unreadable`, `policy` reserved with **no
+producer**), landed deliberately **before the Phase 2.0 protocol-1.0 freeze**. Closes a real lie:
+`undo` said "over size cap" for all three causes. Rides along a behavior change — over-cap/io-failed
+now record `after: Some(hash)`, so `modified_since` stops reporting large files modified forever.
+PROTOCOL §5 + IMPLEMENTATION (D45, SR1–SR7) same commit; **conformance-fixture debt recorded against
+N1, not fabricated** (the corpus still does not exist). **(C) `911d274`+`b5a3652` noise folding** —
+config-declared `noise_globs`, display-only, `--all-files` (deliberately NOT overloading `--all`,
+which is the turn-grade axis). Also fixed a real panic it surfaced: an absolute `FileEntry.path`
+tripped `Gitignore`'s `assert!(!path.has_root())` — same log-as-trust-boundary class as the prior
+P0. **Round-1 GATE FAIL was earned and is instructive:** the SR6 regression guard was **vacuous** —
+it seeded `op: "modify"`, which `build_plan` refuses via an *independent* before-hash branch, so the
+`skipped` gate could be deleted entirely and the test stayed green. The reachable case is
+`op: "create"` (exactly what `Recorder::resolve` emits for a new over-cap file, and which change (B)
+newly made reachable): the skeptic proved live that with the gate removed, `undo` **deletes the
+file**. Closed in `7be9e4d` by fixing the fixture, RED-proven under gate removal, source restored
+byte-identically (sha256 `512fdc61…`). `7be9e4d` also closed: the unclassified 4th `skipped`
+producer (symlink `read_link` arm), a missing cross-seam test for the (B)×(A) ghost-hash chain (all
+five read verbs degrade honestly, none lies — now pinned), the untested `prior snapshot unavailable`
+string, and D-PD6-class vocabulary drift (`build_plan` vs `print_entry` spelling the same fact two
+ways; `diff` was also *less* specific than `undo` about corrupt-vs-missing). **Known and NOT to be
+written up as a win: noise folding does not reduce the churn blast it was justified by.**
+`fmt::turn_list_line` renders only a file *count* and `turn_detail_header` renders no file list, so
+a 9602-entry churn turn goes from `9602 files` to `0 files` **plus a fold line** — output is one
+line *longer*, and `show --all-files` is vacuous. The only surface that prints noise paths
+one-per-line is `diff`'s `print_entry`, scoped out as an attribution surface. Extending folding to
+`diff` under the same display-only contract is the actual fix — **founder decision, deliberately not
+taken.** **Nothing here is verified against a live daemon:** every BL/SR/NF test seeds `log.jsonl`
+directly or calls `Recorder::stage` in-process; the over-cap→ghost-hash chain is inferred from code
+plus seeded fixtures, never observed end-to-end. This repo has history of exactly that gap mattering
+(two green gitignore tests coexisted with a 764 MiB leak) — owe an E2E leg before merge. **claimd:
+declare-first was skipped this round** (4 coverage findings: IMPLEMENTATION.md, daemon.rs,
+readcmds.rs, integration.rs). **Retroactive declaration deliberately refused** — the skill forbids
+it and a declare-record postdating the code would make the log lie about ordering, the one property
+claimd provides. Also: `.claims/lint.ignore` does **not** exist despite an earlier note saying it
+was seeded — that note is stale. The two D29 claims went STALE (daemon.rs touched) and were
+re-verified **confirmed** at HEAD (`c522de1c…`, `f5b73066…`), so this round did not break the
+gitignore fix. Design record for the deferred storage work: `docs/superpowers/specs/2026-07-25-store-churn-designs.md`
+(`c46519c`). A detached review worktree was left at `…/scratchpad/gate` (`c46519c`) — remove when
+convenient.
+
 **Store bloat has TWO classes — correction (2026-07-25, `main`, docs-only):** the 2026-07-17
 round below is right that *its* 2.55 GiB was orphaned superseded snapshots, but it reads as if
 that is the only bloat class. It is not, and reaching for `purge --orphans` on the wrong class
