@@ -345,6 +345,93 @@ fn self_ignoring_gitignore_dir_is_not_recorded_by_a_real_daemon() {
     );
 }
 
+// The trigger fix (`e453e86`) sets `gitignore_dirty` at event-ingest time,
+// independent of the touched path's own ignore verdict — but nothing then
+// consumed that flag unless some OTHER path also classified `Watch` and drove
+// the debounce to settle. So editing a `.gitignore` to re-include a path,
+// then only ever touching THAT path, never rebuilds: the re-included path
+// still classifies against the stale (pre-edit) set, never arms the
+// debounce, and the flush block — where the rebuild used to live — never
+// runs. This proves the *consumption* half is fixed, not just the trigger
+// the unit test already covers.
+#[test]
+fn unignore_is_honored_without_other_watched_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    // Positive control, written BEFORE the ignore-rule edit. A control
+    // written afterward would itself be a Class::Watch path — it would arm
+    // the debounce, `settled` would fire, and (under the pre-fix code) the
+    // rebuild would run inside that same flush block, making the test pass
+    // before the fix and prove nothing. This ordering is load-bearing.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("src/control.rs")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Re-widen: negate the self-matching rule for one file.
+    std::fs::write(root.join("cache/.gitignore"), "*\n!keep.log\n").unwrap();
+
+    // Touch NOTHING else from here on — that is the defect's escape hatch
+    // ("some unrelated watched path changed"), and the test must not contain
+    // it. Two writes, spaced past one POLL tick (250ms, `daemon::POLL`), so
+    // they don't collapse into a single notify batch.
+    std::fs::write(root.join("cache/keep.log"), "one").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("cache/keep.log"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_keep = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("cache/keep.log")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        saw_keep.is_some(),
+        "cache/keep.log, re-included by a mid-run .gitignore edit, was never recorded — \
+         the ignore-set rebuild was never consumed"
+    );
+}
+
 #[test]
 fn second_record_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

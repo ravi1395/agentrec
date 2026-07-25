@@ -104,6 +104,37 @@ pub fn run(root: &Path) -> Result<(), String> {
     let mut gitignore_dirty = false;
 
     loop {
+        // A touched `.gitignore` changes the filter, and is consumed HERE —
+        // at the top of the tick, before this iteration's
+        // `drain_watch_events` runs `classify` on anything — not inside the
+        // `settled || capped` flush block below. The rebuild used to live in
+        // that block, implicitly gated on `pending` becoming non-empty; but
+        // `pending` only ever receives `Class::Watch` paths, and a path the
+        // STALE ignore set still classifies `Ignore` (e.g. one a
+        // `.gitignore` edit just re-included) never arms the debounce — so
+        // the flush block, and the rebuild inside it, could go unreached
+        // forever while the flag sat `true`. Moving the rebuild here means
+        // it runs on the very next tick regardless of whether anything else
+        // is pending.
+        //
+        // Residual window (stated, not eliminated): classification happens
+        // inside `drain_watch_events`, which runs AFTER this. An event for
+        // the same path arriving in the SAME drain batch as the `.gitignore`
+        // edit is still classified against the pre-edit set. After this fix
+        // the hole is "the next mutation of that path is honored" (≤1 POLL
+        // tick + notify latency), not "never, until unrelated watched
+        // activity." Closing it fully would mean reclassifying `pending` at
+        // flush time — a larger change, deliberately not taken here.
+        //
+        // Consequence of losing the triggering event itself: harmless.
+        // `Recorder::stage` reads *current* file bytes at flush time, so a
+        // dropped intermediate event costs an intermediate snapshot, never
+        // the file's content — the next mutation snapshots it as it then
+        // stands.
+        if let Some(fresh) = maybe_rebuild(&mut gitignore_dirty, &root) {
+            ignore_set = fresh;
+        }
+
         // D9: block for the first message, then drain everything already
         // queued via `try_recv` before moving on to flush logic. The old
         // one-event-per-250ms-tick shape let a large burst dribble in over
@@ -143,11 +174,6 @@ pub fn run(root: &Path) -> Result<(), String> {
             .map(|t| t.elapsed() >= MAX_DEBOUNCE)
             .unwrap_or(false);
         if settled || capped {
-            // A touched `.gitignore` changes the filter — rebuild after staging.
-            // The flag is set at event-ingest time, NOT derived from `pending`:
-            // `pending` holds watched content only, and a `.gitignore` may
-            // legitimately be ignored by its own rules.
-            let gitignore_touched = gitignore_dirty;
             // H7: exclude paths a concurrent `undo --confirm` is writing to —
             // those are undo's own mutation, not agent/human activity, and
             // must never mint a spurious bare turn.
@@ -165,10 +191,6 @@ pub fn run(root: &Path) -> Result<(), String> {
             pending.clear();
             last_event = None;
             first_event = None;
-            if gitignore_touched {
-                ignore_set = IgnoreSet::build(&root);
-                gitignore_dirty = false;
-            }
         }
 
         // Consume any new hook signals (start/stop brackets). Fill missing
@@ -536,6 +558,19 @@ impl IgnoreSet {
         }
         false
     }
+}
+
+/// Rebuild the `IgnoreSet` iff `dirty` is set, clearing it in the same call.
+/// Exists so the loop tick's rate rule — at most one full-repo walk per
+/// `POLL` — has a unit-reachable target: `run`'s loop body itself is not
+/// unit-testable, which is exactly how the unconsumed-flag bug survived a
+/// prior round undetected.
+fn maybe_rebuild(dirty: &mut bool, root: &Path) -> Option<IgnoreSet> {
+    if !*dirty {
+        return None;
+    }
+    *dirty = false;
+    Some(IgnoreSet::build(root))
 }
 
 /// Repo-relative paths a concurrent `undo --confirm` is currently writing
@@ -2584,11 +2619,14 @@ mod tests {
     // content only — so a `.gitignore` whose own rules match it (`*`) classified
     // `Ignore`, never entered `pending`, and could never announce its own edit.
     // Editing it (adding `!keep.log`) went unhonored until a daemon restart.
-    //
-    // Regression introduced alongside the self-matching-gitignore fix and caught
-    // by the done-gate. Fails if the trigger is derived from `pending` again.
+    // `e453e86` fixed that trigger — this test used to assert only that the
+    // flag got SET, which left the *consumption* half (nothing ever read the
+    // flag unless something else was also pending) entirely uncaught; that's
+    // the bug this plan's Phase 1 fixes. Now also drives `maybe_rebuild`, the
+    // loop tick's consumer, and checks the rebuilt set actually reflects the
+    // edit — not just that a rebuild happened.
     #[test]
-    fn self_matching_gitignore_edit_still_flags_a_rebuild() {
+    fn self_matching_gitignore_edit_flags_and_rebuild_consumes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let initialized = std::process::Command::new("git")
@@ -2604,12 +2642,20 @@ mod tests {
         let ignore_set = IgnoreSet::build(&root);
 
         // Precondition: this is exactly the file that classifies `Ignore`, so a
-        // `pending`-derived trigger cannot see it.
+        // `pending`-derived trigger cannot see it — and `keep.log` is ignored
+        // under this STALE set too, the fact the rebuild below must flip.
         let gi = root.join("cache/.gitignore");
         assert!(
             matches!(classify(&root, &gi, &ignore_set), Class::Ignore),
             "a self-matching .gitignore must classify Ignore (else this test proves nothing)"
         );
+        assert!(
+            ignore_set.is_ignored(&root.join("cache/keep.log"), false),
+            "keep.log must be ignored under the pre-edit set (else the rebuild proves nothing)"
+        );
+
+        // The edit under test: negate one file.
+        std::fs::write(&gi, "*\n!keep.log\n").unwrap();
 
         let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
         tx.send(Ok(notify::Event::default().add_path(gi))).unwrap();
@@ -2638,6 +2684,64 @@ mod tests {
             pending.is_empty(),
             "the .gitignore itself is still not recorded as watched content"
         );
+
+        // Consumption: `maybe_rebuild` is the loop tick's rate-limited reader
+        // of the flag. This is the part the old test never reached.
+        let rebuilt = maybe_rebuild(&mut gitignore_dirty, &root);
+        assert!(
+            rebuilt.is_some(),
+            "a set dirty flag must produce a rebuilt IgnoreSet"
+        );
+        assert!(
+            !gitignore_dirty,
+            "maybe_rebuild must clear the flag it just consumed"
+        );
+        assert!(
+            !rebuilt
+                .unwrap()
+                .is_ignored(&root.join("cache/keep.log"), false),
+            "the rebuilt IgnoreSet must reflect the edited rules (keep.log re-included)"
+        );
+    }
+
+    // `maybe_rebuild` is the unit-reachable target for the loop tick's rate
+    // rule (at most one full-repo walk per dirty flag) — `run`'s loop body
+    // itself cannot be driven from a unit test.
+    #[test]
+    fn maybe_rebuild_runs_once_per_dirty_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        let mut dirty = false;
+        assert!(
+            maybe_rebuild(&mut dirty, &root).is_none(),
+            "a clear flag must never rebuild"
+        );
+
+        // First dirty setting: rebuilds exactly once, then goes quiet.
+        dirty = true;
+        assert!(maybe_rebuild(&mut dirty, &root).is_some());
+        assert!(
+            !dirty,
+            "the flag must be cleared by the call that consumed it"
+        );
+        assert!(
+            maybe_rebuild(&mut dirty, &root).is_none(),
+            "an immediate second call on a now-clean flag must not rebuild again"
+        );
+
+        // A second, independent dirty setting: still exactly one `Some`.
+        dirty = true;
+        assert!(maybe_rebuild(&mut dirty, &root).is_some());
+        assert!(!dirty);
+        assert!(maybe_rebuild(&mut dirty, &root).is_none());
     }
 
     // ---- D9: event-channel draining + walk exclusion -------------------------
