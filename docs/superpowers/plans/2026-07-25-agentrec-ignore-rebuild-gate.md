@@ -60,9 +60,15 @@ Nothing in the suite exercises a mid-run ignore-rule change.
 - Append-only: `log.jsonl` / `signal.jsonl` never rewritten.
 - `cargo clippy -- -D warnings` + `cargo fmt --check` clean on debug **and** release.
 - Integration tests run `--test-threads=3` (FSEvents contention).
-- Every fixture touching `ignore::` does a real `git init` — `WalkBuilder::require_git` defaults
-  true, and a non-git tempdir applies no ignore rules at all, so the fixture tests nothing. This trap
-  already made `nested_gitignore_precedence` pass vacuously for months.
+- Every **live-daemon** fixture touching `ignore::` does a real `git init` — `WalkBuilder::require_git`
+  defaults true, and without a repo the walk applies no ignore rules, so the recording path is never
+  actually filtered and the fixture proves nothing.
+  **Corrected by measurement in Phase 3 — do not repeat the old wording:** the claim that this trap
+  "already made `nested_gitignore_precedence` pass vacuously for months" is **false**. `matchers.len()`
+  is 2 in all four cells — {pre-D29 `build` body, post-D29} × {`git init`, none} — and every
+  precedence assertion passes in all four. That unit test builds its `IgnoreSet` directly, so it was
+  never vacuous. The claim was inherited from CLAUDE.md, repeated in this plan, and is now corrected
+  in all three places.
 - Any test-only env seam is `#[cfg(debug_assertions)]`-gated; release `strings` must not contain it.
 
 ## Executor protocol
@@ -258,14 +264,16 @@ lost-event consequence and says nothing about walk rate. Add that sentence here,
 ignore-rule change at all. Add the two cases nothing covers, so the next change to this code cannot
 pass for the wrong reason. Tests only — independently mergeable, no behavior change.
 
-**Correction, made before this plan was committed:** CLAUDE.md records `nested_gitignore_precedence`
-as passing **vacuously** in a non-git tempdir. That describes the **pre-D29** state and is no longer
-true at HEAD. `IgnoreSet::build` now probes `dir.join(".gitignore")` for each directory the walk
-reaches instead of relying on the walk to *yield* the ignore file, and a non-git walk still yields
-directories — so both matchers are collected and the test's precedence assertions are real. Adding
-`git init` is still worth doing (it makes the fixture match how the code runs in production, where
-`require_git` governs pruning), but it is **hygiene, not a vacuity fix**, and no AC may claim
-otherwise.
+**Correction, and then a correction to the correction — the second one is measured.** CLAUDE.md
+records `nested_gitignore_precedence` as passing **vacuously** in a non-git tempdir. This plan
+originally said that described the pre-D29 state only. **Both are wrong: the test was never vacuous.**
+Phase 3's reviewer measured `matchers.len()` across all four cells — {pre-D29 `build` body, post-D29}
+× {`git init`, none} — and got **2 every time**, with every precedence assertion passing in every
+cell. The claim is self-refuting on its own terms: it depends on the walk still *yielding* both
+`.gitignore` files without git, which is precisely the condition under which matchers are collected
+and the assertions are real. Adding `git init` is **hygiene, not a vacuity fix**, no AC may claim
+otherwise, and the false claim is corrected in this plan, in the test's own comment, and in
+CLAUDE.md.
 
 **Files:** `cli/src/daemon.rs` (edit — unit tests only), `cli/tests/integration.rs` (edit).
 
@@ -298,6 +306,23 @@ otherwise.
 `cargo test -p agentrec --test integration -- --test-threads=3` → +2. Workspace →
 **395 passed, 0 failed, 1 ignored** — Phase 2 already reached 393, so the previous target of 393
 would let this phase pass having added **neither** of its two required tests.
+
+**DELIVERED at `ec2874b`.** Workspace **395/0/1**, matching the corrected target exactly; confirmed
+independently by implementer, Opus reviewer and orchestrator. Scope held: the `daemon.rs` hunk lands
+inside `mod tests`, so **no production code changed**. Reviewer verdict **DONE**.
+Beyond the plan's own neuter, the reviewer added one this plan did not think to ask for and it earned
+its place: the placement neuter reds all three mid-run tests identically, so it cannot show the
+deletion test covers anything the Phase 1 E2E doesn't. Adding `&& path.is_file()` to the `.gitignore`
+filename trigger reds **only** `deleted_gitignore_rewidens_recording` — that test is the sole thing in
+the suite pinning that the trigger does no `stat`, so a Remove event still sets the dirty flag.
+Also measured rather than reasoned: `new_gitignore_honored_without_restart` is an *absence*
+assertion, so control-after-edit (forbidden for the presence-style Phase 1 test) does not make it
+pass pre-fix — pre-fix the rebuild sat *after* `recorder.stage(&pending)`, and `pending` holds paths
+already classified at ingest, so the ignored file was staged before any rebuild could run.
+Flake: 6/6 consecutive isolated runs at ±0.1 s variance, plus 2 full-suite runs. Watch-item recorded,
+not fixed: the 400 ms sleep in the create-test must cover FSEvents delivery + ≤1 `POLL` tick + a
+full-repo `IgnoreSet::build`; failure direction is RED, never a false pass, and inotify should widen
+the margin — but that is macOS-only evidence.
 
 **Also in scope, carried from the Phase 1 review:** the Phase 1 E2E calls `daemon.kill()` after the
 control assert, so an early control failure drops the `Child` unkilled. Ten integration tests share

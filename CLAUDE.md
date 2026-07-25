@@ -71,13 +71,18 @@ the RED-first test would have gone green pre-fix and its neuter would have prove
 named a counter that lands a phase later plus a fallback assert inside a loop body the plan itself
 calls unit-unreachable; and one Phase 2 AC asserted stderr-line counts inside a 250 ms window, which
 is FSEvents-coalescing flake bait this repo has already been burned by.
-**Correction to a claim this repo has been repeating:** `nested_gitignore_precedence` is **no longer
-vacuous** at HEAD. CLAUDE.md describes it as passing in a non-git tempdir where no rules apply —
-true **pre-D29**; post-D29 `IgnoreSet::build` probes `dir.join(".gitignore")` per directory instead
-of relying on the walk to *yield* the file, and a non-git walk still yields directories, so matchers
-are collected and its assertions are real. Adding `git init` there is hygiene, not a vacuity fix, and
-the plan's AC says so and asks the executor to print `matchers.len()` so the correction is itself
-falsifiable. Also **verified rather than assumed**: `IgnoreSet::is_ignored` maps
+**Correction to a claim this file has been repeating, now measured — `nested_gitignore_precedence`
+was NEVER vacuous.** This entry previously said the "passes vacuously in a non-git tempdir" note was
+true pre-D29 and stale after. Both readings are wrong. Phase 3's reviewer measured `matchers.len()`
+across all four cells — {pre-D29 `build` body, post-D29} × {`git init`, none} — and got **2 in every
+cell**, with every precedence assertion passing in every cell. The claim is self-refuting on its own
+terms: it depends on the walk still *yielding* both `.gitignore` files without git, which is exactly
+the condition under which matchers are collected and the assertions are real. What `require_git`
+genuinely governs is whether ignore rules prune the **traversal**, which is why `git init` is
+load-bearing in **live-daemon** fixtures (a matcher-less walk there really does prove nothing) and
+merely hygiene in a unit test that builds its `IgnoreSet` directly. Corrected in three places —
+here, the plan, and the test's own comment — because a false claim in a source comment is the
+doc-drift class that already produced a GATE FAIL in this repo. Also **verified rather than assumed**: `IgnoreSet::is_ignored` maps
 `ignore::Match::Whitelist` to `false`, so the fixture's `!keep.log` genuinely re-widens.
 
 **(3) Phase 2.0 substrate — `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`** (written the

@@ -1748,17 +1748,21 @@ mod tests {
     // files override shallower ones, `!` re-includes, and a matched directory
     // ignores everything beneath it.
     //
-    // `git init` here is hygiene, not a vacuity fix (Phase 3 of the
-    // rebuild-gate plan): pre-D29, `IgnoreSet::build` relied on a
-    // gitignore-aware walk to *yield* each `.gitignore`, so a non-git tempdir
-    // (where `ignore::WalkBuilder::require_git` applies no rules at all)
-    // still yielded both files and this test passed vacuously. Post-D29,
-    // `build` probes `dir.join(".gitignore")` for every directory the walk
-    // reaches instead, and a non-git walk still yields directories — so the
-    // matchers were collected and these assertions were already real. `git
-    // init` just makes the fixture match how the code runs in production
-    // (where `require_git` also governs traversal pruning). The precondition
-    // assert states what the test depends on.
+    // `git init` here is hygiene, not a vacuity fix, and the widely-repeated
+    // claim that this test "passed vacuously in a non-git tempdir" is simply
+    // FALSE — measured, not argued. `matchers.len()` is **2** in all four
+    // cells: {pre-D29 `build` body, post-D29} × {`git init`, none}, and every
+    // precedence assertion passes in all four. The claim is also self-
+    // refuting: it rests on the walk still *yielding* both `.gitignore` files
+    // without git, which is exactly the condition under which matchers get
+    // collected and the assertions are real.
+    //
+    // What `require_git` genuinely governs is whether ignore rules prune the
+    // *traversal* — which is why `git init` belongs here (it makes the fixture
+    // match production) and why it is load-bearing in the live-daemon tests,
+    // where a matcher-less walk really would prove nothing. The precondition
+    // assert below states what this test depends on so the question never has
+    // to be re-litigated from prose.
     #[test]
     fn nested_gitignore_precedence() {
         let tmp = tempfile::tempdir().unwrap();
