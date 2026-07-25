@@ -6,7 +6,7 @@
 //! logic as `status`/`record`/`init` rather than re-deriving it.
 
 use crate::state::read_state;
-use crate::{agentrec_dir, log_path, objects_dir, signal_path};
+use crate::{agentrec_dir, log_path, objects_dir, signal_path, state_path};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -53,6 +53,19 @@ impl Check {
             name: name.to_string(),
             status: CheckStatus::Fail,
             remedy: Some(remedy.into()),
+        }
+    }
+    /// A non-blocking finding: rendered as `pass` (never contributes to
+    /// `ok`/exit code) but still carries a printed note, unlike a plain
+    /// `pass()`. Used for conditions worth surfacing but not worth breaking
+    /// `doctor`'s all-pass exit-0 deploy gate over (Phase 2, honesty-fixes
+    /// round: a corrupt `state.json` field is exactly this shape — real, but
+    /// self-healing and non-fatal).
+    fn advisory(name: &str, note: impl Into<String>) -> Self {
+        Check {
+            name: name.to_string(),
+            status: CheckStatus::Pass,
+            remedy: Some(note.into()),
         }
     }
 }
@@ -111,6 +124,7 @@ pub(crate) fn diagnose(root: &Path) -> Report {
                 "hook presence",
                 "signal freshness",
                 "store health",
+                "state parse",
                 "store permissions",
                 "inotify headroom",
             ]
@@ -126,6 +140,7 @@ pub(crate) fn diagnose(root: &Path) -> Report {
         check_hooks(root),
         check_signal_freshness(root),
         check_degraded(root),
+        check_state_parse(root),
         check_permissions(root),
         check_inotify(root),
     ];
@@ -315,6 +330,33 @@ fn check_degraded(root: &Path) -> Check {
         )
     } else {
         Check::pass("store health")
+    }
+}
+
+// ---- state.json parse health (Phase 2, honesty-fixes round) ----------------
+
+/// Reports a nonzero `state_parse_failures` (a `state.json` field that
+/// failed to parse and fell back to its default — see `state::read_state`).
+/// Deliberately ADVISORY ONLY, always rendered as `pass`: the condition is
+/// real but self-healing (the next `write_state` call anywhere serializes
+/// the in-memory default back to disk, curing it) and `doctor` all-pass
+/// exit 0 is this repo's production deploy gate — a Fail here would make a
+/// transient, already-recovering parse hiccup block deploys.
+fn check_state_parse(root: &Path) -> Check {
+    let state = read_state(root);
+    if state.state_parse_failures > 0 {
+        Check::advisory(
+            "state parse",
+            format!(
+                "{} field(s) in {} fell back to defaults (last: {}) — advisory only, \
+                 self-heals on the next write; investigate if this recurs",
+                state.state_parse_failures,
+                state_path(root).display(),
+                state.last_bad_field.as_deref().unwrap_or("unknown"),
+            ),
+        )
+    } else {
+        Check::pass("state parse")
     }
 }
 

@@ -438,6 +438,22 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             state.prompt_put_failures
         ));
     }
+    // Phase 2 (honesty-fixes round): `read_state` degrades per FIELD instead
+    // of resetting the whole `state.json` struct on one bad value — this is
+    // the visible evidence that happened. Deliberately not folded into the
+    // "DEGRADED" banners above and not cleared by `--ack-degraded`: unlike a
+    // failed write, a corrupt field self-heals the moment any code path next
+    // calls `write_state` (the in-memory default gets serialized back), so
+    // there is nothing here for a human to acknowledge — only to notice.
+    if state.state_parse_failures > 0 {
+        out.push('\n');
+        out.push_str(&format!(
+            "state.json had {} field(s) fall back to defaults (last: {}) — \
+             self-heals on the next write; run `agentrec doctor` for detail.\n",
+            state.state_parse_failures,
+            state.last_bad_field.as_deref().unwrap_or("unknown"),
+        ));
+    }
     Ok(out)
 }
 
@@ -993,6 +1009,32 @@ mod tests {
 
         let after = read_state(root);
         assert_eq!(after.non_utf8_path_skips, 0);
+    }
+
+    // Phase 2 (honesty-fixes round): a corrupt state.json field bumps
+    // `state_parse_failures` (via `read_state`'s per-field degrade), and
+    // `status` must say so — silent loss of this counter is exactly the
+    // failure shape every other counter on this page exists to prevent.
+    #[test]
+    fn status_report_surfaces_state_parse_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":0,"signal_offset":"nope"}"#,
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("fall back to defaults"),
+            "expected the state-parse notice: {out}"
+        );
+        assert!(
+            out.contains("signal_offset"),
+            "expected the bad field named: {out}"
+        );
     }
 
     // D-PD5: the turns line drops implementer jargon ("agent, git/merged

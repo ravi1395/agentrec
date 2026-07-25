@@ -4520,6 +4520,96 @@ fn doctor_inotify_low_watches_fails() {
     assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
 }
 
+// Phase 2 (honesty-fixes round): a corrupt `state.json` field (e.g.
+// signal_offset written as a string) must surface as an ADVISORY-only
+// doctor finding — reported, but never flips the overall exit code or `ok`.
+// `doctor` all-pass exit 0 is this repo's production deploy gate; treating
+// this as a Fail would block deploys on a condition the daemon's own
+// per-field degrade already recovered from.
+#[test]
+fn doctor_state_parse_advisory_never_flips_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Real hooks installed (matches doctor_healthy_all_pass_exit_0's fixture)
+    // so every OTHER check genuinely passes, isolating the assertion to the
+    // new state-parse finding.
+    let out = agentrec(root, &["init", "--no-service"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    // Corrupt exactly one field (signal_offset) while every other
+    // DEGRADED-triggering counter stays 0 — an exit-1 here could only come
+    // from the new check itself, not from a pre-existing failure mode.
+    // `daemon_is_running` is a flock probe (not this pid value), so
+    // clobbering state.json here doesn't disturb the liveness check.
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":123,"signal_offset":"not-a-number","snapshot_failures":0,"io_failed":[]}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["doctor", "--root", root.to_str().unwrap()])
+        .env(
+            "AGENTREC_CLAUDE_PROJECTS_DIR",
+            tmp.path().join("no-transcripts-here"),
+        )
+        .output()
+        .expect("run agentrec doctor");
+    // Capture --json while the daemon is still alive too — killing it first
+    // would make `daemon liveness` genuinely fail and pollute this test's
+    // `ok:true` assertion with an unrelated failure mode.
+    let v = Command::new(bin())
+        .args(["doctor", "--json", "--root", root.to_str().unwrap()])
+        .env(
+            "AGENTREC_CLAUDE_PROJECTS_DIR",
+            tmp.path().join("no-transcripts-here"),
+        )
+        .output()
+        .map(|o| {
+            serde_json::from_slice::<serde_json::Value>(&o.stdout)
+                .unwrap_or_else(|e| panic!("doctor --json did not emit valid JSON ({e}): {o:?}"))
+        })
+        .expect("run agentrec doctor --json");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "an advisory state-parse finding must never flip doctor's exit code: {out:?}\nstdout={stdout}"
+    );
+    assert!(
+        stdout.contains("signal_offset"),
+        "expected the bad field named: {stdout}"
+    );
+    assert!(
+        stdout.contains("state.json"),
+        "expected the file named: {stdout}"
+    );
+
+    assert_eq!(v["ok"], true, "advisory finding must not flip ok: {v}");
+    let checks = v["checks"].as_array().unwrap();
+    let state_check = checks
+        .iter()
+        .find(|c| c["name"] == "state parse")
+        .unwrap_or_else(|| panic!("no 'state parse' check in {v}"));
+    assert_eq!(
+        state_check["status"], "pass",
+        "advisory finding must render as pass — a Fail here would flip exit: {v}"
+    );
+    assert!(
+        state_check["remedy"]
+            .as_str()
+            .unwrap_or("")
+            .contains("signal_offset"),
+        "expected the remedy to name the bad field: {v}"
+    );
+}
+
 // --- AC-Z+2, AC-Z+3, AC-Z+4 (D42/D43): relative-time default / --utc
 // absolute, color gated off when piped or under NO_COLOR, and the
 // `--explain` glossary only ever mentions terms present in this listing.

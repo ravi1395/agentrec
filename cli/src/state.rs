@@ -76,13 +76,111 @@ pub struct State {
     /// posture as `ignore_rebuilds`.
     #[serde(default)]
     pub last_ignore_rebuild_ms: u64,
+    /// Count of individual `state.json` FIELDS that failed to parse and fell
+    /// back to their default (Phase 2, honesty-fixes round). Distinct from
+    /// every other counter here in one way: it counts a failure in reading
+    /// this very struct, not a failure in some other subsystem. Persisted
+    /// like the rest — a corrupt field heals itself the next time any code
+    /// path calls `write_state` (the in-memory default gets serialized back),
+    /// so this counter is the only durable evidence the corruption ever
+    /// happened once that heal fires.
+    #[serde(default)]
+    pub state_parse_failures: u64,
+    /// Name of the last field that failed to parse (e.g. `"signal_offset"`),
+    /// or the sentinel below when the whole file was unreadable/not JSON.
+    /// `None` only when `state_parse_failures` is 0.
+    #[serde(default)]
+    pub last_bad_field: Option<String>,
 }
 
+/// Sentinel `last_bad_field` value for a file that could not be parsed as a
+/// JSON object at all (unreadable, truncated, or valid JSON of the wrong
+/// shape) — there is no single field name to blame.
+const WHOLE_FILE_SENTINEL: &str = "<state.json: unreadable or not a JSON object>";
+
+/// Read `state.json`, degrading PER FIELD rather than resetting the whole
+/// struct on one bad value (Phase 2, honesty-fixes round). A single corrupt
+/// field — e.g. `signal_offset` written as a string — must cost only that
+/// field: every sibling field (`pid`, `snapshot_failures`, `io_failed`, ...)
+/// keeps its real persisted value. This matters most for `signal_offset`
+/// itself: resetting it to 0 on an unrelated field's corruption would replay
+/// the entire `signal.jsonl` hook inbox from byte zero.
+///
+/// `#[serde(default)]` alone (the taken plan decision) only rescues a field
+/// that is MISSING from the JSON — a struct-level `serde_json::from_str::
+/// <State>` still fails outright the instant one PRESENT field has the wrong
+/// type (e.g. a string where a `u64` is expected), which is exactly the shape
+/// every acceptance criterion here needs to survive. So this parses into a
+/// generic `serde_json::Value` first and converts each field independently,
+/// falling back to that field's `Default` and counting the miss. This is the
+/// case flagged in the plan's open question: per-field `#[serde(default)]`
+/// alone cannot cover a wrong-TYPE field, only a missing one.
+///
+/// A missing `state.json` (first run, nothing to degrade) returns plain
+/// defaults with no counter bump — that is normal, not a failure. A file that
+/// exists but is unreadable, or whose content is not a JSON object at all, is
+/// genuinely unrecoverable field-by-field; it still degrades to defaults, but
+/// counts as exactly one failure (`state_parse_failures = 1`,
+/// `last_bad_field` = the whole-file sentinel) rather than being silent.
 pub fn read_state(root: &Path) -> State {
-    std::fs::read_to_string(state_path(root))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let text = match std::fs::read_to_string(state_path(root)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+        Err(_) => return whole_file_failure(), // exists but unreadable (e.g. permissions)
+    };
+    let obj = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => return whole_file_failure(), // not JSON, or valid JSON that isn't an object
+    };
+
+    let mut failures = 0u64;
+    let mut last_bad: Option<String> = None;
+    macro_rules! field {
+        ($name:literal) => {
+            match obj.get($name) {
+                None => Default::default(),
+                Some(v) => match serde_json::from_value(v.clone()) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        failures += 1;
+                        last_bad = Some($name.to_string());
+                        Default::default()
+                    }
+                },
+            }
+        };
+    }
+
+    let mut state = State {
+        pid: field!("pid"),
+        signal_offset: field!("signal_offset"),
+        snapshot_failures: field!("snapshot_failures"),
+        io_failed: field!("io_failed"),
+        memory_rejects: field!("memory_rejects"),
+        unknown_signal_ignored: field!("unknown_signal_ignored"),
+        non_utf8_path_skips: field!("non_utf8_path_skips"),
+        prompt_put_failures: field!("prompt_put_failures"),
+        ignore_rebuilds: field!("ignore_rebuilds"),
+        last_ignore_rebuild_ms: field!("last_ignore_rebuild_ms"),
+        state_parse_failures: field!("state_parse_failures"),
+        last_bad_field: field!("last_bad_field"),
+    };
+
+    // Accumulate onto whatever count was already persisted (itself read
+    // tolerantly above) — same accumulation pattern as `record_io_failure`.
+    state.state_parse_failures += failures;
+    if last_bad.is_some() {
+        state.last_bad_field = last_bad;
+    }
+    state
+}
+
+fn whole_file_failure() -> State {
+    State {
+        state_parse_failures: 1,
+        last_bad_field: Some(WHOLE_FILE_SENTINEL.to_string()),
+        ..State::default()
+    }
 }
 
 /// Persist `state` atomically (tmp+rename): a crash mid-write must not leave
@@ -229,5 +327,123 @@ mod tests {
         let text = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&text).unwrap();
         assert_eq!(back.prompt_put_failures, 1);
+    }
+
+    // Phase 2 (honesty-fixes round): `read_state` must degrade PER FIELD, not
+    // reset the whole struct on one bad field. A `signal_offset` that fails
+    // to parse must not cost `pid`/`snapshot_failures`/`io_failed` — those
+    // are sibling fields with no relationship to the corrupt one. Neuter:
+    // restore the old `.ok().and_then(...).unwrap_or_default()` chain (which
+    // discards the entire struct on any single field error) → RED.
+    #[test]
+    fn state_survives_one_bad_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":7,"signal_offset":"not-a-number","snapshot_failures":2,"io_failed":["a.rs"]}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.pid, 7,
+            "sibling field pid must survive a corrupt signal_offset"
+        );
+        assert_eq!(
+            state.snapshot_failures, 2,
+            "sibling field snapshot_failures must survive"
+        );
+        assert_eq!(
+            state.io_failed,
+            vec!["a.rs".to_string()],
+            "sibling field io_failed must survive"
+        );
+        assert_eq!(
+            state.signal_offset, 0,
+            "the corrupt field itself falls back to its default"
+        );
+        assert_eq!(
+            state.state_parse_failures, 1,
+            "the corrupt field must be counted, not silent"
+        );
+        assert_eq!(state.last_bad_field.as_deref(), Some("signal_offset"));
+    }
+
+    // The criterion that matters most: a corrupt field OTHER than
+    // signal_offset must never reset signal_offset to 0, because that
+    // replays the entire signal.jsonl inbox from byte 0. Neuter: same whole-
+    // struct reset → RED.
+    #[test]
+    fn corrupt_field_does_not_replay_signal_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":1,"signal_offset":4096,"io_failed":"not-an-array"}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.signal_offset, 4096,
+            "a corrupt UNRELATED field must never reset signal_offset — \
+             that would replay the whole signal inbox"
+        );
+        assert_eq!(state.state_parse_failures, 1);
+        assert_eq!(state.last_bad_field.as_deref(), Some("io_failed"));
+    }
+
+    // A file that is not JSON at all (or unreadable) genuinely cannot be
+    // recovered field-by-field — but that must still be COUNTED, never
+    // silent. Neuter: drop the counter increment on this path → RED.
+    #[test]
+    fn wholly_unparseable_state_counts_failure_and_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(state_path(root), "not json at all { garbage").unwrap();
+
+        let state = read_state(root);
+        assert_eq!(state.pid, 0);
+        assert_eq!(state.signal_offset, 0);
+        assert_eq!(
+            state.state_parse_failures, 1,
+            "a wholly unparseable file must still be counted, not silent"
+        );
+        assert!(state.last_bad_field.is_some());
+    }
+
+    // A healthy state.json (nothing corrupt) must round-trip byte-identically
+    // through read_state -> write_state: the per-field extraction must not
+    // introduce drift for the common case.
+    #[test]
+    fn read_state_round_trips_healthy_file_byte_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut state = State {
+            pid: 55,
+            signal_offset: 999,
+            ..State::default()
+        };
+        record_io_failure(&mut state, "x.rs");
+        write_state(root, &state).unwrap();
+
+        let text_before = std::fs::read_to_string(state_path(root)).unwrap();
+        let reloaded = read_state(root);
+        assert_eq!(
+            reloaded.state_parse_failures, 0,
+            "no failures on a healthy file"
+        );
+        write_state(root, &reloaded).unwrap();
+        let text_after = std::fs::read_to_string(state_path(root)).unwrap();
+
+        assert_eq!(
+            text_before, text_after,
+            "a healthy state.json must round-trip byte-identically"
+        );
     }
 }
