@@ -502,45 +502,86 @@ fn blame_line(
     }
     let target_text = lines[line_no - 1];
 
-    let mut responsible: Option<&TurnRecord> = None;
-    for t in touching {
+    // `touching` is oldest→newest (append order — see the doc comment
+    // above). `responsible` tracks the newest turn whose recorded diff
+    // introduces `target_text`; `newest_unresolvable_idx` tracks the newest
+    // candidate whose `before`/`after` snapshot didn't resolve, so a turn
+    // can't be silently skipped past — mirrors the `has_gap_after`
+    // poisoning idiom below, but for missing snapshots instead of missing
+    // recording coverage.
+    let mut responsible: Option<(usize, &TurnRecord)> = None;
+    let mut newest_unresolvable_idx: Option<usize> = None;
+    for (idx, t) in touching.iter().enumerate() {
         let Some(entry) = t.files.iter().find(|f| f.path == file) else {
             continue;
         };
         let before = load_text(store, entry.before.as_deref());
         let after = load_text(store, entry.after.as_deref());
+        let (Some(before), Some(after)) = (before, after) else {
+            // Can't compute this turn's diff at all — it might have
+            // introduced or removed `target_text`; treat it as poisoning
+            // rather than silently skipping it (that would either wrongly
+            // credit an older turn or wrongly fall through to "before
+            // recording began").
+            newest_unresolvable_idx = Some(idx);
+            continue;
+        };
         let intro = diff::added_or_changed_lines(&before, &after);
         if intro.iter().any(|l| l == target_text) {
-            responsible = Some(t);
+            responsible = Some((idx, t));
         }
     }
 
+    // A responsible turn is only honestly reportable when no unresolvable
+    // candidate is NEWER than it — a newer unresolvable turn could have
+    // overwritten the line, so naming the older turn would be a guess.
+    let responsible_poisoned = matches!(
+        (responsible, newest_unresolvable_idx),
+        (Some((r_idx, _)), Some(u_idx)) if u_idx > r_idx
+    );
+
     match responsible {
-        Some(t) => println!("{file}:{line_no}: {}", render_turn(t)),
-        // E3: no turn's recorded diff introduces this exact line text. That
-        // is only honestly "before recording began" when the whole history
-        // is actually gap-free — a line that was silently added during an
+        Some((_, t)) if !responsible_poisoned => {
+            println!("{file}:{line_no}: {}", render_turn(t));
+        }
+        // Some candidate's snapshot didn't resolve (whether or not a
+        // now-poisoned `responsible` was also found) — the CRITICAL SCOPE
+        // RULE: this branches only on `store.get` failing, never on why.
+        _ if newest_unresolvable_idx.is_some() => {
+            println!("{file}:{line_no}: attribution unavailable — snapshot unavailable");
+        }
+        // E3: no turn's recorded diff introduces this exact line text, and
+        // every candidate's snapshot resolved cleanly. That is only
+        // honestly "before recording began" when the whole history is
+        // actually gap-free — a line that was silently added during an
         // uncovered interval (then folded into a later turn's unchanged
         // `before`) would otherwise be misreported as predating all
         // recording, when really its origin is just unknown.
         None if has_gap_after(records, "") => {
             println!("{file}:{line_no}: attribution stale — recording gap");
         }
-        None => println!("{file}:{line_no}: before recording began"),
+        _ => println!("{file}:{line_no}: before recording began"),
     }
     Ok(())
 }
 
-/// Loads blob text by optional hash, empty on any read error (purged,
-/// corrupt) or absent hash — line-diffing degrades to "no lines introduced"
-/// rather than failing the whole blame.
-fn load_text(store: &BlobStore, hash: Option<&str>) -> String {
+/// Loads blob text by optional hash, distinguishing two shapes callers must
+/// not conflate: `None` hash is legitimately-empty text (a `create` op has
+/// no `before` — every line of its `after` really was introduced by that
+/// turn, and collapsing that to "unresolvable" would wrongly deny credit
+/// for every file-creating turn). `Some(hash)` that fails to resolve (any
+/// error — the caller must not, and does not, care which) is UNRESOLVABLE
+/// and returned as `None`, never silently coerced to empty text: an
+/// unresolvable snapshot is not "no text there", it's "no idea what text
+/// was there", and must poison the comparison rather than let it pass
+/// through as if nothing changed.
+fn load_text(store: &BlobStore, hash: Option<&str>) -> Option<String> {
     match hash {
-        None => String::new(),
-        Some(h) => match store.get(h) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => String::new(),
-        },
+        None => Some(String::new()),
+        Some(h) => store
+            .get(h)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
     }
 }
 
@@ -1094,4 +1135,37 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BL1: `load_text` must tell "legitimately empty" (no hash at all, e.g.
+    // a `create` op's `before`) apart from "unresolvable" (a hash is
+    // recorded but the blob won't load) — collapsing both to `""` is
+    // exactly the bug (blame credits any turn for any line once one
+    // candidate's `before` goes missing).
+    #[test]
+    fn load_text_distinguishes_absent_resolvable_and_unresolvable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path().join("objects"));
+
+        // Absent hash (e.g. a `create` op's `before`) — legitimately empty.
+        assert_eq!(load_text(&store, None), Some(String::new()));
+
+        // Resolvable hash — real content comes back.
+        let hash = store.put(b"hello\n").unwrap();
+        assert_eq!(load_text(&store, Some(&hash)), Some("hello\n".to_string()));
+
+        // Present-but-unresolvable hash: well-formed, genuinely never
+        // stored — proves the store really can't resolve it, rather than
+        // assuming so.
+        let ghost = agentrec_core::store::hash_bytes(b"never-actually-stored");
+        assert!(
+            store.get(&ghost).is_err(),
+            "precondition: ghost must be genuinely unresolvable"
+        );
+        assert_eq!(load_text(&store, Some(&ghost)), None);
+    }
 }

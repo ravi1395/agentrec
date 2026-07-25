@@ -1397,6 +1397,192 @@ fn blame_gap_is_stale() {
     );
 }
 
+#[test]
+fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
+    // BL2/BL3: a turn whose `before` blob doesn't resolve must never be
+    // credited for a line it merely happens to still contain. T1 genuinely
+    // introduced "a"; T2's own `before` snapshot is gone, so whether T2
+    // changed line 1 is unknown, not "definitely not" — blame must refuse
+    // rather than guess T1 either.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::{hash_bytes, BlobStore};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after1 = store.put(b"a\nb\n").unwrap();
+    let turn1 = make_turn(
+        "t_BLUNRESOLVE1000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("first pass introduces a and b"),
+        vec![FileEntry {
+            path: "f.rs".into(),
+            before: None,
+            after: Some(after1),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn1);
+
+    // A well-formed hash that was never actually written to the store —
+    // proves the "unresolvable" precondition for real rather than assuming
+    // it (a torn/absent-by-construction hash would test nothing).
+    let ghost_hash = hash_bytes(b"never-actually-stored");
+    assert!(
+        store.get(&ghost_hash).is_err(),
+        "precondition: ghost_hash must be genuinely unresolvable"
+    );
+
+    let after2 = store.put(b"a\nb\n").unwrap(); // textually unchanged from turn1
+    let turn2 = make_turn(
+        "t_BLUNRESOLVE2000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T10:00:00.000Z",
+        Some("second pass unresolvable before"),
+        vec![FileEntry {
+            path: "f.rs".into(),
+            before: Some(ghost_hash),
+            after: Some(after2),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn2);
+
+    std::fs::write(root.join("f.rs"), b"a\nb\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f.rs:1"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("f.rs:1: attribution unavailable — snapshot unavailable"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("second pass unresolvable before"),
+        "must not credit T2 (unresolvable before): stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("first pass introduces a and b"),
+        "must not silently credit T1 either — a newer unresolvable turn could \
+         have overwritten this line: stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("before recording began"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("attribution stale — recording gap"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn blame_line_create_turn_still_credited() {
+    // BL4 regression guard: a `create` turn (before == None) is legitimately
+    // empty-before, not unresolvable — every line of its `after` really was
+    // introduced by it. Must keep working exactly as before the fix.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"x\ny\n").unwrap();
+    let turn = make_turn(
+        "t_BLCREATE0000000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("create f2.rs"),
+        vec![FileEntry {
+            path: "f2.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn);
+    std::fs::write(root.join("f2.rs"), b"x\ny\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f2.rs:2"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("create f2.rs"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("attribution unavailable"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn blame_line_unresolvable_after_not_false_predating() {
+    // BL5: an unresolvable `after` must not silently degrade to "before
+    // recording began" — that would be a confident false negative. The
+    // turn genuinely touched this file; its outcome just isn't provable.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::{hash_bytes, BlobStore};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"a\nb\n").unwrap();
+    let ghost_after = hash_bytes(b"never-actually-stored-after");
+    assert!(
+        store.get(&ghost_after).is_err(),
+        "precondition: ghost_after must be genuinely unresolvable"
+    );
+
+    let turn = make_turn(
+        "t_BLAFTERGHOST00000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("edit with lost after snapshot"),
+        vec![FileEntry {
+            path: "f3.rs".into(),
+            before: Some(before),
+            after: Some(ghost_after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    std::fs::write(root.join("f3.rs"), b"a\nb\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f3.rs:1"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("f3.rs:1: attribution unavailable — snapshot unavailable"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("before recording began"),
+        "stdout: {stdout}"
+    );
+}
+
 // --- AC H1–H7, Z+1/D42: `undo` reverts a turn's file changes, per file, with
 // a preview-first destructive gate. Seeded directly via agentrec-core, same
 // rationale as the `diff`/`blame` tests above — the on-disk fixture bytes
