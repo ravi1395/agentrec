@@ -210,7 +210,7 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
         println!("{payload}");
         return Ok(());
     }
-    print!("{}", status_report(root, agentrec_core::MAX_STORE_BYTES)?);
+    print!("{}", status_report(root, effective_store_budget())?);
     Ok(())
 }
 
@@ -351,7 +351,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // receipt for why. Prompt blobs are exempt; only snapshot blobs evict.
     if size > budget {
         let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
-        let evicted = agentrec_core::retention::enforce_budget(&store, &owned_turns, budget);
+        // SAFETY (Phase 1 honesty fix): harvest the protect-set as late as
+        // possible, immediately before calling `enforce_budget`, to narrow
+        // the window a live daemon (running continuously under launchd —
+        // Decisions log #2, no liveness refusal here) could append a new
+        // in-flight blob after we've read log.jsonl/open.json but before the
+        // remove loop runs.
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns,
+            budget,
+            &extra_protected,
+        );
         // Honesty (B): budget enforcement here only evicts turn-referenced
         // snapshot blobs. Most store bloat is usually ORPHANED blobs —
         // superseded intermediate snapshots the daemon `put` for crash
@@ -366,6 +378,16 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             human_bytes(budget),
             human_bytes(evicted.bytes)
         ));
+        // Honesty (Phase 1): protecting pinned/in-flight refs shrinks
+        // `evicted.bytes` — sometimes to 0 even while genuinely over
+        // budget — and an unexplained "0 freed" is exactly the dishonest
+        // status class the orphan-bloat attribution above already fixed.
+        if evicted.protected_bytes > 0 {
+            out.push_str(&format!(
+                "; {} protected (pinned or in-flight — never evicted)",
+                human_bytes(evicted.protected_bytes)
+            ));
+        }
         if orphans > 0 {
             out.push_str(&format!(
                 "; {} is unreferenced (superseded snapshots) — run `agentrec purge --orphans` to reclaim",
@@ -417,6 +439,54 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// Phase 1 honesty fix: hashes `enforce_budget`'s own structured walk over
+/// its `entries` argument cannot see, so must be protected separately —
+/// `open.json` (the in-flight turn's crash journal), `memory.jsonl` (pin
+/// hashes `verify`'s pin-diff resolves as CAS blobs), and any `log.jsonl`
+/// line `load_log` silently dropped as torn/unparseable.
+///
+/// Deliberately NOT `purgecmd::referenced_hashes` wholesale: that function
+/// also folds in every VALIDLY-referenced `log.jsonl` hash, which is
+/// correct for `--orphans`' absence-based test (anything cited anywhere,
+/// however old, must survive) but wrong here — `enforce_budget`'s own
+/// age-based walk already decided a validly-referenced blob's fate
+/// (including evicting a sole old turn's blob when nothing older exists to
+/// sacrifice, `status_prints_over_budget_notice`); passing the FULL
+/// referenced-anywhere set as `extra_protected` would protect every
+/// snapshot ever committed and silently defeat the budget. Only refs
+/// invisible to a structured `load_log` parse are "extra".
+fn extra_protected_refs(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    // open.json + memory.jsonl are never themselves a `TurnRecord`, so
+    // every ref in them is "extra" by construction — no validity filter
+    // needed (mirrors `recover_orphan`'s own tolerance of a corrupt
+    // journal: raw bytes are scanned whether or not they parse).
+    for path in [
+        crate::open_path(root),
+        agentrec_core::memory::memory_path(root),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            crate::purgecmd::harvest_refs(&text, &mut out);
+        }
+    }
+    // log.jsonl: only lines `load_log` could NOT parse contribute — a
+    // validly-parsed line's hashes are already reachable through
+    // `owned_turns`, so re-adding them here would over-protect (see the
+    // doc comment above).
+    if let Ok(text) = std::fs::read_to_string(log_path(root)) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<LogRecord>(trimmed).is_err() {
+                crate::purgecmd::harvest_refs(trimmed, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// `hook`: invoked by a Claude Code lifecycle hook with the JSON payload on
@@ -478,6 +548,31 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Test-only override (Phase 1, `cli/tests/integration.rs`,
+/// `status_eviction_keeps_open_turn_blob`) that lets an integration test
+/// exercise the real `status` verb's over-budget/eviction path — the AC
+/// this test proves is call-site wiring (does `status` actually pass the
+/// harvested protect-set into `enforce_budget`?), not the eviction
+/// mechanism itself (already core-unit-tested), and a genuine ~2 GiB store
+/// is infeasible to build in a test. Same `#[cfg(debug_assertions)]`
+/// fail-safe class as [`TEST_FORCE_BUDGET_EXCEEDED_VAR`] below — compiled
+/// out of release builds, so it can never override a real user's budget.
+#[cfg(debug_assertions)]
+const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
+
+/// [`agentrec_core::MAX_STORE_BYTES`] unless [`TEST_STORE_BUDGET_BYTES_VAR`]
+/// is set to a valid `u64`, in which case that value is used instead. The
+/// override is a no-op — the env is never read — in release builds.
+fn effective_store_budget() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
+        if let Ok(n) = v.parse::<u64>() {
+            return n;
+        }
+    }
+    agentrec_core::MAX_STORE_BYTES
 }
 
 /// Test-only override (`cli/tests/integration.rs`,
@@ -747,6 +842,24 @@ mod tests {
     use super::*;
     use agentrec_core::record::{append_log, FileEntry};
 
+    /// In a release build, `TEST_STORE_BUDGET_BYTES_VAR` must be a no-op —
+    /// proves the `#[cfg(debug_assertions)]` arm actually compiles out the
+    /// env read rather than merely being unreachable dead code. Only runs
+    /// under `cargo test --release` (the debug test build never exercises
+    /// this arm at all). Same fail-safe class as
+    /// `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn store_budget_override_is_a_no_op_in_release() {
+        std::env::set_var("AGENTREC_TEST_STORE_BUDGET_BYTES", "5");
+        assert_eq!(
+            effective_store_budget(),
+            agentrec_core::MAX_STORE_BYTES,
+            "release builds must never honor AGENTREC_TEST_STORE_BUDGET_BYTES"
+        );
+        std::env::remove_var("AGENTREC_TEST_STORE_BUDGET_BYTES");
+    }
+
     fn turn_with_snapshot(id: &str, path: &str, hash: &str) -> TurnRecord {
         TurnRecord {
             v: 1,
@@ -1001,6 +1114,301 @@ mod tests {
         assert!(
             out.to_lowercase().contains("reload"),
             "expected a reload line once ignore_rebuilds > 0: {out}"
+        );
+    }
+
+    // ---- Phase 1: enforce_budget's extra_protected wiring -----------------
+    //
+    // Backdates a blob's mtime well before `enforce_budget`'s internal
+    // `pass_start` so the pre-existing A3(c) freshness guard cannot rescue
+    // it vacuously — these fixtures must genuinely be old, evictable
+    // candidates that only survive because of the Phase 1 protect-set.
+    fn backdate(objects_dir: &std::path::Path, hash: &str, secs_ago: u64) {
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    fn owned_turns(root: &Path) -> Vec<TurnRecord> {
+        agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect()
+    }
+
+    // A blob cited only by the in-flight turn's crash journal (`open.json`)
+    // and one otherwise-evictable OLD turn must survive: `open.json`'s
+    // `before` for a file is exactly the prior committed turn's `after` for
+    // that same file, so a live daemon's in-flight state and an "old"
+    // budget-eviction candidate are frequently the SAME blob. Neuter: drop
+    // `open.json` from `purgecmd::referenced_hashes`'s scanned paths.
+    #[test]
+    fn eviction_keeps_open_turn_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 500]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_OPENOLD00000000000000001",
+                "old.bin",
+                &old,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_OPENNEW00000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // Simulates the daemon's crash journal: the in-flight open turn's
+        // `before` cites the same blob. Raw text is enough here —
+        // `referenced_hashes` scans for `sha256:<hex>` regardless of JSON
+        // shape.
+        std::fs::write(crate::open_path(root), format!(r#"{{"before":"{old}"}}"#)).unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(
+            store.contains(&old),
+            "blob cited by the in-flight turn must survive"
+        );
+        assert!(store.contains(&new));
+        assert_eq!(evicted.bytes, 0, "nothing freed — old blob was protected");
+    }
+
+    // A blob cited only by a `memory.jsonl` pin (which `verify`'s pin-diff
+    // resolves as a CAS blob to render old content) must survive the same
+    // way. Neuter: drop `memory.jsonl` from the scanned paths.
+    #[test]
+    fn eviction_keeps_pinned_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xBBu8; 500]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_PINOLD00000000000000001",
+                "old.bin",
+                &old,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_PINNEW00000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // A real, parseable memory pin citing `old` — exactly the shape
+        // `verify`'s pin-diff resolves.
+        agentrec_core::memory::append_memory(
+            root,
+            &agentrec_core::memory::MemoryRecord {
+                v: 1,
+                kind: "memory".into(),
+                id: "mem_TESTPIN000000000000001".into(),
+                op: agentrec_core::memory::MemoryOp::Assert,
+                fact: "test pinned fact".into(),
+                pins: vec![agentrec_core::memory::Pin {
+                    path: "old.bin".into(),
+                    hash: old.clone(),
+                }],
+                source_turns: vec![],
+                origin: "human".into(),
+                ts: 0,
+                reason: None,
+            },
+        )
+        .unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(store.contains(&old), "pinned blob must survive");
+        assert!(store.contains(&new));
+        assert_eq!(
+            evicted.bytes, 0,
+            "nothing freed — pinned blob was protected"
+        );
+    }
+
+    // A blob cited only by a torn/unparseable line survives too — in
+    // log.jsonl (a corrupted committed-turn line `load_log` silently drops)
+    // and, separately, in a truncated open.json (which `recover_orphan`
+    // itself already treats as discardable, per its own comment). This is
+    // the criterion that lifts eviction to purge's own guarantee: the
+    // protect-set must come from the RAW scan, never from re-parsing.
+    // Neuter: build the protect-set from `load_log`/serde instead of the
+    // raw scan (both for log.jsonl and open.json).
+    #[test]
+    fn eviction_keeps_torn_line_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        // Sub-case 1: a torn log.jsonl line.
+        let torn_log = store.put(&[0x11u8; 500]).unwrap();
+        backdate(&objects_dir(root), &torn_log, 3600);
+        // Sub-case 2: a truncated open.json.
+        let torn_open = store.put(&[0x22u8; 500]).unwrap();
+        backdate(&objects_dir(root), &torn_open, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        // Each torn blob is ALSO a normal, structurally-visible eviction
+        // candidate via one old committed turn — proving survival is due to
+        // the torn-line/open.json ref, not ordinary A5/A2 protection.
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNLOG0000000000000001",
+                "log.bin",
+                &torn_log,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNOPEN00000000000001",
+                "open.bin",
+                &torn_open,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNNEW0000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // A truncated mid-JSON line, invalid on its own — `load_log` skips
+        // it — but carrying a valid `sha256:<64hex>` the raw scan finds.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_path(root))
+            .unwrap();
+        use std::io::Write;
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_TORN","files":[{{"before":"{torn_log}"#
+        )
+        .unwrap();
+
+        // A truncated open.json — not valid `OrphanJournal` JSON, but still
+        // carrying the hash.
+        std::fs::write(
+            crate::open_path(root),
+            format!(r#"{{"files":[{{"before":"{torn_open}"#),
+        )
+        .unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(
+            store.contains(&torn_log),
+            "blob cited only by a torn log.jsonl line must survive"
+        );
+        assert!(
+            store.contains(&torn_open),
+            "blob cited only by a truncated open.json must survive"
+        );
+        assert!(store.contains(&new));
+        assert_eq!(
+            evicted.bytes, 0,
+            "nothing freed — both torn-cited blobs were protected"
+        );
+    }
+
+    // Over-budget status where EVERY eviction candidate is protected must
+    // explain why 0 bytes were freed, naming pinned/in-flight refs — "over
+    // budget, 0 freed" with no explanation is the exact dishonest-status
+    // shape an earlier round fixed for the orphan-bloat case. Neuter: delete
+    // the attribution clause.
+    #[test]
+    fn status_attributes_protected_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 800]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+
+        let turn = turn_with_snapshot("t_ALLPROTECTED0000000000001", "old.bin", &old);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        // The sole turn's own blob is protected via A5 (newest-turn), so
+        // exercise the in-flight path instead by seeding open.json with the
+        // SAME hash after also making it look like a low-budget candidate
+        // via a second, newer turn that pushes it out of `keep`.
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+        let newer = turn_with_snapshot("t_ALLPROTECTEDNEW000000001", "new.bin", &new);
+        append_log(&log_path(root), &LogRecord::Turn(newer)).unwrap();
+        std::fs::write(crate::open_path(root), format!(r#"{{"before":"{old}"}}"#)).unwrap();
+
+        // Budget small enough that `old` is a candidate.
+        let out = status_report(root, 5).unwrap();
+        assert!(out.contains("over"), "expected over-budget notice: {out}");
+        assert!(
+            out.contains("snapshot eviction freed 0 B"),
+            "expected 0 freed: {out}"
+        );
+        assert!(
+            out.contains("protected") && (out.contains("pinned") || out.contains("in-flight")),
+            "expected a protected-bytes attribution naming pinned/in-flight: {out}"
         );
     }
 }

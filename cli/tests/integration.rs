@@ -7964,3 +7964,103 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
         "expected every failure stat to be tagged reason:store_corrupt: {stats:?}"
     );
 }
+
+// Phase 1 (honesty-fixes round) — call-site wiring: proves `status`
+// actually threads its harvested protect-set into `enforce_budget`, not
+// just that the core mechanism honors one when handed one directly (that's
+// already unit-tested in `cli/src/cmds.rs`'s `eviction_keeps_*` tests). A
+// real ~2 GiB store is infeasible here, so this drives the real binary with
+// the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` override (compiled out
+// of release — see `cmds::effective_store_budget`), seeding an old,
+// otherwise-evictable turn whose blob is ALSO the in-flight open turn's
+// `before` — exactly the live-daemon scenario this phase's defect
+// describes (open.json's before is typically the previous committed
+// turn's after for the same file).
+#[test]
+fn status_eviction_keeps_open_turn_blob() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let old = store.put(&[0xAAu8; 500]).unwrap();
+    // Backdate well before `enforce_budget`'s internal `pass_start` so the
+    // pre-existing A3(c) freshness guard can't rescue it vacuously.
+    {
+        let hex = old.strip_prefix("sha256:").unwrap();
+        let path = root
+            .join(".agentrec/objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+
+    seed_turn(
+        root,
+        &base_turn(
+            "t_OPENWIRE0000000000000001",
+            vec![FileEntry {
+                path: "old.bin".into(),
+                before: None,
+                after: Some(old.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            }],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn(
+            "t_OPENWIRENEW000000000001",
+            vec![FileEntry {
+                path: "new.bin".into(),
+                before: None,
+                after: Some(new.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            }],
+        ),
+    );
+
+    // Simulates the daemon's crash journal: the in-flight open turn's
+    // `before` cites the same blob as the old committed turn's `after`.
+    std::fs::write(
+        root.join(".agentrec/open.json"),
+        format!(r#"{{"before":"{old}"}}"#),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["status", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")
+        .output()
+        .expect("run agentrec status");
+    assert!(out.status.success(), "status failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("over"),
+        "expected over-budget notice: {stdout}"
+    );
+
+    assert!(
+        store.contains(&old),
+        "the in-flight turn's blob must survive a real `status` eviction pass: {stdout}"
+    );
+    assert!(store.contains(&new));
+}
