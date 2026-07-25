@@ -76,6 +76,23 @@ pub struct State {
     /// posture as `ignore_rebuilds`.
     #[serde(default)]
     pub last_ignore_rebuild_ms: u64,
+    /// Ignore-set rebuilds since the CURRENT daemon epoch started (Phase 3,
+    /// honesty-fixes round — open question 1 answered as option (a)).
+    /// `status` renders THIS figure, never `ignore_rebuilds`: a long-lived
+    /// repo would otherwise eventually render `reloaded 4821 time(s)` in a
+    /// daily-driver surface whose line budget is contested. `ignore_rebuilds`
+    /// itself is untouched by the reset below and keeps accumulating — it is
+    /// real lifetime history and must not be destroyed.
+    #[serde(default)]
+    pub epoch_ignore_rebuilds: u64,
+    /// The pid `epoch_ignore_rebuilds` was last reset for. `acquire_lock`
+    /// (daemon.rs) already writes `state.pid = std::process::id()` before
+    /// anything else happens in a fresh daemon run, so the first
+    /// `record_ignore_rebuild` call of a new daemon epoch observes
+    /// `pid != epoch_pid` and resets — no daemon.rs changes needed to detect
+    /// the boundary. Not surfaced to `status`/`--json`; purely bookkeeping.
+    #[serde(default)]
+    pub epoch_pid: u32,
     /// Count of individual `state.json` FIELDS that failed to parse and fell
     /// back to their default (Phase 2, honesty-fixes round). Distinct from
     /// every other counter here in one way: it counts a failure in reading
@@ -164,6 +181,8 @@ pub fn read_state(root: &Path) -> State {
         last_ignore_rebuild_ms: field!("last_ignore_rebuild_ms"),
         state_parse_failures: field!("state_parse_failures"),
         last_bad_field: field!("last_bad_field"),
+        epoch_ignore_rebuilds: field!("epoch_ignore_rebuilds"),
+        epoch_pid: field!("epoch_pid"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -226,12 +245,24 @@ pub fn record_prompt_put_failure(state: &mut State) {
     state.prompt_put_failures += 1;
 }
 
-/// Record a completed `IgnoreSet` rebuild: bumps the counter and stamps the
-/// wall-clock time it happened, so `status` can render "reloaded N time(s),
-/// last ... ago" — and print nothing at all when `ignore_rebuilds` is still
-/// 0 (never a vacuous "0 reloads" line).
+/// Record a completed `IgnoreSet` rebuild: bumps the lifetime and epoch
+/// counters and stamps the wall-clock time it happened, so `status` can
+/// render "reloaded N time(s), last ... ago" — and print nothing at all when
+/// the epoch counter is still 0 (never a vacuous "0 reloads" line).
+///
+/// Epoch detection (Phase 3): if `state.pid` (set by `acquire_lock` before
+/// anything else runs in a fresh daemon process) no longer matches
+/// `state.epoch_pid` (the pid the epoch counter was last reset for), a new
+/// daemon epoch has begun since the last rebuild — reset
+/// `epoch_ignore_rebuilds` to 0 and adopt the new pid before incrementing.
+/// `ignore_rebuilds` (lifetime) is never reset.
 pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
+    if state.epoch_pid != state.pid {
+        state.epoch_ignore_rebuilds = 0;
+        state.epoch_pid = state.pid;
+    }
     state.ignore_rebuilds += 1;
+    state.epoch_ignore_rebuilds += 1;
     state.last_ignore_rebuild_ms = wall_ms;
 }
 
@@ -279,6 +310,43 @@ mod tests {
         assert_eq!(state.prompt_put_failures, 0);
         assert_eq!(state.ignore_rebuilds, 0);
         assert_eq!(state.last_ignore_rebuild_ms, 0);
+        assert_eq!(state.epoch_ignore_rebuilds, 0);
+    }
+
+    // Phase 3 (honesty-fixes round): the epoch counter must reset when the
+    // owning pid changes (simulating a daemon restart via `acquire_lock`
+    // writing a fresh `state.pid`), while the lifetime counter keeps
+    // accumulating across that boundary rather than resetting too. Sibling
+    // non-default value pinned per the vacuity trap: `ignore_rebuilds` (5,
+    // non-zero) is asserted in the SAME test as `epoch_ignore_rebuilds`
+    // reading a smaller, epoch-only figure (2) — a version of
+    // `record_ignore_rebuild` that never resets would show 5 for both.
+    #[test]
+    fn record_ignore_rebuild_resets_epoch_counter_on_pid_change() {
+        let mut state = State {
+            pid: 111,
+            ..State::default()
+        };
+        record_ignore_rebuild(&mut state, 1_000);
+        record_ignore_rebuild(&mut state, 2_000);
+        record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.ignore_rebuilds, 3);
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // Simulate a daemon restart: acquire_lock stamps the new pid before
+        // any rebuild in the new epoch can happen.
+        state.pid = 222;
+        record_ignore_rebuild(&mut state, 4_000);
+        record_ignore_rebuild(&mut state, 5_000);
+
+        assert_eq!(
+            state.ignore_rebuilds, 5,
+            "lifetime total must keep accumulating across the epoch boundary"
+        );
+        assert_eq!(
+            state.epoch_ignore_rebuilds, 2,
+            "epoch counter must have restarted from zero at the new epoch"
+        );
     }
 
     #[test]

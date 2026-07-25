@@ -996,6 +996,37 @@ fn status_shows_prompt_degraded_banner_and_ack_clears_it_too() {
     assert!(!stdout.contains("DEGRADED"), "stdout: {stdout}");
 }
 
+// Phase 3 (honesty-fixes round): `status --ack-degraded --json` must never
+// print prose on stdout under a `--json` flag — the ack branch previously
+// returned before the json branch ran, so a script piping this combination
+// to `jq` would get "acknowledged — DEGRADED cleared" instead of JSON.
+// Fixed via a clap conflict (rejected at parse time, before any repo state
+// is even read) rather than inventing a JSON shape for an action verb.
+// Neuter: restore the early text-return branch (drop the clap conflict) →
+// this test's exit-code/stdout-prose assertions fail RED.
+#[test]
+fn ack_degraded_json_is_not_prose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let out = agentrec(root, &["status", "--ack-degraded", "--json"]);
+    assert!(
+        !out.status.success(),
+        "the combination must be rejected, not silently accepted: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "must never print prose (or anything else) on stdout under --json: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict message on stderr: {stderr:?}"
+    );
+}
+
 // D-PD3: an empty store has zero agent turns, so a rich-rate percentage would
 // be vacuous (100% over 0 turns misleadingly reads as "healthy"). `status`
 // must print an honest "n/a" instead of fabricating a rate.

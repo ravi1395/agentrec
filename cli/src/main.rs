@@ -76,8 +76,12 @@ enum Command {
     },
     /// Store size, recording gaps, and rich-rate health.
     Status {
-        /// Acknowledge and clear a DEGRADED snapshot-failure banner.
-        #[arg(long)]
+        /// Acknowledge and clear a DEGRADED snapshot-failure banner. Rejected
+        /// together with `--json` (Phase 3, honesty-fixes round): the ack
+        /// path prints prose ("acknowledged — DEGRADED cleared") on success,
+        /// and prose on stdout under a `--json` flag would break any
+        /// consumer piping to `jq`.
+        #[arg(long, conflicts_with = "json")]
         ack_degraded: bool,
         /// Emit machine-readable operational fields (state.json data — NOT
         /// the PROTOCOL wire format) instead of the text report.

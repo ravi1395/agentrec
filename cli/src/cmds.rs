@@ -168,9 +168,14 @@ fn format_turn(
 
 /// `status`: store size, recording gaps, and rich-rate (the health stat that
 /// catches silently broken hooks). `ack_degraded` clears a prior DEGRADED
-/// snapshot-failure banner (D35) instead of printing status. `json` emits
-/// machine-readable operational fields instead of the text report — today
-/// just the ignore-rebuild counters (additive; more fields can join later).
+/// snapshot-failure banner (D35) instead of printing status; clap rejects
+/// combining it with `json` (see `main.rs`'s `Status` variant) — the ack
+/// path is prose-on-success by design, and prose on stdout under a `--json`
+/// flag would break any consumer piping to `jq`. `json` emits
+/// machine-readable operational fields instead of the text report: the
+/// ignore-reload counters (lifetime + epoch-scoped) plus, since Phase 3 of
+/// the honesty-fixes round, every DEGRADED field the text banner reports
+/// (additive; more fields can join later).
 pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String> {
     if ack_degraded {
         let mut state = read_state(root);
@@ -192,26 +197,46 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
         return Ok(());
     }
     if json {
-        // `state.json` is OPERATIONAL data, not the PROTOCOL wire format
-        // (PROTOCOL §5 deliberately keeps it off the wire) — this is a
-        // separate, additive JSON surface, not a serialization of a wire
-        // record. `last_ignore_rebuild_ms` is `null` rather than `0` when
-        // never reloaded, so a JSON consumer can't mistake the Unix epoch
-        // for a real reload time.
-        let state = read_state(root);
-        let payload = serde_json::json!({
-            "ignore_rebuilds": state.ignore_rebuilds,
-            "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
-                Some(state.last_ignore_rebuild_ms)
-            } else {
-                None
-            },
-        });
-        println!("{payload}");
+        println!("{}", status_json(root)?);
         return Ok(());
     }
     print!("{}", status_report(root, effective_store_budget())?);
     Ok(())
+}
+
+/// Builds `status --json`'s payload (split out from [`status`] so it's
+/// unit-testable without capturing stdout). `state.json` is OPERATIONAL
+/// data, not the PROTOCOL wire format (PROTOCOL §5 deliberately keeps it off
+/// the wire) — this is a separate, additive JSON surface, not a
+/// serialization of a wire record.
+///
+/// Phase 3 (honesty-fixes round): before this phase, this payload carried
+/// only the ignore-reload counters, while the text `status` report also
+/// prints a DEGRADED banner — a monitoring script running
+/// `status --json | jq .snapshot_failures` got `null`, indistinguishable
+/// from healthy, while a human running bare `status` saw the banner. Every
+/// field the text banner reports is now here too: `snapshot_failures` +
+/// `io_failed` (the affected-files list), `prompt_put_failures`,
+/// `state_parse_failures` + `last_bad_field` (Phase 2's per-field-degrade
+/// counter). `ignore_rebuilds` keeps its established lifetime-cumulative
+/// meaning (additive field, unchanged); `epoch_ignore_rebuilds` is the new
+/// current-epoch figure `status`'s text report now renders instead.
+fn status_json(root: &Path) -> Result<serde_json::Value, String> {
+    let state = read_state(root);
+    Ok(serde_json::json!({
+        "ignore_rebuilds": state.ignore_rebuilds,
+        "epoch_ignore_rebuilds": state.epoch_ignore_rebuilds,
+        "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
+            Some(state.last_ignore_rebuild_ms)
+        } else {
+            None
+        },
+        "snapshot_failures": state.snapshot_failures,
+        "io_failed": state.io_failed,
+        "prompt_put_failures": state.prompt_put_failures,
+        "state_parse_failures": state.state_parse_failures,
+        "last_bad_field": state.last_bad_field,
+    }))
 }
 
 /// Builds `status`'s full output as a string (split out from [`status`] so
@@ -255,18 +280,24 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         turns.len()
     ));
     out.push_str(&format!("gaps:       {gaps} recording gap(s)\n"));
-    // Only rendered once a rebuild has ever happened — a repo whose
-    // .gitignore never churned has nothing to report, and printing "0
-    // reloads" would be exactly the vacuous line the zero-turn rich-rate
-    // line above already refuses to print (D-PD3 precedent).
-    if state.ignore_rebuilds > 0 {
+    // Only rendered once a rebuild has ever happened THIS DAEMON EPOCH — a
+    // repo whose .gitignore never churned since the daemon last started has
+    // nothing to report, and printing "0 reloads" would be exactly the
+    // vacuous line the zero-turn rich-rate line above already refuses to
+    // print (D-PD3 precedent). Phase 3 (honesty-fixes round, open question 1
+    // option (a)): deliberately `epoch_ignore_rebuilds`, not the lifetime
+    // `ignore_rebuilds` — a long-lived repo would otherwise eventually render
+    // "reloaded 4821 time(s)" in this daily-driver surface. The lifetime
+    // total is still preserved in `state.json` (and in `status --json`); it
+    // is just not what this line renders.
+    if state.epoch_ignore_rebuilds > 0 {
         let when = fmt::relative_time(
             &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
             wall_now_ms(),
         );
         out.push_str(&format!(
             "ignore:     reloaded {} time(s), last {when}\n",
-            state.ignore_rebuilds
+            state.epoch_ignore_rebuilds
         ));
     }
     if trailing.is_empty() {
@@ -1156,6 +1187,112 @@ mod tests {
         assert!(
             out.to_lowercase().contains("reload"),
             "expected a reload line once ignore_rebuilds > 0: {out}"
+        );
+    }
+
+    // Phase 3 (honesty-fixes round), open question 1 answered as option (a):
+    // the rendered reload figure must be scoped to the CURRENT daemon epoch,
+    // not the lifetime total, once a daemon restart has happened. Simulates
+    // an old epoch (pid 111, 3 rebuilds) followed by a restart (pid 222, 2
+    // more rebuilds) — the same shape `acquire_lock` + `record_ignore_rebuild`
+    // produce in production. Sibling non-default value pinned per the
+    // vacuity trap: `ignore_rebuilds` (5, lifetime) is asserted alongside the
+    // rendered epoch figure (2) — a version of `status_report` that renders
+    // the lifetime total would print "5", not "2", and this test would catch
+    // it. Neuter: render `state.ignore_rebuilds` instead of
+    // `state.epoch_ignore_rebuilds` → RED.
+    #[test]
+    fn status_reload_line_is_epoch_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let mut state = crate::state::State {
+            pid: 111,
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        // Simulate the daemon restart `acquire_lock` performs: a fresh pid
+        // stamped before any rebuild in the new epoch happens.
+        state.pid = 222;
+        crate::state::record_ignore_rebuild(&mut state, 4_000);
+        crate::state::record_ignore_rebuild(&mut state, 5_000);
+        write_state(root, &state).unwrap();
+
+        assert_eq!(
+            read_state(root).ignore_rebuilds,
+            5,
+            "lifetime total must be preserved across the simulated restart"
+        );
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 2 time(s)"),
+            "expected the CURRENT-EPOCH figure (2), not the lifetime total: {out}"
+        );
+        assert!(
+            !out.contains("reloaded 5 time(s)"),
+            "must not render the lifetime-cumulative figure: {out}"
+        );
+    }
+
+    // Phase 3: `status --json` must carry every field the text DEGRADED
+    // banner reports, not just the ignore-reload counters — a monitoring
+    // script piping `--json` to `jq` must never see less than a human running
+    // bare `status` sees. Neuter: drop one field from the payload's
+    // construction → this loop's named assert fires for exactly that field.
+    #[test]
+    fn status_json_carries_degraded_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let mut state = crate::state::State::default();
+        crate::state::record_io_failure(&mut state, "src/a.rs");
+        crate::state::record_prompt_put_failure(&mut state);
+        state.state_parse_failures = 3;
+        state.last_bad_field = Some("signal_offset".to_string());
+        write_state(root, &state).unwrap();
+
+        let payload = status_json(root).unwrap();
+        for field in [
+            "snapshot_failures",
+            "prompt_put_failures",
+            "io_failed",
+            "state_parse_failures",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "status --json missing field: {field} (payload: {payload})"
+            );
+        }
+        assert_eq!(payload["snapshot_failures"], 1);
+        assert_eq!(payload["prompt_put_failures"], 1);
+        assert_eq!(payload["io_failed"], serde_json::json!(["src/a.rs"]));
+        assert_eq!(payload["state_parse_failures"], 3);
+    }
+
+    // Bare `status` output for a healthy store must be unchanged by this
+    // phase — three renderers (text, --json, --ack-degraded --json) now read
+    // the same `State`, so pin the plain case to catch any of them drifting
+    // it.
+    #[test]
+    fn status_healthy_store_output_is_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert_eq!(
+            out,
+            "store:      0 B\n\
+             turns:      0 (agent turns; git activity hidden)\n\
+             gaps:       0 recording gap(s)\n\
+             rich-rate:  n/a (no agent turns yet)\n\
+             memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures\n",
+            "healthy-store status output must be unchanged: {out}"
         );
     }
 
