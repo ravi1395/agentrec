@@ -70,15 +70,31 @@ impl NoiseMatcher {
         builder.build().ok().map(NoiseMatcher)
     }
 
-    /// `path` is a `FileEntry.path` — repo-relative, forward-slash. Uses
-    /// `matched_path_or_any_parents` (not `matched`) so a directory-style
-    /// pattern like `.remember/` or bare `.remember` folds every file
-    /// beneath it, not only paths that literally repeat the pattern text —
-    /// mirrors the idiom `daemon::IgnoreSet::is_ignored` already uses for
-    /// the same reason.
+    /// `path` is a `FileEntry.path` — normally repo-relative, forward-slash.
+    /// Uses `matched_path_or_any_parents` (not `matched`) so a
+    /// directory-style pattern like `.remember/` or bare `.remember` folds
+    /// every file beneath it, not only paths that literally repeat the
+    /// pattern text — mirrors the idiom `daemon::IgnoreSet::is_ignored`
+    /// already uses for the same reason.
+    ///
+    /// `log.jsonl` is a trust boundary, not a schema-enforced one — nothing
+    /// stops a hand-edited or foreign-tool-written line from carrying an
+    /// absolute `FileEntry.path`. `Gitignore::matched_path_or_any_parents`
+    /// panics (`assert!(!path.has_root())`) on a path that shares no common
+    /// prefix with the matcher's root, which an absolute path never will
+    /// against a repo root — so that case is rejected up front rather than
+    /// handed to the matcher. Folding nothing is the safe direction (same
+    /// posture as `parse_glob_array`/`build`'s per-line degrade): a foreign
+    /// absolute path was never going to match a repo-relative noise glob
+    /// anyway, and `log`/`show` must never crash over a `noise_globs`
+    /// config that has nothing to do with this entry.
     pub(crate) fn is_noise(&self, path: &str) -> bool {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            return false;
+        }
         matches!(
-            self.0.matched_path_or_any_parents(Path::new(path), false),
+            self.0.matched_path_or_any_parents(p, false),
             ignore::Match::Ignore(_)
         )
     }
@@ -153,6 +169,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let matcher = NoiseMatcher::build(tmp.path(), &[".remember/**".to_string()]).unwrap();
         assert!(!matcher.is_noise("src/main.rs"));
+    }
+
+    // Advisor-surfaced (log.jsonl is a trust boundary, not schema-enforced):
+    // `matched_path_or_any_parents` panics on a path that shares no common
+    // prefix with the matcher root, which an absolute path never will —
+    // `is_noise` must degrade to "not noise" instead of crashing `log`/`show`
+    // over a foreign or hand-edited log line.
+    #[test]
+    fn is_noise_does_not_panic_on_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let matcher = NoiseMatcher::build(tmp.path(), &[".remember/**".to_string()]).unwrap();
+        assert!(!matcher.is_noise("/etc/passwd"));
     }
 
     #[test]

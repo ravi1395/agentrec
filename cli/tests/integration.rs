@@ -4029,6 +4029,49 @@ fn nf1_log_and_show_unaffected_when_noise_globs_absent() {
     );
 }
 
+// Advisor-surfaced: `log.jsonl` is a trust boundary (the P0 in the 2026-07-11
+// hardening round was exactly this — an unvalidated hash/path read from the
+// log). A `FileEntry.path` is normally repo-relative, but nothing in the wire
+// format enforces that — a hand-edited or foreign-tool-written log line could
+// carry an absolute path. `Gitignore::matched_path_or_any_parents` panics
+// (`assert!(!path.has_root())`) when the given path shares no common prefix
+// with the matcher's root, which an absolute path never will. This must
+// degrade (fold nothing) rather than crash `log`/`show`.
+#[test]
+fn nf_is_noise_does_not_panic_on_absolute_path() {
+    use agentrec_core::record::FileEntry;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let turn = base_turn(
+        "t_NFABSPATH00000000000001",
+        vec![FileEntry {
+            path: "/etc/passwd".into(),
+            before: None,
+            after: Some(agentrec_core::store::hash_bytes(b"/etc/passwd")),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["log"]);
+    assert!(
+        out.status.success(),
+        "log must not crash on an absolute FileEntry.path: {out:?}"
+    );
+    let show_out = agentrec(root, &["show", &turn.id]);
+    assert!(
+        show_out.status.success(),
+        "show must not crash on an absolute FileEntry.path: {show_out:?}"
+    );
+}
+
 // NF2: with a matching glob configured, `log` folds the matched entries out
 // of the visible count and prints the exact mandated line. The --all-files
 // cross-check proves the glob genuinely matched this fixture (not a
