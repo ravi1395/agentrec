@@ -363,8 +363,11 @@ fn unignore_is_honored_without_other_watched_activity() {
     std::fs::create_dir_all(root.join("cache")).unwrap();
     std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
 
-    let mut daemon = spawn_record(root);
-    wait_for_live_daemon(root);
+    // `SingleDaemonGuard`, not a bare `Child`: the control assert below runs
+    // BEFORE any kill, and `Child::drop` does not reap — a RED run (which
+    // this test sees by design during TDD and every neuter check) would
+    // otherwise leak a live daemon per run.
+    let mut daemon = SingleDaemonGuard::spawn(root);
 
     // Positive control, written BEFORE the ignore-rule edit. A control
     // written afterward would itself be a Class::Watch path — it would arm
@@ -422,13 +425,194 @@ fn unignore_is_honored_without_other_watched_activity() {
             .then_some(())
     });
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    daemon.kill();
 
     assert!(
         saw_keep.is_some(),
         "cache/keep.log, re-included by a mid-run .gitignore edit, was never recorded — \
          the ignore-set rebuild was never consumed"
+    );
+}
+
+// Phase 3 of the rebuild-gate plan — the mirror of
+// `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
+// event carries the filename too (`apply_watch_result`'s filename check
+// precedes `classify`), so it sets `gitignore_dirty` exactly like an edit.
+// Nothing pinned that path before this test.
+#[test]
+fn deleted_gitignore_rewidens_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    // Self-matching, self-ignoring: `*` matches `cache/.gitignore` itself, so
+    // its own DELETE event classifies `Ignore` and (pre-fix) never arms
+    // `pending` on its own — exactly the escape hatch this test must not
+    // route around.
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Positive control, written BEFORE the deletion. A control written
+    // afterward would itself be a Class::Watch path — it would arm the
+    // debounce and (under pre-fix code) drive the flush block where the
+    // rebuild used to live, making the test pass before the fix and prove
+    // nothing. This ordering is load-bearing, exactly as in
+    // `unignore_is_honored_without_other_watched_activity`.
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("src/control.rs")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Re-widen by deletion instead of edit.
+    std::fs::remove_file(root.join("cache/.gitignore")).unwrap();
+
+    // Touch NOTHING else from here on. Two writes, spaced past one POLL tick
+    // (250ms, `daemon::POLL`), so they don't collapse into a single notify
+    // batch with the deletion event.
+    std::fs::write(root.join("cache/keep.log"), "one").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("cache/keep.log"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_keep = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("cache/keep.log")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_keep.is_some(),
+        "cache/keep.log, re-included by deleting cache/.gitignore mid-run, was never recorded — \
+         the ignore-set rebuild was never consumed"
+    );
+}
+
+// Phase 3 of the rebuild-gate plan: the case nothing covered was a rule
+// re-widening an already-known path. This covers the opposite direction — a
+// `.gitignore` CREATED under a directory that had none, honored without a
+// daemon restart.
+#[test]
+fn new_gitignore_honored_without_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Positive control, written before any `.gitignore` exists under data/ —
+    // proves the daemon is alive and watching this directory from the start.
+    std::fs::write(root.join("data/control1.txt"), "one").unwrap();
+    let saw_control1 = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("data/control1.txt")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control1.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Create the `.gitignore` mid-run: only `block.log` is ignored (the file
+    // itself doesn't match its own rule, unlike the self-matching fixtures
+    // elsewhere in this suite).
+    std::fs::write(root.join("data/.gitignore"), "block.log\n").unwrap();
+
+    // Wait past one POLL tick (250ms, `daemon::POLL`) before touching
+    // block.log/control2, so the top-of-tick rebuild has a chance to consume
+    // the dirty flag before these events are classified — otherwise they can
+    // land in the SAME drain batch as the `.gitignore` create and still be
+    // classified against the stale (pre-rule) set, which is decision 2's
+    // documented residual window, not what this test is proving.
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("data/block.log"), "should be ignored now").unwrap();
+    std::fs::write(root.join("data/control2.txt"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_control2 = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("data/control2.txt")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    // Positive control IN THE SAME WINDOW as the absence assertion below —
+    // without it, a dead or unarmed daemon would also satisfy "block.log was
+    // never recorded", which is exactly the gap that let two green gitignore
+    // tests coexist with a 764 MiB leak in this repo.
+    assert!(
+        saw_control2.is_some(),
+        "control2.txt, written after the new .gitignore existed, was never recorded — \
+         daemon not alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let leaked_block_log = turns(root).iter().any(|t| {
+        t.get("files")
+            .and_then(|f| f.as_array())
+            .map(|fs| {
+                fs.iter()
+                    .any(|f| f.get("path").and_then(|p| p.as_str()) == Some("data/block.log"))
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        !leaked_block_log,
+        "data/block.log, ignored by a .gitignore created mid-run, leaked into a turn — \
+         the new rule was not honored without a daemon restart"
     );
 }
 

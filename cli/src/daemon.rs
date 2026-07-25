@@ -1747,16 +1747,45 @@ mod tests {
     // B+ / D29: nested `.gitignore` precedence follows git's rules — deeper
     // files override shallower ones, `!` re-includes, and a matched directory
     // ignores everything beneath it.
+    //
+    // `git init` here is hygiene, not a vacuity fix (Phase 3 of the
+    // rebuild-gate plan): pre-D29, `IgnoreSet::build` relied on a
+    // gitignore-aware walk to *yield* each `.gitignore`, so a non-git tempdir
+    // (where `ignore::WalkBuilder::require_git` applies no rules at all)
+    // still yielded both files and this test passed vacuously. Post-D29,
+    // `build` probes `dir.join(".gitignore")` for every directory the walk
+    // reaches instead, and a non-git walk still yields directories — so the
+    // matchers were collected and these assertions were already real. `git
+    // init` just makes the fixture match how the code runs in production
+    // (where `require_git` also governs traversal pruning). The precondition
+    // assert states what the test depends on.
     #[test]
     fn nested_gitignore_precedence() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
         std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/.gitignore"), "!keep.log\n*.tmp\n").unwrap();
         std::fs::create_dir_all(root.join("build")).unwrap();
 
         let set = IgnoreSet::build(root);
+        eprintln!(
+            "nested_gitignore_precedence: matchers.len() = {}",
+            set.matchers.len()
+        );
+        assert!(
+            set.matchers.len() >= 2,
+            "expected at least the root and sub/ matchers, got {}",
+            set.matchers.len()
+        );
         let ig = |p: &str, is_dir: bool| set.is_ignored(&root.join(p), is_dir);
 
         assert!(ig("a.log", false), "root *.log ignored");
