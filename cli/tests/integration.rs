@@ -451,8 +451,12 @@ fn daemon_counts_ignore_rebuilds() {
     let root = tmp.path();
     init(root); // real `git init -q` — WalkBuilder::require_git needs it
 
-    let mut daemon = spawn_record(root);
-    wait_for_live_daemon(root);
+    // `SingleDaemonGuard`, not a bare `Child`: the first assert below precedes
+    // any kill, and `Child::drop` does NOT reap — a RED run (which this test
+    // sees by design during TDD and every neuter check) would otherwise leak a
+    // live daemon per run. Leaked test daemons have already cost this repo a
+    // diagnosis round via FSEvents contention.
+    let mut daemon = SingleDaemonGuard::spawn(root);
 
     std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
     let saw_one = poll_until(Duration::from_secs(10), || {
@@ -472,8 +476,7 @@ fn daemon_counts_ignore_rebuilds() {
         (ignore_rebuilds(root)? == 2).then_some(())
     });
 
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    daemon.kill();
 
     assert!(
         saw_two.is_some(),
