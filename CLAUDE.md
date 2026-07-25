@@ -8,6 +8,89 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Planning round — three plans committed, zero code changed (2026-07-25, branch
+`fix/blame-attribution-and-noise-folding`, `8da3e16..6244afb`, not pushed):** Documented here
+**before** implementation because these plans are the next things to be attacked, and an
+un-registered plan file is not a durable artifact. **Nothing below is implemented.** Test suite
+untouched at the prior round's **386 passed / 0 failed / 1 ignored** (a figure carried from that
+round's receipt and marked UNVERIFIED in every plan header — re-run before trusting it).
+
+**(1) Churn-honesty round — `docs/superpowers/plans/2026-07-25-agentrec-churn-honesty-round.md`
+(`8da3e16`), 9 phases.** The 5-item handoff scope (fold `diff`'s per-path renderer · record-time
+`ignore_globs` · `doctor` advisories + a ref→blob presence check · `enforce_budget` protect-set ·
+re-measure), refined by a 3-lens adversarial fable redteam (honesty/attribution ·
+daemon-crash-concurrency · vacuity/measurement/scope) whose lenses **disagreed on two daemon facts**;
+reading the code settled both and one lens was wrong — subagent reports are leads, not evidence.
+Three findings reshaped the scope, each verified firsthand:
+**(a) `enforce_budget` deletes live-cited blobs today — a real bug in shipped code, not a plan
+item.** Its keep-set is built from *parsed* `TurnRecord`s and it hard-deletes (`store.remove` →
+`fs::remove_file`), while `open.json` refs, `memory.jsonl` pins and torn-line refs go unprotected —
+exactly the classes `purgecmd::referenced_hashes`' raw non-parsing `sha256:` byte-scan exists to
+protect. Its sole caller is `cmds::status_report`, so **running `agentrec status` on an over-budget
+store can destroy an in-flight turn's snapshot**, with no daemon-liveness refusal anywhere on that
+path. Fix keeps hard-delete (archive-on-evict frees zero disk — archives sit under `.agentrec/` —
+while *reporting* bytes freed, and eviction fires from a read verb, so it would grow an unbounded
+archive as a side effect of reading status) and adds a raw-scan protect-set harvested as late as
+possible; the residual live-daemon window is narrowed-not-closed, same posture as `purge --orphans`'
+undo race. **(b)** the `e453e86` rebuild-gate defect, pulled out into its own plan (below).
+**(c) record-time exclusion is a non-event**, so `blame` fills the vacuum: `blame_line` falls through
+to `"before recording began"` and a touched-then-excluded path prints `"· human-edited since"` —
+an agent edit attributed to the human, byte-for-byte the confident-false-answer class `17657d9` just
+fixed. Hence item 2 splits into two phases with the honesty surface marked **non-optional** — the
+feature "works" without it, which is exactly why it would get deferred.
+**Ordering deliberately reversed from the handoff's list:** measurement runs **first**, because
+`status` mutates the store, so a measurement taken after any lever measures a store that lever
+already changed; and the owed live-daemon E2E is promoted ahead of feature work because it builds
+the harness two later phases need. **Two zero-yield results are stated up front so no receipt can
+claim otherwise:** folding `diff` is render-time only (`log.jsonl` is append-only; zero bytes, zero
+lines), and record-time globs measure **~0** churn reduction on this corpus (0 churn entries since
+the D29 fix merged; `.claims/`, the named next instance, has 3 tracked files so the rule keeps it) —
+their justification is the PROTOCOL.md:25 promise that no code has ever read, nothing else.
+Every acceptance criterion names the **neuter** that must turn a *named* test RED; criteria
+unprovable by fixture are marked for a live-daemon leg or a VERIFY-LEDGER row, never a PASS.
+**4 open questions**, of which Q1 (config globs vs git-tracked precedence) gates Phase 5 and changes
+its **file count**, not just its fixture — answer before chunking.
+
+**(2) Ignore-set rebuild gate — `docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`
+(`fba86e9`, corrected `6244afb`), 3 phases.** Pulled out of the above because it is a defect in
+**already-merged** code. `e453e86` fixed the *trigger* (`apply_watch_result` sets `gitignore_dirty`
+at ingest by filename, verdict-independent — correct, and unit-tested). It never fixed the
+*consumption*: the rebuild lives inside `if settled || capped` in `daemon::run`, and both predicates
+derive from `last_event`/`first_event`, armed **only** for `Class::Watch`. So editing `.gitignore` to
+add `!keep.log` and then writing only `keep.log` leaves the rebuild permanently unrun — the file is
+never recorded until some unrelated watched path changes. Direction is under-record, so nothing is
+corrupted, but the recorder silently ignores a file the user explicitly re-enabled. **Second time
+this class has shipped** (`049a4aa` introduced the trigger defect, `e453e86` fixed the trigger and
+left the gate). No existing test can catch it: the unit test drives `drain_watch_events` directly and
+asserts the flag is *set*, never that anything consumes it; the real-daemon test proves *ignoring*,
+never *re-widening*; nothing in the suite exercises a mid-run ignore-rule change at all.
+**`6244afb` corrected the plan's own errors before any code was written:** Phase 1's AC1 and AC2 were
+jointly unsatisfiable (a positive control written *after* the ignore-rule edit is itself
+`Class::Watch` activity — it arms the timer, `settled` fires, the rebuild runs under current code, so
+the RED-first test would have gone green pre-fix and its neuter would have proven nothing); one AC
+named a counter that lands a phase later plus a fallback assert inside a loop body the plan itself
+calls unit-unreachable; and one Phase 2 AC asserted stderr-line counts inside a 250 ms window, which
+is FSEvents-coalescing flake bait this repo has already been burned by.
+**Correction to a claim this repo has been repeating:** `nested_gitignore_precedence` is **no longer
+vacuous** at HEAD. CLAUDE.md describes it as passing in a non-git tempdir where no rules apply —
+true **pre-D29**; post-D29 `IgnoreSet::build` probes `dir.join(".gitignore")` per directory instead
+of relying on the walk to *yield* the file, and a non-git walk still yields directories, so matchers
+are collected and its assertions are real. Adding `git init` there is hygiene, not a vacuity fix, and
+the plan's AC says so and asks the executor to print `matchers.len()` so the correction is itself
+falsifiable. Also **verified rather than assumed**: `IgnoreSet::is_ignored` maps
+`ignore::Match::Whitelist` to `false`, so the fixture's `!keep.log` genuinely re-widens.
+
+**(3) Phase 2.0 substrate — `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`** (written the
+prior round, left untracked, committed in `8da3e16` so a fresh worktree can see it), 5 phases:
+`import claude` gate → import persist → golden harness → `RepositoryView` → `--json` contracts.
+Unchanged content; its 3 open questions are still open, including whether the 12 unchecked tasks in
+the memory-v1 plan are stale bookkeeping or real work.
+
+**Cross-plan seam, recorded so it cannot be re-fixed in parallel:** churn-honesty Phase 5 now points
+at plan (2) for the loop-placement fix and adds only the `config.toml` trigger on top of it. And
+folding must stay in the CLI adapter — if it migrates into Phase 2.0's `RepositoryView::diff`, then
+`diff --json` and the MCP read surface inherit it silently.
+
 **Blame-honesty + skipped_reason + noise folding — GATE PASS (2026-07-25,
 branch `fix/blame-attribution-and-noise-folding`, `17657d9..c4ada8f`, not pushed):** Three changes
 landed off a 4-lens adversarial redteam of store churn. Binding skeptical-reviewer done-gate in an
