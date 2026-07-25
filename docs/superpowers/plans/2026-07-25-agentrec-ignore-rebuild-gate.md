@@ -103,23 +103,37 @@ real-daemon test).
 - Strengthen the existing unit test so it asserts *consumption*, not just the flag: after the drain,
   assert the flag is observable to the rebuild step and that a rebuilt `IgnoreSet` reflects the
   edited rules. Rename it if the name now overstates what it proves.
+- Extract `maybe_rebuild(dirty: &mut bool, root: &Path) -> Option<IgnoreSet>` so the rate rule has a
+  unit-reachable target — `run`'s loop itself is not unit-testable, which is exactly why the bug
+  survived.
 - New live-daemon test `unignore_is_honored_without_other_watched_activity`: `git init` tempdir,
-  `cache/.gitignore` = `*`, real `agentrec init && agentrec record`; wait for a live daemon; rewrite
-  `cache/.gitignore` to `*\n!keep.log`; **touch nothing else**; write `cache/keep.log` twice, spaced
-  past one `POLL` tick; wait past debounce + quiet window; assert a turn exists whose files contain
-  `cache/keep.log`.
+  `cache/.gitignore` = `*`, real `agentrec init && agentrec record`; wait for a live daemon; **write
+  the positive-control file FIRST and assert it lands in a turn**; only then rewrite
+  `cache/.gitignore` to `*\n!keep.log`; **touch nothing else for the rest of the test**; write
+  `cache/keep.log` twice, spaced past one `POLL` tick; wait past debounce + quiet window; assert a
+  turn exists whose files contain `cache/keep.log`.
+  **The control must precede the ignore-rule edit, not follow it.** A control written afterwards is a
+  `Class::Watch` path: it arms `last_event`, `settled` fires, the `settled || capped` block runs, and
+  the rebuild happens **under current code** — the test would pass pre-fix and prove nothing. "Some
+  unrelated watched path changed" is the escape hatch this defect is defined by; the test must not
+  contain it. Control-first is sufficient because the post-fix assertion is *presence*: a dead daemon
+  yields a false RED, never a false pass. The control exists only to make the RED run attributable.
+- **Verified before writing this plan:** `IgnoreSet::is_ignored` maps `ignore::Match::Whitelist` to
+  `false` (`daemon.rs`), so `!keep.log` genuinely re-widens after a rebuild. The fixture does not
+  rest on an unchecked assumption about negation semantics.
 
 **Acceptance criteria:**
 - [ ] `unignore_is_honored_without_other_watched_activity` **fails against unmodified `daemon.rs`**
       and passes after the move — demonstrated in the receipt with both outputs, not asserted.
       Neuter: move the rebuild back inside `if settled || capped` → that named test RED.
-- [ ] The test's daemon is proven alive in the same window by a positive control (a normal file
-      written after the config change that *does* appear in a turn) — absence must never be
-      satisfiable by a dead or unarmed daemon. Neuter: kill the daemon before the writes → the
-      control assert fails, proving the test cannot pass on a corpse.
-- [ ] The rebuild runs at most once per `POLL` tick even when `.gitignore` is rewritten repeatedly
-      (flag cleared after each rebuild). Neuter: drop the flag clear → a counter-based unit assert RED
-      (the counter itself lands in Phase 2; until then assert the flag is false after the rebuild step).
+- [ ] The test's daemon is proven alive by a positive control written **before** the ignore-rule
+      edit and asserted recorded there, after which nothing but `cache/keep.log` is touched. Neuter:
+      move the control to after the edit → the test passes against unmodified `daemon.rs`, which the
+      executor must demonstrate and then revert (it is the reason the ordering is specified).
+- [ ] `maybe_rebuild` returns `Some` exactly once for a run of N consecutive dirty-flag settings and
+      clears the flag. Neuter: drop the flag clear → `maybe_rebuild_runs_once_per_dirty_flag` RED.
+      (This is why the helper is extracted in this phase — the loop body it lives in is not
+      unit-reachable, and an AC with no possible test is not an AC.)
 - [ ] Behavior under a stable config is unchanged: `self_ignoring_gitignore_dir_is_not_recorded_by_a_real_daemon`
       and `records_rich_turn_..._filters_ignored` pass untouched and un-weakened.
 - [ ] The strengthened unit test asserts its own precondition (the edited `.gitignore` classifies
@@ -159,9 +173,11 @@ persisted counter), `cli/src/cmds.rs` (edit — `status` line).
       reload line. Neuter: make the line unconditional → `status_omits_reload_line_when_never_reloaded` RED.
 - [ ] `status --json` carries the field; a pre-existing `state.json` without it parses (serde
       default) and renders as never-reloaded. Neuter: drop the default → `status_tolerates_state_without_rebuild_counter` RED.
-- [ ] The stderr line appears exactly once per rebuild, not once per event, when `.gitignore` is
-      rewritten 5 times inside one tick. Neuter: log inside `apply_watch_result` instead →
-      `reload_logs_once_per_rebuild` RED.
+- [ ] `.gitignore` rewritten 5 times in quick succession yields `ignore_rebuilds >= 1` and
+      `<= 5` — asserted on the **persisted counter**, never by counting stderr lines inside a 250 ms
+      window. FSEvents coalesces and this repo has documented flake from exactly that timing
+      assumption. Neuter: increment per event in `apply_watch_result` instead of per rebuild →
+      `rebuild_count_is_bounded_by_writes` RED on the upper bound.
 
 **Expected test outputs:** `cargo test -p agentrec --test integration -- --test-threads=3` → +2;
 `cargo test -p agentrec cmds::` → +1. Workspace → **390 passed, 0 failed, 1 ignored**.
@@ -170,17 +186,26 @@ persisted counter), `cli/src/cmds.rs` (edit — `status` line).
 
 ## Phase 3 — Close the vacuity in the neighbouring ignore tests (tests only)
 
-**Description:** The reason this defect survived two rounds is that the ignore-path tests around it
-prove weaker things than their names claim. CLAUDE.md already records that
-`nested_gitignore_precedence` passes **vacuously** in a non-git tempdir. Fix the fixtures and add
-the two mid-run cases nothing covers, so the next change to this code cannot pass for the wrong
-reason. Tests only — independently mergeable, no behavior change.
+**Description:** The reason this defect survived two rounds is that nothing exercises a mid-run
+ignore-rule change at all. Add the two cases nothing covers, so the next change to this code cannot
+pass for the wrong reason. Tests only — independently mergeable, no behavior change.
+
+**Correction, made before this plan was committed:** CLAUDE.md records `nested_gitignore_precedence`
+as passing **vacuously** in a non-git tempdir. That describes the **pre-D29** state and is no longer
+true at HEAD. `IgnoreSet::build` now probes `dir.join(".gitignore")` for each directory the walk
+reaches instead of relying on the walk to *yield* the ignore file, and a non-git walk still yields
+directories — so both matchers are collected and the test's precedence assertions are real. Adding
+`git init` is still worth doing (it makes the fixture match how the code runs in production, where
+`require_git` governs pruning), but it is **hygiene, not a vacuity fix**, and no AC may claim
+otherwise.
 
 **Files:** `cli/src/daemon.rs` (edit — unit tests only), `cli/tests/integration.rs` (edit).
 
 **Changes:**
-- `nested_gitignore_precedence`: add a real `git init` and a precondition assert that at least one
-  matcher was built — today it exercises an `IgnoreSet` with zero matchers and asserts nothing real.
+- `nested_gitignore_precedence`: add a real `git init` plus a precondition assert on the matcher
+  count, so the test states what it depends on. Print `matchers.len()` once while doing this and
+  record the number in the receipt — if it is 0, the correction above is wrong and Phase 3 becomes a
+  genuine vacuity fix.
 - New: **deleting** a `.gitignore` mid-run re-widens recording (the mirror of Phase 1's un-ignore
   case; the trigger fires on deletion events too, and nothing pins it).
 - New: a `.gitignore` **created** mid-run under a directory that had none is honored without a
@@ -192,8 +217,9 @@ reason. Tests only — independently mergeable, no behavior change.
 
 **Acceptance criteria:**
 - [ ] `nested_gitignore_precedence` asserts `matchers.len() >= 2` before its precedence assertions,
-      and its fixture is a real git repo. Neuter: remove the `git init` → the precondition assert RED
-      (today, removing it changes nothing — that is the proof it was vacuous).
+      and its fixture is a real git repo. **No neuter exists and none is claimed** — per the
+      correction above, removing `git init` is expected to change nothing at HEAD. This is a
+      documented hygiene change, recorded as such rather than dressed up as a proof.
 - [ ] Deleting a `.gitignore` mid-run causes previously-ignored paths to be recorded on their next
       mutation. Neuter: revert Phase 1's move → `deleted_gitignore_rewidens_recording` RED.
 - [ ] A newly created `.gitignore` is honored without restart. Neuter: same → `new_gitignore_honored_without_restart` RED.
