@@ -38,6 +38,13 @@ const RECALL_BUDGET_MS: u128 = 50;
 /// RFC 3339 timestamp instead (`--json` already emits absolute timestamps and
 /// is unaffected by either). `--explain` appends a glossary of only the
 /// domain terms that appear in this invocation's rendered output (D43).
+///
+/// NF-C: `--all-files` is orthogonal to `--all` — `--all` controls which
+/// TURNS are visible (git/superseded), `--all-files` controls which FILE
+/// ENTRIES within a visible turn are counted individually vs. folded into a
+/// `noise_globs` (config.toml) summary line (NF-A/NF-B). Folding is
+/// human-render only: `--json` output is never touched by either the
+/// matching or the flag (NF-D.1).
 pub fn log(
     root: &Path,
     all: bool,
@@ -45,6 +52,7 @@ pub fn log(
     limit: usize,
     utc: bool,
     explain: bool,
+    all_files: bool,
 ) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let superseded = merged_ids(&records);
@@ -74,6 +82,13 @@ pub fn log(
         std::env::var_os("NO_COLOR").is_some(),
     );
 
+    // NF1: absent/empty `noise_globs` yields `None` here, so every branch
+    // below that consults `noise_matcher` behaves exactly as it did before
+    // this feature existed — no separate "is the feature configured" flag
+    // needed anywhere else in this function.
+    let noise_globs = crate::noise::read_noise_globs(root);
+    let noise_matcher = crate::noise::NoiseMatcher::build(root, &noise_globs);
+
     // Rendered lines (non-JSON only) are accumulated so `--explain` can scan
     // exactly what this invocation printed, not every term that ever exists.
     let mut rendered = String::new();
@@ -84,10 +99,30 @@ pub fn log(
             let line = serde_json::to_string(turn).map_err(|e| e.to_string())?;
             println!("{line}");
         } else {
-            let line = format_turn(turn, now_ms, utc, color);
+            // NF-B/NF-D.4: fold counts a matched entry out of the visible
+            // count regardless of the turn's grade/tool — a turn whose
+            // entries are ALL noise still prints its own list line (turn
+            // selection above is untouched) plus this fold line, never
+            // silently disappears.
+            let noise_n = if all_files {
+                0
+            } else {
+                noise_matcher
+                    .as_ref()
+                    .map(|m| turn.files.iter().filter(|f| m.is_noise(&f.path)).count())
+                    .unwrap_or(0)
+            };
+            let visible_files = turn.files.len() - noise_n;
+            let line = format_turn(turn, now_ms, utc, color, visible_files);
             println!("{line}");
             rendered.push_str(&line);
             rendered.push('\n');
+            if noise_n > 0 {
+                let fold_line = format!("+{noise_n} noise files (--all-files to show)");
+                println!("{fold_line}");
+                rendered.push_str(&fold_line);
+                rendered.push('\n');
+            }
         }
     }
 
@@ -107,17 +142,26 @@ pub fn log(
 /// Thin wrapper: computes `log`'s caller-owned fields (relative/UTC time,
 /// file count) and hands off to the shared [`fmt::turn_list_line`] renderer
 /// (D-PD6 — this used to be a fully independent implementation).
-fn format_turn(t: &TurnRecord, now_ms: u64, utc: bool, color: bool) -> String {
+///
+/// `visible_files` is the caller-computed count AFTER any `noise_globs`
+/// fold (NF-B) — `format_turn` itself stays ignorant of noise matching, same
+/// as it was ignorant of turn-grade filtering before this feature existed.
+fn format_turn(
+    t: &TurnRecord,
+    now_ms: u64,
+    utc: bool,
+    color: bool,
+    visible_files: usize,
+) -> String {
     let when = if utc {
         t.started.clone()
     } else {
         fmt::relative_time(&t.started, now_ms)
     };
-    let n = t.files.len();
-    let files = if n == 1 {
+    let files = if visible_files == 1 {
         "1 file".to_string()
     } else {
-        format!("{n} files")
+        format!("{visible_files} files")
     };
     fmt::turn_list_line(t, &when, &files, color)
 }

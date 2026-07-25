@@ -9,6 +9,7 @@ mod initcmd;
 mod loglock;
 mod memlock;
 mod memorycmds;
+mod noise;
 mod purgecmd;
 mod readcmds;
 mod service;
@@ -67,6 +68,11 @@ enum Command {
         /// Append a glossary of domain terms present in this output.
         #[arg(long)]
         explain: bool,
+        /// Show file entries folded by `noise_globs` (config.toml) instead
+        /// of collapsing them into a count line. Orthogonal to --all (which
+        /// controls turn visibility, not file-entry visibility).
+        #[arg(long = "all-files")]
+        all_files: bool,
     },
     /// Store size, recording gaps, and rich-rate health.
     Status {
@@ -91,6 +97,10 @@ enum Command {
         /// Print the full post-scrub prompt text instead of the header.
         #[arg(long)]
         prompt: bool,
+        /// Show file entries folded by `noise_globs` (config.toml) instead
+        /// of collapsing them into a count line.
+        #[arg(long = "all-files")]
+        all_files: bool,
     },
     /// Revert a turn's changes, per file.
     Undo {
@@ -262,11 +272,16 @@ fn main() {
             limit,
             utc,
             explain,
-        } => cmds::log(&root, all, json, limit, utc, explain),
+            all_files,
+        } => cmds::log(&root, all, json, limit, utc, explain, all_files),
         Command::Status { ack_degraded } => cmds::status(&root, ack_degraded),
         Command::Diff { turn } => readcmds::diff(&root, &turn),
         Command::Blame { target } => readcmds::blame(&root, &target),
-        Command::Show { turn, prompt } => readcmds::show(&root, &turn, prompt),
+        Command::Show {
+            turn,
+            prompt,
+            all_files,
+        } => readcmds::show(&root, &turn, prompt, all_files),
         Command::Undo {
             turn,
             confirm,

@@ -36,13 +36,18 @@ pub fn diff(root: &Path, turn_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `show <turn> [--prompt]` (D-PD2, SPEC §Prompt posture item 4): bare form
-/// prints only the turn header, via the same renderer `blame` uses — that
-/// renders `prompt_excerpt` (already post-scrub AND length-capped), never the
-/// full prompt. `--prompt` is the one explicit path to the full post-scrub
-/// prompt text, loaded through the integrity-checked blob store; prompt blobs
-/// are post-scrub at rest, so printing the full text here is safe.
-pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
+/// `show <turn> [--prompt] [--all-files]` (D-PD2, SPEC §Prompt posture item
+/// 4): bare form prints only the turn header, via the same renderer `blame`
+/// uses — that renders `prompt_excerpt` (already post-scrub AND
+/// length-capped), never the full prompt. `--prompt` is the one explicit
+/// path to the full post-scrub prompt text, loaded through the
+/// integrity-checked blob store; prompt blobs are post-scrub at rest, so
+/// printing the full text here is safe. `--all-files` is NF-C's file-class
+/// reveal flag (NF-A/NF-B) — it only ever affects the bare-header branch;
+/// `--prompt` prints raw prompt bytes to stdout and must never gain an
+/// appended line regardless of `all_files` (a fold notice there would
+/// silently corrupt the printed prompt).
+pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = records
         .iter()
@@ -56,6 +61,19 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
 
     if !prompt {
         println!("{}", render_turn(turn));
+        if !all_files {
+            let noise_globs = crate::noise::read_noise_globs(root);
+            if let Some(matcher) = crate::noise::NoiseMatcher::build(root, &noise_globs) {
+                let n = turn
+                    .files
+                    .iter()
+                    .filter(|f| matcher.is_noise(&f.path))
+                    .count();
+                if n > 0 {
+                    println!("+{n} noise files (--all-files to show)");
+                }
+            }
+        }
         return Ok(());
     }
 

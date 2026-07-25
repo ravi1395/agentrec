@@ -3953,6 +3953,438 @@ fn log_and_show_render_turn_header_with_identical_formatting() {
     );
 }
 
+// --- NF1–NF9: `noise_globs` fold (display-only). Declaratively-configured
+// glob-matched file entries are folded out of `log`/`show`'s HUMAN rendering
+// only — never `--json`, never `diff`/`blame`/`undo`. Precedent: `log`
+// already hides an entire class by default (git turns via the `tool != "git"`
+// filter, `--all` reveals) — this is the same idea one level down, from
+// turns to individual file entries within a turn, with `--all-files` as the
+// orthogonal reveal flag.
+
+fn set_noise_globs(root: &Path, globs: &[&str]) {
+    let config_path = root.join(".agentrec/config.toml");
+    let mut text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let items: Vec<String> = globs.iter().map(|g| format!("\"{g}\"")).collect();
+    text.push_str(&format!("\nnoise_globs = [{}]\n", items.join(", ")));
+    std::fs::write(&config_path, text).unwrap();
+}
+
+fn short_id_of(id: &str) -> String {
+    let body = id.strip_prefix("t_").unwrap();
+    format!("t_{}…{}", &body[..4], &body[body.len() - 4..])
+}
+
+/// A rich turn touching 1 ordinary file + 2 files under `.remember/` (the
+/// measured real-world noise class from CLAUDE.md's store-bloat notes).
+fn noise_turn(id: &str) -> agentrec_core::record::TurnRecord {
+    use agentrec_core::record::FileEntry;
+    let entry = |path: &str| FileEntry {
+        path: path.to_string(),
+        before: None,
+        after: Some(agentrec_core::store::hash_bytes(path.as_bytes())),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+        skipped_reason: None,
+    };
+    base_turn(
+        id,
+        vec![
+            entry("src/main.rs"),
+            entry(".remember/session.log"),
+            entry(".remember/session.pid"),
+        ],
+    )
+}
+
+// NF1: regression guard — no `noise_globs` configured (or empty) means `log`
+// and `show` are completely unaffected by this feature's existence.
+#[test]
+fn nf1_log_and_show_unaffected_when_noise_globs_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF1BASELINE00000000000001");
+    seed_turn(root, &turn);
+
+    let log_out = agentrec(root, &["log", "--utc"]);
+    assert!(log_out.status.success(), "log failed: {log_out:?}");
+    let log_stdout = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        log_stdout.contains("3 files"),
+        "expected the unreduced 3-file count with no noise_globs: {log_stdout}"
+    );
+    assert!(
+        !log_stdout.contains("noise files"),
+        "no fold line must ever print with no noise_globs configured: {log_stdout}"
+    );
+
+    let show_out = agentrec(root, &["show", &turn.id]);
+    assert!(show_out.status.success(), "show failed: {show_out:?}");
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    assert!(
+        !show_stdout.contains("noise files"),
+        "show must not print a fold line with no noise_globs configured: {show_stdout}"
+    );
+}
+
+// NF2: with a matching glob configured, `log` folds the matched entries out
+// of the visible count and prints the exact mandated line. The --all-files
+// cross-check proves the glob genuinely matched this fixture (not a
+// coincidental 0) rather than assuming it.
+#[test]
+fn nf2_log_folds_matching_entries_and_prints_exact_count_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+    let turn = noise_turn("t_NF2FOLDCOUNT0000000000001");
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["log", "--utc"]);
+    assert!(out.status.success(), "log failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 file"),
+        "folded count must be 3 total - 2 noise = 1: {stdout}"
+    );
+    assert!(
+        stdout.contains("+2 noise files (--all-files to show)"),
+        "expected the exact mandated fold line: {stdout}"
+    );
+
+    let unfolded = agentrec(root, &["log", "--utc", "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout);
+    assert!(
+        unfolded_stdout.contains("3 files"),
+        "precondition: --all-files must show the real unreduced count \
+         (proves the glob genuinely matched, not a coincidental 0): {unfolded_stdout}"
+    );
+}
+
+// NF3: `--all-files` output must match the no-`noise_globs` baseline exactly
+// — folding fully reversed, byte for byte.
+#[test]
+fn nf3_all_files_matches_unfolded_rendering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF3ALLFILES0000000000001");
+    seed_turn(root, &turn);
+
+    let baseline = agentrec(root, &["log", "--utc"]);
+    assert!(baseline.status.success());
+    let baseline_stdout = String::from_utf8_lossy(&baseline.stdout).to_string();
+
+    set_noise_globs(root, &[".remember/**"]);
+    let folded = agentrec(root, &["log", "--utc"]);
+    assert!(folded.status.success());
+    let folded_stdout = String::from_utf8_lossy(&folded.stdout).to_string();
+    assert_ne!(
+        folded_stdout, baseline_stdout,
+        "sanity: folding must actually change output before --all-files un-does it"
+    );
+
+    let unfolded = agentrec(root, &["log", "--utc", "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout).to_string();
+    assert_eq!(
+        unfolded_stdout, baseline_stdout,
+        "--all-files output must match the no-noise_globs baseline exactly"
+    );
+}
+
+// NF4: `--json` is the machine contract — byte-identical with and without
+// `noise_globs` configured. Folding is human-render only.
+#[test]
+fn nf4_json_output_byte_identical_regardless_of_noise_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF4JSONSTABLE000000000001");
+    seed_turn(root, &turn);
+
+    let before = agentrec(root, &["log", "--json"]);
+    assert!(before.status.success());
+
+    set_noise_globs(root, &[".remember/**"]);
+    let after = agentrec(root, &["log", "--json"]);
+    assert!(after.status.success());
+
+    assert_eq!(
+        before.stdout, after.stdout,
+        "log --json must be byte-identical with and without noise_globs"
+    );
+}
+
+// NF5: `blame` and `undo` never consult `noise_globs` — attribution and
+// revert are completely unaffected for a file that matches it.
+#[test]
+fn nf5_blame_and_undo_unaffected_by_noise_globs() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    std::fs::create_dir_all(root.join(".remember")).unwrap();
+    let before = store.put(b"before\n").unwrap();
+    let after = store.put(b"after\n").unwrap();
+    std::fs::write(root.join(".remember/session.log"), b"after\n").unwrap();
+
+    let turn = base_turn(
+        "t_NF5BLAMEUNDO0000000000001",
+        vec![FileEntry {
+            path: ".remember/session.log".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let blame_out = agentrec(root, &["blame", ".remember/session.log"]);
+    assert!(blame_out.status.success(), "blame failed: {blame_out:?}");
+    let blame_stdout = String::from_utf8_lossy(&blame_out.stdout);
+    assert!(
+        blame_stdout.contains(&short_id_of(&turn.id)),
+        "blame must still attribute the noise-matched file normally: {blame_stdout}"
+    );
+    assert!(
+        !blame_stdout.contains("no recorded turn"),
+        "blame must not treat a noise-matched file as untouched: {blame_stdout}"
+    );
+
+    let undo_out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+    assert!(undo_out.status.success(), "undo failed: {undo_out:?}");
+    let reverted = std::fs::read(root.join(".remember/session.log")).unwrap();
+    assert_eq!(
+        reverted, b"before\n",
+        "undo must still revert a noise-matched file"
+    );
+}
+
+// NF6: a turn whose entries are ALL noise still appears in `log` (turn
+// selection is untouched — only individual file entries fold), and
+// `status`'s rich-rate is completely unaffected either way.
+#[test]
+fn nf6_all_noise_turn_still_appears_and_rich_rate_unaffected() {
+    use agentrec_core::record::FileEntry;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let entry = |path: &str| FileEntry {
+        path: path.to_string(),
+        before: None,
+        after: Some(agentrec_core::store::hash_bytes(path.as_bytes())),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+        skipped_reason: None,
+    };
+    let all_noise_turn = base_turn(
+        "t_NF6ALLNOISE00000000000001",
+        vec![entry(".remember/a.log"), entry(".remember/b.log")],
+    );
+    seed_turn(root, &all_noise_turn);
+
+    let status_before = agentrec(root, &["status"]);
+    assert!(status_before.status.success());
+    let status_before_stdout = String::from_utf8_lossy(&status_before.stdout).to_string();
+
+    set_noise_globs(root, &[".remember/**"]);
+
+    let log_out = agentrec(root, &["log", "--utc"]);
+    assert!(log_out.status.success(), "log failed: {log_out:?}");
+    let log_stdout = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        log_stdout.contains(&short_id_of(&all_noise_turn.id)),
+        "an all-noise turn must still appear in log: {log_stdout}"
+    );
+    assert!(
+        log_stdout.contains("+2 noise files (--all-files to show)"),
+        "expected the fold line even when every entry is noise: {log_stdout}"
+    );
+
+    let status_after = agentrec(root, &["status"]);
+    assert!(status_after.status.success());
+    let status_after_stdout = String::from_utf8_lossy(&status_after.stdout);
+    assert_eq!(
+        status_after_stdout, status_before_stdout,
+        "status rich-rate must be completely unaffected by noise_globs"
+    );
+}
+
+// NF7: `--all` (turn-grade axis) and `--all-files` (file-class axis) are
+// orthogonal — neither flag's behavior leaks into the other's.
+#[test]
+fn nf7_all_and_all_files_flags_are_orthogonal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let mut git_turn = noise_turn("t_NF7GITTURN0000000000001");
+    git_turn.tool = Some("git".to_string());
+    seed_turn(root, &git_turn);
+
+    // --all-files alone: git turn stays hidden.
+    let all_files_only = agentrec(root, &["log", "--all-files"]);
+    assert!(all_files_only.status.success());
+    let stdout = String::from_utf8_lossy(&all_files_only.stdout);
+    assert!(
+        !stdout.contains(&short_id_of(&git_turn.id)),
+        "--all-files must not reveal a git turn: {stdout}"
+    );
+
+    // --all alone: git turn revealed, but its noise files still folded.
+    let all_only = agentrec(root, &["log", "--all"]);
+    assert!(all_only.status.success());
+    let stdout2 = String::from_utf8_lossy(&all_only.stdout);
+    assert!(
+        stdout2.contains(&short_id_of(&git_turn.id)),
+        "--all must reveal the git turn: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("noise files"),
+        "--all alone must not reveal noise files: {stdout2}"
+    );
+}
+
+// NF8: `init`'s default config.toml mentions `noise_globs`, and a
+// pre-existing config lacking the key still works and is never clobbered.
+#[test]
+fn nf8_init_default_config_mentions_noise_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let config = std::fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
+    assert!(
+        config.contains("noise_globs"),
+        "default config.toml must mention noise_globs: {config}"
+    );
+}
+
+#[test]
+fn nf8_existing_config_missing_noise_globs_key_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // Simulate a pre-existing repo's config.toml written before this
+    // feature existed — no noise_globs key at all.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\n",
+    )
+    .unwrap();
+
+    let turn = noise_turn("t_NF8OLDCONFIG00000000001");
+    seed_turn(root, &turn);
+    let out = agentrec(root, &["log", "--utc"]);
+    assert!(out.status.success(), "log must still work: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("3 files"), "stdout: {stdout}");
+
+    // Re-running init on this pre-existing config must not clobber it.
+    let init_out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(init_out.status.success());
+    let config_after = std::fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
+    assert!(
+        !config_after.contains("noise_globs"),
+        "init must not clobber a pre-existing config.toml lacking the key: {config_after}"
+    );
+}
+
+// `show`: same fold behavior as `log`, plus --all-files suppresses it.
+#[test]
+fn nf_show_folds_and_all_files_reveals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+    let turn = noise_turn("t_NFSHOWFOLD0000000000001");
+    seed_turn(root, &turn);
+
+    let folded = agentrec(root, &["show", &turn.id]);
+    assert!(folded.status.success());
+    let folded_stdout = String::from_utf8_lossy(&folded.stdout);
+    assert!(
+        folded_stdout.contains("+2 noise files (--all-files to show)"),
+        "show must print the fold line: {folded_stdout}"
+    );
+
+    let unfolded = agentrec(root, &["show", &turn.id, "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout);
+    assert!(
+        !unfolded_stdout.contains("noise files"),
+        "show --all-files must suppress the fold line: {unfolded_stdout}"
+    );
+}
+
+// Judgement call (not a named AC, but load-bearing): `show --prompt` writes
+// raw post-scrub prompt bytes to stdout — the fold line must never leak into
+// that path, or it silently corrupts the printed prompt.
+#[test]
+fn nf_show_prompt_output_never_gets_fold_line() {
+    use agentrec_core::store::BlobStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let prompt_hash = store.put(b"do the thing").unwrap();
+    let mut turn = noise_turn("t_NFSHOWPROMPT000000000001");
+    turn.prompt_ref = Some(prompt_hash);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["show", &turn.id, "--prompt"]);
+    assert!(out.status.success(), "show --prompt failed: {out:?}");
+    assert_eq!(out.stdout, b"do the thing", "stdout: {:?}", out.stdout);
+}
+
+// NF-E: `--explain`'s glossary only explains noise-folding when a fold
+// actually occurred in this invocation's output (D43's existing rule,
+// extended to the new term).
+#[test]
+fn nf_explain_explains_noise_fold_only_when_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = noise_turn("t_NFEXPLAINNONE0000000001");
+    seed_turn(root, &turn);
+
+    let without = agentrec(root, &["log", "--explain"]);
+    assert!(without.status.success());
+    let without_stdout = String::from_utf8_lossy(&without.stdout).to_lowercase();
+    assert!(
+        !without_stdout.contains("noise files:"),
+        "must not explain noise folding when none occurred: {without_stdout}"
+    );
+
+    set_noise_globs(root, &[".remember/**"]);
+    let with = agentrec(root, &["log", "--explain"]);
+    assert!(with.status.success());
+    let with_stdout = String::from_utf8_lossy(&with.stdout).to_lowercase();
+    assert!(
+        with_stdout.contains("noise files:"),
+        "must explain noise folding once a fold occurred: {with_stdout}"
+    );
+}
+
 // --- Task 4: `agentrec remember` — manual pinned memories.
 
 #[test]

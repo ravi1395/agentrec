@@ -158,6 +158,10 @@ const GLOSSARY: &[(&str, &str)] = &[
         "human-edited since",
         "human-edited since: the file changed after this turn ended, outside any rich turn's coverage",
     ),
+    (
+        "noise files",
+        "noise files: file entries matching a config-declared noise_globs pattern, folded out of this listing by default — see --all-files",
+    ),
 ];
 
 /// Scan `rendered` (the text this invocation of `log` actually printed) for
