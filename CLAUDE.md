@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 ## Status (update after every delivery round — house rule)
 
 **Blame-honesty + skipped_reason + noise folding — GATE PASS (2026-07-25,
-branch `fix/blame-attribution-and-noise-folding`, `17657d9..dc4bd9a`, not pushed):** Three changes
+branch `fix/blame-attribution-and-noise-folding`, `17657d9..c4ada8f`, not pushed):** Three changes
 landed off a 4-lens adversarial redteam of store churn. Binding skeptical-reviewer done-gate in an
 isolated worktree: round 1 **GATE FAIL** (one blocking finding, below), round 2 **GATE PASS** at
 `7be9e4d` — all 6 findings CLOSED, each refuted by neutering the fix and observing a *named* test go
