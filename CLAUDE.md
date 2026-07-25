@@ -72,8 +72,13 @@ renderer emits lowercase `revert`), pre-existing and carried forward, harmless b
 declare-first was skipped this round** (4 coverage findings: IMPLEMENTATION.md, daemon.rs,
 readcmds.rs, integration.rs). **Retroactive declaration deliberately refused** — the skill forbids
 it and a declare-record postdating the code would make the log lie about ordering, the one property
-claimd provides. Also: `.claims/lint.ignore` does **not** exist despite an earlier note saying it
-was seeded — that note is stale. The two D29 claims went STALE (daemon.rs touched) and were
+claimd provides. The ignore list lives in `.claims/config.json` under `lint.ignore` and is seeded
+with `CLAUDE.md`, `VERIFY-LEDGER.md`, `docs/**` *(an earlier draft of this entry claimed a
+`.claims/lint.ignore` file was missing and the seeding note was stale — both false; there is no such
+file because the mechanism is the config key)*. **Open, founder's call:** `IMPLEMENTATION.md` is not
+in that list, so every edit to the AC register fires a coverage finding; its two narrative siblings
+are both already ignored, but `PROTOCOL.md` is not, so adding one without deciding the rule just
+moves the finding. The two D29 claims went STALE (daemon.rs touched) and were
 re-verified **confirmed** at HEAD (`c522de1c…`, `f5b73066…`), so this round did not break the
 gitignore fix. Design record for the deferred storage work: `docs/superpowers/specs/2026-07-25-store-churn-designs.md`
 (`c46519c`). A detached review worktree was left at `…/scratchpad/gate` (`c46519c`) — remove when
