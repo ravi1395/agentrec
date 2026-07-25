@@ -75,10 +75,16 @@ it and a declare-record postdating the code would make the log lie about orderin
 claimd provides. The ignore list lives in `.claims/config.json` under `lint.ignore` and is seeded
 with `CLAUDE.md`, `VERIFY-LEDGER.md`, `docs/**` *(an earlier draft of this entry claimed a
 `.claims/lint.ignore` file was missing and the seeding note was stale — both false; there is no such
-file because the mechanism is the config key)*. **Open, founder's call:** `IMPLEMENTATION.md` is not
-in that list, so every edit to the AC register fires a coverage finding; its two narrative siblings
-are both already ignored, but `PROTOCOL.md` is not, so adding one without deciding the rule just
-moves the finding. The two D29 claims went STALE (daemon.rs touched) and were
+file because the mechanism is the config key)*. **`IMPLEMENTATION.md` added to that list by the
+agent, not the founder — review it.** The Stop hook's coverage rule fired on it three times across
+this round and names exactly two remedies; retroactive declaration is the one the skill forbids, so
+the ignore entry was taken as the sanctioned alternative. It is one line in
+`.claims/config.json`, trivially reversible, and consistent with its two narrative siblings already
+being ignored. **The underlying rule is still undecided:** `PROTOCOL.md` is NOT ignored, so the same
+finding will fire on the next normative-doc edit; the real question is whether register/narrative
+docs are categorically out of claim scope (they have no honest replay command) or whether spec docs
+should carry grep-style claims precisely because doc drift has already caused a GATE FAIL in this
+repo. The two D29 claims went STALE (daemon.rs touched) and were
 re-verified **confirmed** at HEAD (`c522de1c…`, `f5b73066…`), so this round did not break the
 gitignore fix. Design record for the deferred storage work: `docs/superpowers/specs/2026-07-25-store-churn-designs.md`
 (`c46519c`). A detached review worktree was left at `…/scratchpad/gate` (`c46519c`) — remove when
