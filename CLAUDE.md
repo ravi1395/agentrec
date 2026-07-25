@@ -8,11 +8,78 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Ignore-set rebuild gate — GATE PASS (2026-07-25, branch `fix/ignore-rebuild-gate`,
+`bdb911c..fe57cda`, not pushed):** All 3 phases delivered against
+`docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`. **386 → 395 tests, 0 failed,
+1 ignored**, clippy `-D warnings` + fmt clean on debug **and** release, release `strings` carries no
+`AGENTREC_TEST` seam. Sonnet implementers, an Opus reviewer per phase in an isolated worktree, and a
+binding **fable skeptic** done-gate — plus an orchestrator re-run of the full suite at every phase,
+independent of every implementer. Each count agreed three ways.
+**The defect, closed:** `e453e86` fixed the *trigger* (`gitignore_dirty` set at event ingest by
+filename, verdict-independent) and left the *consumption* inside `if settled || capped`, whose
+predicates are armed **only** by `Class::Watch` events. Editing `.gitignore` to re-include a path and
+then touching only that path therefore produced **no rebuild, ever** — the path classified against the
+stale set, armed no timer, and the flush block never ran. Under-record direction, so nothing was
+corrupted; the recorder simply, silently, did not record a file the user had explicitly re-enabled.
+Second shipping of this class (`049a4aa` introduced the trigger defect). **(P1) `0a7b279`** moves the
+rebuild to the top of `run`'s loop behind `maybe_rebuild(dirty, root)` — top-of-tick, not inside
+ingest, so a hot `.gitignore` costs at most one full-repo `IgnoreSet::build` per `POLL` rather than
+one per event. **(P2) `b68bc42`+`8cce05a`** makes reloads observable (`ignore_rebuilds` /
+`last_ignore_rebuild_ms` in `state.json`, one stderr line per rebuild, a `status` line shown only when
+the counter is non-zero, and `status --json`, which did not exist before) — the class shipped twice
+partly because nothing anywhere reported whether the filter config was ever reloaded. **(P3)
+`ec2874b`** adds the mid-run coverage that never existed: deletion re-widens, creation is honored
+without restart, `SingleDaemonGuard` hygiene, and a matcher-count precondition.
+**The skeptic verified the product, not the suite:** live binary, real daemon, real repo, all four
+mid-run directions (widen / narrow / delete / create) checked against `.agentrec/log.jsonl` directly,
+`ignore_rebuilds: 4` with matching stderr lines and 0700/0600 perms. It also **empirically confirmed
+the documented residual window** — an event arriving in the same drain batch as the ignore-file edit
+is still classified against the pre-edit set, and is honored on the path's *next* mutation (≤1 `POLL`
+tick), which is the honest claim the plan makes rather than "instant".
+**Three things this round got wrong and corrected rather than buried.** (a) The plan's test-count
+ladder was wrong **twice** (387→388, 391→393→395), both times derivable from the plan's own contents
+before any implementer touched it — Phase 3's original target of 393 was already met by Phase 2, so
+it could have passed having added neither required test. (b) A claim came back **REFUTED**
+(`clm_1H62NAJN`): its replay was authored as `cargo test A B`, and cargo accepts one TESTNAME, so it
+errored instead of running and never proved its property — its own evidence event recorded `exit: 1`
+and the orchestrator reported the ledger clean without checking exit codes. Left REFUTED in the log
+deliberately, replaced by `clm_4H93KXD1`; every other evidence exit was then audited (all 0).
+(c) **`nested_gitignore_precedence` was NEVER vacuous** — see the correction below, now measured in
+four cells and fixed in the test comment, the plan and this file.
+**AC4 could not have proven itself as written:** the plan's literal "5 rapid `.gitignore` rewrites →
+counter in `1..=5`" fails to discriminate its own neuter, because 5 writes coalesce to ~3 FSEvents
+events, so a per-event counter also lands ≤5. Reproduced directly by the reviewer. Delivered form is
+40 writes bounded `1..=10` (correct code measures 3–4; the neuter measures 15–18). The declared claim
+still carried the false text, so it was amended to replay what exists and **superseded** by
+`clm_6SAFG0JJ`, not deleted. **Claim ledger: 17 claims — 10 confirmed, 6 evidenced, 1 deliberately
+refuted**, declare-first per criterion at the parent commit each time (last round skipped this).
+**Coverage gaps the gate names, none blocking:** (1) **narrowing while events are pending** — paths
+already admitted to `pending` under the older, wider rules are still staged at the next flush even if
+a mid-debounce edit now ignores them; the over-record mirror of the documented residual window,
+untested and undescribed in the module comment. (2) **Everything here is macOS/FSEvents** — the
+400 ms margins and the `1..=10` bound are reasoned safe (failures fall RED, and inotify widens the
+margins) but unobserved; Linux CI leg owed, same posture as the `unreadable`/`io_failed` producers.
+(3) counter behavior across a daemon restart never observed. (4) no test pins the sustained walk rate
+on a continuously-rewritten `.gitignore`.
+**Recorded, not fixed:** `status --ack-degraded --json` prints plain text under a `--json` flag;
+`status --json` omits the DEGRADED fields entirely (README now says so), so a monitoring script sees
+less than the text surface; `state::read_state` chains two `.ok()`s into `unwrap_or_default()`, so
+**one** unparseable field silently resets `pid`, `signal_offset`, `snapshot_failures` and `io_failed`
+with no diagnostic — and a reset `signal_offset` replays the entire signal inbox (pre-existing; this
+round did not worsen it, and its own AC3 test is built to discriminate that fallback). Open question 1
+was **resolved by defaulting** to option (c): the reload line shows whenever the counter is non-zero,
+and the counter is lifetime-cumulative and not cleared by `--ack-degraded`, so a long-lived repo
+eventually renders `ignore: reloaded 4821 time(s)` in the daily-driver surface. Option (a),
+epoch-scoping, remains the cheap reversal — founder call. **Favorable fact for the churn-honesty
+plan:** `status --json` performs **zero writes** (returns before `enforce_budget`; mtime and inode
+unchanged across a run), so that plan's Phase 5 criterion starts satisfied on this path.
+
 **Planning round — three plans committed, zero code changed (2026-07-25, branch
 `fix/blame-attribution-and-noise-folding`, `8da3e16..6244afb`, not pushed):** Documented here
 **before** implementation because these plans are the next things to be attacked, and an
-un-registered plan file is not a durable artifact. **Nothing below is implemented.** Test suite
-untouched at the prior round's **386 passed / 0 failed / 1 ignored** (a figure carried from that
+un-registered plan file is not a durable artifact. **Nothing below was implemented at the time of
+writing** — plan (2), the rebuild gate, has since shipped in full; see the GATE PASS entry above.
+Test suite untouched at the prior round's **386 passed / 0 failed / 1 ignored** (a figure carried from that
 round's receipt and marked UNVERIFIED in every plan header — re-run before trusting it).
 
 **(1) Churn-honesty round — `docs/superpowers/plans/2026-07-25-agentrec-churn-honesty-round.md`
