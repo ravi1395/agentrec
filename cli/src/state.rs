@@ -59,6 +59,23 @@ pub struct State {
     /// evidence the write was attempted and failed, not silently absent.
     #[serde(default)]
     pub prompt_put_failures: u64,
+    /// Count of times the daemon rebuilt its in-memory `IgnoreSet` after a
+    /// `.gitignore` change (Phase 1 of the rebuild-gate fix, `0a7b279`, made
+    /// this happen reliably; this counter makes its RATE observable rather
+    /// than theoretical — see `daemon::run`'s loop-tick comment for why that
+    /// rate matters). Same `snapshot_failures` honesty pattern as every
+    /// other counter here: nothing else on disk shows whether a filter
+    /// reload ever happened, so a user cannot otherwise tell "my new rule is
+    /// active" from "the daemon is still running last week's rules".
+    /// OPERATIONAL state only — never part of the PROTOCOL wire format
+    /// (PROTOCOL §5 deliberately keeps `state.json` off the wire).
+    #[serde(default)]
+    pub ignore_rebuilds: u64,
+    /// Wall-clock ms of the most recent ignore-set rebuild, or 0 when
+    /// `ignore_rebuilds` is 0 (never happened). Same operational, off-wire
+    /// posture as `ignore_rebuilds`.
+    #[serde(default)]
+    pub last_ignore_rebuild_ms: u64,
 }
 
 pub fn read_state(root: &Path) -> State {
@@ -111,6 +128,15 @@ pub fn record_prompt_put_failure(state: &mut State) {
     state.prompt_put_failures += 1;
 }
 
+/// Record a completed `IgnoreSet` rebuild: bumps the counter and stamps the
+/// wall-clock time it happened, so `status` can render "reloaded N time(s),
+/// last ... ago" — and print nothing at all when `ignore_rebuilds` is still
+/// 0 (never a vacuous "0 reloads" line).
+pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
+    state.ignore_rebuilds += 1;
+    state.last_ignore_rebuild_ms = wall_ms;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +179,22 @@ mod tests {
         assert!(state.io_failed.is_empty());
         assert_eq!(state.non_utf8_path_skips, 0);
         assert_eq!(state.prompt_put_failures, 0);
+        assert_eq!(state.ignore_rebuilds, 0);
+        assert_eq!(state.last_ignore_rebuild_ms, 0);
+    }
+
+    #[test]
+    fn record_ignore_rebuild_increments_and_stamps_time_and_round_trips() {
+        let mut state = State::default();
+        record_ignore_rebuild(&mut state, 1_000);
+        record_ignore_rebuild(&mut state, 2_000);
+        assert_eq!(state.ignore_rebuilds, 2);
+        assert_eq!(state.last_ignore_rebuild_ms, 2_000);
+
+        let text = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.ignore_rebuilds, 2);
+        assert_eq!(back.last_ignore_rebuild_ms, 2_000);
     }
 
     #[test]

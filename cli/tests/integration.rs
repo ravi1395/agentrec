@@ -432,6 +432,164 @@ fn unignore_is_honored_without_other_watched_activity() {
     );
 }
 
+/// Read `.agentrec/state.json`'s `ignore_rebuilds` counter, or `None` if the
+/// file is missing/unparseable/lacks the key.
+fn ignore_rebuilds(root: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("ignore_rebuilds")?.as_u64()
+}
+
+// Phase 2 of the rebuild-gate fix: nothing anywhere reported whether the
+// filter configuration was ever reloaded, which is part of why this defect
+// class shipped twice. `state.json`'s `ignore_rebuilds` is the instrument —
+// it must count actual REBUILDS (one per `.gitignore` edit that lands in its
+// own tick), not raw filesystem events.
+#[test]
+fn daemon_counts_ignore_rebuilds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let saw_one = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? == 1).then_some(())
+    });
+    assert!(
+        saw_one.is_some(),
+        "expected ignore_rebuilds to reach 1 after the first .gitignore edit, got {:?}",
+        ignore_rebuilds(root)
+    );
+
+    // Spaced past one POLL tick (250ms) so it doesn't collapse into the same
+    // notify batch as the first edit.
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join(".gitignore"), "*.log\n*.tmp\n").unwrap();
+    let saw_two = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? == 2).then_some(())
+    });
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        saw_two.is_some(),
+        "expected ignore_rebuilds to reach 2 after the second .gitignore edit, got {:?}",
+        ignore_rebuilds(root)
+    );
+}
+
+// AC: rebuild rate is bounded by the dirty flag (at most one `IgnoreSet::build`
+// walk per `POLL` tick), never by raw event count. Asserted on the PERSISTED
+// counter only — never by counting stderr lines inside a fixed window, which
+// this repo has documented FSEvents flake from (see CLAUDE.md's
+// daemon-test-FSEvents-contention note).
+//
+// Deviation from the plan's literal "5 writes -> 1..=5", recorded because it
+// was measured, not assumed: on this macOS/FSEvents setup, 5 back-to-back
+// `.gitignore` writes already coalesce to ~3 raw notify events, so a
+// per-EVENT counter (the neuter this test exists to catch) also lands
+// <= 5 and the test would never go red. Empirically, 40 writes yields ~3-4
+// rebuilds under the correct per-TICK counter (repeatedly measured) vs.
+// ~15-18 under the per-event neuter — bounding to 10 keeps a wide margin on
+// both sides while still being far below what raw event-counting produces.
+#[test]
+fn rebuild_count_is_bounded_by_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    for i in 0..40 {
+        std::fs::write(root.join(".gitignore"), format!("*.log{i}\n")).unwrap();
+    }
+
+    // Prove at least one rebuild happened at all (daemon liveness), then let
+    // any still-in-flight rebuild settle before the final read.
+    let saw_rebuild = poll_until(Duration::from_secs(10), || {
+        let n = ignore_rebuilds(root)?;
+        (n >= 1).then_some(n)
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let count = ignore_rebuilds(root).unwrap_or(0);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        saw_rebuild.is_some(),
+        "no ignore-set rebuild observed at all — rest of the test is moot"
+    );
+    assert!(
+        (1..=10).contains(&count),
+        "expected ignore_rebuilds bounded to 1..=10 for 40 writes (rate-limited by the dirty \
+         flag, not per-event), got {count}"
+    );
+}
+
+// A pre-existing state.json written by an OLDER binary (before Phase 2) has
+// neither field at all. `#[serde(default)]` must let it still parse, render
+// as never-reloaded in text `status`, and `status --json` must carry the
+// new field regardless.
+//
+// `snapshot_failures`/`io_failed` are planted alongside the missing fields
+// and asserted to survive — `State` derives `Default`, so a version of this
+// fix that drops `#[serde(default)]` (making the field required) doesn't
+// fail to parse in an obviously-visible way: `read_state` swallows any
+// deserialize error via `.ok()` and falls back to `State::default()`, whose
+// `ignore_rebuilds` is ALSO 0. Asserting only `ignore_rebuilds == 0` would
+// pass identically whether the JSON parsed field-by-field or failed whole
+// and silently reset every OTHER field too (losing `snapshot_failures`,
+// `pid`, everything) — this is exactly the vacuity trap the DEGRADED-banner
+// assertion below closes.
+#[test]
+fn status_tolerates_state_without_rebuild_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":0,"signal_offset":0,"snapshot_failures":3,"io_failed":["src/a.rs"]}"#,
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["status"]);
+    assert!(
+        out.status.success(),
+        "status failed on a state.json missing the new fields: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.to_lowercase().contains("reload"),
+        "a state.json without ignore_rebuilds must render as never-reloaded: {stdout}"
+    );
+    assert!(
+        stdout.contains("DEGRADED") && stdout.contains('3') && stdout.contains("src/a.rs"),
+        "pre-existing fields (snapshot_failures/io_failed) must survive parsing a state.json \
+         missing the new ignore-rebuild fields — a whole-struct parse failure falling back to \
+         State::default() would silently lose them too: {stdout}"
+    );
+
+    let json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        json_out.status.success(),
+        "status --json failed: {json_out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout)
+        .unwrap_or_else(|e| panic!("status --json did not emit valid JSON ({e}): {json_out:?}"));
+    assert_eq!(
+        v.get("ignore_rebuilds").and_then(|c| c.as_u64()),
+        Some(0),
+        "status --json must carry ignore_rebuilds even from a pre-existing state.json: {v}"
+    );
+}
+
 #[test]
 fn second_record_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

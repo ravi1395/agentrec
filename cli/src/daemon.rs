@@ -10,8 +10,8 @@
 
 use crate::cmds::wall_now_ms;
 use crate::state::{
-    read_state, record_io_failure, record_non_utf8_path_skip, record_prompt_put_failure,
-    write_state, State,
+    read_state, record_ignore_rebuild, record_io_failure, record_non_utf8_path_skip,
+    record_prompt_put_failure, write_state, State,
 };
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
@@ -131,7 +131,16 @@ pub fn run(root: &Path) -> Result<(), String> {
         // dropped intermediate event costs an intermediate snapshot, never
         // the file's content — the next mutation snapshots it as it then
         // stands.
+        //
+        // Walk-rate cost of this move (Phase 2 of the rebuild-gate fix):
+        // pre-fix, a repo where only `.gitignore` churns did ZERO
+        // `IgnoreSet::build` full-repo walks (the flush block never ran);
+        // post-fix it can do up to one per `POLL` tick (250ms) indefinitely —
+        // `state.json`'s `ignore_rebuilds`/`last_ignore_rebuild_ms` (surfaced
+        // by `status`) is what makes that rate observable rather than
+        // theoretical.
         if let Some(fresh) = maybe_rebuild(&mut gitignore_dirty, &root) {
+            log_ignore_rebuild(&root, fresh.matchers.len(), clock.wall_ms(clock.now_ms()));
             ignore_set = fresh;
         }
 
@@ -571,6 +580,22 @@ fn maybe_rebuild(dirty: &mut bool, root: &Path) -> Option<IgnoreSet> {
     }
     *dirty = false;
     Some(IgnoreSet::build(root))
+}
+
+/// Persist + log a completed ignore-set rebuild (Phase 2 of the
+/// rebuild-gate fix — this class shipped twice partly because nothing
+/// reported whether a reload ever happened). Bumps `state.json`'s
+/// `ignore_rebuilds`/`last_ignore_rebuild_ms` and prints one stderr line
+/// naming the matcher count, mirroring `drain_io_failures`'s
+/// read-mutate-log-write shape. Called only from the `Some(fresh)` arm of
+/// `maybe_rebuild`'s caller, so the increment tracks REBUILDS, never events.
+fn log_ignore_rebuild(root: &Path, matcher_count: usize, wall_ms: u64) {
+    let mut state = read_state(root);
+    record_ignore_rebuild(&mut state, wall_ms);
+    eprintln!("agentrec: ignore rules reloaded ({matcher_count} matchers)");
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist ignore-rebuild state: {e}");
+    }
 }
 
 /// Repo-relative paths a concurrent `undo --confirm` is currently writing

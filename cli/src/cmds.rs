@@ -168,8 +168,10 @@ fn format_turn(
 
 /// `status`: store size, recording gaps, and rich-rate (the health stat that
 /// catches silently broken hooks). `ack_degraded` clears a prior DEGRADED
-/// snapshot-failure banner (D35) instead of printing status.
-pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
+/// snapshot-failure banner (D35) instead of printing status. `json` emits
+/// machine-readable operational fields instead of the text report — today
+/// just the ignore-rebuild counters (additive; more fields can join later).
+pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String> {
     if ack_degraded {
         let mut state = read_state(root);
         state.snapshot_failures = 0;
@@ -187,6 +189,25 @@ pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
             return Err(format!("could not clear DEGRADED state: {e}"));
         }
         println!("acknowledged — DEGRADED cleared");
+        return Ok(());
+    }
+    if json {
+        // `state.json` is OPERATIONAL data, not the PROTOCOL wire format
+        // (PROTOCOL §5 deliberately keeps it off the wire) — this is a
+        // separate, additive JSON surface, not a serialization of a wire
+        // record. `last_ignore_rebuild_ms` is `null` rather than `0` when
+        // never reloaded, so a JSON consumer can't mistake the Unix epoch
+        // for a real reload time.
+        let state = read_state(root);
+        let payload = serde_json::json!({
+            "ignore_rebuilds": state.ignore_rebuilds,
+            "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
+                Some(state.last_ignore_rebuild_ms)
+            } else {
+                None
+            },
+        });
+        println!("{payload}");
         return Ok(());
     }
     print!("{}", status_report(root, agentrec_core::MAX_STORE_BYTES)?);
@@ -217,6 +238,11 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
 
     let gaps = count_gaps(&records);
 
+    // Read once, reused below for the ignore-reload line and (further down)
+    // the memory/DEGRADED sections — same single-read pattern those already
+    // used, just hoisted so this line can consult it too.
+    let state = read_state(root);
+
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
@@ -229,6 +255,20 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         turns.len()
     ));
     out.push_str(&format!("gaps:       {gaps} recording gap(s)\n"));
+    // Only rendered once a rebuild has ever happened — a repo whose
+    // .gitignore never churned has nothing to report, and printing "0
+    // reloads" would be exactly the vacuous line the zero-turn rich-rate
+    // line above already refuses to print (D-PD3 precedent).
+    if state.ignore_rebuilds > 0 {
+        let when = fmt::relative_time(
+            &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
+            wall_now_ms(),
+        );
+        out.push_str(&format!(
+            "ignore:     reloaded {} time(s), last {when}\n",
+            state.ignore_rebuilds
+        ));
+    }
     if trailing.is_empty() {
         out.push_str("rich-rate:  n/a (no agent turns yet)\n");
     } else {
@@ -261,7 +301,6 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             | agentrec_core::memory::Freshness::Orphaned => mem_stale += 1,
         }
     }
-    let state = read_state(root);
     // I = memory-stats.jsonl lines that recorded a real injection (carry
     // `n`) — the hook-owned injection log (Task 9); this is the only
     // visible evidence recall actually fired into a prompt, so status
@@ -837,7 +876,7 @@ mod tests {
         crate::state::record_non_utf8_path_skip(&mut state);
         write_state(root, &state).unwrap();
 
-        status(root, true).unwrap();
+        status(root, true, false).unwrap();
 
         let after = read_state(root);
         assert_eq!(after.non_utf8_path_skips, 0);
@@ -934,6 +973,34 @@ mod tests {
         assert!(
             out.contains("2 failures"),
             "expected exactly 2 memory-store failures counted, malformed lines ignored: {out}"
+        );
+    }
+
+    // Phase 2 of the rebuild-gate fix: a repo whose `.gitignore` never
+    // churned must never print a vacuous "0 reloads" line (the zero-turn
+    // `rich-rate: n/a` precedent, D-PD3). The second half of this test
+    // (nonzero counter -> line DOES appear) is load-bearing, not padding: a
+    // version of `status_report` that never prints a reload line at all
+    // would pass the first half for the wrong reason.
+    #[test]
+    fn status_omits_reload_line_when_never_reloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.to_lowercase().contains("reload"),
+            "no reload line expected when ignore_rebuilds is 0: {out}"
+        );
+
+        let mut state = crate::state::State::default();
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.to_lowercase().contains("reload"),
+            "expected a reload line once ignore_rebuilds > 0: {out}"
         );
     }
 }

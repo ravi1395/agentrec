@@ -79,6 +79,10 @@ enum Command {
         /// Acknowledge and clear a DEGRADED snapshot-failure banner.
         #[arg(long)]
         ack_degraded: bool,
+        /// Emit machine-readable operational fields (state.json data — NOT
+        /// the PROTOCOL wire format) instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Unified diff of a turn's changes.
     Diff {
@@ -274,7 +278,7 @@ fn main() {
             explain,
             all_files,
         } => cmds::log(&root, all, json, limit, utc, explain, all_files),
-        Command::Status { ack_degraded } => cmds::status(&root, ack_degraded),
+        Command::Status { ack_degraded, json } => cmds::status(&root, ack_degraded, json),
         Command::Diff { turn } => readcmds::diff(&root, &turn),
         Command::Blame { target } => readcmds::blame(&root, &target),
         Command::Show {
