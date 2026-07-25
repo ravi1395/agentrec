@@ -4,7 +4,6 @@
 //! to the worktree but not to the daemon's internal state.
 
 use crate::cmds::wall_now_ms;
-use crate::state::State;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
@@ -214,8 +213,9 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
     }
     if entry.skipped {
         println!(
-            "  {}: (content not snapshotted — over size cap)",
-            entry.path
+            "  {}: (content not snapshotted — {})",
+            entry.path,
+            fmt::skip_reason_text(entry.skipped_reason.as_deref())
         );
         return;
     }
@@ -223,20 +223,17 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
     let before = match load_blob(store, entry.before.as_deref()) {
         Ok(bytes) => bytes,
         Err(()) => {
-            println!(
-                "  {}: (snapshot unavailable — purged or missing)",
-                entry.path
-            );
+            // Cause genuinely unknown here — a hash IS recorded but the blob
+            // doesn't resolve, and asserting a specific reason ("purged or
+            // missing") would be the exact defect SR-D exists to fix.
+            println!("  {}: (snapshot unavailable)", entry.path);
             return;
         }
     };
     let after = match load_blob(store, entry.after.as_deref()) {
         Ok(bytes) => bytes,
         Err(()) => {
-            println!(
-                "  {}: (snapshot unavailable — purged or missing)",
-                entry.path
-            );
+            println!("  {}: (snapshot unavailable)", entry.path);
             return;
         }
     };
@@ -637,11 +634,9 @@ pub fn undo(
     }
 
     let store = BlobStore::new(objects_dir(root));
-    let state = crate::state::read_state(root);
     let plans = build_plan(
         root,
         &store,
-        &state,
         target,
         target_idx,
         &turns,
@@ -797,7 +792,6 @@ enum PlanKind {
 fn build_plan(
     root: &Path,
     store: &BlobStore,
-    state: &State,
     target: &TurnRecord,
     target_idx: usize,
     turns: &[&TurnRecord],
@@ -828,12 +822,21 @@ fn build_plan(
             });
             continue;
         }
+        // SR6: the skipped gate MUST stay above modified-since (below). A
+        // skipped entry is refused unconditionally here and `continue`s
+        // before `entry.after` is ever compared against the current on-disk
+        // hash — otherwise an unmodified skipped file (SR-C now gives it a
+        // real `after` hash) could fall through into the revert path and
+        // undo would try to restore a blob that was never stored.
         if entry.skipped {
-            let reason = if state.io_failed.iter().any(|p| p == &entry.path) {
-                "no snapshot exists (write failed at record time)".to_string()
-            } else {
-                "content not snapshotted (over size cap)".to_string()
-            };
+            // SR-D: the wire field is the per-entry authoritative cause —
+            // `state.json`'s `io_failed` is a separate, aggregate/operational
+            // channel (drives the DEGRADED banner) and is deliberately never
+            // consulted here, so the two can't be made to disagree.
+            let reason = format!(
+                "content not snapshotted ({})",
+                fmt::skip_reason_text(entry.skipped_reason.as_deref())
+            );
             plans.push(Plan {
                 entry: entry.clone(),
                 kind: PlanKind::Refused { reason },
@@ -849,7 +852,9 @@ fn build_plan(
                 None => Some("no prior snapshot to restore".to_string()),
                 Some(h) => match store.get(h) {
                     Ok(_) => None,
-                    Err(StoreError::Missing(_)) => Some("no prior snapshot to restore".to_string()),
+                    Err(StoreError::Missing(_)) => {
+                        Some("prior snapshot unavailable — refusing to restore".to_string())
+                    }
                     Err(StoreError::Corrupt(_)) => Some(
                         "prior snapshot corrupt (hash mismatch) — refusing to restore".to_string(),
                     ),
@@ -1051,6 +1056,7 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
         skipped: false,
         withheld: false,
         baseline_unknown: false,
+        skipped_reason: None,
     })
 }
 

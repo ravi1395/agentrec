@@ -113,7 +113,7 @@ The daemon appends epoch records on start and clean shutdown. Any uncovered inte
 }
 ```
 
-`before: null` = file created; `after: null` = deleted; over-cap = `"skipped": true`; secret-denylisted = `"withheld": true` (never snapshotted, never revertible). Epoch records (`type: "epoch"`, daemon start/stop) interleave with turns so gaps are first-class data. Format is versioned (`v`); the normative spec is published in-repo as `PROTOCOL.md` so other tools can emit it.
+`before: null` = file created; `after: null` = deleted; content not captured to the store (over-cap, a snapshot write that failed, or a file that was unreadable at record time) = `"skipped": true` with a `"skipped_reason"` naming which (PROTOCOL §5); secret-denylisted = `"withheld": true` (never snapshotted, never revertible). Epoch records (`type: "epoch"`, daemon start/stop) interleave with turns so gaps are first-class data. Format is versioned (`v`); the normative spec is published in-repo as `PROTOCOL.md` so other tools can emit it.
 
 ## Prompt posture
 

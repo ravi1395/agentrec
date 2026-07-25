@@ -687,6 +687,7 @@ mod tests {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         }
     }

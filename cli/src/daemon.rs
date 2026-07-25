@@ -17,10 +17,11 @@ use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
 use agentrec_core::record::{
-    append_log, parse_signals, EpochRecord, FileEntry, LogRecord, SignalEvent, TurnRecord,
+    append_log, parse_signals, skip_reason, EpochRecord, FileEntry, LogRecord, SignalEvent,
+    TurnRecord,
 };
 use agentrec_core::scrub;
-use agentrec_core::store::{BlobStore, PutResult};
+use agentrec_core::store::{hash_bytes, BlobStore, PutResult};
 use agentrec_core::time::rfc3339;
 use agentrec_core::MAX_SNAPSHOT_BYTES;
 use notify::{RecursiveMode, Watcher};
@@ -654,11 +655,19 @@ impl Recorder {
                 continue; // directory mtime churn is not a file change
             }
 
-            // Compute the `after` snapshot.
-            let (after, snapshotted, withheld) = if secret {
-                (None, false, true) // never snapshotted (D31)
+            // Compute the `after` snapshot. The 4th element is
+            // `FileEntry::skipped_reason` (SR-B): which of the three genuinely
+            // different causes made `snapshotted` false. SR-C: whenever the
+            // content bytes were actually read (over-cap, I/O-failed-write),
+            // a hash IS computable even though nothing was stored — record it
+            // as `after` so `modified-since` doesn't false-positive forever on
+            // an unmodified skipped file. `unreadable` never has bytes, so its
+            // `after` honestly stays `None` — never fabricate a hash we don't
+            // have.
+            let (after, snapshotted, withheld, skip_cause) = if secret {
+                (None, false, true, None) // never snapshotted (D31)
             } else if deleted {
-                (None, true, false) // delete: no content, but not "skipped"
+                (None, true, false, None) // delete: no content, but not "skipped"
             } else if is_symlink {
                 // Not followed (AC B5): snapshot the link *target string*, so the
                 // symlink change is recorded without reading the pointed-to file.
@@ -667,23 +676,55 @@ impl Recorder {
                         self.store.put(target.to_string_lossy().as_bytes()),
                         true,
                         false,
+                        None,
                     ),
-                    Err(_) => (None, false, false),
+                    Err(_) => (None, false, false, None),
                 }
             } else {
                 match std::fs::read(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
                         match self.store.put_result(&bytes) {
-                            PutResult::Stored(h) => (Some(h), true, false),
-                            PutResult::OverCap => (None, false, false), // over cap → skipped
+                            PutResult::Stored(h) => (Some(h), true, false, None),
+                            // Unreachable given the `<= MAX_SNAPSHOT_BYTES` guard
+                            // above (store.put_result's own over-cap check can
+                            // never trip here) — handled anyway, symmetrically
+                            // with the pre-check arm below, per SR-B/C.
+                            PutResult::OverCap => (
+                                Some(hash_bytes(&bytes)),
+                                false,
+                                false,
+                                Some(skip_reason::OVER_CAP.to_string()),
+                            ),
                             PutResult::IoError(cause) => {
                                 self.io_failures.push((rel_str.clone(), cause));
-                                (None, false, false) // write failed → skipped
+                                // The write failed, but the bytes were read
+                                // successfully — the content hash is still
+                                // honestly knowable (SR-C).
+                                (
+                                    Some(hash_bytes(&bytes)),
+                                    false,
+                                    false,
+                                    Some(skip_reason::IO_FAILED.to_string()),
+                                )
                             }
                         }
                     }
-                    Ok(_) => (None, false, false), // over cap → skipped
-                    Err(_) => (None, false, false), // unreadable → skipped
+                    // Over cap: bytes were read (hash computable) but never
+                    // stored (SR-C).
+                    Ok(bytes) => (
+                        Some(hash_bytes(&bytes)),
+                        false,
+                        false,
+                        Some(skip_reason::OVER_CAP.to_string()),
+                    ),
+                    // Unreadable: no bytes were ever obtained, so no hash can
+                    // be honestly recorded (SR-C — never fabricate one).
+                    Err(_) => (
+                        None,
+                        false,
+                        false,
+                        Some(skip_reason::UNREADABLE.to_string()),
+                    ),
                 }
             };
 
@@ -720,6 +761,7 @@ impl Recorder {
                 withheld,
                 baseline_unknown,
                 deleted,
+                skip_reason: skip_cause,
             });
         }
         out
@@ -730,8 +772,10 @@ impl Recorder {
         let after = self.after.get(&obs.path).cloned().flatten();
         let before = obs.before_hash.clone();
         // `op` keys on whether the file is actually gone, NOT on `after.is_none()`
-        // — an over-cap or unreadable *modify* has no `after` snapshot yet still
-        // exists, and must never be logged as a delete.
+        // — an unreadable *modify* has no `after` snapshot yet still exists
+        // (an over-cap modify DOES have an `after` hash since SR-C — content was
+        // read even though it wasn't stored), and neither must ever be logged
+        // as a delete.
         let op = if obs.deleted {
             "delete"
         } else if before.is_none() && !obs.baseline_unknown {
@@ -747,6 +791,7 @@ impl Recorder {
             skipped: !obs.snapshotted && !obs.withheld,
             withheld: obs.withheld,
             baseline_unknown: obs.baseline_unknown,
+            skipped_reason: obs.skip_reason.clone(),
         }
     }
 }
@@ -1757,6 +1802,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             deleted,
+            skip_reason: None,
         }
     }
 
@@ -1787,6 +1833,211 @@ mod tests {
         let entry = rec.resolve(&change("c.rs", None, true, false));
         assert_eq!(entry.op, "create");
         assert_eq!(entry.after.as_deref(), Some("sha256:new"));
+    }
+
+    // SR2 (over_cap producer) + SR-C (after-hash honesty gain): a real
+    // over-cap file, staged through the actual `Recorder::stage` production
+    // path (not a synthetic `ChangeObs`) — bytes ARE read here, so the
+    // resulting `FileEntry` must carry `skipped_reason: over_cap` AND a real
+    // `after` hash matching the content, even though the blob itself was
+    // never stored (the store never saw it — RED-relevant: pre-SR-C this
+    // asserted `entry.after == None`, which made `modified_since` a
+    // permanent false positive for every never-modified over-cap file).
+    #[test]
+    fn stage_over_cap_sets_reason_and_recoverable_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let content = vec![b'x'; MAX_SNAPSHOT_BYTES + 1];
+        let file = root.join("huge.bin");
+        std::fs::write(&file, &content).unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+        assert_eq!(
+            changes.len(),
+            1,
+            "must still produce an observation: {changes:?}"
+        );
+        assert!(!changes[0].snapshotted, "over cap must not be snapshotted");
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::OVER_CAP),
+            "changes: {:?}",
+            changes[0]
+        );
+
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(entry.skipped_reason.as_deref(), Some(skip_reason::OVER_CAP));
+        let expected_hash = hash_bytes(&content);
+        assert_eq!(
+            entry.after.as_deref(),
+            Some(expected_hash.as_str()),
+            "a computable hash must be recorded even though nothing was stored"
+        );
+        // Precondition this test depends on: the blob genuinely never landed
+        // in the store (the honesty gain is recording a KNOWN hash, not
+        // claiming content was captured).
+        let store2 = BlobStore::new(root.join(".agentrec/objects"));
+        assert!(
+            store2.get(&expected_hash).is_err(),
+            "over-cap content must never actually be stored"
+        );
+    }
+
+    // SR2 (unreadable producer): no bytes were ever obtained, so `after`
+    // must honestly stay `None` — never fabricate a hash for content that
+    // was never read (SR-C's other half).
+    #[cfg(unix)]
+    #[test]
+    fn stage_unreadable_sets_reason_and_no_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let file = root.join("secret.rs");
+        std::fs::write(&file, b"can't read me").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(file.clone());
+        let changes = recorder.stage(&paths);
+
+        // restore perms so tempdir cleanup can remove it
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert!(!changes[0].snapshotted);
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::UNREADABLE),
+            "changes: {:?}",
+            changes[0]
+        );
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(
+            entry.skipped_reason.as_deref(),
+            Some(skip_reason::UNREADABLE)
+        );
+        assert_eq!(
+            entry.after, None,
+            "no bytes were ever read — a hash must never be fabricated"
+        );
+    }
+
+    // SR2 (io_failed producer): the write itself fails, but the bytes WERE
+    // read successfully first — so a hash is knowable here too, same as the
+    // over-cap case (a judgment call: the task text only worked through
+    // over_cap/unreadable explicitly, but io_failed's bytes are equally in
+    // hand at the point `put_result` returns `IoError`).
+    #[cfg(unix)]
+    #[test]
+    fn stage_io_failed_sets_reason_and_recoverable_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        // store dir does not exist yet; `locked` will be made read-only so
+        // `put_result`'s `create_dir_all` of the fan-out dir must fail
+        // (mirrors `store::tests::io_error_is_typed`).
+        let store_dir = locked.join("store");
+        let store = BlobStore::new(&store_dir);
+        let mut recorder = Recorder::scan(&root, store);
+
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let content = b"some real content".to_vec();
+        let file = root.join("a.rs");
+        std::fs::write(&file, &content).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+
+        // restore perms first so tempdir cleanup can remove `locked`
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert!(!changes[0].snapshotted);
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::IO_FAILED),
+            "changes: {:?}",
+            changes[0]
+        );
+        assert_eq!(
+            recorder.io_failures.len(),
+            1,
+            "must record the D35 operational failure too"
+        );
+
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(
+            entry.skipped_reason.as_deref(),
+            Some(skip_reason::IO_FAILED)
+        );
+        assert_eq!(
+            entry.after.as_deref(),
+            Some(hash_bytes(&content).as_str()),
+            "the write failed, but the bytes were read — a hash is still knowable"
+        );
+    }
+
+    // SR5: the false-positive fix, end to end at the producer level — an
+    // over-cap file that is NEVER modified after being recorded must not be
+    // reported as `modified_since` (the exact bug: `after` used to be `None`
+    // forever, so `current_hash != None` was always true). This exercises
+    // the real producer's output against `modified_since`'s actual
+    // comparison rule (mirrored inline — `readcmds::modified_since` is
+    // private to a different module — its rule is a one-line hash
+    // comparison, asserted identically to its real implementation).
+    #[test]
+    fn sr5_over_cap_after_hash_makes_modified_since_false_for_unmodified_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let content = vec![b'z'; MAX_SNAPSHOT_BYTES + 1];
+        let file = root.join("huge.bin");
+        std::fs::write(&file, &content).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+        let entry = recorder.resolve(&changes[0]);
+        assert!(
+            entry.skipped,
+            "precondition: this entry is over-cap-skipped"
+        );
+
+        // The file on disk is untouched since recording — re-hash it exactly
+        // as `readcmds::modified_since` does for the live worktree.
+        let current_hash = Some(hash_bytes(&content));
+        let modified_since = current_hash.as_deref() != entry.after.as_deref();
+        assert!(
+            !modified_since,
+            "an unmodified over-cap file must not be reported as modified: after={:?} current={:?}",
+            entry.after, current_hash
+        );
     }
 
     // Item 2 (non-UTF8 path handling): a path whose raw OS bytes are not
@@ -2218,6 +2469,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 deleted: false,
+                skip_reason: None,
             },
             ChangeObs {
                 path: "src/b.rs".into(),
@@ -2226,6 +2478,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 deleted: false,
+                skip_reason: None,
             },
         ];
         engine.observe_changes(500, &changes);
@@ -2468,6 +2721,7 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }];
 
         let existing = TurnRecord {
@@ -2545,6 +2799,7 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }];
 
         let id = turn_id();
@@ -2627,6 +2882,7 @@ mod tests {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
             id: turn_id(),
         };

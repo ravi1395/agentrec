@@ -641,6 +641,7 @@ fn diff_text_modify_shows_unified() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "src/new.rs".into(),
@@ -650,6 +651,7 @@ fn diff_text_modify_shows_unified() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -688,6 +690,7 @@ fn diff_binary_file_message() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -725,6 +728,7 @@ fn diff_skipped_file_notice() {
             skipped: true,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
         }],
     );
     seed_turn(root, &turn);
@@ -735,6 +739,107 @@ fn diff_skipped_file_notice() {
     assert!(
         stdout.contains("(content not snapshotted — over size cap)"),
         "stdout: {stdout}"
+    );
+}
+
+// SR4: `print_entry` must name the REAL cause, not always "over size cap" —
+// a sibling coverage gap to `diff_skipped_file_notice` above (which only
+// ever exercised the over-cap text). Also covers the absent/unknown-value
+// fallback ("reason unrecorded") and the distinct "snapshot unavailable"
+// (no suffix) message for a present-but-unresolvable hash — SR-D's other
+// honesty fix: the old text asserted a specific cause ("purged or missing")
+// that this repo cannot actually distinguish.
+#[test]
+fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::hash_bytes;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = base_turn(
+        "t_SKIPCAUSE000000000000000001",
+        vec![
+            FileEntry {
+                path: "io.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: Some(skip_reason::IO_FAILED.to_string()),
+            },
+            FileEntry {
+                path: "unreadable.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: Some(skip_reason::UNREADABLE.to_string()),
+            },
+            FileEntry {
+                path: "legacy.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None, // pre-this-round log entry
+            },
+            FileEntry {
+                // hash recorded, but no such blob was ever put in the store —
+                // cause genuinely unknown, must NOT assert "purged or missing".
+                path: "gone.rs".into(),
+                before: None,
+                after: Some(hash_bytes(b"never actually stored")),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            },
+        ],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert!(out.status.success(), "diff failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let io_line = stdout.lines().find(|l| l.contains("io.rs")).unwrap_or("");
+    assert!(
+        io_line.contains("(content not snapshotted — write failed at record time)"),
+        "io.rs line: {io_line}"
+    );
+    let unreadable_line = stdout
+        .lines()
+        .find(|l| l.contains("unreadable.rs"))
+        .unwrap_or("");
+    assert!(
+        unreadable_line.contains("(content not snapshotted — file unreadable at record time)"),
+        "unreadable.rs line: {unreadable_line}"
+    );
+    let legacy_line = stdout
+        .lines()
+        .find(|l| l.contains("legacy.rs"))
+        .unwrap_or("");
+    assert!(
+        legacy_line.contains("(content not snapshotted — reason unrecorded)"),
+        "legacy.rs line: {legacy_line}"
+    );
+    let gone_line = stdout.lines().find(|l| l.contains("gone.rs")).unwrap_or("");
+    assert!(
+        gone_line.contains("(snapshot unavailable)"),
+        "gone.rs line: {gone_line}"
+    );
+    assert!(
+        !gone_line.contains("purged or missing"),
+        "cause is genuinely unknown here — must not assert one: {gone_line}"
     );
 }
 
@@ -1166,6 +1271,7 @@ fn blame_file_reports_last_rich_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -1184,6 +1290,7 @@ fn blame_file_reports_last_rich_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -1250,6 +1357,7 @@ fn blame_bare_turn_no_fabrication() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1288,6 +1396,7 @@ fn blame_deleted_file_resolves() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     // z.rs is never written to disk — absent, as expected post-delete.
@@ -1327,6 +1436,7 @@ fn blame_line_level_added_and_predating() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1376,6 +1486,7 @@ fn blame_gap_is_stale() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1427,6 +1538,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -1455,6 +1567,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -1515,6 +1628,7 @@ fn blame_line_create_turn_still_credited() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1564,6 +1678,7 @@ fn blame_line_unresolvable_after_not_false_predating() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1621,6 +1736,7 @@ fn undo_clean_revert_byte_exact() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1669,6 +1785,7 @@ fn undo_preview_does_not_mutate() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1715,6 +1832,7 @@ fn undo_file_subset() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "b.rs".into(),
@@ -1724,6 +1842,7 @@ fn undo_file_subset() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -1765,6 +1884,7 @@ fn undo_modified_since_excluded_then_allowed() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1809,9 +1929,14 @@ fn undo_skipped_and_withheld_refused() {
     let root = tmp.path();
     init(root);
 
+    // SR-E: `state.json`'s `io_failed` is a SEPARATE, aggregate/operational
+    // channel (drives the DEGRADED banner) — deliberately populated here with
+    // a path that is NOT the one under test, to prove `undo`'s per-entry
+    // message is driven only by the wire `skipped_reason` field below, never
+    // derived from this list.
     std::fs::write(
         root.join(".agentrec/state.json"),
-        r#"{"pid":0,"signal_offset":0,"snapshot_failures":1,"io_failed":["s.rs"]}"#,
+        r#"{"pid":0,"signal_offset":0,"snapshot_failures":1,"io_failed":["some-other-file.rs"]}"#,
     )
     .unwrap();
 
@@ -1826,6 +1951,7 @@ fn undo_skipped_and_withheld_refused() {
                 skipped: true,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: Some(agentrec_core::record::skip_reason::IO_FAILED.to_string()),
             },
             FileEntry {
                 path: "w.rs".into(),
@@ -1835,6 +1961,7 @@ fn undo_skipped_and_withheld_refused() {
                 skipped: false,
                 withheld: true,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -1859,7 +1986,9 @@ fn undo_skipped_and_withheld_refused() {
         "an all-refused plan must not record a turn"
     );
 
-    // Second turn: a skipped path NOT in io_failed reports the over-cap reason.
+    // Second turn: a skipped path whose wire-recorded cause is over_cap
+    // reports the over-cap reason — again independent of state.json, which
+    // doesn't mention o.rs at all.
     let turn2 = base_turn(
         "t_UNDOREFUSE20000000000000001",
         vec![FileEntry {
@@ -1870,6 +1999,7 @@ fn undo_skipped_and_withheld_refused() {
             skipped: true,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
         }],
     );
     seed_turn(root, &turn2);
@@ -1882,6 +2012,77 @@ fn undo_skipped_and_withheld_refused() {
     assert!(
         !o_line.contains("write failed at record time"),
         "o.rs line: {o_line}"
+    );
+}
+
+// SR6: the `skipped` gate must stay ABOVE the modified-since check in
+// `build_plan`. This is the data-loss-shaped scenario SR-C's honesty gain
+// makes newly reachable — an over-cap entry now carries a real `after` hash
+// (SR-C), so a naive reordering of the two checks would let an unmodified
+// skipped file's `is_modified` come out `false` and fall through into the
+// Revert plan, where undo would then try to restore a `before` blob that
+// was never stored. Pinned here at the CLI level: the file must be REFUSED
+// (never appear as a revert) and must be byte-identical on disk afterward.
+#[test]
+fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::hash_bytes;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // Precondition this test depends on: the on-disk file's CURRENT hash
+    // matches the turn's recorded `after` exactly — i.e. genuinely
+    // unmodified since the turn, the one case a reordered gate would
+    // misclassify as revertible.
+    let content = b"over-cap content, never actually stored".to_vec();
+    let after_hash = hash_bytes(&content);
+    std::fs::write(root.join("big.bin"), &content).unwrap();
+    let current_hash = hash_bytes(&std::fs::read(root.join("big.bin")).unwrap());
+    assert_eq!(
+        current_hash, after_hash,
+        "precondition: current on-disk hash must equal the turn's `after`"
+    );
+
+    let turn = base_turn(
+        "t_SR6GATE0000000000000000001",
+        vec![FileEntry {
+            path: "big.bin".into(),
+            before: None,
+            after: Some(after_hash),
+            op: "modify".into(),
+            skipped: true,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+    assert!(out.status.success(), "undo failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.contains("big.bin")).unwrap_or("");
+    assert!(
+        line.trim_start().starts_with("REFUSE"),
+        "an over-cap entry must always refuse, even when unmodified: {line}"
+    );
+    assert!(
+        !line.contains("EXCLUDE") && !stdout.contains("REVERT  big.bin"),
+        "must never be classified as a revert candidate: stdout: {stdout}"
+    );
+
+    // The file must be completely untouched — no attempted restore, no
+    // partial mutation.
+    assert_eq!(
+        std::fs::read(root.join("big.bin")).unwrap(),
+        content,
+        "a refused skipped entry must never touch the worktree file"
+    );
+    assert!(
+        agentrec_turns(root).is_empty(),
+        "an all-refused plan must not record a turn"
     );
 }
 
@@ -1908,6 +2109,7 @@ fn undo_create_and_delete_inverse() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -1931,6 +2133,7 @@ fn undo_create_and_delete_inverse() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_b);
@@ -1968,6 +2171,7 @@ fn undo_is_a_turn_and_reversible() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2025,6 +2229,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn1);
@@ -2043,6 +2248,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn2);
@@ -2088,6 +2294,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn_rich);
@@ -2106,6 +2313,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn_bare);
@@ -2541,6 +2749,7 @@ fn panic_undo_skips_git_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_claude);
@@ -2562,6 +2771,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "checkout_b.rs".into(),
@@ -2571,6 +2781,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "checkout_c.rs".into(),
@@ -2580,6 +2791,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -2671,6 +2883,7 @@ fn purge_removes_expired_prompt_blob_keeps_shared() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     old_shared.started = days_ago_rfc3339(200);
@@ -2795,6 +3008,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_old1.started = "2024-01-01T00:00:00.000Z".into();
@@ -2811,6 +3025,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_old2.started = "2024-02-01T00:00:00.000Z".into();
@@ -2829,6 +3044,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_new.started = "2024-06-01T00:00:00.000Z".into();
@@ -4550,6 +4766,7 @@ fn memories_stale_shows_drifted_pin_and_when() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);

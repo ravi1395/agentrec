@@ -18,8 +18,15 @@ pub struct ChangeObs {
     pub baseline_unknown: bool, // first seen post-change; original unrecoverable
     #[serde(default)]
     pub deleted: bool, // file absent at observation — a true delete, NOT
-                           // merely "no snapshot captured" (distinguishes
-                           // `op:delete` from an over-cap `op:modify`)
+    // merely "no snapshot captured" (distinguishes
+    // `op:delete` from an over-cap `op:modify`)
+    /// Cause of `snapshotted: false` (mirrors `record::FileEntry::skipped_reason`
+    /// — same open string enum, `record::skip_reason::*`). `None` when
+    /// `snapshotted` is true or the cause predates this field. Carried
+    /// verbatim into the crash journal (`open.json`) and the closed
+    /// `FileEntry`; the engine itself never inspects or branches on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -515,6 +522,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             deleted: false,
+            skip_reason: None,
         }
     }
 
@@ -902,6 +910,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             deleted: true,
+            skip_reason: None,
         };
         e.observe_changes(1_000, &[del]);
         let recreate = ChangeObs {
@@ -911,6 +920,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             deleted: false,
+            skip_reason: None,
         };
         e.observe_changes(2_000, &[recreate]);
         let closed = e.observe_stop(3_000, "claude-code", None, None);

@@ -11,7 +11,7 @@
 //! [`turn_list_line`] and [`turn_detail_header`] are now the only two turn
 //! renderers, both built on the shared [`SEP`] and [`short_id`].
 
-use agentrec_core::record::TurnRecord;
+use agentrec_core::record::{skip_reason, TurnRecord};
 
 /// The one separator every turn-rendering call site (`log`, `show`,
 /// `blame`) uses between fields. Centralized so a third caller can't
@@ -252,6 +252,23 @@ pub fn turn_detail_header(t: &TurnRecord, when: &str) -> String {
     }
 }
 
+/// Renders [`agentrec_core::record::FileEntry::skipped_reason`] as the
+/// human-readable clause `readcmds::build_plan`'s refusal and `readcmds::
+/// print_entry`'s notice both embed (SR-D). The ONE place that maps the wire
+/// enum to text — `undo` and `diff` must never drift on this vocabulary the
+/// way the pre-SR-D messages did. Any value outside the defined enum
+/// (including `skip_reason::POLICY`, which has no producer yet) degrades to
+/// `reason unrecorded`, per PROTOCOL.md's additive-enum consumer contract —
+/// never match exhaustively on this open set.
+pub fn skip_reason_text(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(r) if r == skip_reason::OVER_CAP => "over size cap",
+        Some(r) if r == skip_reason::IO_FAILED => "write failed at record time",
+        Some(r) if r == skip_reason::UNREADABLE => "file unreadable at record time",
+        _ => "reason unrecorded",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +461,36 @@ mod tests {
         let detail = turn_detail_header(&t, "14:03");
         assert!(list.starts_with("t_ABCD…EFGH · "));
         assert!(detail.starts_with("t_ABCD…EFGH · "));
+    }
+
+    // SR4: the one shared mapping every `skipped_reason` value renders to.
+    // Unknown/reserved values (incl. `policy`, which has no producer yet)
+    // and an absent reason both degrade to "reason unrecorded" — never
+    // fabricate a cause the wire record didn't actually carry.
+    #[test]
+    fn skip_reason_text_maps_each_defined_cause() {
+        assert_eq!(
+            skip_reason_text(Some(skip_reason::OVER_CAP)),
+            "over size cap"
+        );
+        assert_eq!(
+            skip_reason_text(Some(skip_reason::IO_FAILED)),
+            "write failed at record time"
+        );
+        assert_eq!(
+            skip_reason_text(Some(skip_reason::UNREADABLE)),
+            "file unreadable at record time"
+        );
+        assert_eq!(skip_reason_text(None), "reason unrecorded");
+        assert_eq!(
+            skip_reason_text(Some("policy")),
+            "reason unrecorded",
+            "reserved-not-yet-produced value must degrade, not panic or invent text"
+        );
+        assert_eq!(
+            skip_reason_text(Some("some_future_value_this_binary_predates")),
+            "reason unrecorded",
+            "unknown values MUST degrade to plain skipped behavior"
+        );
     }
 }
