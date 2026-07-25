@@ -140,8 +140,22 @@ real-daemon test).
       `Ignore`), so it cannot pass for the wrong reason.
 
 **Expected test outputs:** `cargo test -p agentrec --test integration -- --test-threads=3` → +1;
-`cargo test -p agentrec daemon::` → unit count unchanged (one test strengthened, not added).
-Workspace → **387 passed, 0 failed, 1 ignored**. Receipt must paste the RED run.
+`cargo test -p agentrec daemon::` → **+1** (`maybe_rebuild_runs_once_per_dirty_flag` is new; the
+other unit test is strengthened, not added). Workspace → **388 passed, 0 failed, 1 ignored**.
+Receipt must paste the RED run.
+
+**Corrected in flight (was 387):** the original ladder forgot that this phase's own AC names a new
+unit test. The whole ladder shifts by one — Phase 2 → 391, Phase 3 → 393. Caught by the Phase 1
+reviewer, not by the plan author.
+
+**DELIVERED at `0a7b279`.** Baseline independently re-run at the parent (`bdb911c`) → **386/0/1**,
+so the carried figure was right. Post-fix workspace **388/0/1**, confirmed three ways (implementer,
+Opus reviewer, orchestrator). Opus reviewer verdict **DONE**: every criterion proven by a neuter that
+went RED — placement neuter reds the E2E; flag-clear neuter reds two unit tests; and the reviewer
+demonstrated that moving the positive control to *after* the ignore-rule edit makes the E2E pass
+against pre-fix code, which is the vacuity this plan was corrected to avoid. Claims
+`clm_3NC55…`, `clm_5CJWF…`, `clm_5PCCR…`, `clm_29RN5…`, `clm_1H62N…` declared at the parent commit
+and evidenced.
 
 ---
 
@@ -180,7 +194,16 @@ persisted counter), `cli/src/cmds.rs` (edit — `status` line).
       `rebuild_count_is_bounded_by_writes` RED on the upper bound.
 
 **Expected test outputs:** `cargo test -p agentrec --test integration -- --test-threads=3` → +2;
-`cargo test -p agentrec cmds::` → +1. Workspace → **390 passed, 0 failed, 1 ignored**.
+`cargo test -p agentrec cmds::` → +1. Workspace → **391 passed, 0 failed, 1 ignored** (ladder
+corrected from 390; see Phase 1).
+
+**Carried in from the Phase 1 review — a new cost this phase is the mitigation for:** pre-fix, a repo
+where only `.gitignore` churns and nothing watched ever changes did **zero** `IgnoreSet::build`
+walks, because the flush block never ran. Post-fix it does up to **4 full-repo walks per second,
+indefinitely**. Decision 1 chose top-of-tick precisely to bound this to one walk per `POLL`, so it is
+a declared trade — but the inline comment at the call site documents only the residual window and the
+lost-event consequence and says nothing about walk rate. Add that sentence here, and treat
+`ignore_rebuilds` as the instrument that makes the rate observable rather than theoretical.
 
 ---
 
@@ -228,7 +251,14 @@ otherwise.
 
 **Expected test outputs:** `cargo test -p agentrec daemon::` → +0 (one test strengthened);
 `cargo test -p agentrec --test integration -- --test-threads=3` → +2. Workspace →
-**392 passed, 0 failed, 1 ignored**.
+**393 passed, 0 failed, 1 ignored** (ladder corrected from 392; see Phase 1).
+
+**Also in scope, carried from the Phase 1 review:** the new E2E calls `daemon.kill()` after the
+control assert, so an early control failure drops the `Child` unkilled. Ten integration tests share
+that bare `let _ = daemon.kill()` pattern and only one uses `SingleDaemonGuard`. Leaked test daemons
+have already cost this repo a diagnosis round (FSEvents contention, ~6 unattributed failures), and
+this test is deliberately run RED during TDD, so it leaks by design during development. Route the new
+test through the guard; converting the other nine is explicitly NOT in scope.
 
 ---
 
