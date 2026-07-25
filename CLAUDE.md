@@ -8,12 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
-**Blame-honesty + skipped_reason + noise folding — GATE VERDICT PENDING, NOT DONE (2026-07-25,
-branch `fix/blame-attribution-and-noise-folding`, `17657d9..7be9e4d`, not pushed):** Three changes
-landed off a 4-lens adversarial redteam of store churn. **The binding done-gate has NOT returned
-PASS** — round 1 was **GATE FAIL**, the finding was fixed, and **round 2 died on an API session
-limit before reaching a verdict**. Do not treat this round as complete; re-run the gate at
-`7be9e4d` first. **349 → 386 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt clean,
+**Blame-honesty + skipped_reason + noise folding — GATE PASS (2026-07-25,
+branch `fix/blame-attribution-and-noise-folding`, `17657d9..dc4bd9a`, not pushed):** Three changes
+landed off a 4-lens adversarial redteam of store churn. Binding skeptical-reviewer done-gate in an
+isolated worktree: round 1 **GATE FAIL** (one blocking finding, below), round 2 **GATE PASS** at
+`7be9e4d` — all 6 findings CLOSED, each refuted by neutering the fix and observing a *named* test go
+RED, sources restored byte-identically (`readcmds.rs` `53a7683e…`, `daemon.rs` `2387b22b…`,
+`cmds.rs` `438a3dba…`). **349 → 386 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt clean,
 verified by the orchestrator independently of every implementer. **(A) `17657d9` blame
 over-attribution — a real, live correctness bug in the product's core claim:** `load_text` swallowed
 both `StoreError::Missing` and `Corrupt` into `""`, and `added_or_changed_lines("", after)` returns
@@ -37,8 +38,14 @@ it seeded `op: "modify"`, which `build_plan` refuses via an *independent* before
 `skipped` gate could be deleted entirely and the test stayed green. The reachable case is
 `op: "create"` (exactly what `Recorder::resolve` emits for a new over-cap file, and which change (B)
 newly made reachable): the skeptic proved live that with the gate removed, `undo` **deletes the
-file**. Closed in `7be9e4d` by fixing the fixture, RED-proven under gate removal, source restored
-byte-identically (sha256 `512fdc61…`). `7be9e4d` also closed: the unclassified 4th `skipped`
+file**. Closed in `7be9e4d` by fixing the fixture — re-refuted at round 2 by DELETING the 886-byte
+`skipped` block outright (not short-circuiting it), which reds two tests; the `op: "create"` fixture
+genuinely isolates the gate because `build_plan`'s before-blob branch only runs for
+`modify`/`delete`. **Watch-item on implementer reports:** the fix round's own sha256 restoration
+proof cited `512fdc61…`, which is `c46519c`'s hash, not `readcmds.rs`'s at `7be9e4d` — the code was
+fine, the *report* was stale, and that figure was propagated into this Status entry before the gate
+caught it. Verify hashes against the commit under review, not the one before it. `7be9e4d` also
+closed: the unclassified 4th `skipped`
 producer (symlink `read_link` arm), a missing cross-seam test for the (B)×(A) ghost-hash chain (all
 five read verbs degrade honestly, none lies — now pinned), the untested `prior snapshot unavailable`
 string, and D-PD6-class vocabulary drift (`build_plan` vs `print_entry` spelling the same fact two
@@ -52,7 +59,16 @@ one-per-line is `diff`'s `print_entry`, scoped out as an attribution surface. Ex
 taken.** **Nothing here is verified against a live daemon:** every BL/SR/NF test seeds `log.jsonl`
 directly or calls `Recorder::stage` in-process; the over-cap→ghost-hash chain is inferred from code
 plus seeded fixtures, never observed end-to-end. This repo has history of exactly that gap mattering
-(two green gitignore tests coexisted with a 764 MiB leak) — owe an E2E leg before merge. **claimd:
+(two green gitignore tests coexisted with a 764 MiB leak) — owe an E2E leg before merge: `record` in
+a tempdir, write an 11 MiB file, wait past debounce + the 10 s quiet window, shrink it below cap,
+wait again, then assert the two real `log.jsonl` entries carry `skipped_reason:"over_cap"` /
+`before:<ghost>` before running `blame`/`diff`/`undo`. The `unreadable` and `io_failed` producer
+fixtures are `#[cfg(unix)]` and were exercised on **macOS/APFS only** — Linux CI leg owed.
+**Gate-accepted cosmetic residuals, recorded not fixed:** `undo`'s refusal now renders a double
+em-dash (`REFUSE  big.bin — content not snapshotted — over size cap`) — consistent vocabulary,
+awkward line; and `integration.rs:2327`'s `!stdout.contains("REVERT  big.bin")` clause is dead (the
+renderer emits lowercase `revert`), pre-existing and carried forward, harmless because the
+`starts_with("REFUSE")` and `.exists()` asserts carry that test. **claimd:
 declare-first was skipped this round** (4 coverage findings: IMPLEMENTATION.md, daemon.rs,
 readcmds.rs, integration.rs). **Retroactive declaration deliberately refused** — the skill forbids
 it and a declare-record postdating the code would make the log lie about ordering, the one property
