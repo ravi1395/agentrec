@@ -197,6 +197,51 @@ persisted counter), `cli/src/cmds.rs` (edit — `status` line).
 `cargo test -p agentrec cmds::` → +1. Workspace → **391 passed, 0 failed, 1 ignored** (ladder
 corrected from 390; see Phase 1).
 
+**DELIVERED at `b68bc42`, hygiene + docs at `8cce05a`.** Workspace **393/0/1** (not 391 — see the
+ladder correction below), confirmed independently by implementer, Opus reviewer and orchestrator.
+Every criterion PASSES on a RED neuter. Reviewer's first verdict was **NOT DONE** on records/docs
+only — no correctness gap — and all five blocking items are now closed: the superseded claim
+(below), evidence recorded and committed, this DELIVERED block, the daemon-leak fix, and the README
+row.
+
+**Ladder corrected again, and the plan was wrong before the implementer added anything:** expected
+outputs said integration `+2` / cmds `+1` = 391, but this phase's own four ACs name **three**
+integration tests and one cmds test = 392, plus a `state.rs` round-trip test matching that file's
+existing per-counter convention = **393**. Second ladder error in this plan (Phase 1 was 387→388) —
+a pattern in how the plan was written, not an implementation slip. **Phase 3's target moves 393 →
+395**, or Phase 3 could be declared complete having added none of its required tests.
+
+**AC4 was rewritten in flight and the change is right:** the literal "5 rapid rewrites → `1..=5`"
+**cannot discriminate its own neuter** — five writes coalesce to ~3 FSEvents notify events, so a
+per-event counter also lands ≤5. The reviewer reproduced this directly (plan-literal form + per-event
+neuter → passes 3/3). Delivered form is 40 writes bounded `1..=10`; correct code measures 3 across
+5 live runs, the neuter measures 15–18. The bound is architectural (rebuilds are capped by *POLL
+ticks spanned*, not event count), and Linux/inotify moves both sides further from the boundary.
+The declared claim `clm_23B6MYA8` still carried the false 5/`1..=5` text; it is amended to replay
+the delivered test and **superseded by `clm_6SAFG0JJ`** with accurate text, rather than deleted.
+
+**Favorable fact for the churn-honesty plan, verified here:** `status --json` performs **zero
+writes** — the JSON branch returns before `status_report` and therefore before
+`retention::enforce_budget` (`state.json` mtime and inode unchanged across a run). That plan's
+Phase 5 criterion "`status --json` writes nothing" starts already satisfied on this path.
+
+**Recorded, not fixed (follow-ups, none blocking):** `status --json` omits the DEGRADED fields
+entirely, so a monitoring script cannot see degradation the text surface shows (README now says so);
+`status --ack-degraded --json` prints plain text under a `--json` flag; `state::read_state` chains
+two `.ok()`s into `unwrap_or_default()`, so **one** unparseable field silently resets the whole
+`State` — `pid`, `signal_offset`, `snapshot_failures`, `io_failed` — with no counter and no
+diagnostic, and a reset `signal_offset` replays the entire signal inbox (pre-existing, newly
+demonstrated live by this phase's own AC3 neuter); and the rebuild's wall-clock stamp is taken one
+statement before `clock.reanchor()`, the only stamp in the loop that is, though it is display-only
+and self-corrects on the next rebuild.
+
+**Open question 1 was resolved by defaulting to option (c)** — `status` shows the line whenever the
+counter is non-zero. Consequence now on the record: the counter is **lifetime-cumulative and not
+cleared by `--ack-degraded`** (deliberately — a standing fact is not an incident), so a long-lived
+repo eventually renders `ignore: reloaded 4821 time(s)` in the daily-driver surface whose line budget
+the question called contested. Option (a) — scope to the current daemon epoch — exists precisely to
+avoid that and remains a cheap reversal.
+
 **Carried in from the Phase 1 review — a new cost this phase is the mitigation for:** pre-fix, a repo
 where only `.gitignore` churns and nothing watched ever changes did **zero** `IgnoreSet::build`
 walks, because the flush block never ran. Post-fix it does up to **4 full-repo walks per second,
@@ -251,14 +296,17 @@ otherwise.
 
 **Expected test outputs:** `cargo test -p agentrec daemon::` → +0 (one test strengthened);
 `cargo test -p agentrec --test integration -- --test-threads=3` → +2. Workspace →
-**393 passed, 0 failed, 1 ignored** (ladder corrected from 392; see Phase 1).
+**395 passed, 0 failed, 1 ignored** — Phase 2 already reached 393, so the previous target of 393
+would let this phase pass having added **neither** of its two required tests.
 
-**Also in scope, carried from the Phase 1 review:** the new E2E calls `daemon.kill()` after the
+**Also in scope, carried from the Phase 1 review:** the Phase 1 E2E calls `daemon.kill()` after the
 control assert, so an early control failure drops the `Child` unkilled. Ten integration tests share
 that bare `let _ = daemon.kill()` pattern and only one uses `SingleDaemonGuard`. Leaked test daemons
 have already cost this repo a diagnosis round (FSEvents contention, ~6 unattributed failures), and
-this test is deliberately run RED during TDD, so it leaks by design during development. Route the new
-test through the guard; converting the other nine is explicitly NOT in scope.
+these tests are deliberately run RED during TDD, so they leak by design during development.
+`daemon_counts_ignore_rebuilds` was already routed through the guard at `8cce05a`; do the same for
+`unignore_is_honored_without_other_watched_activity`. Converting the other nine is explicitly NOT in
+scope.
 
 ---
 
