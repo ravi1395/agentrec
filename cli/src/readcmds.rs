@@ -240,18 +240,22 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
 
     let before = match load_blob(store, entry.before.as_deref()) {
         Ok(bytes) => bytes,
-        Err(()) => {
-            // Cause genuinely unknown here — a hash IS recorded but the blob
-            // doesn't resolve, and asserting a specific reason ("purged or
-            // missing") would be the exact defect SR-D exists to fix.
-            println!("  {}: (snapshot unavailable)", entry.path);
+        Err(e) => {
+            // Finding #5(b): distinguish Missing from Corrupt, restoring
+            // parity with `build_plan`'s refusal messages — `diff` was
+            // strictly less specific than `undo` about the exact same
+            // condition. The *cause* of Missing stays genuinely unknown
+            // (never "purged or missing" — that's the SR-D defect); Corrupt
+            // is a distinct, honest fact (a hash mismatch), not folded into
+            // the same generic message.
+            println!("  {}: {}", entry.path, unresolvable_msg(&e));
             return;
         }
     };
     let after = match load_blob(store, entry.after.as_deref()) {
         Ok(bytes) => bytes,
-        Err(()) => {
-            println!("  {}: (snapshot unavailable)", entry.path);
+        Err(e) => {
+            println!("  {}: {}", entry.path, unresolvable_msg(&e));
             return;
         }
     };
@@ -289,11 +293,28 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
 
 /// Load a blob by its optional hash ref; `None` (e.g. a create's `before`)
 /// yields empty content, not an error. A present hash that the store can't
-/// serve (purged or corrupt) is the only error case.
-fn load_blob(store: &BlobStore, hash: Option<&str>) -> Result<Vec<u8>, ()> {
+/// serve (purged or corrupt) is the only error case — the real
+/// [`StoreError`] is preserved (not collapsed) so the caller can render
+/// Missing and Corrupt distinctly (finding #5(b)).
+fn load_blob(store: &BlobStore, hash: Option<&str>) -> Result<Vec<u8>, StoreError> {
     match hash {
         None => Ok(Vec::new()),
-        Some(h) => store.get(h).map_err(|_| ()),
+        Some(h) => store.get(h),
+    }
+}
+
+/// `diff`'s rendering of an unresolvable blob, mirroring `undo`'s
+/// `build_plan` distinction (finding #5(b)) rather than `diff` collapsing
+/// both into one generic message: `Missing`'s cause stays genuinely
+/// unknown (never "purged or missing"), `Corrupt` is a distinct, honest
+/// fact. `undo`'s established `StoreError::Corrupt` wording is
+/// "prior snapshot corrupt (hash mismatch) — refusing to restore" — kept
+/// as-is there; this is `diff`'s own (shorter, no verb) rendering of the
+/// same fact.
+fn unresolvable_msg(e: &StoreError) -> String {
+    match e {
+        StoreError::Missing(_) => "(snapshot unavailable)".to_string(),
+        StoreError::Corrupt(_) => "(snapshot corrupt — hash mismatch)".to_string(),
     }
 }
 
@@ -851,8 +872,11 @@ fn build_plan(
             // `state.json`'s `io_failed` is a separate, aggregate/operational
             // channel (drives the DEGRADED banner) and is deliberately never
             // consulted here, so the two can't be made to disagree.
+            // Finding #5(a): unified on `print_entry`'s em-dash form (was
+            // parenthesized here) — same fact, one spelling; D-PD6 is the
+            // tracked debt item for exactly this renderer-drift class.
             let reason = format!(
-                "content not snapshotted ({})",
+                "content not snapshotted — {}",
                 fmt::skip_reason_text(entry.skipped_reason.as_deref())
             );
             plans.push(Plan {

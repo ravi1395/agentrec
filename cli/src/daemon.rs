@@ -671,15 +671,7 @@ impl Recorder {
             } else if is_symlink {
                 // Not followed (AC B5): snapshot the link *target string*, so the
                 // symlink change is recorded without reading the pointed-to file.
-                match std::fs::read_link(abs) {
-                    Ok(target) => (
-                        self.store.put(target.to_string_lossy().as_bytes()),
-                        true,
-                        false,
-                        None,
-                    ),
-                    Err(_) => (None, false, false, None),
-                }
+                symlink_change(&self.store, std::fs::read_link(abs))
             } else {
                 match std::fs::read(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
@@ -793,6 +785,37 @@ impl Recorder {
             baseline_unknown: obs.baseline_unknown,
             skipped_reason: obs.skip_reason.clone(),
         }
+    }
+}
+
+/// Classify a symlink's `read_link` outcome into `stage`'s
+/// `(after, snapshotted, withheld, skip_reason)` shape. Pulled out to a
+/// standalone, deterministically-testable function rather than inlined:
+/// the failure arm is a TOCTOU race (the dirent can vanish, or change kind,
+/// in the gap between the `symlink_metadata` check above and this
+/// `read_link` call) that real threads can't be made to reliably win in a
+/// test, but the classification logic itself — a `read_link` error is the
+/// `unreadable` cause, exactly like a regular file's unreadable `fs::read`
+/// (finding #2: previously left `skip_reason: None`, rendering as the
+/// unclassified "reason unrecorded" instead of naming the plainly-known
+/// cause) — is ordinary pure logic that doesn't need the race to verify.
+fn symlink_change(
+    store: &BlobStore,
+    read_result: std::io::Result<std::path::PathBuf>,
+) -> (Option<String>, bool, bool, Option<String>) {
+    match read_result {
+        Ok(target) => (
+            store.put(target.to_string_lossy().as_bytes()),
+            true,
+            false,
+            None,
+        ),
+        Err(_) => (
+            None,
+            false,
+            false,
+            Some(skip_reason::UNREADABLE.to_string()),
+        ),
     }
 }
 
@@ -1935,6 +1958,34 @@ mod tests {
             entry.after, None,
             "no bytes were ever read — a hash must never be fabricated"
         );
+    }
+
+    // Finding #2 (symlink producer, previously unclassified): a symlink
+    // whose `read_link` fails (a TOCTOU race against the `symlink_metadata`
+    // check that decided `is_symlink` — the dirent can vanish or change
+    // kind in the gap between the two calls) must set `unreadable`, not
+    // leave `skipped_reason: None` (which rendered as "reason unrecorded"
+    // even though the cause — no bytes obtained — is exactly the same as
+    // the regular-file unreadable case above). The race itself can't be
+    // deterministically won against a real filesystem in a test, so this
+    // exercises `symlink_change` — the actual production classification
+    // function `stage` calls — directly with a synthetic `read_link`
+    // error, rather than asserting on a flaky real race.
+    #[test]
+    fn stage_symlink_unreadable_sets_unreadable_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path().join("objects"));
+
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "race: link vanished");
+        let (after, snapshotted, withheld, skip_cause) = symlink_change(&store, Err(err));
+
+        assert_eq!(
+            after, None,
+            "no bytes were ever read for a failed read_link — a hash must never be fabricated"
+        );
+        assert!(!snapshotted);
+        assert!(!withheld);
+        assert_eq!(skip_cause.as_deref(), Some(skip_reason::UNREADABLE));
     }
 
     // SR2 (io_failed producer): the write itself fails, but the bytes WERE

@@ -843,6 +843,248 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
     );
 }
 
+// Finding #5(b): `print_entry` (the `diff` renderer) must distinguish
+// `StoreError::Missing` from `StoreError::Corrupt`, the same way
+// `build_plan` (the `undo` renderer) already does — before this fix both
+// collapsed to the same generic "(snapshot unavailable)", so `diff` was
+// LESS specific than `undo` about the identical condition. This test
+// covers ONLY the Corrupt leg (the Missing leg is already pinned by
+// `diff_names_the_real_skip_cause_and_unresolvable_blob`'s `gone.rs` case
+// above, which never even puts the blob — genuinely missing, not
+// tampered).
+#[test]
+fn diff_reports_corrupt_blob_distinctly_from_missing() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"will be tampered\n").unwrap();
+    // Tamper the object's bytes on disk so the stored hash no longer
+    // matches (mirrors `show_prompt_corrupt_blob_reports_hash_mismatch_on_stderr`
+    // and `agentrec_core::store::tests::corrupt_object_detected`).
+    let hex = after.strip_prefix("sha256:").unwrap();
+    let path = root
+        .join(".agentrec/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::write(&path, b"tampered").unwrap();
+    // Precondition: the store must genuinely report Corrupt for this hash,
+    // not some other error, before asserting on `diff`'s rendering of it.
+    assert!(
+        matches!(
+            store.get(&after),
+            Err(agentrec_core::store::StoreError::Corrupt(_))
+        ),
+        "precondition: tampered blob must be genuinely Corrupt"
+    );
+
+    let turn = base_turn(
+        "t_DIFFCORRUPT000000000000001",
+        vec![FileEntry {
+            path: "tampered.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert!(out.status.success(), "diff failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("tampered.rs"))
+        .unwrap_or("");
+    assert!(
+        line.contains("(snapshot corrupt — hash mismatch)"),
+        "tampered.rs line: {line}"
+    );
+    assert!(
+        !line.contains("(snapshot unavailable)"),
+        "a Corrupt blob must not render the same message as a genuinely Missing one: {line}"
+    );
+}
+
+// Finding #3 (cross-seam: change C x change A) + finding #4 (untested
+// message string): change C gave over-cap/io-failed `FileEntry`s a real
+// `after` hash even though the blob was never stored (SR-C's honesty
+// gain). That hash still advances `Recorder::baseline` in `daemon.rs`, so
+// the NEXT turn touching that path carries `before: Some(<hash that was
+// never actually stored>)` — a "ghost hash". Nothing joins the producer
+// test (which only checks `daemon.rs`'s own output) with the read-side
+// tests (which only ever seed already-resolvable hashes), so this scenario
+// — genuinely reachable in production, never exercised end to end — went
+// untested. Seeds turn1 (over-cap create, ghost `after`) + turn2 (modify,
+// `before` = that same ghost hash) and asserts every read verb degrades
+// honestly rather than lying: `blame <file>` still reports the correct
+// fact from the log alone (no blob load needed), `blame <file>:<line>`
+// honestly can't attribute, `diff` shows the blob as unavailable, and
+// `undo` REFUSES with the exact "prior snapshot unavailable — refusing to
+// restore" string — which is finding #4's target message; `git grep
+// "prior snapshot unavailable" -- cli/tests` was empty before this test,
+// so this closes that finding too (no redundant second test added).
+// `doctor`'s "store health" check is asserted passing too, proving the
+// ghost hash is a read-side degradation only, never a DEGRADED-store
+// false positive (state.json's counters are untouched by directly seeding
+// the log — this scenario never goes through the daemon's write path).
+#[test]
+fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // A hash that was computed (SR-C) but genuinely never `put` into the
+    // store — exactly what an over-cap file's `after` looks like.
+    let ghost_hash = hash_bytes(b"over-cap content, never actually stored");
+    // Precondition this whole test depends on: the store must genuinely
+    // fail to resolve the ghost hash before any output is asserted.
+    assert!(
+        matches!(store.get(&ghost_hash), Err(StoreError::Missing(_))),
+        "precondition: ghost_hash must be genuinely unresolvable"
+    );
+
+    let final_content = b"final content\n".to_vec();
+    let final_hash = store.put(&final_content).unwrap();
+    std::fs::write(root.join("f.txt"), &final_content).unwrap();
+
+    // turn1: over-cap create — `after` is the ghost hash (SR-C: computed,
+    // never stored). Seeded first so it's the OLDER turn in append order.
+    let turn1 = base_turn(
+        "t_GHOSTBASE0000000000000001",
+        vec![FileEntry {
+            path: "f.txt".into(),
+            before: None,
+            after: Some(ghost_hash.clone()),
+            op: "create".into(),
+            skipped: true,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+        }],
+    );
+    seed_turn(root, &turn1);
+
+    // turn2: a normal modify whose `before` is that same ghost hash — the
+    // baseline `daemon.rs` advanced to it, exactly as `Recorder::stage`
+    // does for any snapshotted-or-not `after`. `after` here IS a real,
+    // stored hash (this turn's own write succeeded), so the file is
+    // genuinely unmodified-since on disk.
+    let turn2 = base_turn(
+        "t_GHOSTNEXT00000000000000002",
+        vec![FileEntry {
+            path: "f.txt".into(),
+            before: Some(ghost_hash),
+            after: Some(final_hash),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn2);
+
+    // blame f.txt: the log fact alone (no blob load) is correct — must
+    // name turn2 and must NOT claim anything is unavailable.
+    let blame_file_out = agentrec(root, &["blame", "f.txt"]);
+    assert!(
+        blame_file_out.status.success(),
+        "blame f.txt failed: {blame_file_out:?}"
+    );
+    let blame_file_stdout = String::from_utf8_lossy(&blame_file_out.stdout);
+    assert!(
+        blame_file_stdout.contains(&short_id_of(&turn2.id)),
+        "blame f.txt must still attribute correctly from the log alone: {blame_file_stdout}"
+    );
+    assert!(
+        !blame_file_stdout.to_lowercase().contains("unavailable"),
+        "blame f.txt needs no blob load and must not degrade: {blame_file_stdout}"
+    );
+
+    // blame f.txt:1: line-level attribution DOES need to load blobs for
+    // both candidate turns, and both cite the same unresolvable ghost hash
+    // — must honestly refuse, never guess.
+    let blame_line_out = agentrec(root, &["blame", "f.txt:1"]);
+    assert!(
+        blame_line_out.status.success(),
+        "blame f.txt:1 failed: {blame_line_out:?}"
+    );
+    let blame_line_stdout = String::from_utf8_lossy(&blame_line_out.stdout);
+    assert!(
+        blame_line_stdout.contains("f.txt:1: attribution unavailable — snapshot unavailable"),
+        "blame_line stdout: {blame_line_stdout}"
+    );
+
+    // diff turn2: `before` doesn't resolve — must say so, not crash or
+    // silently show an empty diff.
+    let diff_out = agentrec(root, &["diff", &turn2.id]);
+    assert!(diff_out.status.success(), "diff failed: {diff_out:?}");
+    let diff_stdout = String::from_utf8_lossy(&diff_out.stdout);
+    let diff_line = diff_stdout
+        .lines()
+        .find(|l| l.contains("f.txt"))
+        .unwrap_or("");
+    assert!(
+        diff_line.contains("(snapshot unavailable)"),
+        "diff line: {diff_line}"
+    );
+
+    // undo turn2: build_plan's `StoreError::Missing` arm on a `before` hash
+    // (finding #4's untested message) — must REFUSE with the exact
+    // established string, never attempt a restore.
+    let undo_out = agentrec(root, &["undo", &turn2.id, "--confirm"]);
+    assert!(undo_out.status.success(), "undo failed: {undo_out:?}");
+    let undo_stdout = String::from_utf8_lossy(&undo_out.stdout);
+    let undo_line = undo_stdout
+        .lines()
+        .find(|l| l.contains("f.txt"))
+        .unwrap_or("");
+    assert!(
+        undo_line.trim_start().starts_with("REFUSE"),
+        "undo line: {undo_line}"
+    );
+    assert!(
+        undo_line.contains("prior snapshot unavailable — refusing to restore"),
+        "undo line: {undo_line}"
+    );
+    // The file must be completely untouched by the refused undo.
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).unwrap(),
+        final_content,
+        "a refused ghost-hash entry must never touch the worktree file"
+    );
+
+    // doctor store health: a ghost hash is a read-side degradation only —
+    // it must never masquerade as a DEGRADED store (state.json's counters
+    // are untouched; these turns were seeded directly, not written by the
+    // daemon's own fault-tracking write path).
+    let doctor_json = doctor_json_value(root);
+    let checks = doctor_json["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a checks array: {doctor_json}"));
+    let store_health = checks
+        .iter()
+        .find(|c| c["name"] == "store health")
+        .unwrap_or_else(|| panic!("expected a 'store health' check: {doctor_json}"));
+    assert_eq!(
+        store_health["status"], "pass",
+        "store health: {store_health}"
+    );
+}
+
 #[test]
 fn diff_unknown_turn_exits_1_with_range() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2023,6 +2265,20 @@ fn undo_skipped_and_withheld_refused() {
 // Revert plan, where undo would then try to restore a `before` blob that
 // was never stored. Pinned here at the CLI level: the file must be REFUSED
 // (never appear as a revert) and must be byte-identical on disk afterward.
+//
+// The fixture below MUST use `op: "create"` (before: None), not `op:
+// "modify"`. A prior version of this test used `op: "modify"` with
+// `before: None`, which is refused by an INDEPENDENT check —
+// `build_plan`'s `op == "modify"` before-blob branch (`None => "no prior
+// snapshot to restore"`) fires before the `entry.skipped` gate is ever
+// reached, so that fixture pinned nothing: a done-gate review deleted the
+// `skipped` gate entirely and the test still passed. `op == "create"`
+// skips the before-blob branch entirely (it only runs for
+// `"modify"`/`"delete"`), so the `skipped` gate is the ONLY thing standing
+// between this fixture and `execute_revert`'s create-inverse, which
+// deletes the file on disk — reproduced live against a gate-removed build:
+// `undo t_SR6P…0002 (claude)` / `  revert  big.bin (create)` /
+// `reverted 1 file(s)` / file gone from disk.
 #[test]
 fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
     use agentrec_core::record::{skip_reason, FileEntry};
@@ -2051,7 +2307,7 @@ fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
             path: "big.bin".into(),
             before: None,
             after: Some(after_hash),
-            op: "modify".into(),
+            op: "create".into(),
             skipped: true,
             withheld: false,
             baseline_unknown: false,
@@ -2074,7 +2330,12 @@ fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
     );
 
     // The file must be completely untouched — no attempted restore, no
-    // partial mutation.
+    // partial mutation, and (the reachable data-loss shape this test
+    // exists to catch) it must not have been DELETED by a create-inverse.
+    assert!(
+        root.join("big.bin").exists(),
+        "a refused skipped `create` entry must never be deleted from the worktree"
+    );
     assert_eq!(
         std::fs::read(root.join("big.bin")).unwrap(),
         content,
@@ -4301,7 +4562,27 @@ fn nf7_all_and_all_files_flags_are_orthogonal() {
     );
     assert!(
         stdout2.contains("noise files"),
-        "--all alone must not reveal noise files: {stdout2}"
+        "--all alone must leave noise files folded (fold notice still prints): {stdout2}"
+    );
+
+    // Finding #6: both flags together. They are orthogonal axes (`--all` =
+    // turn grade, `--all-files` = file class), so combining them must
+    // reveal everything either flag alone reveals — the git turn AND its
+    // unfolded file count — never have one flag suppress the other.
+    let both = agentrec(root, &["log", "--all", "--all-files"]);
+    assert!(both.status.success());
+    let stdout3 = String::from_utf8_lossy(&both.stdout);
+    assert!(
+        stdout3.contains(&short_id_of(&git_turn.id)),
+        "--all --all-files together must still reveal the git turn: {stdout3}"
+    );
+    assert!(
+        !stdout3.contains("noise files"),
+        "--all-files must unfold noise even when combined with --all: {stdout3}"
+    );
+    assert!(
+        stdout3.contains("3 files"),
+        "combined flags must show the full unreduced file count: {stdout3}"
     );
 }
 
