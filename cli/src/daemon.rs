@@ -126,6 +126,24 @@ pub fn run(root: &Path) -> Result<(), String> {
         // activity." Closing it fully would mean reclassifying `pending` at
         // flush time — a larger change, deliberately not taken here.
         //
+        // Mirror residual window, the OTHER direction (over-record, untested
+        // before Phase 4 of the honesty-fixes plan): a path already sitting
+        // in `pending`, admitted under the OLDER, WIDER rules, is still
+        // staged at the next flush even if a `.gitignore` edit narrows it out
+        // mid-debounce — `Recorder::stage` reads whatever `pending` holds and
+        // never re-consults `ignore_set`. Magnitude is bounded: one extra
+        // snapshot, never more. This is NOT the same failure mode as the
+        // under-record residual above and has no analogous deadlock —
+        // `gitignore_dirty` is an independent flag, and the very fact that
+        // the pre-edit admission is present is what settles the debounce and
+        // runs this rebuild, so by the time that flush completes `ignore_set`
+        // is already current for every subsequent tick. There is no
+        // "unrelated watched activity" escape hatch to close here; the next
+        // mutation of that path, whenever it comes, is classified against the
+        // fresh set. See `narrowing_mid_debounce_still_stages_pending_paths`
+        // (`cli/tests/integration.rs`), which pins the one-extra-snapshot
+        // behavior deliberately rather than treating it as a defect to fix.
+        //
         // Consequence of losing the triggering event itself: harmless.
         // `Recorder::stage` reads *current* file bytes at flush time, so a
         // dropped intermediate event costs an intermediate snapshot, never

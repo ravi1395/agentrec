@@ -616,6 +616,139 @@ fn new_gitignore_honored_without_restart() {
     );
 }
 
+/// True if a turn record's `files` array names `path`.
+fn turn_has_file(t: &serde_json::Value, path: &str) -> bool {
+    t.get("files")
+        .and_then(|f| f.as_array())
+        .map(|fs| {
+            fs.iter()
+                .any(|f| f.get("path").and_then(|p| p.as_str()) == Some(path))
+        })
+        .unwrap_or(false)
+}
+
+// Phase 4 of the honesty-fixes plan — the untested MIRROR of
+// `unignore_is_honored_without_other_watched_activity`/`new_gitignore_honored_
+// without_restart` above. Those cover WIDENING (a path becomes watched);
+// nothing covered NARROWING while a path already sits in `pending`. Because
+// classification happens at ingest (`apply_watch_result` -> `classify`) and
+// staging happens later at flush (`Recorder::stage`, which reads current
+// bytes and never re-consults the ignore set), a path admitted to `pending`
+// under the OLDER, wider rules is still staged at the next flush even if a
+// `.gitignore` edit lands mid-debounce and now ignores it. This first half is
+// NOT a bug and has NO neuter — it pins the current, deliberate behavior (see
+// the extended `daemon.rs` comment at the `maybe_rebuild` call site). The
+// second half (a LATER, separate mutation of the same now-ignored path) DOES
+// have a neuter: it must stop being recorded once the rebuild has actually
+// run, and reverting the rebuild-gate fix (moving `maybe_rebuild` back inside
+// `if settled || capped`) reproduces the old unconsumed-flag deadlock and
+// reds it.
+#[test]
+fn narrowing_mid_debounce_still_stages_pending_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // In-window positive control, written before anything else — proves the
+    // daemon is alive and actually flushing during the window the first
+    // (over-record) assertion below depends on.
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    // The path under test: admitted to `pending` under the WIDE (no rule yet)
+    // ignore set.
+    std::fs::write(root.join("src/target.txt"), "one").unwrap();
+
+    // Within the debounce window (1.5s, `daemon::DEBOUNCE`), narrow the rules
+    // to ignore it. `gitignore_dirty` is set at ingest time regardless of
+    // this event's own verdict, but the path is already sitting in `pending`
+    // by now and `Recorder::stage` never re-classifies it — this is the
+    // over-record direction under test.
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(root.join("src/.gitignore"), "target.txt\n").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "src/control.rs"))
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Debounce (1.5s) + slack: by now the burst that admitted target.txt
+    // (and the .gitignore edit itself) must have settled and flushed.
+    let flushed_once = poll_until(Duration::from_secs(20), || {
+        let hits = turns(root)
+            .iter()
+            .filter(|t| turn_has_file(t, "src/target.txt"))
+            .count();
+        (hits >= 1).then_some(hits)
+    });
+    let first_hits = flushed_once.unwrap_or(0);
+    assert_eq!(
+        first_hits, 1,
+        "src/target.txt, already pending before the mid-debounce narrowing rule, must be \
+         staged exactly once — this pins the documented over-record residual, it is not a bug"
+    );
+
+    // Precondition for the absence assertion below: the rebuild this test
+    // depends on must have actually happened at least once, and not merely
+    // that the daemon happened not to re-admit the path. Without this, "not
+    // recorded again" could pass vacuously if the rebuild mechanism were
+    // disabled entirely (nothing would ever narrow anything, and the second
+    // mutation's absence would prove nothing) — the same discipline this
+    // repo's own `self_matching_gitignore_edit_still_flags_a_rebuild`-style
+    // unit tests apply to their own preconditions.
+    let rebuilds_after_first_flush = ignore_rebuilds(root);
+    assert!(
+        rebuilds_after_first_flush.unwrap_or(0) >= 1,
+        "ignore_rebuilds counter is {rebuilds_after_first_flush:?} — the rebuild this test's \
+         second half depends on never ran, so 'not recorded again' would prove nothing"
+    );
+
+    // A second, separate mutation of the same path, well after the rule has
+    // had time to land (multiple `daemon::POLL` ticks, 250ms each) — this
+    // half DOES have a neuter (see module comment above).
+    std::thread::sleep(Duration::from_secs(2));
+    std::fs::write(root.join("src/target.txt"), "two").unwrap();
+    std::fs::write(root.join("src/control2.rs"), "fn main() {}").unwrap();
+
+    let saw_control2 = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "src/control2.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    // Positive control IN THE SAME WINDOW as the absence assertion below —
+    // without it, a dead or unarmed daemon would also satisfy "never recorded
+    // again," exactly the gap that once let two green gitignore tests
+    // coexist with a 764 MiB live leak in this repo.
+    assert!(
+        saw_control2.is_some(),
+        "control2.rs, written after the narrowing rule had time to land, was never recorded — \
+         daemon not alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let final_hits = turns(root)
+        .iter()
+        .filter(|t| turn_has_file(t, "src/target.txt"))
+        .count();
+    assert_eq!(
+        final_hits, 1,
+        "src/target.txt was recorded again after the narrowing rule had time to land — \
+         the ignore-set rebuild was never consumed for the second mutation"
+    );
+}
+
 /// Read `.agentrec/state.json`'s `ignore_rebuilds` counter, or `None` if the
 /// file is missing/unparseable/lacks the key.
 fn ignore_rebuilds(root: &Path) -> Option<u64> {
