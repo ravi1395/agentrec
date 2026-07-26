@@ -104,24 +104,30 @@ pub fn run(root: &Path) -> Result<(), String> {
     // ignore verdict; cleared after the ignore set is rebuilt.
     let mut gitignore_dirty = false;
     // Directories `admit_existing_contents` has already walked this daemon
-    // run. Honesty-round gate finding 1 (`247df9e` review): admission itself
-    // is now `#[cfg(target_os = "linux")]`-only (see `apply_watch_result`) —
-    // FSEvents delivers coalesced per-path flag unions, so the FIRST event a
-    // pre-existing directory receives after daemon start routinely carries
-    // historical `ItemCreated` alongside the real change, which `notify`
-    // reports as `Create(Folder)`. That is indistinguishable, from this
-    // daemon's side, from a genuine `mkdir`, so no macOS kind-gate can close
-    // this without also reopening the fabrication it exists to prevent —
-    // measured live, 2/2 probe runs on a repo where `admitted_dirs` was
-    // empty at daemon start (i.e. essentially every real directory in
-    // production). `admitted_dirs` therefore stays populated only on Linux,
-    // where a real `mkdir` fires `Create(Folder)` exactly once and this set
-    // solely dedups the case documented at the admission call site. Cleared
-    // on `Remove(Folder)` (and on any rename event, see the clear below) so
-    // a directory removed/renamed away and genuinely recreated at the same
-    // path within one run is still walked again — kept unconditional even
-    // though it is a no-op on macOS (the set never gains an entry there),
-    // rather than adding a second cfg split for a clear that costs nothing.
+    // run. Honesty-round gate finding 1 (`247df9e` review) compiled the whole
+    // admission ACTION out on macOS because gating on `Create(_)` there
+    // fabricated: FSEvents delivers coalesced per-path flag unions, so the
+    // FIRST event a pre-existing directory receives after daemon start
+    // routinely carries historical `ItemCreated` alongside the real change,
+    // which `notify` reports as `Create(Folder)` — measured live, 2/2 probe
+    // runs. Residuals round: that Create-axis poisoning is still real
+    // (Phase 1's spike re-measured it, 2/10 fresh-fixture `touch` trials
+    // producing a spurious `Create(Folder)` — see
+    // docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md),
+    // but the same spike measured the RENAME axis clean (0/80 spurious
+    // `Modify(Name(_))` across 2 fixtures x 4 stimuli x 10 trials, 0/5
+    // delayed replays over a 68s hold) — clean enough to close a real,
+    // independently-measured silent-loss hole: a directory moved INTO the
+    // watched root lost its contents on macOS (3/3 at HEAD). So admission is
+    // no longer Linux-only: `admitted_dirs` is now populated on BOTH
+    // platforms, but the GATE that feeds it is platform-split at the call
+    // site — Linux keeps `Create(_) | Modify(Name(_))`, macOS/non-Linux
+    // admits on `Modify(Name(_))` ONLY, never `Create(_)`. Cleared on
+    // `Remove(Folder)` (and on any rename event, see the clear below) so a
+    // directory removed/renamed away and genuinely recreated at the same
+    // path within one run is still walked again — unconditional on both
+    // platforms rather than adding a second cfg split for a clear that costs
+    // nothing.
     let mut admitted_dirs: HashSet<PathBuf> = HashSet::new();
 
     loop {
@@ -536,46 +542,63 @@ fn apply_watch_result(
                         // exactly the fabricating case without narrowing the
                         // fix this replaced.
                         //
-                        // Linux-only (honesty-round gate finding 1, review of
-                        // `247df9e`): this same `kind` gate does NOT hold on
-                        // macOS. FSEvents delivers coalesced per-path flag
-                        // UNIONS, not descriptions of one event — the first
-                        // event a directory receives after daemon start
-                        // routinely carries historical `ItemCreated` alongside
-                        // an unrelated real change (e.g. a later `touch`'s
-                        // `InodeMetaMod`), and `notify` reports that union as
-                        // `Create(Folder)` regardless of the directory's real
-                        // age. `admitted_dirs` is empty for every directory
-                        // that predates the daemon — i.e. essentially the
-                        // whole repo in production — so that first event
-                        // passes this gate and walks the whole subtree.
-                        // Measured live at `247df9e`: `touch <pre-existing
-                        // dir>` fabricated every file inside it as
-                        // `op: "modify"` in 2 of 2 probe runs, escalating into
-                        // a rich `tool:"claude"`-attributed turn in 2 of 4
-                        // bracket trials — reproduced again here before this
-                        // fix (see the integration test below). No `kind`
-                        // available from FSEvents distinguishes "directory
-                        // just created" from "directory existed, something
-                        // about it just changed for the first time this
-                        // run" — dueling FSEvents flag semantics would be
-                        // fighting the platform, not fixing the bug. Since
-                        // FSEvents has no watch-arming gap in the first place
-                        // (the defect this admission mechanism exists to
-                        // close is inotify-specific — see the module comment
-                        // above), the whole admission ACTION is compiled out
-                        // on non-Linux platforms rather than kept live and
-                        // dependent on FSEvents kind semantics. The
-                        // `admitted_dirs` clears above stay unconditional
-                        // (harmless no-ops on macOS, where the set never
-                        // gains an entry) so this is the only platform split
-                        // in this function.
+                        // Platform-split (residuals round, gated on Phase 1's
+                        // measurement — docs/superpowers/specs/
+                        // 2026-07-26-fsevents-rename-measurements.md,
+                        // VERDICT: CLEAN — before this arm existed): honesty-
+                        // round gate finding 1 (review of `247df9e`) compiled
+                        // the whole admission ACTION out on macOS because
+                        // FSEvents delivers coalesced per-path flag UNIONS —
+                        // the first event a directory receives after daemon
+                        // start routinely carries historical `ItemCreated`
+                        // alongside an unrelated real change, and `notify`
+                        // reports that union as `Create(Folder)` regardless
+                        // of the directory's real age (measured live at
+                        // `247df9e`, 2/2; re-measured at Phase 1, 2/10 on a
+                        // fresh fixture's first `touch`). `Create(_)` stays
+                        // excluded here on every non-Linux platform for
+                        // exactly that reason — Decisions log #2, not
+                        // reopened by this round.
+                        //
+                        // The RENAME axis is different: Phase 1 measured it
+                        // directly (not reasoned from FSEvents docs — this
+                        // repo's prior FSEvents intuition has been wrong
+                        // every time it went unmeasured) and found it clean:
+                        // 0/80 spurious `Modify(Name(_))` across 2 fixtures x
+                        // 4 stimuli x 10 trials (fresh tempdir AND an aged
+                        // real-repo copy), 0/5 delayed replays over a 68s
+                        // hold, plus a positive control (10/10 genuine
+                        // rename-ins deliver `Modify(Name(Any))`) proving the
+                        // measurement harness itself worked. That is clean
+                        // enough to close a real, independently-measured
+                        // macOS silent-loss hole — a directory moved INTO the
+                        // watched root lost its contents (3/3 at HEAD) — by
+                        // admitting on rename kinds only, never `Create(_)`.
                         #[cfg(target_os = "linux")]
                         if path.is_dir()
                             && matches!(
                                 kind,
                                 EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
                             )
+                            && admitted_dirs.insert(path.clone())
+                        {
+                            admit_existing_contents(
+                                root,
+                                &path,
+                                ignore_set,
+                                pending,
+                                first_event,
+                                last_event,
+                            );
+                        }
+                        // macOS / any non-Linux platform: rename kinds ONLY —
+                        // see the comment above this `cfg` pair. Never
+                        // `Create(_)` here; `create_kind_does_not_admit_on_macos`
+                        // pins that a `Create(Folder)` for a real, populated,
+                        // pre-existing directory admits nothing.
+                        #[cfg(not(target_os = "linux"))]
+                        if path.is_dir()
+                            && matches!(kind, EventKind::Modify(ModifyKind::Name(_)))
                             && admitted_dirs.insert(path.clone())
                         {
                             admit_existing_contents(
@@ -697,12 +720,15 @@ fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
 /// nothing this walk would otherwise exclude (denylist, gitignore) gets
 /// staged under different rules than normal events.
 ///
-/// `#[cfg(target_os = "linux")]`: its sole call site is Linux-gated
-/// (honesty-round gate finding 1 — see the comment there), so on other
-/// platforms this function is unused; gated to avoid a `dead_code` warning
-/// rather than leaving unreachable admission machinery compiled into a
-/// binary where it must never run.
-#[cfg(target_os = "linux")]
+/// Called from both platform arms at the call site (see the comment there):
+/// Linux on `Create(_) | Modify(Name(_))`, macOS/non-Linux on
+/// `Modify(Name(_))` ONLY — residuals round, gated on the FSEvents
+/// rename-kind measurement at
+/// docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md
+/// (VERDICT: CLEAN). Previously `#[cfg(target_os = "linux")]`-only
+/// (honesty-round gate finding 1) because gating macOS admission on
+/// `Create(_)` fabricated; the rename-only gate does not reopen that —
+/// `Create(_)` stays excluded on non-Linux platforms.
 fn admit_existing_contents(
     root: &Path,
     dir: &Path,
@@ -2995,6 +3021,67 @@ mod tests {
         );
     }
 
+    // Residuals round, Decisions log #2 pin: un-cfg'ing `admit_existing_contents`
+    // for macOS (this round closed the moved-in-directory silent-loss hole)
+    // must NOT resurrect a `Create(_)`-gated macOS admission — that was
+    // measured fabricating 2/2 at `f4bca8a` and re-measured fabricating 2/10
+    // at this round's Phase 1 spike (see
+    // docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md).
+    // macOS's gate admits on `Modify(Name(_))` ONLY; a synthetic
+    // `Create(Folder)` for a real, populated, pre-existing directory here
+    // must stage nothing and leave `admitted_dirs` empty — the direct
+    // discriminator proving the platform split, not a blanket un-cfg, is
+    // what protects macOS post-fix.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn create_kind_does_not_admit_on_macos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        tx.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a Create(Folder) event admitted srcdir/a.rs on macOS: {pending:?}"
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/b.rs")),
+            "a Create(Folder) event admitted srcdir/b.rs on macOS: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a Create(Folder) event must not mark the directory as admitted on macOS: \
+             {admitted_dirs:?}"
+        );
+    }
+
     // A second, independently measured fabrication source the event-kind gate
     // alone does not close: measured live on macOS/FSEvents in the fix round
     // that introduced this test (3 of 5 trials, no bracket, no hook, no other
@@ -3200,6 +3287,102 @@ mod tests {
             pending.contains(&root.join("build/new.rs")),
             "a directory renamed away and recreated at the same path must still be admitted: \
              {pending:?}"
+        );
+    }
+
+    // Residuals round, rename-out safety: a `Modify(Name(RenameMode::From))`
+    // for a path that does not (yet) resolve on disk must not walk anything
+    // — the walk itself yields nothing regardless (`ignore::WalkBuilder`
+    // over a nonexistent path produces an error entry that `.flatten()`
+    // silently swallows), so "nothing staged" ALONE cannot discriminate a
+    // regression here — AND must not poison `admitted_dirs` with a bogus
+    // entry for a path that was never really admitted. Dropping the
+    // `is_dir()` conjunct inserts the nonexistent path into `admitted_dirs`
+    // anyway, which then SUPPRESSES the legitimate follow-up admission when
+    // the real directory materializes moments later at the same path
+    // (`insert` returns `false` for an already-present entry) — two
+    // independent discriminators for the one regression. The follow-up
+    // event kind is platform-split: Linux's gate additionally admits on
+    // `Create(_)`, so a plain `mkdir`-shaped follow-up exercises the same
+    // gate Linux uses in production; macOS's gate excludes `Create(_)` by
+    // design (`create_kind_does_not_admit_on_macos` pins that), so the
+    // follow-up there must be the rename-TO kind macOS actually receives.
+    #[test]
+    fn rename_out_of_nonexistent_path_does_not_poison_admitted_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        let ghost = root.join("ghost");
+        assert!(!ghost.exists(), "ghost must not exist yet: {ghost:?}");
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // Leg 1: rename-out of a path that never existed here.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(ghost.clone())))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !pending.iter().any(|p| p.starts_with(&ghost) && p != &ghost),
+            "a rename-out of a nonexistent path staged content under it: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a rename-out of a nonexistent path must not poison admitted_dirs: \
+             {admitted_dirs:?}"
+        );
+
+        // The path now genuinely materializes — the follow-up admission
+        // MUST stage its contents.
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(ghost.join("new.rs"), "fn new() {}").unwrap();
+
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        #[cfg(target_os = "linux")]
+        tx2.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(ghost.clone())))
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        tx2.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::To,
+        )))
+        .add_path(ghost.clone())))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&ghost.join("new.rs")),
+            "the follow-up admission after a rename-out/rename-in at the same path did not \
+             stage the real directory's contents: {pending:?}"
         );
     }
 

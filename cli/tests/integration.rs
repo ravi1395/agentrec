@@ -709,6 +709,87 @@ fn metadata_only_event_on_directory_that_predates_daemon_stages_nothing() {
     );
 }
 
+// Residuals round: the sharpest known silent-loss hole in the product's core
+// "who broke my repo" claim, on the majority platform — a directory moved
+// INTO the watched root lost its contents SILENTLY on macOS (measured 3/3 at
+// HEAD, 2/2 at the pre-round baseline; not a regression). The admission
+// machinery (`admit_existing_contents`) already existed but was
+// `#[cfg(target_os = "linux")]`-only. Phase 1 of this round measured FSEvents
+// rename-kind semantics directly before any code changed
+// (docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md,
+// VERDICT: CLEAN: 10/10 rename-ins deliver `Modify(Name(Any))`, 0/80 spurious
+// rename kinds across 2 fixtures x 4 stimuli x 10 trials, 0/5 delayed replays
+// over a 68s hold) — clean enough to extend admission to macOS gated on
+// rename kinds ONLY, never `Create(_)` (the Create axis stays measured
+// poisoned: 2/10 fresh-fixture `touch` trials in that same spike produced a
+// spurious `Create(Folder)`, matching the 2/2 fabrication that got the whole
+// action compiled out of macOS in the first place — Decisions log #2, not
+// reopened here).
+//
+// On Linux this exercises the PRE-EXISTING `Modify(Name(_))` arm of the same
+// gate (`daemon.rs::apply_watch_result`) — not new coverage there, but this
+// test pins that arm too since nothing else in this suite builds a directory
+// entirely outside the root and moves it in.
+#[test]
+fn directory_moved_into_root_records_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let outside = tempfile::tempdir().unwrap();
+    let src_dir = outside.path().join("moved_in");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("one.rs"), "fn one() {}").unwrap();
+    std::fs::write(src_dir.join("two.rs"), "fn two() {}").unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // The directory materializes at this path for the very first time in
+    // this daemon's run — a genuine rename-in, built entirely outside the
+    // watched root beforehand so nothing about it was ever recorded before
+    // the move.
+    std::fs::rename(&src_dir, root.join("moved_in")).unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "moved_in/one.rs") && turn_has_file(t, "moved_in/two.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    let all = turns(root);
+    assert!(
+        saw.is_some(),
+        "a directory moved into the watched root lost its contents — neither \
+         moved_in/one.rs nor moved_in/two.rs was ever recorded: {all:#?}"
+    );
+
+    let op_of = |path: &str| -> Option<String> {
+        all.iter().find_map(|t| {
+            t.get("files")?.as_array()?.iter().find_map(|f| {
+                if f.get("path").and_then(|p| p.as_str()) == Some(path) {
+                    f.get("op").and_then(|o| o.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+    };
+    assert_eq!(
+        op_of("moved_in/one.rs").as_deref(),
+        Some("create"),
+        "moved_in/one.rs did not record op:\"create\": {all:#?}"
+    );
+    assert_eq!(
+        op_of("moved_in/two.rs").as_deref(),
+        Some("create"),
+        "moved_in/two.rs did not record op:\"create\": {all:#?}"
+    );
+}
+
 // Phase 3 of the rebuild-gate plan — the mirror of
 // `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
 // event carries the filename too (`apply_watch_result`'s filename check
