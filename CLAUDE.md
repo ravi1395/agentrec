@@ -8,6 +8,74 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Epoch nonce + the Linux leg — GATE PASS (2026-07-26, branch `fix/honesty-round`,
+`f8c6cc9..f4bca8a`, pushed, no PR):** Two founder asks. The nonce was routine; **the Linux leg,
+recorded as "owed" for three rounds, found a shipping product defect within minutes of first
+running.** macOS **419 → 422**, Linux **first-ever run: 316 passed / 2 failed → 426 passed / 0
+failed / 2 ignored**. Both platforms re-run by the orchestrator after every commit, independent of
+every implementer. Binding fable skeptic: **FAIL → FAIL → PASS** across three rounds.
+**How Linux was run, since this is now load-bearing infrastructure:** `ci.yml` fires only on
+`push: branches: [main]` and `pull_request` and has **no `workflow_dispatch`**, so a branch push runs
+nothing and GitHub only exposes dispatch for workflows already on the default branch — a PR was
+declined, so the leg ran locally in a **Colima Linux VM** (`rust:1-bookworm`, arm64, **non-root**,
+real inotify, `max_user_watches=1048576`). Fixtures land in the container's own `/tmp`, so the daemon
+watches native overlayfs, not the virtiofs mount. **Run it non-root**: as root, `chmod 000` fixtures
+pass vacuously because root bypasses mode bits — that alone made the two `#[cfg(unix)]` permission
+tests fail spuriously on the first attempt.
+**(A) `942985d` epoch nonce.** Epoch identity was the **pid**, which pid reuse defeats: reader and
+writer keyed on the same comparison, so a recycled pid made a dead epoch's reload count render as
+current *and* made the new epoch's first rebuild accumulate onto it. `acquire_lock` now stamps
+`epoch_nonce = ulid()` (a bare ms timestamp can collide across a rapid record→stop→record cycle);
+`release_lock` clears it; a pre-nonce `state.json` renders nothing rather than claiming a stale count.
+Refutation-proven with **writer-only and reader-only** reverts, the asymmetry that caused the
+original bug.
+**(B) `034c883` — the defect Linux found, and it is a real one.** `notify` arms the watch for a
+**newly created directory** only after processing the batch containing its creation event, and
+inotify is edge-triggered with no catch-up — so **a file written into a brand-new directory before
+the watch is armed was never recorded. Permanently, silently.** Proven with an isolated repro against
+the raw `notify` crate (no agentrec code) plus instrumentation showing the watcher arms ~4.3ms after
+the pid is written, which kills the competing "startup scan catches it" explanation. Fixed by
+`admit_existing_contents`, which walks the new subtree and stages it. A dedicated test names the
+defect, because the only assertion previously pointing at it lived inside a test entirely about
+ignore-set rebuilds — it would have been misattributed forever.
+**(C) The fix fabricated attribution — twice — and the gate caught both.** `247df9e` and `f4bca8a`.
+First shape gated on `path.is_dir()` alone, so `touch src` / `chmod src` walked whole unchanged
+subtrees and emitted every file as `op:"modify"`; with a bracket open they folded into the rich
+`tool:"claude"` turn and **`blame` named the agent for files it never touched** — a macOS regression
+at the product's headline surface, undoing what `17657d9` spent a gate cycle fixing. The kind gate
+that followed **also failed**: FSEvents delivers **coalesced per-path flag unions**, so the first
+event for a directory that pre-dates the daemon routinely carries historical `ItemCreated`, and
+`admitted_dirs` is empty for every such directory — i.e. essentially the whole repo. Skeptic measured
+**2 of 4** bracket trials fabricating where the implementer had reported one clean run; **a single
+clean observation of a ~50% behavior**, twice in this round. Final shape: admission is
+**`#[cfg(target_os = "linux")]`** — it only exists where it is load-bearing (premise verified: 10/10
+tight `mkdir && write` bursts recorded on macOS with admission compiled out), plus a rename clear,
+since `IN_MOVED_FROM` maps to `Modify(Name(From))` and **not** `Remove(Folder)`, so a directory
+renamed away left a stale `admitted_dirs` entry that suppressed a legitimate later admission —
+reopening the very event-loss class for `mv dir dir.bak && mkdir dir`. Escalation now **5/5** clean.
+**The measurement that should change how these plans are written:** Linux's *correct* rebuild count
+(13–21) **exceeds macOS's *neutered* count (15–18)**. A bound that discriminated perfectly on one
+platform was worthless on the other, and the prior reviewer's reasoning about which way inotify would
+push it was exactly backwards — FSEvents coalesces, inotify does not. `elapsed/POLL` is not a usable
+derivation either (`recv_timeout` returns immediately when a message is queued). Shipped as a
+`cfg(target_os)` split, each side discriminating its own neuter (Linux neuter measures 87–103).
+Every "reasoned safe, unobserved" margin in the last three rounds rested on that class of intuition.
+**Skeptic ruling worth keeping:** `metadata_only_event_does_not_admit_existing_directory_contents` is
+now vacuous on macOS, and that is **acceptable un-gated** — unlike this repo's past vacuity failures,
+it is vacuous only where the guarded code *cannot compile*, so it masks nothing, and it snaps back to
+load-bearing if anyone deletes the `#[cfg]`. Real macOS coverage lives in the pre-existing-dir test.
+**New residual, measured at HEAD *and* at the pre-round baseline — pre-existing, not a regression:**
+on macOS a directory **moved into** the watched root loses its contents (3/3 at HEAD, 2/2 at
+`f8c6cc9`); the round fixes this case on Linux via the rename-in clause. It is now the sharpest known
+silent-loss hole in the core claim, on the majority platform. Durable fix would be macOS admission
+triggered by rename events only, or a scan-diff on rename — founder call. Also still open: the
+crashed-daemon stale reload line, the bound's single-VM statistics, and `wait_for_live_daemon` gating
+on a pid written ~4.3ms before the watcher arms (every live-daemon test nominally races it).
+**Process note, unflattering and worth keeping:** I repeated within one session the exact error that
+produced this round's first REFUTED claim — two positional filters to `cargo test`, which takes one.
+Caught only because I read the output rather than the exit code. **The whole admission mechanism is
+now testable only on Linux**, so the container leg is load-bearing from here on, not optional.
+
 **Honesty-fixes round — GATE PASS (2026-07-26, branch `fix/honesty-round`, `df442f2..0f3b474`,
 pushed to `origin/fix/honesty-round`, no PR):** Founder-directed sweep of the five items the
 rebuild-gate report left open. **395 → 414 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt

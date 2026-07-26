@@ -238,7 +238,21 @@ RED, inotify widens the margins) but unobserved. This also clears the older owed
 `unreadable`/`io_failed` producers. Report the run URL and the per-job result; a red Linux leg is a
 finding for this round, not a separate one.
 
-**OUTCOME: NOT DONE — deliberately, founder decision.** The branch is pushed
+**OUTCOME: DONE, and it paid for itself immediately — see the round record in CLAUDE.md.** Run
+locally in a Colima Linux VM (`rust:1-bookworm`, non-root, real inotify at
+`max_user_watches=1048576`) rather than via CI, because `ci.yml` has no `workflow_dispatch` and a PR
+was declined. **The first-ever Linux run found a shipping product defect**, a macOS-tuned test bound
+that could not discriminate its own neuter on Linux, and — in the fixes for those — two fabricated-
+attribution regressions. Four commits: `034c883`, `247df9e`, `f4bca8a` (plus the nonce at `942985d`).
+**Correction to this plan's own reasoning, measured:** the note below (and the Phase-2 review it came
+from) claimed "inotify widens the margins" and that Linux moves both sides of the rebuild bound in
+the safe direction. That is **backwards**. FSEvents coalesces 40 writes into ~3 batches; inotify
+delivers them individually across many POLL ticks, so Linux's *correct* count (13–21) is far higher
+than macOS's (3–4) — higher, in fact, than macOS's *neutered* count (15–18). One global constant was
+therefore mathematically impossible, and `elapsed/POLL` is unusable as a derivation because
+`recv_timeout` returns immediately whenever a message is queued. Shipped as a `cfg(target_os)` split.
+
+**Superseded — the original text, for the record:** The branch is pushed
 (`origin/fix/honesty-round`), but `.github/workflows/ci.yml` fires only on `push: branches: [main]`
 and on `pull_request` — there is no `workflow_dispatch` — so **a branch push alone runs nothing**.
 The only route is a PR, and because this branch stacks on two earlier unmerged branches
