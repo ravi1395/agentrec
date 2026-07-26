@@ -4783,17 +4783,65 @@ fn doctor_json_value(root: &Path) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("doctor --json did not emit valid JSON ({e}): {out:?}"))
 }
 
-/// Poll `.agentrec/state.json` until the daemon has written a nonzero pid
-/// (i.e. it holds the lock), so `doctor`'s liveness check has something real
-/// to observe.
+/// Poll `.agentrec/state.json` until the daemon has actually ARMED its
+/// watcher, not merely written a nonzero pid. Residuals round, Phase 4: the
+/// pid is written by `acquire_lock` roughly 4.3ms BEFORE `daemon::run` calls
+/// `.watch()` — a helper that stopped at "pid != 0" nominally raced the
+/// watcher, so any fs event a test emitted right after this returned could
+/// be silently lost before the watcher was actually listening. Waiting for
+/// `watcher_armed_nonce == epoch_nonce` (both non-empty) instead pins the
+/// real moment `daemon::stamp_watcher_armed` runs, immediately after
+/// `.watch()` succeeds.
 fn wait_for_live_daemon(root: &Path) {
     let ok = poll_until(Duration::from_secs(10), || {
         let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
         let pid = v.get("pid")?.as_u64()?;
-        (pid != 0).then_some(())
+        let epoch_nonce = v.get("epoch_nonce")?.as_str()?;
+        let armed_nonce = v.get("watcher_armed_nonce")?.as_str()?;
+        (pid != 0 && !epoch_nonce.is_empty() && armed_nonce == epoch_nonce).then_some(())
     });
-    assert!(ok.is_some(), "daemon never wrote a live pid to state.json");
+    assert!(
+        ok.is_some(),
+        "daemon never reached watcher-armed state in state.json"
+    );
+}
+
+// Residuals round, Phase 4: proves `daemon::run` actually CALLS
+// `stamp_watcher_armed` after `.watch()` succeeds against a REAL daemon —
+// the one call site no unit test can reach (there is no real `notify`
+// watcher without spawning an actual daemon process). `SingleDaemonGuard::
+// spawn` already blocks on `wait_for_live_daemon`, which polls for exactly
+// this condition; this test additionally re-reads `state.json` afterward
+// and asserts the fields explicitly by name, so a regression here fails as
+// THIS test rather than only via a generic timeout panic buried inside
+// `spawn()`. Neuter: delete the `stamp_watcher_armed(&root)` call after
+// `.watch()` in `daemon::run` -> this test times out loudly at the 10s
+// bound (and so does every other live-daemon test that spawns via
+// `SingleDaemonGuard`/`wait_for_live_daemon` — loud, not silent).
+#[test]
+fn live_daemon_reports_watcher_armed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = SingleDaemonGuard::spawn(root); // blocks until armed
+
+    let text = std::fs::read_to_string(root.join(".agentrec/state.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let epoch_nonce = v["epoch_nonce"].as_str().unwrap_or("").to_string();
+    let armed_nonce = v["watcher_armed_nonce"].as_str().unwrap_or("").to_string();
+
+    daemon.kill();
+
+    assert!(
+        !epoch_nonce.is_empty(),
+        "epoch_nonce must be stamped once the daemon is live"
+    );
+    assert_eq!(
+        armed_nonce, epoch_nonce,
+        "watcher_armed_nonce must equal the current epoch_nonce once the daemon is live"
+    );
 }
 
 #[test]

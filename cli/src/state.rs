@@ -124,6 +124,23 @@ pub struct State {
     /// `None` only when `state_parse_failures` is 0.
     #[serde(default)]
     pub last_bad_field: Option<String>,
+    /// The `epoch_nonce` the watcher has actually finished arming for
+    /// (residuals round, Phase 4). `acquire_lock` stamps `epoch_nonce` ~4.3ms
+    /// BEFORE the watcher is armed (`daemon::run`'s `.watch()` call) — a test
+    /// helper that treats a non-zero `pid` alone as "daemon ready" nominally
+    /// races the watcher, silently dropping any event emitted in that window.
+    /// `daemon::stamp_watcher_armed` sets this to the CURRENT `epoch_nonce`
+    /// immediately after `.watch()` returns `Ok`; a caller is safe to assume
+    /// the watcher is listening only once `watcher_armed_nonce ==
+    /// epoch_nonce`. Keyed on the nonce rather than a bare bool for the same
+    /// reason `epoch_reload_nonce` is: a stale value left by a crashed prior
+    /// run names a DEAD epoch's nonce, so it can never equal a fresh epoch's
+    /// nonce and is self-invalidating by construction — no explicit reset
+    /// needed beyond `release_lock` clearing it on a clean stop. Empty string
+    /// (the shared default with every other nonce field here) means "not
+    /// armed / unknown", including for a pre-this-field `state.json`.
+    #[serde(default)]
+    pub watcher_armed_nonce: String,
 }
 
 /// Sentinel `last_bad_field` value for a file that could not be parsed as a
@@ -200,6 +217,7 @@ pub fn read_state(root: &Path) -> State {
         epoch_ignore_rebuilds: field!("epoch_ignore_rebuilds"),
         epoch_nonce: field!("epoch_nonce"),
         epoch_reload_nonce: field!("epoch_reload_nonce"),
+        watcher_armed_nonce: field!("watcher_armed_nonce"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -379,6 +397,7 @@ mod tests {
         assert_eq!(state.epoch_ignore_rebuilds, 0);
         assert_eq!(state.epoch_nonce, "");
         assert_eq!(state.epoch_reload_nonce, "");
+        assert_eq!(state.watcher_armed_nonce, "");
     }
 
     // Phase 3 (honesty-fixes round), revised in the follow-up honesty round:

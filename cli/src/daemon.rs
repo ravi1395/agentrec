@@ -85,6 +85,12 @@ pub fn run(root: &Path) -> Result<(), String> {
     watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| watch_error(&e))?;
+    // Residuals round, Phase 4: stamp the armed signal immediately after the
+    // watcher is confirmed listening — see `stamp_watcher_armed`'s doc for
+    // why this closes the `wait_for_live_daemon` race without moving
+    // `acquire_lock` (rejected: the flock IS the single-daemon gate, and
+    // arming before holding it would let two daemons watch concurrently).
+    stamp_watcher_armed(&root);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_h = stop.clone();
@@ -1927,12 +1933,44 @@ fn release_lock(root: &Path) {
         // this epoch's last reload count for still-current once the daemon
         // has genuinely stopped.
         state.epoch_nonce.clear();
+        // Clear the watcher-armed nonce too — a stopped daemon must never
+        // leave a value a later reader (`wait_for_live_daemon`) could read
+        // as "armed" for its own (already-dead) epoch. In practice this is
+        // belt-and-suspenders: a dead epoch's nonce can never equal a NEW
+        // epoch's fresh `epoch_nonce` anyway (see `watcher_armed_nonce`'s
+        // field doc), but a clean stop should not leave stale bookkeeping
+        // lying around when there's an obvious moment to clear it.
+        state.watcher_armed_nonce.clear();
         if let Err(e) = write_state(root, &state) {
             eprintln!("agentrec: warning: failed to clear pid in state.json: {e}");
         }
     }
     // The flock itself releases when `_lock`'s `File` drops at the end of
     // `run()` (fd close) — nothing to do here for the actual mutex.
+}
+
+/// Stamp `state.watcher_armed_nonce = state.epoch_nonce`, marking the CURRENT
+/// epoch's watcher as actually listening (residuals round, Phase 4). Must be
+/// called only after `.watch()` has returned `Ok` — calling it earlier would
+/// make `wait_for_live_daemon` believe the watcher is armed before it is,
+/// reopening the exact race this exists to close.
+///
+/// Extracted as its own function — same shape as `acquire_lock`/
+/// `release_lock` — specifically so it is unit-testable in isolation; an
+/// inline stamp at the `run()` call site would not be (there is no seam to
+/// drive it from a unit test without spawning a real watcher).
+///
+/// Keying on the epoch nonce rather than a bare bool is load-bearing: a
+/// stale `watcher_armed_nonce` left behind by a crashed prior run still
+/// names that DEAD epoch's nonce, which can never equal a fresh epoch's
+/// nonce (`acquire_lock` always mints a new one) — so the stale value reads
+/// as "not armed for THIS epoch" with no separate reset needed.
+fn stamp_watcher_armed(root: &Path) {
+    let mut state = read_state(root);
+    state.watcher_armed_nonce = state.epoch_nonce.clone();
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to stamp watcher-armed nonce in state.json: {e}");
+    }
 }
 
 /// Non-blocking liveness probe (D2) for `doctor`: if we can acquire the lock
@@ -2556,11 +2594,19 @@ mod tests {
 
         let first_nonce = {
             let _first = acquire_lock(root).expect("first acquire succeeds");
-            let state = read_state(root);
+            let mut state = read_state(root);
             assert!(
                 !state.epoch_nonce.is_empty(),
                 "acquire_lock must stamp a non-empty epoch nonce"
             );
+            // Residuals round, Phase 4: simulate the watcher having armed
+            // for this epoch (the real call site is `run()`, unreachable
+            // from a unit test — `stamp_watcher_armed` itself is exercised
+            // directly in `watcher_arm_stamp_keys_on_current_epoch_nonce`
+            // below). Seeding it here is what makes THIS test able to prove
+            // `release_lock` clears it, not just `epoch_nonce`.
+            state.watcher_armed_nonce = state.epoch_nonce.clone();
+            write_state(root, &state).unwrap();
             state.epoch_nonce
         };
         // `_first` (the flock-holding File) has already dropped by now, but
@@ -2571,6 +2617,11 @@ mod tests {
         assert_eq!(
             stopped.pid, 0,
             "release_lock must clear pid on a clean stop"
+        );
+        assert!(
+            stopped.watcher_armed_nonce.is_empty(),
+            "release_lock must also clear the watcher-armed nonce — a stopped daemon must \
+             never leave a value a later reader could mistake for this epoch still being armed"
         );
         assert!(
             stopped.epoch_nonce.is_empty(),
@@ -2584,6 +2635,57 @@ mod tests {
         assert_ne!(
             second.epoch_nonce, first_nonce,
             "each new epoch must get its own distinct nonce"
+        );
+    }
+
+    // Residuals round, Phase 4: `stamp_watcher_armed` must key on the
+    // CURRENT `epoch_nonce`, not a bare bool — a stale `watcher_armed_nonce`
+    // left by a crashed prior epoch must never read as "armed" for a fresh
+    // epoch that hasn't actually stamped it yet. Calls the REAL
+    // `stamp_watcher_armed` (not a re-implementation or a simulation).
+    // Neuter 1: make the helper write a constant string instead of
+    // `state.epoch_nonce` → REDs the final equality assertion (a constant
+    // never equals the real nonce). Neuter 2: make the helper a no-op →
+    // REDs (the armed nonce stays the stale PREVIOUS epoch's value forever).
+    // Note: this test does NOT cover the `run()` call site invoking the
+    // helper after `.watch()` — that deletion is covered only by the
+    // integration test `live_daemon_reports_watcher_armed`.
+    #[test]
+    fn watcher_arm_stamp_keys_on_current_epoch_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // Seed a state carrying a PREVIOUS epoch's armed nonce, as a
+        // crashed prior run would leave behind.
+        let mut state = State {
+            epoch_nonce: "previous-epoch-nonce".to_string(),
+            watcher_armed_nonce: "previous-epoch-nonce".to_string(),
+            ..State::default()
+        };
+        write_state(root, &state).unwrap();
+
+        // A fresh epoch begins: acquire_lock stamps a brand-new nonce.
+        let _lock = acquire_lock(root).expect("acquire succeeds");
+        state = read_state(root);
+        let fresh_nonce = state.epoch_nonce.clone();
+        assert_ne!(
+            fresh_nonce, "previous-epoch-nonce",
+            "acquire_lock must mint a distinct nonce for the new epoch"
+        );
+        assert_ne!(
+            state.watcher_armed_nonce, fresh_nonce,
+            "before the watcher arms, the armed nonce must NOT equal the fresh epoch's nonce \
+             — it is still the stale previous epoch's value, which is exactly why it must not \
+             equal the new one"
+        );
+
+        stamp_watcher_armed(root);
+
+        let armed = read_state(root);
+        assert_eq!(
+            armed.watcher_armed_nonce, fresh_nonce,
+            "stamp_watcher_armed must set watcher_armed_nonce to the CURRENT epoch_nonce"
         );
     }
 
