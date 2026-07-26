@@ -24,7 +24,8 @@ use agentrec_core::scrub;
 use agentrec_core::store::{hash_bytes, BlobStore, PutResult};
 use agentrec_core::time::rfc3339;
 use agentrec_core::MAX_SNAPSHOT_BYTES;
-use notify::{RecursiveMode, Watcher};
+use notify::event::{ModifyKind, RemoveKind};
+use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -102,6 +103,21 @@ pub fn run(root: &Path) -> Result<(), String> {
     // Set whenever a `.gitignore` event is observed, regardless of its own
     // ignore verdict; cleared after the ignore set is rebuilt.
     let mut gitignore_dirty = false;
+    // Directories `admit_existing_contents` has already walked this daemon
+    // run — measured live (macOS/FSEvents, `repro_longwait` in the fix
+    // round's notes): the SAME directory can receive a second, independent
+    // `Create(Folder)` event many seconds after the real one, apparently a
+    // delayed replay tied to the underlying event stream rather than to any
+    // new content, alongside a genuine `Modify(Metadata)` for an ordinary
+    // later `touch`. Reproduced in 3/5 trials with no bracket, no hook, and
+    // no other watched activity involved — frequent enough to require
+    // closing, not a documented residual. inotify does not show this
+    // (`Create(Folder)` fires exactly once per real `mkdir`), so this set
+    // costs Linux nothing; it only suppresses a second admission of a
+    // directory this run has already fully walked. Cleared on
+    // `Remove(Folder)` so a directory deleted and genuinely recreated at the
+    // same path within one run is still walked again.
+    let mut admitted_dirs: HashSet<PathBuf> = HashSet::new();
 
     loop {
         // A touched `.gitignore` changes the filter, and is consumed HERE —
@@ -177,6 +193,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             &mut first_event,
             &mut git_hit,
             &mut gitignore_dirty,
+            &mut admitted_dirs,
         ) {
             break; // channel disconnected — the watcher thread is gone
         }
@@ -368,6 +385,7 @@ fn drain_watch_events(
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
     gitignore_dirty: &mut bool,
+    admitted_dirs: &mut HashSet<PathBuf>,
 ) -> bool {
     match rx.recv_timeout(POLL) {
         Ok(res) => apply_watch_result(
@@ -379,6 +397,7 @@ fn drain_watch_events(
             first_event,
             git_hit,
             gitignore_dirty,
+            admitted_dirs,
         ),
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => return true,
@@ -394,6 +413,7 @@ fn drain_watch_events(
                 first_event,
                 git_hit,
                 gitignore_dirty,
+                admitted_dirs,
             ),
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => return true,
@@ -411,9 +431,15 @@ fn apply_watch_result(
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
     gitignore_dirty: &mut bool,
+    admitted_dirs: &mut HashSet<PathBuf>,
 ) {
     match res {
         Ok(event) => {
+            // Captured once: `event.kind` describes the whole batch (a rename
+            // even carries two paths, from/to, under one kind), not a
+            // per-path property, so it must be read before `event.paths` is
+            // moved out below.
+            let kind = event.kind;
             for path in event.paths {
                 // A `.gitignore` is filter *configuration*, not watched content,
                 // so the rebuild trigger must not depend on its own ignore
@@ -423,6 +449,16 @@ fn apply_watch_result(
                 // (e.g. adding `!keep.log`) went unhonored until a restart.
                 if path.file_name().and_then(|n| n.to_str()) == Some(".gitignore") {
                     *gitignore_dirty = true;
+                }
+                // A directory genuinely removed can be genuinely recreated at
+                // the same path later in this same daemon run — forget it was
+                // ever admitted so a real recreation is walked again, not
+                // silently skipped by the dedup below. Unconditional (not
+                // gated on `classify`): the directory may have been ignored
+                // when admitted and watched now, or vice versa, and either
+                // way a stale dedup entry must not survive its removal.
+                if matches!(kind, EventKind::Remove(RemoveKind::Folder)) {
+                    admitted_dirs.remove(&path);
                 }
                 match classify(root, &path, ignore_set) {
                     Class::GitRef => *git_hit = true,
@@ -449,7 +485,56 @@ fn apply_watch_result(
                         // this race, scoped to the one new subtree, mirroring
                         // `Recorder::scan`'s startup walk rather than a general
                         // poll fallback.
-                        if path.is_dir() {
+                        //
+                        // Gated on `kind`, not `path.is_dir()` alone (the
+                        // gate this replaced): `is_dir()` alone can't tell a
+                        // directory that just materialized from one that
+                        // always existed and merely had a metadata-only event
+                        // (`touch`, `chmod`, an xattr change) — a real, live
+                        // gate review caught this walking a whole unchanged
+                        // subtree and fabricating `op: "modify"` for every
+                        // file in it, including into rich agent turns via
+                        // `blame`. `Create(_)` covers `mkdir` on both
+                        // platforms (measured: FSEvents and inotify both
+                        // report `Create(Folder)`). `Modify(Name(_))` is
+                        // included deliberately for rename-in: a directory
+                        // *moved* into the watched root genuinely
+                        // materializes its contents at this path, and
+                        // inotify reports that as `IN_MOVED_TO` ->
+                        // `Modify(Name(RenameMode::To))` (confirmed against
+                        // notify's inotify.rs source), never `Create` — a
+                        // strict `Create`-only gate would silently reopen the
+                        // same event-loss class for moved-in directories.
+                        // Measured directly against the real daemon on both
+                        // platforms (not assumed): a metadata-only event on
+                        // an existing, unchanged directory is
+                        // `Modify(Metadata(_))` on both FSEvents and inotify
+                        // — never `Create` or `Modify(Name(_))` — so this
+                        // gate excludes exactly the fabricating case without
+                        // narrowing the fix this replaced.
+                        //
+                        // `admitted_dirs` closes a SECOND, independent
+                        // fabrication source the `kind` gate alone does not:
+                        // measured live on macOS (`repro_longwait`, fix-round
+                        // notes), the SAME directory can receive a further
+                        // `Create(Folder)` event many seconds after its real
+                        // creation — a delayed FSEvents replay, not new
+                        // content — alongside an ordinary later `touch`'s
+                        // genuine `Modify(Metadata)`. Reproduced in 3 of 5
+                        // trials with no bracket, no hook, and no other
+                        // watched activity involved, so it is not a rare
+                        // edge case. inotify does not exhibit this (a real
+                        // `mkdir` fires `Create(Folder)` exactly once), so
+                        // the set costs the Linux fix nothing — the first,
+                        // genuine admission for a newly created directory
+                        // still happens unconditionally.
+                        if path.is_dir()
+                            && matches!(
+                                kind,
+                                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+                            )
+                            && admitted_dirs.insert(path.clone())
+                        {
                             admit_existing_contents(
                                 root,
                                 &path,
@@ -2779,6 +2864,153 @@ mod tests {
         assert_eq!(closed[0].files.len(), 2);
     }
 
+    // ---- honesty-round gate finding: admit_existing_contents event-kind gate --
+
+    // The blocking finding from the honesty-round gate review of `034c883`:
+    // `admit_existing_contents` was called whenever the event path merely
+    // `is_dir()`, with no look at what KIND of event this was. A metadata-only
+    // event on an EXISTING, unchanged directory (`touch`, `chmod`, an xattr
+    // write) walked its whole subtree and staged every file in it as
+    // `op: "modify"` — a live, reproducible fabrication (verified against the
+    // real binary this round: `touch src` on an untouched repo claimed 3
+    // files "modified"; with an agent bracket open, `blame` attributed those
+    // files to the agent). This test drives `apply_watch_result` directly
+    // with a synthetic `Modify(Metadata(_))` event — bypassing the real
+    // watcher entirely — so it is deterministic regardless of platform/OS
+    // event-delivery quirks (FSEvents vs inotify): a pure unit test of the
+    // gate itself, independent of the `admitted_dirs` de-dup test below.
+    #[test]
+    fn metadata_only_event_does_not_admit_existing_directory_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        // Content already on disk — nothing about it is new; the event below
+        // is the ONLY thing the daemon ever observes for this directory.
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        tx.send(Ok(notify::Event::new(EventKind::Modify(
+            ModifyKind::Metadata(notify::event::MetadataKind::Any),
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+
+        // The directory path itself is still queued (it IS a real,
+        // Watch-classified mutation of some kind — `Recorder::stage` drops
+        // bare directory entries at flush time, see its `is_dir { continue }`
+        // arm) — but its CONTENTS must never have been walked.
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a metadata-only event admitted srcdir/a.rs into pending: {pending:?}"
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/b.rs")),
+            "a metadata-only event admitted srcdir/b.rs into pending: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a metadata-only event must not mark the directory as admitted: {admitted_dirs:?}"
+        );
+    }
+
+    // The SECOND, independently measured fabrication source the event-kind
+    // gate alone does not close: on macOS/FSEvents, the SAME directory can
+    // receive a further `Create(Folder)` event long after its real creation —
+    // a delayed replay, not new content (measured live this round: 3 of 5
+    // trials, no bracket, no hook, no other watched activity at all involved,
+    // pure `touch` on an already-recorded directory sometimes redelivers a
+    // spurious `Create(Folder)` many seconds later). `admitted_dirs` closes
+    // this: once a directory has been walked once this daemon run, a further
+    // `Create`/`Modify(Name)` event for the SAME path is not re-admitted.
+    // Deterministic here by construction — two synthetic `Create(Folder)`
+    // events for the same path, no reliance on real OS event timing.
+    #[test]
+    fn admitted_dirs_prevents_a_second_admission_of_the_same_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // First Create(Folder): a genuine first-ever observation — must admit.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("srcdir/a.rs")),
+            "the first Create(Folder) for a never-seen directory must admit its contents: \
+             {pending:?}"
+        );
+
+        // Simulate the intervening flush that would normally clear `pending`.
+        pending.clear();
+
+        // Second Create(Folder) for the SAME path — the measured replay.
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        tx2.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a SECOND Create(Folder) for an already-admitted directory re-staged its contents: \
+             {pending:?}"
+        );
+    }
+
     // The watch-event path (not just the pure classifier) must flip
     // `git_hit` for a packed-refs event, the same signal HEAD/index/refs
     // already produce — this is the whole path a real notify event takes.
@@ -2807,6 +3039,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
 
         assert!(git_hit, "a packed-refs transition must set git_hit");
@@ -2876,6 +3109,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut gitignore_dirty,
+            &mut HashSet::new(),
         );
 
         assert!(
@@ -2978,6 +3212,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
 
         assert!(!disconnected);
@@ -3012,6 +3247,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
         assert!(disconnected);
     }

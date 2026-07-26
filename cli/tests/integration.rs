@@ -505,6 +505,109 @@ fn file_written_into_brand_new_directory_is_recorded() {
     );
 }
 
+// The blocking finding from the binding gate review of `034c883`:
+// `admit_existing_contents` was called whenever the event path `is_dir()`,
+// with no look at what KIND of notify event this was. A metadata-only event
+// on an EXISTING, already-recorded directory — `touch`, `chmod`, an xattr
+// write, no content change anywhere inside it — walked the WHOLE subtree
+// again and staged every file in it as `op: "modify"`. Verified live against
+// the real binary before this fix: `touch src` on an untouched 3-file repo
+// produced a turn claiming all 3 files "modified"; with an agent bracket
+// open (`UserPromptSubmit` -> touch -> `Stop`, no other filesystem activity
+// at all), the fabricated files folded into the rich `tool:"claude"` turn
+// and `agentrec blame` attributed files the agent never touched. Fixed by
+// gating the walk on `event.kind` (`daemon.rs::apply_watch_result`) plus an
+// `admitted_dirs` de-dup set closing a second, independently measured
+// fabrication source on macOS: FSEvents can redeliver a `Create(Folder)` for
+// an already-admitted directory many seconds after its real creation,
+// alongside an ordinary later `touch`'s genuine `Modify(Metadata)` — measured
+// in 3 of 5 trials with no bracket and no other watched activity at all.
+//
+// Shaped like the gate's own probe: create a directory with files, let the
+// daemon record them (establishing a REAL baseline, not `baseline_unknown` —
+// a re-admission after this point is guaranteed to be DETECTABLE, even if
+// same-hash, never silently absorbed), then mutate only the directory's own
+// metadata and assert nothing about its contents is re-staged.
+#[cfg(unix)]
+#[test]
+fn metadata_only_event_on_existing_directory_stages_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    std::fs::create_dir_all(root.join("srcdir")).unwrap();
+    std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+    // Positive control: the directory's real creation, with a REAL baseline
+    // for both files (`op: "create"`, not `baseline_unknown`) — also proves
+    // the daemon is alive and recording before anything else is asserted.
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "srcdir/a.rs") && turn_has_file(t, "srcdir/b.rs"))
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+    let turns_before = turns(root).len();
+
+    // Metadata-only mutations on the DIRECTORY itself — no content change
+    // anywhere inside it. `touch`(1) rather than a std::fs call: this crate
+    // has no `filetime` dependency, and a real external syscall is a more
+    // faithful probe of what the daemon actually observes than anything
+    // achievable purely through `std::fs`.
+    let touch_status = std::process::Command::new("touch")
+        .arg(root.join("srcdir"))
+        .status()
+        .unwrap();
+    assert!(touch_status.success(), "touch(1) must be available");
+    std::thread::sleep(Duration::from_millis(400));
+    let mut perms = std::fs::metadata(root.join("srcdir"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(root.join("srcdir"), perms).unwrap();
+
+    // Positive control IN THE SAME WINDOW as the absence assert below —
+    // without it, a dead or unarmed daemon would also satisfy "no new turn
+    // names srcdir's files," exactly the gap this repo has been burned by
+    // before (see `unignore_is_honored_without_other_watched_activity`).
+    std::fs::write(root.join("control.rs"), "fn main() {}").unwrap();
+    let saw_control2 = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "control.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_control2.is_some(),
+        "control.rs, written after the directory's metadata-only mutations, was never \
+         recorded — daemon not alive/recording during the assertion window, rest of the \
+         test is moot"
+    );
+
+    let after = turns(root);
+    let refabricated = after
+        .iter()
+        .skip(turns_before)
+        .any(|t| turn_has_file(t, "srcdir/a.rs") || turn_has_file(t, "srcdir/b.rs"));
+    assert!(
+        !refabricated,
+        "touch(1)/chmod on an existing, content-unchanged directory re-staged its contents \
+         as modified: {after:#?}"
+    );
+}
+
 // Phase 3 of the rebuild-gate plan — the mirror of
 // `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
 // event carries the filename too (`apply_watch_result`'s filename check
