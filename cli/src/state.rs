@@ -266,6 +266,35 @@ pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
     state.last_ignore_rebuild_ms = wall_ms;
 }
 
+/// The genuinely-current-epoch reload count, for every reader of `state.json`
+/// (`status` text and `status --json` alike) — not just `record_ignore_
+/// rebuild`'s writer side.
+///
+/// The reset in `record_ignore_rebuild` above only fires the next time a
+/// rebuild happens; it does nothing at the moment a new epoch actually
+/// *starts* (`acquire_lock` stamping a fresh `state.pid`), and nothing at
+/// all while the daemon is stopped. In both windows, `epoch_ignore_rebuilds`
+/// and `epoch_pid` on disk still describe whichever epoch last rebuilt —
+/// which may be a dead pid, or (when stopped) `state.pid == 0` while
+/// `epoch_pid` is still the last live pid. A reader that used
+/// `state.epoch_ignore_rebuilds` directly would attribute that stale epoch's
+/// reloads to "now".
+///
+/// So every reader must ask the same question `record_ignore_rebuild` asks
+/// before trusting the field: does `epoch_pid` still match the CURRENT
+/// `pid`? If not, no rebuild has happened in the current epoch yet, and the
+/// true current-epoch count is 0 — not "unknown", not the stale figure.
+/// `pid == 0` (daemon stopped, `release_lock`'s sentinel) can never match a
+/// real `epoch_pid`, so the stopped case falls out of the same check for
+/// free.
+pub fn current_epoch_reloads(state: &State) -> u64 {
+    if state.epoch_pid == state.pid {
+        state.epoch_ignore_rebuilds
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

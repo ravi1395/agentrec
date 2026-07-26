@@ -2,7 +2,7 @@
 //! are file-based — they never need the daemon running.
 
 use crate::fmt;
-use crate::state::{read_state, write_state};
+use crate::state::{current_epoch_reloads, read_state, write_state};
 use crate::{log_path, memorycmds, objects_dir, signal_path};
 use agentrec_core::record::{append_log_line, LogRecord, SignalEvent, TurnRecord};
 use agentrec_core::scrub;
@@ -220,12 +220,17 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 /// `state_parse_failures` + `last_bad_field` (Phase 2's per-field-degrade
 /// counter). `ignore_rebuilds` keeps its established lifetime-cumulative
 /// meaning (additive field, unchanged); `epoch_ignore_rebuilds` is the new
-/// current-epoch figure `status`'s text report now renders instead.
+/// current-epoch figure `status`'s text report now renders instead — and,
+/// like the text report, it goes through `current_epoch_reloads` rather than
+/// the raw field, so a monitoring script sees the same epoch-scoped truth a
+/// human sees, including in the stale-epoch window right after a restart or
+/// while the daemon is stopped (raw field still holds the previous epoch's
+/// count there).
 fn status_json(root: &Path) -> Result<serde_json::Value, String> {
     let state = read_state(root);
     Ok(serde_json::json!({
         "ignore_rebuilds": state.ignore_rebuilds,
-        "epoch_ignore_rebuilds": state.epoch_ignore_rebuilds,
+        "epoch_ignore_rebuilds": current_epoch_reloads(&state),
         "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
             Some(state.last_ignore_rebuild_ms)
         } else {
@@ -290,14 +295,21 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // "reloaded 4821 time(s)" in this daily-driver surface. The lifetime
     // total is still preserved in `state.json` (and in `status --json`); it
     // is just not what this line renders.
-    if state.epoch_ignore_rebuilds > 0 {
+    //
+    // Blocking gate finding (honesty-round follow-up): the raw field alone is
+    // not enough — `record_ignore_rebuild`'s epoch reset only fires on the
+    // NEXT rebuild, so right after a restart (or while stopped) the field
+    // still holds the previous epoch's count under the previous epoch's pid.
+    // `current_epoch_reloads` re-checks `epoch_pid == pid` at render time —
+    // the state needed to detect this was already on disk, nothing read it.
+    let epoch_reloads = current_epoch_reloads(&state);
+    if epoch_reloads > 0 {
         let when = fmt::relative_time(
             &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
             wall_now_ms(),
         );
         out.push_str(&format!(
-            "ignore:     reloaded {} time(s), last {when}\n",
-            state.epoch_ignore_rebuilds
+            "ignore:     reloaded {epoch_reloads} time(s), last {when}\n"
         ));
     }
     if trailing.is_empty() {
@@ -504,6 +516,18 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
 /// referenced-anywhere set as `extra_protected` would protect every
 /// snapshot ever committed and silently defeat the budget. Only refs
 /// invisible to a structured `load_log` parse are "extra".
+///
+/// Honesty note (blocking-gate follow-up): the "only torn lines can hide a
+/// hash" premise holds for TORN lines specifically, not as a general
+/// guarantee. A line that parses fine as `LogRecord` but carries a hash on
+/// some field this struct doesn't model (e.g. a future additive PROTOCOL
+/// field) would be invisible here — `load_log` succeeds, so `owned_turns`
+/// never sees the unmodeled field, and this function only re-scans lines
+/// `serde_json::from_str::<LogRecord>` failed on. `purge --orphans`' raw
+/// byte-scan has no such blind spot (any `sha256:`-shaped substring counts,
+/// parse success or not), so the two would disagree on that hash. No
+/// producer emits such a field today; a future additive protocol field
+/// carrying a hash needs revisiting this function, not just PROTOCOL.md.
 fn extra_protected_refs(root: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     // open.json + memory.jsonl are never themselves a `TurnRecord`, so
@@ -1235,6 +1259,83 @@ mod tests {
         assert!(
             !out.contains("reloaded 5 time(s)"),
             "must not render the lifetime-cumulative figure: {out}"
+        );
+    }
+
+    // Blocking gate finding (honesty-round follow-up): `status_reload_line_is_
+    // epoch_scoped` above only covers a restart that has ALREADY seen a
+    // rebuild in the new epoch (record_ignore_rebuild does the reset+bump
+    // together). The gate found the real hole is the window BEFORE that:
+    // right after a restart, or while the daemon is stopped, nothing has
+    // called `record_ignore_rebuild` yet, so `epoch_ignore_rebuilds`/
+    // `epoch_pid` on disk still belong to the OLD epoch — and the old
+    // `status_report` rendered them unconditionally, attributing a dead
+    // daemon's reloads to the live one. Neuter: remove the epoch_pid==pid
+    // gate (render `state.epoch_ignore_rebuilds` unconditionally again) →
+    // RED on both sub-cases below.
+    #[test]
+    fn status_omits_stale_epoch_reload_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Old epoch (pid 111) rebuilt 3 times; nothing has rebuilt yet since.
+        let mut state = crate::state::State {
+            pid: 111,
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.epoch_pid, 111);
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // Case A: daemon restarted under a NEW pid (acquire_lock already
+        // stamped it) but no rebuild has happened in the new epoch yet.
+        state.pid = 222;
+        write_state(root, &state).unwrap();
+
+        assert_eq!(
+            read_state(root).ignore_rebuilds,
+            3,
+            "lifetime total must still be on disk — this is not a wipe"
+        );
+        let payload = status_json(root).unwrap();
+        assert_eq!(
+            payload["ignore_rebuilds"], 3,
+            "status --json lifetime total must survive the stale-epoch window"
+        );
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "no rebuild has happened in the NEW epoch (pid 222) yet — the \
+             line must be omitted, not attribute pid 111's reloads to it: {out}"
+        );
+
+        // Case B: daemon is stopped (pid == 0, release_lock's sentinel) —
+        // epoch_pid (111) still stale from the last running epoch.
+        state.pid = 0;
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "daemon stopped — must not render the last epoch's reload count: {out}"
+        );
+
+        // Once the new epoch actually rebuilds, the line must reappear with
+        // ONLY the new epoch's count, never the old one.
+        state.pid = 222;
+        crate::state::record_ignore_rebuild(&mut state, 6_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 1 time(s)"),
+            "expected the new epoch's own count (1): {out}"
+        );
+        assert!(
+            !out.contains("reloaded 3 time(s)") && !out.contains("reloaded 4 time(s)"),
+            "must never blend in the old epoch's count: {out}"
         );
     }
 
