@@ -3402,9 +3402,23 @@ mod tests {
     // `is_dir()` conjunct inserts the nonexistent path into `admitted_dirs`
     // anyway, which then SUPPRESSES the legitimate follow-up admission when
     // the real directory materializes moments later at the same path
-    // (`insert` returns `false` for an already-present entry) — two
-    // independent discriminators for the one regression. The follow-up
-    // event kind is platform-split: Linux's gate additionally admits on
+    // (`insert` returns `false` for an already-present entry).
+    //
+    // How many discriminators that gives you is PLATFORM-DEPENDENT, and an
+    // earlier revision of this comment claimed "two independent
+    // discriminators" unconditionally — false on macOS, measured at the
+    // round's gate. The `admitted_dirs` clear for any `Modify(Name(_))`
+    // (see `apply_watch_result`) runs BEFORE this gate, and macOS's
+    // follow-up leg is itself `Modify(Name(RenameMode::To))` — so on macOS
+    // that clear wipes the leg-1 poison and `insert` returns `true`, and the
+    // staging assertion passes even under the neuter. Only the `is_empty`
+    // assertion discriminates here. On Linux the follow-up is
+    // `Create(Folder)`, which never touches that clear, so `insert` returns
+    // `false` and BOTH assertions discriminate. The neuter turns this test
+    // RED on both platforms either way — but do not rely on the staging
+    // assertion alone to catch it on macOS.
+    //
+    // The follow-up event kind is platform-split: Linux's gate additionally admits on
     // `Create(_)`, so a plain `mkdir`-shaped follow-up exercises the same
     // gate Linux uses in production; macOS's gate excludes `Create(_)` by
     // design (`create_kind_does_not_admit_on_macos` pins that), so the

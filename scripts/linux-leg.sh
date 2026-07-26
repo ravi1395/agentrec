@@ -42,10 +42,18 @@
 #      /tmp untouched.
 #
 #   4. Real inotify, `fs.inotify.max_user_watches` raised well above a
-#      fresh `agentrec init`'s directory count. This is a VM-wide kernel
-#      setting (not per-container-namespaced), so it is set on the Colima
-#      VM itself via `colima ssh`, not via `docker run --sysctl` (which
-#      cannot touch this particular knob).
+#      fresh `agentrec init`'s directory count.
+#
+#      CAVEAT — the MECHANISM here is an inference, not recovered history.
+#      What the round actually recorded is the VALUE (1048576), never how it
+#      was applied. `fs.inotify.max_user_watches` is a VM-wide kernel knob
+#      rather than a per-container-namespaced one, so `docker run --sysctl`
+#      cannot set it; this script therefore sets it on the Colima VM itself
+#      via `colima ssh`. That reasoning is sound but UNVERIFIED against the
+#      original manual session, which may have applied it differently (e.g.
+#      baked into a custom Colima VM template). If you are the first to run
+#      this script, confirm the value actually took inside the container
+#      before trusting a green leg.
 #
 # Fails loudly and early on any unmet precondition (no colima, colima not
 # running, wrong arch, no docker) rather than silently running a degraded
@@ -88,10 +96,23 @@ colima ssh -- sudo sysctl -w "fs.inotify.max_user_watches=${MAX_USER_WATCHES}" \
   || fail "could not raise fs.inotify.max_user_watches on the Colima VM"
 
 log "running the suite non-root, fixtures in container-native /tmp"
+# The repo is mounted READ-ONLY and copied to a container-native working
+# directory before anything builds. Two host-mutation bugs this avoids, both
+# caught at the round's gate before this script had ever been run:
+#   - `chown -R builder:builder /workspace` on an rw bind mount rewrites the
+#     HOST repo's ownership metadata through virtiofs. The container needs a
+#     writable tree; the host does not need to pay for it.
+#   - an rw mount also puts the container's `target/` at the same non-triple
+#     `target/debug` path the host's macOS build uses, so a Linux run
+#     clobbers the host's build cache. `CARGO_TARGET_DIR` now points at
+#     container-native storage, off the mount entirely.
+# `target/` is excluded from the copy: it is the host's macOS artifacts, is
+# large, and is exactly what must not travel.
 docker run --rm --name "$CONTAINER_NAME" \
   --platform "$PLATFORM" \
-  -v "${REPO_ROOT}:/workspace:rw" \
-  -w /workspace \
+  -v "${REPO_ROOT}:/src:ro" \
+  -w /work \
+  -e CARGO_TARGET_DIR=/work-target \
   "$IMAGE" \
   bash -euxc '
     set -euo pipefail
@@ -99,11 +120,14 @@ docker run --rm --name "$CONTAINER_NAME" \
     # Real unprivileged user — item 2 above. No chmod-000 fixture may pass
     # while this script runs as root.
     id -u builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
-    chown -R builder:builder /workspace /usr/local/cargo /usr/local/rustup
+
+    mkdir -p /work /work-target
+    tar -C /src --exclude=./target -cf - . | tar -C /work -xf -
+    chown -R builder:builder /work /work-target /usr/local/cargo /usr/local/rustup
 
     su builder -s /bin/bash -c "
       set -euo pipefail
-      cd /workspace
+      cd /work
 
       # Hard gate, not a hope: refuse to continue if somehow still root.
       test \"\$(id -u)\" -ne 0 || { echo FATAL: still running as root >&2; exit 1; }
