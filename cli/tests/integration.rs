@@ -434,6 +434,77 @@ fn unignore_is_honored_without_other_watched_activity() {
     );
 }
 
+// AC: a file written into a brand-new directory, in the same burst as the
+// directory's own creation, must still be recorded. No `.gitignore` appears
+// anywhere in this fixture — unlike its neighbors above/below, this test is
+// not exercising ignore-set semantics at all; it pins a lower-level watcher
+// gap that `unignore_is_honored_without_other_watched_activity`'s positive
+// control was incidentally ALSO exercising (that test's name, comments, and
+// failure message are all about ignore-set rebuild consumption — a reader
+// chasing its failure would never land on watch-arming without this test).
+//
+// Real defect found running this repo's Linux integration leg for the first
+// time (previously exercised only on macOS/FSEvents): `notify`'s
+// `RecursiveMode::Recursive` arms a watch for a NEWLY created directory only
+// AFTER the crate finishes processing the batch containing its
+// `Create(Folder)` event — not synchronously as the directory appears.
+// `mkdir foo && write foo/bar`, issued back-to-back with no delay, can
+// therefore write `foo/bar` before inotify has a watch on `foo` at all;
+// inotify is edge-triggered at the kernel level (a watch must predate an
+// event — there is no catch-up), so that write generates NO notify event,
+// ever, not just late. Confirmed directly against the raw `notify` crate in
+// an isolated standalone repro (mkdir+write, no daemon involved) before
+// attributing it to this daemon. Fixed by `admit_existing_contents` in
+// `daemon.rs`: whenever a Watch-classified event path currently IS a
+// directory, its current contents are walked and staged immediately,
+// exactly like `Recorder::scan`'s startup walk but scoped to the one new
+// subtree — self-catch-up for the specific race above.
+//
+// macOS readers: this test passes unconditionally there too — FSEvents does
+// not show the same gap (confirmed: the pre-fix daemon already passed this
+// exact scenario on macOS), so it has no discriminating power on macOS. Its
+// value is entirely the Linux leg, the same posture this repo already uses
+// for its other `#[cfg(target_os = "linux")]`-only-meaningful tests (e.g.
+// `doctor_inotify_low_watches_fails`), except this one is cheap enough to
+// run everywhere rather than gating it out.
+//
+// Residual window, stated not eliminated: the catch-up walk below runs on
+// THIS daemon's main thread, when it drains the `Create(Folder)` event;
+// `notify`'s own `add_watch` runs asynchronously on notify's internal
+// thread, after ITS batch. A third write landing in the gap between this
+// walk completing and notify's watch actually arming is still missed — this
+// closes the specific race the test above exercises (nothing written before
+// the directory's own creation event is drained), not every conceivable
+// timing of writes into a directory that is still mid-registration.
+#[test]
+fn file_written_into_brand_new_directory_is_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // No sleep between mkdir and write — the tight sequence is the point;
+    // it is exactly the race window `admit_existing_contents` closes.
+    std::fs::create_dir_all(root.join("newdir")).unwrap();
+    std::fs::write(root.join("newdir/fresh.rs"), "fn main() {}").unwrap();
+
+    let saw = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "newdir/fresh.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw.is_some(),
+        "newdir/fresh.rs, written in the same burst as its own directory's creation, was \
+         never recorded — the new-directory watch-arming gap was not closed"
+    );
+}
+
 // Phase 3 of the rebuild-gate plan — the mirror of
 // `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
 // event carries the filename too (`apply_watch_result`'s filename check
@@ -814,8 +885,52 @@ fn daemon_counts_ignore_rebuilds() {
 // per-EVENT counter (the neuter this test exists to catch) also lands
 // <= 5 and the test would never go red. Empirically, 40 writes yields ~3-4
 // rebuilds under the correct per-TICK counter (repeatedly measured) vs.
-// ~15-18 under the per-event neuter — bounding to 10 keeps a wide margin on
-// both sides while still being far below what raw event-counting produces.
+// ~15-18 under the per-event neuter on macOS/FSEvents.
+//
+// Why the bound isn't derived from `elapsed_wall_time / POLL` (the obvious
+// first idea, and the one this repo's Linux gap report suggested): `run`'s
+// `recv_timeout(POLL)` call returns THE INSTANT a message is already queued
+// — it only blocks the full `POLL` when the channel is empty. During a
+// dense burst (this test's 40 back-to-back writes), the loop can tick far
+// faster than one per `POLL`; `POLL` floors idle latency, not busy-burst
+// tick rate. So `elapsed_ms / POLL_ms` UNDERESTIMATES the real tick count
+// during a burst and cannot be used as an upper bound — confirmed by
+// measurement, not assumed: the write+settle window here is on the order of
+// 2.2s wall time, `2200 / 250 ≈ 9`, yet the CORRECT per-tick counter alone
+// measures up to 21 on Linux, already past that formula's ceiling.
+//
+// The bound is PER-PLATFORM, not one shared constant — each half measured
+// directly on its own platform, not assumed. An earlier draft of this test
+// reasoned that Linux/inotify would move *both* sides in the safe direction
+// ("fewer rebuilds, since inotify doesn't add FSEvents' ~1s batching
+// latency"); that reasoning was backwards and never actually run on Linux.
+// FSEvents coalesces the 40 writes into a handful of batches — only ~3-4
+// ticks ever see the dirty flag set. inotify does the opposite: it delivers
+// the writes as many separate wake-ups (a single `fs::write` yields more
+// than one raw inotify event — ~90 total for 40 writes, confirmed by
+// instrumenting the per-event neuter below), so on Linux the *correct*
+// per-TICK counter itself measures ~13-21 (15 runs), already above the
+// macOS-tuned `1..=10` bound this test used to carry. The per-EVENT neuter
+// on Linux measures ~87-93 (11 runs) — still cleanly separated from the
+// correct range, just not by the macOS bound. This is why a single global
+// bound is impossible, not just inconvenient: Linux's correct ceiling (21)
+// EXCEEDS macOS's neutered floor (15), so any one fixed number that passes
+// correct-Linux also passes neutered-macOS — there is no number that can sit
+// above 21 and below 15 at once. Hence the `cfg!(target_os = "linux")` split
+// below, each half carrying its own wide margin measured on that platform
+// (macOS: neutered floor 15 vs bound 10; Linux: correct ceiling 21 and
+// neutered floor 87 vs bound 45 — roughly 2x clearance on both sides).
+//
+// Direction of safety for 45 on unseen CI hardware (this was measured on one
+// colima Linux VM, not a fleet): a slower or more contended runner makes
+// `drain_watch_events`'s per-tick batch-drain scoop up MORE already-queued
+// events before returning to the top of the loop, which means FEWER ticks
+// see the dirty flag freshly set per unit of real work — the correct-code
+// count moves DOWN, away from 45, on slower hardware. The neutered count is
+// keyed to raw event volume (~90, driven by how many raw events 40 writes
+// produce, not by how fast the loop drains them) and is comparatively
+// machine-independent. Both sides move away from the boundary in the safe
+// direction as hardware gets slower, not toward it.
 #[test]
 fn rebuild_count_is_bounded_by_writes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -845,9 +960,17 @@ fn rebuild_count_is_bounded_by_writes() {
         saw_rebuild.is_some(),
         "no ignore-set rebuild observed at all — rest of the test is moot"
     );
+    // See the platform-measurement comment above the test: a single
+    // constant cannot separate correct-vs-neutered on both platforms, so
+    // the bound is conditioned on the OS actually running the test.
+    let bound: std::ops::RangeInclusive<u64> = if cfg!(target_os = "linux") {
+        1..=45
+    } else {
+        1..=10
+    };
     assert!(
-        (1..=10).contains(&count),
-        "expected ignore_rebuilds bounded to 1..=10 for 40 writes (rate-limited by the dirty \
+        bound.contains(&count),
+        "expected ignore_rebuilds bounded to {bound:?} for 40 writes (rate-limited by the dirty \
          flag, not per-event), got {count}"
     );
 }

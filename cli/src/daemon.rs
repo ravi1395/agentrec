@@ -427,10 +427,39 @@ fn apply_watch_result(
                 match classify(root, &path, ignore_set) {
                     Class::GitRef => *git_hit = true,
                     Class::Watch => {
-                        pending.insert(path);
                         let at = Instant::now();
                         first_event.get_or_insert(at);
                         *last_event = Some(at);
+                        // Linux/inotify gap (confirmed against the raw `notify`
+                        // crate in isolation, and against this daemon, before
+                        // this fix landed): `RecursiveMode::Recursive` arms a
+                        // watch for a NEWLY created directory only after the
+                        // crate has finished processing the batch containing
+                        // its `Create(Folder)` event — not synchronously as the
+                        // directory appears. A file written into that directory
+                        // in the same burst (`mkdir foo && write foo/bar`, no
+                        // other watched activity in between) can land on disk
+                        // before the watch exists; inotify is edge-triggered at
+                        // the kernel level (a watch must predate an event, there
+                        // is no catch-up), so that write then generates NO
+                        // notify event — not late, never. FSEvents does not
+                        // show the same gap. Whenever a Watch-classified path
+                        // currently IS a directory, proactively admit whatever
+                        // it already contains — a self-catch-up for exactly
+                        // this race, scoped to the one new subtree, mirroring
+                        // `Recorder::scan`'s startup walk rather than a general
+                        // poll fallback.
+                        if path.is_dir() {
+                            admit_existing_contents(
+                                root,
+                                &path,
+                                ignore_set,
+                                pending,
+                                first_event,
+                                last_event,
+                            );
+                        }
+                        pending.insert(path);
                     }
                     Class::Ignore => {}
                 }
@@ -529,6 +558,42 @@ struct IgnoreSet {
 /// them from these one-shot scans too).
 fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
     !matches!(entry.file_name().to_str(), Some(".git") | Some(".agentrec"))
+}
+
+/// Proactively stage whatever a newly-observed directory currently
+/// contains. See the call site's comment in `apply_watch_result` for why
+/// this exists — a real Linux/inotify event-loss gap for content written
+/// into a brand-new directory before its watch is armed. Walks `dir` only
+/// (never `root` — bounded to the one new subtree), running every found
+/// file through the same `classify` every other event goes through, so
+/// nothing this walk would otherwise exclude (denylist, gitignore) gets
+/// staged under different rules than normal events.
+fn admit_existing_contents(
+    root: &Path,
+    dir: &Path,
+    ignore_set: &IgnoreSet,
+    pending: &mut HashSet<PathBuf>,
+    first_event: &mut Option<Instant>,
+    last_event: &mut Option<Instant>,
+) {
+    for entry in ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .parents(false)
+        .filter_entry(prune_git_and_agentrec)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            continue; // recurse only; only files are staged directly
+        }
+        let p = entry.into_path();
+        if classify(root, &p, ignore_set) == Class::Watch {
+            let at = Instant::now();
+            first_event.get_or_insert(at);
+            *last_event = Some(at);
+            pending.insert(p);
+        }
+    }
 }
 
 impl IgnoreSet {
