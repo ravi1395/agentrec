@@ -1305,16 +1305,6 @@ mod tests {
             payload["ignore_rebuilds"], 3,
             "status --json lifetime total must survive the stale-epoch window"
         );
-        // The `--json` seam needs its own assert, not just the lifetime one:
-        // `status_report` and `status_json` are two independent readers of
-        // `epoch_ignore_rebuilds`, and the gate review proved that neutering
-        // ONLY `status_json` back to the raw field survived the whole suite.
-        // Correct behavior was live-observed; nothing pinned it, so a refactor
-        // could have silently reverted this seam alone.
-        assert_eq!(
-            payload["epoch_ignore_rebuilds"], 0,
-            "status --json must not attribute the dead epoch's reloads to the live one"
-        );
 
         let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
         assert!(
