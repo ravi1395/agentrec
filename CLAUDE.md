@@ -8,6 +8,90 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Honesty-fixes round — GATE PASS (2026-07-26, branch `fix/honesty-round`, `df442f2..0f3b474`,
+pushed to `origin/fix/honesty-round`, no PR):** Founder-directed sweep of the five items the
+rebuild-gate report left open. **395 → 414 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt
+clean debug and release, release `strings` carries no `AGENTREC_TEST` seam. Sonnet implementers, no
+per-phase reviewer this round, one binding **fable skeptic** — plus an orchestrator re-run of the
+full suite after every phase, independent of every implementer. Round-1 verdict **GATE FAIL** on one
+blocking finding, fixed at `9b1b09b`; re-gate **GATE PASS**.
+**(P1) `2d1bd78` — `enforce_budget` deleted live-cited blobs, and did so from a read verb.** Its
+keep-set came from *parsed* `TurnRecord`s while it hard-deletes (`store.remove` → `fs::remove_file`),
+so `open.json` in-flight refs, `memory.jsonl` pins and torn-line refs were all unprotected — and its
+sole caller is `cmds::status_report`. **Running `agentrec status` on an over-budget store could
+destroy an in-flight turn's snapshot.** Fixed with an `extra_protected` set harvested as late as
+possible before the remove loop. **The obvious implementation is a trap:** passing the full
+`purgecmd::referenced_hashes` protects every validly-referenced hash and **permanently defeats budget
+eviction** — it broke `status_prints_over_budget_notice`. Correct cut is `open.json` + `memory.jsonl`
+scanned raw, plus only those `log.jsonl` hashes on lines that **fail to parse**; validly-parsed lines
+are already covered by the age-ordered walk. Hard-delete deliberately retained (archive-on-evict
+frees zero disk while *reporting* bytes freed, from a habitually-run read verb); no liveness refusal
+(the daemon runs 24/7, so a gate makes the budget fiction). Skeptic proved the cut correct in both
+directions on a live daemon: `freed 19 B; 500 B protected`, blob survived.
+**(P2) `7474e26` — `read_state` reset the entire `State` when one field failed to parse**, losing
+`pid`, the honesty counters, and **`signal_offset`, whose reset replays the whole signal inbox** —
+silently, with no counter. Now parses via `serde_json::Value` with per-field extraction and a
+`state_parse_failures` counter surfaced in `status` and `doctor` (advisory only — `doctor` all-pass
+exit 0 is the deploy gate). **The plan's taken decision was wrong and the implementer said so:**
+`#[serde(default)]` rescues a *missing* field only; a struct-level parse still fails outright on a
+*present* field of the wrong type, which is exactly what every criterion required to survive.
+**(P3) `22b085f` — epoch-scoped the reload counter** (open question 1 answered with option (a),
+reversing last round's default-by-omission) and made `status --json` carry every DEGRADED field the
+text banner reports; `status --ack-degraded --json` now rejected by clap instead of printing prose
+under a `--json` flag. **(P4) `6234612`** pins the over-record asymmetry the previous gate named:
+classification happens at ingest but staging at flush, so a path already in `pending` under wider
+rules is still staged after a mid-debounce narrowing.
+**The blocking finding is the one worth remembering.** P3's epoch reset lived only on the *writer*
+side; `status_report` rendered the raw field. So after a restart — until the next `.gitignore` churn,
+potentially days — `status` attributed the **dead epoch's** count to the live one, and `epoch_pid`
+already held the dead pid on disk with nothing reading it. The README line shipped that round ("the
+text line resets on each daemon restart") was therefore **false as observed**. Fixed at `9b1b09b` by
+gating the render on `epoch_pid == pid`, **not** by rewording the AC or the README — the ratchet
+forbids loosening a criterion to pass. Render-gate was chosen over resetting at `acquire_lock` for a
+reason the plan missed: `release_lock` zeroes `pid` and never touches `epoch_pid`, so a writer-side
+reset fixes the restarted window and leaves the **stopped** window stale.
+**A hole in that fix, found at re-gate and closed at `0f3b474`:** `status_report` and `status_json`
+are independent readers, and neutering **only** the json seam survived the entire suite — the test
+asserted the json *lifetime* total but never the epoch figure. Now pinned; the json-only neuter reds
+it by name.
+**Four process failures this round, all mine, none by the implementers.** (1) The plan was wrong
+three times and each implementer caught and disclosed it rather than working around it — including
+that **Phase 4's own named neuter cannot fail** (`gitignore_dirty` is tracked independently of
+`pending`), the third round running in which an AC could not have proven itself as written; a
+trigger-neuter was substituted with disclosure. (2) A second claim came back **REFUTED**
+(`clm_5PCCRY1K`) — again my replay, not the code: the `awk` scanned the whole of `integration.rs` and
+kept the *last* match, so tests added in later phases flipped the apparent ordering. Property
+verified true by direct read; replaced by the body-scoped `clm_5YTX49CR`. That is **two** replays I
+have authored that failed for reasons unrelated to the property claimed. (3) The seam-pin commit
+edited claim-scoped source **before declaring anything**; both remedies the hook offers were wrong
+(retroactive declare makes the log lie about ordering; `lint.ignore` on `cmds.rs` silences coverage
+on core source), so at the founder's direction it was reverted and redone declare-first — the
+reapplied file hashes identically (`d00d848c…`), only the record's ordering changed. (4) `df442f2..HEAD`
+still flags **`cli/src/purgecmd.rs`**, touched in P1 by a one-token `pub(crate)` visibility widening
+that no claim's scope covered. Left standing and recorded rather than papered over — reverting a
+6-commit phase to re-declare a visibility change would be disproportionate, and the two offered
+remedies remain the wrong ones. **Claim ledger: 36 claims — 27 confirmed, 6 evidenced, 2 refuted, 1
+manual awaiting founder attestation.**
+**Recorded, not fixed.** **Pid reuse defeats the epoch gate:** if a later daemon lands on the same
+pid as the epoch that last rebuilt (macOS wraparound — the same recycling class `doctor` handled via
+flock), the stale count renders as current and the new epoch's first rebuild *accumulates* onto it,
+since the writer reset keys on the same comparison. Cosmetic over-count in one line, self-correcting
+at the next restart under a different pid; predates this commit, shared by reader and writer. Durable
+fix is an epoch nonce (a start-timestamp stamped at `acquire_lock`) instead of pid identity.
+**Eviction still is not purge:** a hash on an *unmodeled field of a line that parses* is protected by
+`purge --orphans`' raw scan and evicted by `enforce_budget` — demonstrated live by the skeptic. No
+producer emits that today, but PROTOCOL's additive rule plus the queued 1.0-freeze fields (§4
+`emitter_turn`, §5 `imported`) are exactly how one appears silently; now documented in
+`extra_protected_refs`, and owed a debt line on the freeze checklist. Also: `status --json` runs no
+eviction and reports no store-size/over-budget state, so the "json sees less than text" class this
+round existed to close is only half closed; `last_ignore_rebuild_ms` remains lifetime-scoped while
+the count is now epoch-scoped.
+**Item 3, the Linux CI leg, is NOT done — founder decision, not an oversight.** `ci.yml` fires only
+on `push: branches: [main]` and `pull_request`, with no `workflow_dispatch`, so the branch push runs
+nothing; a PR would carry three stacked rounds at once. Offered draft-PR-to-main / PR-onto-parent /
+skip; **skip was chosen**. Every timing margin across the last three rounds remains macOS/FSEvents
+evidence only, and the older Linux leg for the `unreadable`/`io_failed` producers stays owed.
+
 **Ignore-set rebuild gate — GATE PASS (2026-07-25, branch `fix/ignore-rebuild-gate`,
 `bdb911c..fe57cda`, not pushed):** All 3 phases delivered against
 `docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`. **386 → 395 tests, 0 failed,
