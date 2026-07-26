@@ -104,19 +104,24 @@ pub fn run(root: &Path) -> Result<(), String> {
     // ignore verdict; cleared after the ignore set is rebuilt.
     let mut gitignore_dirty = false;
     // Directories `admit_existing_contents` has already walked this daemon
-    // run — measured live (macOS/FSEvents, `repro_longwait` in the fix
-    // round's notes): the SAME directory can receive a second, independent
-    // `Create(Folder)` event many seconds after the real one, apparently a
-    // delayed replay tied to the underlying event stream rather than to any
-    // new content, alongside a genuine `Modify(Metadata)` for an ordinary
-    // later `touch`. Reproduced in 3/5 trials with no bracket, no hook, and
-    // no other watched activity involved — frequent enough to require
-    // closing, not a documented residual. inotify does not show this
-    // (`Create(Folder)` fires exactly once per real `mkdir`), so this set
-    // costs Linux nothing; it only suppresses a second admission of a
-    // directory this run has already fully walked. Cleared on
-    // `Remove(Folder)` so a directory deleted and genuinely recreated at the
-    // same path within one run is still walked again.
+    // run. Honesty-round gate finding 1 (`247df9e` review): admission itself
+    // is now `#[cfg(target_os = "linux")]`-only (see `apply_watch_result`) —
+    // FSEvents delivers coalesced per-path flag unions, so the FIRST event a
+    // pre-existing directory receives after daemon start routinely carries
+    // historical `ItemCreated` alongside the real change, which `notify`
+    // reports as `Create(Folder)`. That is indistinguishable, from this
+    // daemon's side, from a genuine `mkdir`, so no macOS kind-gate can close
+    // this without also reopening the fabrication it exists to prevent —
+    // measured live, 2/2 probe runs on a repo where `admitted_dirs` was
+    // empty at daemon start (i.e. essentially every real directory in
+    // production). `admitted_dirs` therefore stays populated only on Linux,
+    // where a real `mkdir` fires `Create(Folder)` exactly once and this set
+    // solely dedups the case documented at the admission call site. Cleared
+    // on `Remove(Folder)` (and on any rename event, see the clear below) so
+    // a directory removed/renamed away and genuinely recreated at the same
+    // path within one run is still walked again — kept unconditional even
+    // though it is a no-op on macOS (the set never gains an entry there),
+    // rather than adding a second cfg split for a clear that costs nothing.
     let mut admitted_dirs: HashSet<PathBuf> = HashSet::new();
 
     loop {
@@ -460,6 +465,27 @@ fn apply_watch_result(
                 if matches!(kind, EventKind::Remove(RemoveKind::Folder)) {
                     admitted_dirs.remove(&path);
                 }
+                // Honesty-round gate finding 2: `IN_MOVED_FROM` maps to
+                // `Modify(Name(RenameMode::From))`, not `Remove(Folder)` — the
+                // clear above never fires for a directory renamed AWAY, so
+                // `mv admitted_dir admitted_dir.bak && mkdir admitted_dir`
+                // left the stale entry in place, `admitted_dirs.insert`
+                // returned `false` for the recreated directory, and its
+                // contents were silently never admitted — reopening the
+                // original Linux event-loss class for a common pattern. Any
+                // `Modify(Name(_))` for a path clears it here, before the
+                // admission check below decides whether to (re-)admit: the
+                // from-side of a rename stops referring to that directory
+                // (this path may not even resolve on disk anymore, so it
+                // cannot rely on `path.is_dir()`), and the to-side then
+                // legitimately re-admits under its own `Create`/`Modify(Name)`
+                // event. FSEvents' `RenameMode::Any` (both sides
+                // indistinguishable) is handled the same way — clearing an
+                // already-absent or not-yet-admitted entry is a harmless
+                // no-op either way.
+                if matches!(kind, EventKind::Modify(ModifyKind::Name(_))) {
+                    admitted_dirs.remove(&path);
+                }
                 match classify(root, &path, ignore_set) {
                     Class::GitRef => *git_hit = true,
                     Class::Watch => {
@@ -494,40 +520,57 @@ fn apply_watch_result(
                         // gate review caught this walking a whole unchanged
                         // subtree and fabricating `op: "modify"` for every
                         // file in it, including into rich agent turns via
-                        // `blame`. `Create(_)` covers `mkdir` on both
-                        // platforms (measured: FSEvents and inotify both
-                        // report `Create(Folder)`). `Modify(Name(_))` is
-                        // included deliberately for rename-in: a directory
-                        // *moved* into the watched root genuinely
-                        // materializes its contents at this path, and
-                        // inotify reports that as `IN_MOVED_TO` ->
-                        // `Modify(Name(RenameMode::To))` (confirmed against
-                        // notify's inotify.rs source), never `Create` — a
-                        // strict `Create`-only gate would silently reopen the
-                        // same event-loss class for moved-in directories.
-                        // Measured directly against the real daemon on both
-                        // platforms (not assumed): a metadata-only event on
-                        // an existing, unchanged directory is
-                        // `Modify(Metadata(_))` on both FSEvents and inotify
-                        // — never `Create` or `Modify(Name(_))` — so this
-                        // gate excludes exactly the fabricating case without
-                        // narrowing the fix this replaced.
+                        // `blame`. `Create(_)` covers `mkdir`. `Modify(Name(_))`
+                        // is included deliberately for rename-in: a directory
+                        // *moved* into the watched root genuinely materializes
+                        // its contents at this path, and inotify reports that
+                        // as `IN_MOVED_TO` -> `Modify(Name(RenameMode::To))`
+                        // (confirmed against notify's inotify.rs source),
+                        // never `Create` — a strict `Create`-only gate would
+                        // silently reopen the same event-loss class for
+                        // moved-in directories. Measured directly against the
+                        // real Linux daemon: a metadata-only event on an
+                        // existing, unchanged directory is
+                        // `Modify(Metadata(_))` — never `Create` or
+                        // `Modify(Name(_))` — so on inotify this gate excludes
+                        // exactly the fabricating case without narrowing the
+                        // fix this replaced.
                         //
-                        // `admitted_dirs` closes a SECOND, independent
-                        // fabrication source the `kind` gate alone does not:
-                        // measured live on macOS (`repro_longwait`, fix-round
-                        // notes), the SAME directory can receive a further
-                        // `Create(Folder)` event many seconds after its real
-                        // creation — a delayed FSEvents replay, not new
-                        // content — alongside an ordinary later `touch`'s
-                        // genuine `Modify(Metadata)`. Reproduced in 3 of 5
-                        // trials with no bracket, no hook, and no other
-                        // watched activity involved, so it is not a rare
-                        // edge case. inotify does not exhibit this (a real
-                        // `mkdir` fires `Create(Folder)` exactly once), so
-                        // the set costs the Linux fix nothing — the first,
-                        // genuine admission for a newly created directory
-                        // still happens unconditionally.
+                        // Linux-only (honesty-round gate finding 1, review of
+                        // `247df9e`): this same `kind` gate does NOT hold on
+                        // macOS. FSEvents delivers coalesced per-path flag
+                        // UNIONS, not descriptions of one event — the first
+                        // event a directory receives after daemon start
+                        // routinely carries historical `ItemCreated` alongside
+                        // an unrelated real change (e.g. a later `touch`'s
+                        // `InodeMetaMod`), and `notify` reports that union as
+                        // `Create(Folder)` regardless of the directory's real
+                        // age. `admitted_dirs` is empty for every directory
+                        // that predates the daemon — i.e. essentially the
+                        // whole repo in production — so that first event
+                        // passes this gate and walks the whole subtree.
+                        // Measured live at `247df9e`: `touch <pre-existing
+                        // dir>` fabricated every file inside it as
+                        // `op: "modify"` in 2 of 2 probe runs, escalating into
+                        // a rich `tool:"claude"`-attributed turn in 2 of 4
+                        // bracket trials — reproduced again here before this
+                        // fix (see the integration test below). No `kind`
+                        // available from FSEvents distinguishes "directory
+                        // just created" from "directory existed, something
+                        // about it just changed for the first time this
+                        // run" — dueling FSEvents flag semantics would be
+                        // fighting the platform, not fixing the bug. Since
+                        // FSEvents has no watch-arming gap in the first place
+                        // (the defect this admission mechanism exists to
+                        // close is inotify-specific — see the module comment
+                        // above), the whole admission ACTION is compiled out
+                        // on non-Linux platforms rather than kept live and
+                        // dependent on FSEvents kind semantics. The
+                        // `admitted_dirs` clears above stay unconditional
+                        // (harmless no-ops on macOS, where the set never
+                        // gains an entry) so this is the only platform split
+                        // in this function.
+                        #[cfg(target_os = "linux")]
                         if path.is_dir()
                             && matches!(
                                 kind,
@@ -653,6 +696,13 @@ fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
 /// file through the same `classify` every other event goes through, so
 /// nothing this walk would otherwise exclude (denylist, gitignore) gets
 /// staged under different rules than normal events.
+///
+/// `#[cfg(target_os = "linux")]`: its sole call site is Linux-gated
+/// (honesty-round gate finding 1 — see the comment there), so on other
+/// platforms this function is unused; gated to avoid a `dead_code` warning
+/// rather than leaving unreachable admission machinery compiled into a
+/// binary where it must never run.
+#[cfg(target_os = "linux")]
 fn admit_existing_contents(
     root: &Path,
     dir: &Path,
@@ -2879,6 +2929,18 @@ mod tests {
     // watcher entirely — so it is deterministic regardless of platform/OS
     // event-delivery quirks (FSEvents vs inotify): a pure unit test of the
     // gate itself, independent of the `admitted_dirs` de-dup test below.
+    //
+    // Left un-gated (unlike its sibling below): still true and meaningful on
+    // Linux (the `kind` gate this pins is compiled in and must still exclude
+    // `Modify(Metadata(_))`), but has no discriminating power on macOS since
+    // honesty-round gate finding 1 — there the whole admission action is
+    // `#[cfg(target_os = "linux")]`'d out, so this passes vacuously
+    // regardless of event kind. That is expected, not a gap: macOS's real
+    // regression coverage for the fabrication this test names is the
+    // integration-level `metadata_only_event_on_directory_that_predates_
+    // daemon_stages_nothing` (needs a real, pre-existing-at-daemon-start
+    // directory and real FSEvents delivery — unreproducible through this
+    // synthetic single-event harness).
     #[test]
     fn metadata_only_event_does_not_admit_existing_directory_contents() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2933,17 +2995,31 @@ mod tests {
         );
     }
 
-    // The SECOND, independently measured fabrication source the event-kind
-    // gate alone does not close: on macOS/FSEvents, the SAME directory can
-    // receive a further `Create(Folder)` event long after its real creation —
-    // a delayed replay, not new content (measured live this round: 3 of 5
-    // trials, no bracket, no hook, no other watched activity at all involved,
-    // pure `touch` on an already-recorded directory sometimes redelivers a
-    // spurious `Create(Folder)` many seconds later). `admitted_dirs` closes
-    // this: once a directory has been walked once this daemon run, a further
+    // A second, independently measured fabrication source the event-kind gate
+    // alone does not close: measured live on macOS/FSEvents in the fix round
+    // that introduced this test (3 of 5 trials, no bracket, no hook, no other
+    // watched activity involved), the SAME directory can receive a further
+    // `Create(Folder)` event long after its real creation — a delayed
+    // replay, not new content — alongside an ordinary later `touch`'s
+    // genuine `Modify(Metadata)`. `admitted_dirs` closes this: once a
+    // directory has been walked once this daemon run, a further
     // `Create`/`Modify(Name)` event for the SAME path is not re-admitted.
     // Deterministic here by construction — two synthetic `Create(Folder)`
     // events for the same path, no reliance on real OS event timing.
+    //
+    // Linux-only (honesty-round gate finding 1): that 3/5-macOS observation
+    // is now moot ON macOS specifically — finding 1 established that the
+    // whole admission ACTION — the thing `admitted_dirs` dedups — is
+    // `#[cfg(target_os = "linux")]`'d out there, so the first `Create
+    // (Folder)` in this test would no longer admit anything on macOS
+    // either; the assertion below (`pending.contains(.../a.rs)` after the
+    // FIRST event) would be false on macOS post-fix, not because the de-dup
+    // regressed but because admission itself never runs there. The de-dup
+    // mechanism itself still matters on Linux (a delayed-replay-style
+    // duplicate `Create(Folder)` is not something inotify is documented to
+    // rule out either), so testing it only makes sense on the one platform
+    // where it's compiled in.
+    #[cfg(target_os = "linux")]
     #[test]
     fn admitted_dirs_prevents_a_second_admission_of_the_same_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3007,6 +3083,122 @@ mod tests {
         assert!(
             !pending.contains(&root.join("srcdir/a.rs")),
             "a SECOND Create(Folder) for an already-admitted directory re-staged its contents: \
+             {pending:?}"
+        );
+    }
+
+    // Honesty-round gate finding 2: `IN_MOVED_FROM` maps to
+    // `Modify(Name(RenameMode::From))`, not `Remove(Folder)`
+    // (`notify-6.1.1/src/inotify.rs:222-231`) — before this fix, the
+    // `admitted_dirs` clear only fired on `Remove(Folder)`, so a directory
+    // renamed away kept its stale entry. Reviewer's deterministic repro:
+    // admit `build` -> rename to `build.bak` -> recreate `build` containing
+    // `build/new.rs` -> the `Create(Folder)` for the recreated `build`
+    // arrives, `admitted_dirs.insert` returns `false` (the entry from the
+    // original admission is still present), admission is silently
+    // suppressed, and `build/new.rs` is never staged — reopening the
+    // original Linux event-loss class for the common
+    // `mv dir dir.bak && mkdir dir` pattern. Deterministic by construction:
+    // three synthetic events (`Create(Folder)`, `Modify(Name(From))`,
+    // `Create(Folder)` again, all for `build`), no reliance on real OS
+    // rename delivery. Linux-only for the same reason as its sibling above
+    // — the admission action this pins is compiled out on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_dirs_re_admits_a_directory_renamed_away_and_recreated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/old.rs"), "fn old() {}").unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // First Create(Folder): a genuine first-ever observation — admits.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("build/old.rs")),
+            "the first Create(Folder) must admit build/old.rs: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.contains(&root.join("build")),
+            "build must be marked admitted after its first Create(Folder): {admitted_dirs:?}"
+        );
+        pending.clear();
+
+        // Rename `build` away on disk, mirroring the real `mv` this test
+        // reproduces, then deliver the `IN_MOVED_FROM`-shaped event
+        // (`Modify(Name(From))`) for the OLD path.
+        std::fs::rename(root.join("build"), root.join("build.bak")).unwrap();
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        tx2.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !admitted_dirs.contains(&root.join("build")),
+            "a directory renamed away must be cleared from admitted_dirs so a genuine \
+             recreation at the same path is re-admitted: {admitted_dirs:?}"
+        );
+        pending.clear();
+
+        // Recreate `build` with different contents — the reviewer's repro
+        // shape — and deliver the recreation's Create(Folder).
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/new.rs"), "fn new() {}").unwrap();
+        let (tx3, rx3) = channel::<Result<notify::Event, notify::Error>>();
+        tx3.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx3,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("build/new.rs")),
+            "a directory renamed away and recreated at the same path must still be admitted: \
              {pending:?}"
         );
     }

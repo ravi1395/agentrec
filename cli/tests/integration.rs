@@ -608,6 +608,107 @@ fn metadata_only_event_on_existing_directory_stages_nothing() {
     );
 }
 
+// Honesty-round gate finding 1 (blocking, review of `247df9e`): the prior
+// test's directory is created AFTER `SingleDaemonGuard::spawn`, so it is
+// structurally unable to catch this — FSEvents delivers coalesced per-path
+// flag UNIONS, not descriptions of a single event, and the fabrication only
+// shows up on a directory's FIRST event since daemon start when that
+// directory already existed before the daemon began watching it. Measured
+// live before this fix (real binary, this exact shape): `touch src` on a
+// pre-existing, untouched 3-file directory fabricated all 3 files as
+// `op: "modify"` in 2 of 2 probe runs. This test creates its directory
+// BEFORE spawning the daemon — the load-bearing difference from
+// `metadata_only_event_on_existing_directory_stages_nothing` above — so the
+// directory's first-ever watched event is exactly the metadata-only `touch`
+// under test, reproducing the coalesced-flags condition rather than a clean
+// `Modify(Metadata)` on an already-admitted directory.
+//
+// `touch srcdir` must be the very first thing that happens to any watched
+// path after spawn — no pre-touch positive control — because the historical
+// `ItemCreated` flag rides the directory's first FSEvents delivery since
+// daemon start; draining that first event with unrelated activity first
+// would destroy the exact condition under test. The positive control
+// (`control.rs`) therefore runs AFTER the touch, in the same window as the
+// absence assertion, so a dead/unarmed daemon can't be mistaken for a fixed
+// one.
+//
+// Linux readers: this test has no discriminating power there — inotify
+// never had this gap (a real `mkdir` fires `Create(Folder)` exactly once,
+// and the `kind` gate already excludes `Modify(Metadata)` on every
+// platform) — but it costs nothing to run everywhere and pins the macOS
+// case in the same suite as its sibling.
+#[test]
+fn metadata_only_event_on_directory_that_predates_daemon_stages_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    // Created and committed BEFORE the daemon ever starts — this directory
+    // is old news to the daemon from its very first tick.
+    std::fs::create_dir_all(root.join("srcdir")).unwrap();
+    std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    // The ONLY thing that happens to `srcdir` this whole test — no content
+    // change anywhere inside it, ever.
+    let touch_status = std::process::Command::new("touch")
+        .arg(root.join("srcdir"))
+        .status()
+        .unwrap();
+    assert!(touch_status.success(), "touch(1) must be available");
+
+    // Let the daemon's debounce (1.5s) + quiet window (10s) fully settle
+    // before the control, so a fabricated turn (if any) has already closed.
+    // Generous margin (not just 11.5s + a hair): this suite has documented
+    // FSEvents contention under full parallelism, and a too-tight margin
+    // would risk the fabricated turn folding into the control's turn under
+    // load — still caught by the `fabricated` check below, but the failure
+    // mode to avoid is the daemon not having processed the touch AT ALL yet.
+    std::thread::sleep(Duration::from_secs(20));
+
+    // In-window positive control, AFTER the touch — proves the daemon is
+    // alive and recording during the exact window the absence assert below
+    // relies on.
+    std::fs::write(root.join("control.rs"), "fn main() {}").unwrap();
+    let saw_control = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "control.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_control.is_some(),
+        "control.rs, written after the directory touch, was never recorded — daemon not \
+         alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let fabricated = turns(root)
+        .iter()
+        .any(|t| turn_has_file(t, "srcdir/a.rs") || turn_has_file(t, "srcdir/b.rs"));
+    assert!(
+        !fabricated,
+        "a metadata-only event on a directory that predates the daemon fabricated its \
+         contents as modified: {:#?}",
+        turns(root)
+    );
+}
+
 // Phase 3 of the rebuild-gate plan — the mirror of
 // `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
 // event carries the filename too (`apply_watch_result`'s filename check
