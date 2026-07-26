@@ -85,14 +85,30 @@ pub struct State {
     /// real lifetime history and must not be destroyed.
     #[serde(default)]
     pub epoch_ignore_rebuilds: u64,
-    /// The pid `epoch_ignore_rebuilds` was last reset for. `acquire_lock`
-    /// (daemon.rs) already writes `state.pid = std::process::id()` before
-    /// anything else happens in a fresh daemon run, so the first
-    /// `record_ignore_rebuild` call of a new daemon epoch observes
-    /// `pid != epoch_pid` and resets — no daemon.rs changes needed to detect
-    /// the boundary. Not surfaced to `status`/`--json`; purely bookkeeping.
+    /// Collision-resistant identity of the CURRENT daemon epoch. Stamped by
+    /// `acquire_lock` (daemon.rs) at the moment a fresh epoch begins, using
+    /// the same ULID machinery `agentrec_core::id::ulid()` already uses for
+    /// turn ids (48-bit wall-clock ms + 80 random bits) — deliberately NOT
+    /// the pid. Pid is reused by the OS over a long-lived machine (the same
+    /// recycling class `doctor`'s daemon-liveness check already handles via
+    /// flock rather than pid comparison); keying epoch identity on pid let a
+    /// later epoch that happened to reuse a dead epoch's pid inherit its
+    /// stale reload count. A bare wall-clock-ms stamp alone could still
+    /// collide if two epochs started within the same millisecond (e.g. rapid
+    /// record/stop/record cycles in a test loop); the ULID's random suffix
+    /// rules that out. Empty string is the sentinel for "no epoch is
+    /// currently live" — `release_lock` clears it back to empty on a clean
+    /// stop, and it is also what a pre-this-field `state.json` deserializes
+    /// to (never confusable with a real epoch: `ulid()` never returns an
+    /// empty string). Not surfaced to `status`/`--json`; purely bookkeeping.
     #[serde(default)]
-    pub epoch_pid: u32,
+    pub epoch_nonce: String,
+    /// The `epoch_nonce` `epoch_ignore_rebuilds` was last reset for (replaces
+    /// the old pid-keyed `epoch_pid` field for the same reason described on
+    /// `epoch_nonce` above). Not surfaced to `status`/`--json`; purely
+    /// bookkeeping.
+    #[serde(default)]
+    pub epoch_reload_nonce: String,
     /// Count of individual `state.json` FIELDS that failed to parse and fell
     /// back to their default (Phase 2, honesty-fixes round). Distinct from
     /// every other counter here in one way: it counts a failure in reading
@@ -182,7 +198,8 @@ pub fn read_state(root: &Path) -> State {
         state_parse_failures: field!("state_parse_failures"),
         last_bad_field: field!("last_bad_field"),
         epoch_ignore_rebuilds: field!("epoch_ignore_rebuilds"),
-        epoch_pid: field!("epoch_pid"),
+        epoch_nonce: field!("epoch_nonce"),
+        epoch_reload_nonce: field!("epoch_reload_nonce"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -250,16 +267,18 @@ pub fn record_prompt_put_failure(state: &mut State) {
 /// render "reloaded N time(s), last ... ago" — and print nothing at all when
 /// the epoch counter is still 0 (never a vacuous "0 reloads" line).
 ///
-/// Epoch detection (Phase 3): if `state.pid` (set by `acquire_lock` before
+/// Epoch detection (Phase 3, revised in the honesty round to use a nonce
+/// instead of the pid — see `State::epoch_nonce`'s doc for why pid identity
+/// was unsafe): if `state.epoch_nonce` (set by `acquire_lock` before
 /// anything else runs in a fresh daemon process) no longer matches
-/// `state.epoch_pid` (the pid the epoch counter was last reset for), a new
-/// daemon epoch has begun since the last rebuild — reset
-/// `epoch_ignore_rebuilds` to 0 and adopt the new pid before incrementing.
+/// `state.epoch_reload_nonce` (the nonce the epoch counter was last reset
+/// for), a new daemon epoch has begun since the last rebuild — reset
+/// `epoch_ignore_rebuilds` to 0 and adopt the new nonce before incrementing.
 /// `ignore_rebuilds` (lifetime) is never reset.
 pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
-    if state.epoch_pid != state.pid {
+    if state.epoch_reload_nonce != state.epoch_nonce {
         state.epoch_ignore_rebuilds = 0;
-        state.epoch_pid = state.pid;
+        state.epoch_reload_nonce = state.epoch_nonce.clone();
     }
     state.ignore_rebuilds += 1;
     state.epoch_ignore_rebuilds += 1;
@@ -272,23 +291,31 @@ pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
 ///
 /// The reset in `record_ignore_rebuild` above only fires the next time a
 /// rebuild happens; it does nothing at the moment a new epoch actually
-/// *starts* (`acquire_lock` stamping a fresh `state.pid`), and nothing at
-/// all while the daemon is stopped. In both windows, `epoch_ignore_rebuilds`
-/// and `epoch_pid` on disk still describe whichever epoch last rebuilt —
-/// which may be a dead pid, or (when stopped) `state.pid == 0` while
-/// `epoch_pid` is still the last live pid. A reader that used
+/// *starts* (`acquire_lock` stamping a fresh `state.epoch_nonce`), and
+/// nothing at all while the daemon is stopped. In both windows,
+/// `epoch_ignore_rebuilds` and `epoch_reload_nonce` on disk still describe
+/// whichever epoch last rebuilt — which may be a dead epoch (possibly one
+/// whose pid has since been reused by an unrelated process, or reused by a
+/// later agentrec daemon epoch — pid identity cannot distinguish the two),
+/// or (when stopped) `state.epoch_nonce == ""` while `epoch_reload_nonce` is
+/// still the last live epoch's nonce. A reader that used
 /// `state.epoch_ignore_rebuilds` directly would attribute that stale epoch's
 /// reloads to "now".
 ///
 /// So every reader must ask the same question `record_ignore_rebuild` asks
-/// before trusting the field: does `epoch_pid` still match the CURRENT
-/// `pid`? If not, no rebuild has happened in the current epoch yet, and the
-/// true current-epoch count is 0 — not "unknown", not the stale figure.
-/// `pid == 0` (daemon stopped, `release_lock`'s sentinel) can never match a
-/// real `epoch_pid`, so the stopped case falls out of the same check for
-/// free.
+/// before trusting the field: does `epoch_reload_nonce` still match the
+/// CURRENT `epoch_nonce`? If not, no rebuild has happened in the current
+/// epoch yet, and the true current-epoch count is 0 — not "unknown", not the
+/// stale figure. The empty-string sentinel is checked explicitly (`!state.
+/// epoch_nonce.is_empty()`), not left to fall out of the equality check
+/// alone: a `state.json` written by a pre-nonce binary has neither field at
+/// all, so BOTH `epoch_nonce` and `epoch_reload_nonce` deserialize to their
+/// shared default `""` and would compare equal — while `epoch_ignore_
+/// rebuilds` could still hold a real accumulated figure from that older
+/// binary's pid-keyed bookkeeping. Without the explicit non-empty check,
+/// that stale figure would render as "current".
 pub fn current_epoch_reloads(state: &State) -> u64 {
-    if state.epoch_pid == state.pid {
+    if !state.epoch_nonce.is_empty() && state.epoch_reload_nonce == state.epoch_nonce {
         state.epoch_ignore_rebuilds
     } else {
         0
@@ -340,20 +367,31 @@ mod tests {
         assert_eq!(state.ignore_rebuilds, 0);
         assert_eq!(state.last_ignore_rebuild_ms, 0);
         assert_eq!(state.epoch_ignore_rebuilds, 0);
+        assert_eq!(state.epoch_nonce, "");
+        assert_eq!(state.epoch_reload_nonce, "");
     }
 
-    // Phase 3 (honesty-fixes round): the epoch counter must reset when the
-    // owning pid changes (simulating a daemon restart via `acquire_lock`
-    // writing a fresh `state.pid`), while the lifetime counter keeps
-    // accumulating across that boundary rather than resetting too. Sibling
-    // non-default value pinned per the vacuity trap: `ignore_rebuilds` (5,
-    // non-zero) is asserted in the SAME test as `epoch_ignore_rebuilds`
-    // reading a smaller, epoch-only figure (2) — a version of
-    // `record_ignore_rebuild` that never resets would show 5 for both.
+    // Phase 3 (honesty-fixes round), revised in the follow-up honesty round:
+    // the epoch counter must reset when the EPOCH NONCE changes (simulating
+    // a daemon restart via `acquire_lock` stamping a fresh
+    // `state.epoch_nonce`), NOT the pid — keying on pid let a later epoch
+    // that reused a dead epoch's pid (real over a long-lived machine)
+    // inherit its stale count; see `State::epoch_nonce`'s doc. The lifetime
+    // counter keeps accumulating across the epoch boundary rather than
+    // resetting too. Sibling non-default value pinned per the vacuity trap:
+    // `ignore_rebuilds` (5, non-zero) is asserted in the SAME test as
+    // `epoch_ignore_rebuilds` reading a smaller, epoch-only figure (2) — a
+    // version of `record_ignore_rebuild` that never resets would show 5 for
+    // both. Pid is deliberately left UNCHANGED (111 throughout) to prove the
+    // reset is keyed on the nonce, not on pid — this is the exact reused-pid
+    // shape the fix exists for. Neuter: key the reset back on `state.pid`
+    // (compare `epoch_pid` again) → RED (pid never changes here, so a
+    // pid-keyed version never resets).
     #[test]
-    fn record_ignore_rebuild_resets_epoch_counter_on_pid_change() {
+    fn record_ignore_rebuild_resets_epoch_counter_on_nonce_change() {
         let mut state = State {
             pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
             ..State::default()
         };
         record_ignore_rebuild(&mut state, 1_000);
@@ -362,9 +400,10 @@ mod tests {
         assert_eq!(state.ignore_rebuilds, 3);
         assert_eq!(state.epoch_ignore_rebuilds, 3);
 
-        // Simulate a daemon restart: acquire_lock stamps the new pid before
-        // any rebuild in the new epoch can happen.
-        state.pid = 222;
+        // Simulate a daemon restart that REUSES the same pid but is stamped
+        // with a fresh nonce by acquire_lock before any rebuild in the new
+        // epoch can happen.
+        state.epoch_nonce = "epoch-b".to_string();
         record_ignore_rebuild(&mut state, 4_000);
         record_ignore_rebuild(&mut state, 5_000);
 
@@ -374,7 +413,8 @@ mod tests {
         );
         assert_eq!(
             state.epoch_ignore_rebuilds, 2,
-            "epoch counter must have restarted from zero at the new epoch"
+            "epoch counter must have restarted from zero at the new epoch, keyed on the \
+             nonce even though pid (111) never changed"
         );
     }
 

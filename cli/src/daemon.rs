@@ -1675,6 +1675,14 @@ fn acquire_lock(root: &Path) -> Result<std::fs::File, String> {
     }
     let mut state = read_state(root);
     state.pid = std::process::id();
+    // Honesty round: stamp a fresh epoch identity alongside the pid. Pid
+    // alone is unsafe here — it is reused by the OS over a long-lived
+    // machine, so a later epoch could otherwise inherit a dead epoch's
+    // `state.epoch_ignore_rebuilds` count (see `State::epoch_nonce`'s doc).
+    // `agentrec_core::id::ulid()` is the same collision-resistant machinery
+    // already used for turn ids — reused here rather than inventing a
+    // second id scheme.
+    state.epoch_nonce = agentrec_core::id::ulid();
     // D2: persistence failure here is fatal — an "acquired" lock the daemon
     // can't record its own pid into would still function (the flock IS the
     // gate), but silently leaving a stale/wrong pid on disk would mislead
@@ -1688,6 +1696,11 @@ fn release_lock(root: &Path) {
     let mut state = read_state(root);
     if state.pid == std::process::id() {
         state.pid = 0;
+        // Clear the epoch nonce alongside the pid — same sentinel shape as
+        // `pid = 0` — so a reader (`current_epoch_reloads`) never mistakes
+        // this epoch's last reload count for still-current once the daemon
+        // has genuinely stopped.
+        state.epoch_nonce.clear();
         if let Err(e) = write_state(root, &state) {
             eprintln!("agentrec: warning: failed to clear pid in state.json: {e}");
         }
@@ -2297,6 +2310,54 @@ mod tests {
         assert!(
             second.is_ok(),
             "a fresh acquire after the holder released must succeed"
+        );
+    }
+
+    // Honesty round: epoch identity was previously the pid, and pid reuse
+    // (real over a long-lived machine, same recycling class `doctor`'s
+    // liveness check already handles) let a later daemon epoch inherit a
+    // dead epoch's stale reload count. `acquire_lock` must stamp a fresh,
+    // distinct `epoch_nonce` every time an epoch begins, and `release_lock`
+    // must clear it back to empty on a clean stop — mirroring the existing
+    // `pid = 0` sentinel — so a reader never mistakes a stopped daemon's
+    // last epoch for the current one. Neuter: remove the `epoch_nonce`
+    // stamp/clear lines → RED (nonce stays empty forever, or never clears).
+    #[test]
+    fn acquire_lock_stamps_a_fresh_epoch_nonce_and_release_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let first_nonce = {
+            let _first = acquire_lock(root).expect("first acquire succeeds");
+            let state = read_state(root);
+            assert!(
+                !state.epoch_nonce.is_empty(),
+                "acquire_lock must stamp a non-empty epoch nonce"
+            );
+            state.epoch_nonce
+        };
+        // `_first` (the flock-holding File) has already dropped by now, but
+        // `release_lock`'s state.json cleanup is a distinct step `run()`
+        // calls explicitly on a clean stop — invoke it directly here.
+        release_lock(root);
+        let stopped = read_state(root);
+        assert_eq!(
+            stopped.pid, 0,
+            "release_lock must clear pid on a clean stop"
+        );
+        assert!(
+            stopped.epoch_nonce.is_empty(),
+            "release_lock must also clear the epoch nonce — a stopped daemon must never let \
+             a later reader treat the last epoch's reload count as still current"
+        );
+
+        let _second = acquire_lock(root).expect("second acquire succeeds after release");
+        let second = read_state(root);
+        assert!(!second.epoch_nonce.is_empty());
+        assert_ne!(
+            second.epoch_nonce, first_nonce,
+            "each new epoch must get its own distinct nonce"
         );
     }
 

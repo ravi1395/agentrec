@@ -299,9 +299,13 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // Blocking gate finding (honesty-round follow-up): the raw field alone is
     // not enough — `record_ignore_rebuild`'s epoch reset only fires on the
     // NEXT rebuild, so right after a restart (or while stopped) the field
-    // still holds the previous epoch's count under the previous epoch's pid.
-    // `current_epoch_reloads` re-checks `epoch_pid == pid` at render time —
-    // the state needed to detect this was already on disk, nothing read it.
+    // still holds the previous epoch's count under the previous epoch's
+    // identity. `current_epoch_reloads` re-checks `epoch_reload_nonce ==
+    // epoch_nonce` at render time — the state needed to detect this was
+    // already on disk, nothing read it. (A second honesty-round finding
+    // replaced pid identity with a nonce here — see `State::epoch_nonce`'s
+    // doc: pid reuse on a long-lived machine could make a later epoch
+    // inherit a dead epoch's stale count.)
     let epoch_reloads = current_epoch_reloads(&state);
     if epoch_reloads > 0 {
         let when = fmt::relative_time(
@@ -1191,7 +1195,12 @@ mod tests {
     // `rich-rate: n/a` precedent, D-PD3). The second half of this test
     // (nonzero counter -> line DOES appear) is load-bearing, not padding: a
     // version of `status_report` that never prints a reload line at all
-    // would pass the first half for the wrong reason.
+    // would pass the first half for the wrong reason. The second half stamps
+    // a real `epoch_nonce` (mirroring what `acquire_lock` does at epoch
+    // start) rather than relying on `State::default()`'s empty-string nonce
+    // — a genuinely live epoch always has a non-empty nonce; using the
+    // default here would only coincidentally match `current_epoch_reloads`'s
+    // own default and wouldn't represent a real daemon epoch.
     #[test]
     fn status_omits_reload_line_when_never_reloaded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1204,7 +1213,11 @@ mod tests {
             "no reload line expected when ignore_rebuilds is 0: {out}"
         );
 
-        let mut state = crate::state::State::default();
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
         crate::state::record_ignore_rebuild(&mut state, 1_000);
         write_state(root, &state).unwrap();
         let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
@@ -1217,14 +1230,16 @@ mod tests {
     // Phase 3 (honesty-fixes round), open question 1 answered as option (a):
     // the rendered reload figure must be scoped to the CURRENT daemon epoch,
     // not the lifetime total, once a daemon restart has happened. Simulates
-    // an old epoch (pid 111, 3 rebuilds) followed by a restart (pid 222, 2
-    // more rebuilds) — the same shape `acquire_lock` + `record_ignore_rebuild`
-    // produce in production. Sibling non-default value pinned per the
-    // vacuity trap: `ignore_rebuilds` (5, lifetime) is asserted alongside the
-    // rendered epoch figure (2) — a version of `status_report` that renders
-    // the lifetime total would print "5", not "2", and this test would catch
-    // it. Neuter: render `state.ignore_rebuilds` instead of
-    // `state.epoch_ignore_rebuilds` → RED.
+    // an old epoch (nonce "epoch-a", 3 rebuilds) followed by a restart
+    // (nonce "epoch-b", 2 more rebuilds) — the same shape `acquire_lock` +
+    // `record_ignore_rebuild` produce in production (honesty round: epoch
+    // identity is the nonce, not the pid — see `State::epoch_nonce`'s doc).
+    // Sibling non-default value pinned per the vacuity trap: `ignore_rebuilds`
+    // (5, lifetime) is asserted alongside the rendered epoch figure (2) — a
+    // version of `status_report` that renders the lifetime total would print
+    // "5", not "2", and this test would catch it. Neuter: render
+    // `state.ignore_rebuilds` instead of `state.epoch_ignore_rebuilds` →
+    // RED.
     #[test]
     fn status_reload_line_is_epoch_scoped() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1233,14 +1248,17 @@ mod tests {
 
         let mut state = crate::state::State {
             pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
             ..crate::state::State::default()
         };
         crate::state::record_ignore_rebuild(&mut state, 1_000);
         crate::state::record_ignore_rebuild(&mut state, 2_000);
         crate::state::record_ignore_rebuild(&mut state, 3_000);
         // Simulate the daemon restart `acquire_lock` performs: a fresh pid
-        // stamped before any rebuild in the new epoch happens.
+        // AND a fresh nonce stamped before any rebuild in the new epoch
+        // happens.
         state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
         crate::state::record_ignore_rebuild(&mut state, 4_000);
         crate::state::record_ignore_rebuild(&mut state, 5_000);
         write_state(root, &state).unwrap();
@@ -1268,31 +1286,36 @@ mod tests {
     // together). The gate found the real hole is the window BEFORE that:
     // right after a restart, or while the daemon is stopped, nothing has
     // called `record_ignore_rebuild` yet, so `epoch_ignore_rebuilds`/
-    // `epoch_pid` on disk still belong to the OLD epoch — and the old
-    // `status_report` rendered them unconditionally, attributing a dead
-    // daemon's reloads to the live one. Neuter: remove the epoch_pid==pid
-    // gate (render `state.epoch_ignore_rebuilds` unconditionally again) →
-    // RED on both sub-cases below.
+    // `epoch_reload_nonce` on disk still belong to the OLD epoch — and the
+    // old `status_report` rendered them unconditionally, attributing a dead
+    // daemon's reloads to the live one. Neuter: remove the
+    // epoch_reload_nonce==epoch_nonce gate (render `state.
+    // epoch_ignore_rebuilds` unconditionally again) → RED on both sub-cases
+    // below.
     #[test]
     fn status_omits_stale_epoch_reload_line() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(objects_dir(root)).unwrap();
 
-        // Old epoch (pid 111) rebuilt 3 times; nothing has rebuilt yet since.
+        // Old epoch (pid 111, nonce "epoch-a") rebuilt 3 times; nothing has
+        // rebuilt yet since.
         let mut state = crate::state::State {
             pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
             ..crate::state::State::default()
         };
         crate::state::record_ignore_rebuild(&mut state, 1_000);
         crate::state::record_ignore_rebuild(&mut state, 2_000);
         crate::state::record_ignore_rebuild(&mut state, 3_000);
-        assert_eq!(state.epoch_pid, 111);
+        assert_eq!(state.epoch_reload_nonce, "epoch-a");
         assert_eq!(state.epoch_ignore_rebuilds, 3);
 
-        // Case A: daemon restarted under a NEW pid (acquire_lock already
-        // stamped it) but no rebuild has happened in the new epoch yet.
+        // Case A: daemon restarted under a NEW pid AND a NEW nonce
+        // (acquire_lock already stamped both) but no rebuild has happened in
+        // the new epoch yet.
         state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
         write_state(root, &state).unwrap();
 
         assert_eq!(
@@ -1323,9 +1346,11 @@ mod tests {
              line must be omitted, not attribute pid 111's reloads to it: {out}"
         );
 
-        // Case B: daemon is stopped (pid == 0, release_lock's sentinel) —
-        // epoch_pid (111) still stale from the last running epoch.
+        // Case B: daemon is stopped — release_lock clears BOTH pid and the
+        // epoch nonce (its own "no live epoch" sentinel, same shape as
+        // pid == 0).
         state.pid = 0;
+        state.epoch_nonce = String::new();
         write_state(root, &state).unwrap();
         let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
         assert!(
@@ -1334,8 +1359,11 @@ mod tests {
         );
 
         // Once the new epoch actually rebuilds, the line must reappear with
-        // ONLY the new epoch's count, never the old one.
+        // ONLY the new epoch's count, never the old one. Restart: pid 222
+        // again under the same live epoch it was stamped with in Case A
+        // (status was merely checked once while stopped in between).
         state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
         crate::state::record_ignore_rebuild(&mut state, 6_000);
         write_state(root, &state).unwrap();
         let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
@@ -1346,6 +1374,156 @@ mod tests {
         assert!(
             !out.contains("reloaded 3 time(s)") && !out.contains("reloaded 4 time(s)"),
             "must never blend in the old epoch's count: {out}"
+        );
+    }
+
+    // Honesty round: epoch identity was previously the pid, and pid reuse
+    // (real on a long-lived machine — the same recycling class `doctor`'s
+    // daemon-liveness check already handles via flock, not pid comparison)
+    // let a later daemon epoch inherit a dead epoch's stale reload count.
+    // Simulates a dead epoch (pid 111, nonce "epoch-a", 3 rebuilds) followed
+    // by a new epoch that reuses pid 111 but is stamped with a fresh nonce
+    // ("epoch-b") — the case pid alone cannot distinguish. Neuter: key
+    // either side (`record_ignore_rebuild` or `current_epoch_reloads`) back
+    // on `pid` instead of the nonce → RED (the reused pid makes the new
+    // epoch look like a continuation of the old one).
+    #[test]
+    fn pid_reuse_does_not_resurrect_a_dead_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Dead epoch: pid 111, nonce "epoch-a", rebuilt 3 times.
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // New epoch REUSES the same pid (111) — pid wraparound — but
+        // acquire_lock stamps a fresh, distinct nonce.
+        state.epoch_nonce = "epoch-b".to_string();
+        write_state(root, &state).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "a new epoch that reused the dead epoch's pid must render zero reloads until its \
+             own first rebuild, not the dead epoch's 3: {out}"
+        );
+
+        // Its own first rebuild must start counting from 1, not accumulate
+        // onto the dead epoch's 3.
+        let mut state = read_state(root);
+        crate::state::record_ignore_rebuild(&mut state, 4_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 1 time(s)"),
+            "the reused-pid epoch's first rebuild must read 1, not accumulate onto the dead \
+             epoch's count: {out}"
+        );
+        assert!(
+            !out.contains("reloaded 4 time(s)"),
+            "must never blend the dead epoch's 3 into the new epoch's count: {out}"
+        );
+    }
+
+    // Honesty round: reader (`current_epoch_reloads`) and writer
+    // (`record_ignore_rebuild`) must agree on what counts as "a new epoch"
+    // using the SAME identity (the nonce) — whether or not the pid also
+    // happened to change alongside it. Two fixtures that differ only in
+    // whether pid changed must render byte-identical `status` output.
+    // Neuter: make one side compare `pid` and the other compare
+    // `epoch_nonce` (i.e. revert just one of the two functions) → RED, both
+    // because the two scenarios stop matching each other and because the
+    // "no rebuild yet in the new epoch" assertion fails.
+    #[test]
+    fn epoch_detection_is_symmetric_regardless_of_whether_pid_also_changed() {
+        // Scenario 1: nonce changes, pid does NOT (pid reuse).
+        let tmp1 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path();
+        std::fs::create_dir_all(objects_dir(root1)).unwrap();
+        let mut s1 = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut s1, 1_000);
+        s1.epoch_nonce = "epoch-b".to_string(); // new epoch, pid unchanged
+        write_state(root1, &s1).unwrap();
+        let out1 = status_report(root1, agentrec_core::MAX_STORE_BYTES).unwrap();
+
+        // Scenario 2: both nonce and pid change (the ordinary restart case).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path();
+        std::fs::create_dir_all(objects_dir(root2)).unwrap();
+        let mut s2 = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut s2, 1_000);
+        s2.pid = 222;
+        s2.epoch_nonce = "epoch-b".to_string(); // new epoch, pid also changed
+        write_state(root2, &s2).unwrap();
+        let out2 = status_report(root2, agentrec_core::MAX_STORE_BYTES).unwrap();
+
+        assert_eq!(
+            out1, out2,
+            "epoch detection must depend only on the nonce — whether pid also happened to \
+             change must not change the rendered output"
+        );
+        assert!(
+            !out1.contains("ignore:"),
+            "a brand-new epoch nonce with no rebuild yet must render nothing: {out1}"
+        );
+    }
+
+    // Honesty round, AC #3: a `state.json` written by a binary that predates
+    // the nonce field entirely has neither `epoch_nonce` nor
+    // `epoch_reload_nonce` — both deserialize to their shared default `""`.
+    // A reader that treated that coincidental match as "current epoch" would
+    // resurrect whatever `epoch_ignore_rebuilds` figure an OLD, pid-keyed
+    // binary had accumulated. Neuter: drop the `!epoch_nonce.is_empty()`
+    // guard in `current_epoch_reloads` (treat empty-equals-empty as a match)
+    // → RED.
+    #[test]
+    fn pre_nonce_state_json_renders_no_reload_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Simulate a state.json written by an OLDER binary: it has
+        // accumulated real lifetime + "epoch" history under its old
+        // pid-keyed bookkeeping (the now-unused `epoch_pid` key included, to
+        // prove it's simply ignored), but no `epoch_nonce` /
+        // `epoch_reload_nonce` keys at all — those fields didn't exist yet.
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":111,"ignore_rebuilds":4821,"epoch_ignore_rebuilds":37,
+                "epoch_pid":111,"last_ignore_rebuild_ms":123456}"#,
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "a pre-nonce state.json must not claim the old epoch's count is current: {out}"
+        );
+
+        let payload = status_json(root).unwrap();
+        assert_eq!(
+            payload["ignore_rebuilds"], 4821,
+            "the lifetime total must still survive"
+        );
+        assert_eq!(
+            payload["epoch_ignore_rebuilds"], 0,
+            "must not resurrect the pre-nonce file's stale epoch count"
         );
     }
 
