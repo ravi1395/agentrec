@@ -8,7 +8,8 @@
       "CLAUDE.md",
       "VERIFY-LEDGER.md",
       "IMPLEMENTATION.md",
-      "docs/**"
+      "docs/**",
+      "scripts/**"
     ],
     "denylist": [
       "true",

@@ -79,7 +79,16 @@ were implemented with no claims declared beforehand; `claimd lint --range` repor
 touched-but-uncovered files (`cli/src/cmds.rs` from P3 and `scripts/linux-leg.sh` from P5 — the
 orchestrator's own self-report to the gate named only the first, and the skeptic found the second).
 Retroactive declaration was **refused**, per the skill: a declare-record postdating the code makes
-the log lie about ordering, the one property claimd provides. 8 claims declared this round (4 for
+the log lie about ordering, the one property claimd provides. `amend` cannot widen `stale_on`
+either, so the P5 manual claim — declared *before* implementation but with the script omitted from
+its globs — could not be honestly corrected. **`scripts/**` was added to `.claims/config.json`'s
+`lint.ignore` at the FOUNDER's explicit direction** (contrast `IMPLEMENTATION.md`, which the prior
+round records as agent-added and flags for review); the Stop hook was otherwise firing on every
+turn-end with no legitimate remedy available. `cli/src/cmds.rs` is deliberately NOT ignored — it is
+core source, and it stays standing as recorded debt in the same posture as last round's
+`purgecmd.rs`. **The underlying rule is still undecided and will fire again:** `PROTOCOL.md` is not
+ignored, so the next normative-doc edit reproduces this; and the argument *against* ignoring
+`scripts/` is that this very script shipped two real defects while unexercised. 8 claims declared this round (4 for
 P4, 3 for P5, plus the P4 manual), 5 EVIDENCED, 2 left DECLARED as `manual` awaiting founder
 attestation — **never self-attested**. A pre-existing `illegal transition: evidence from EVIDENCED
 at seq 4` warning on `clm_0TRSZXYXZBBV092VF8D1RXF7PD` (an ignore-rebuild-gate-round claim) predates
