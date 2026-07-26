@@ -1241,6 +1241,14 @@ fn rebuild_count_is_bounded_by_writes() {
     let _ = daemon.kill();
     let _ = daemon.wait();
 
+    // Residuals round, Phase 5: a green run of this test previously carried NO
+    // number — the count only ever surfaced inside the assert-failure message
+    // below, and cargo captures stdout on a passing test. Print it
+    // unconditionally so a green CI run (with `-- --nocapture`) leaves the
+    // observed count in the log, closing the single-VM-statistics residual on
+    // this bound.
+    eprintln!("rebuild_count observed: {count}");
+
     assert!(
         saw_rebuild.is_some(),
         "no ignore-set rebuild observed at all — rest of the test is moot"

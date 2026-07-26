@@ -9,6 +9,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Residuals round, Phase 5: the directory-admission machinery this round
+  # shipped (macOS rename-in admission + the pre-existing Linux arm) is now
+  # testable ONLY on Linux, so the Linux leg is load-bearing infrastructure —
+  # yet a push to any branch other than `main` triggers nothing above, and
+  # there was no way to run this workflow on demand. `workflow_dispatch` adds
+  # a manual button.
+  #
+  # HONEST caveat, not fixed by this line alone: GitHub only exposes
+  # `workflow_dispatch` for a workflow that is already on the repo's default
+  # branch. Adding this trigger on a feature branch produces NO dispatchable
+  # run until the branch (or at least this file) lands on `main` — see
+  # VERIFY-LEDGER.md's Phase 5 rows, both left OPEN for exactly this reason.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -89,6 +102,18 @@ jobs:
         # high-core Mac); this workflow change itself has NOT yet run on a
         # GitHub runner (batch unpushed) — treat as pending CI verification.
         run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=3
+      - name: cargo test rebuild_count_is_bounded_by_writes (observed count)
+        # Residuals round, Phase 5: the main step above already runs this
+        # test, but a passing test's stdout is captured by cargo and never
+        # reaches the log — so a green run of the step above carries no
+        # number for the rebuild-bound residual (Linux 1..=45 / macOS
+        # 1..=10, see the platform-measurement comment on the test itself).
+        # This dedicated `--nocapture` run puts the observed count in the
+        # log on every green CI run, closing the single-VM-statistics gap
+        # named in VERIFY-LEDGER.md.
+        run: |
+          cargo test -p agentrec --test integration --all-features \
+            rebuild_count_is_bounded_by_writes -- --exact --nocapture
 
   inotify-low-watches:
     name: doctor inotify headroom (induced low watches, AC Y++2)
