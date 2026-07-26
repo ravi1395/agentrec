@@ -314,6 +314,16 @@ pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
 /// rebuilds` could still hold a real accumulated figure from that older
 /// binary's pid-keyed bookkeeping. Without the explicit non-empty check,
 /// that stale figure would render as "current".
+///
+/// Residuals round, Phase 3: this function CANNOT close the crashed-daemon
+/// window by itself — `release_lock` never runs on `kill -9`, so a dead
+/// epoch's `epoch_nonce`/`epoch_reload_nonce` stay matched on disk exactly
+/// as if the epoch were still live, and this function has no `root` to probe
+/// liveness with. Callers (`status` text and `status --json` alike) MUST
+/// additionally gate on an actual liveness check (`daemon::daemon_is_running`)
+/// before trusting this return value as "the current daemon's count" — this
+/// function only answers "what does the on-disk epoch bookkeeping say",
+/// never "is anything actually running".
 pub fn current_epoch_reloads(state: &State) -> u64 {
     if !state.epoch_nonce.is_empty() && state.epoch_reload_nonce == state.epoch_nonce {
         state.epoch_ignore_rebuilds

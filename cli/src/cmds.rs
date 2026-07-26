@@ -226,11 +226,24 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 /// human sees, including in the stale-epoch window right after a restart or
 /// while the daemon is stopped (raw field still holds the previous epoch's
 /// count there).
+///
+/// Residuals round, Phase 3 (Q3 answered as option (c)): `release_lock`
+/// never runs on `kill -9`, so a crashed daemon leaves `epoch_nonce` stamped
+/// on disk — `current_epoch_reloads` (which has no `root` and therefore
+/// cannot probe liveness itself) then renders the dead epoch's count as if
+/// it were the live daemon's. `epoch_ignore_rebuilds` itself is deliberately
+/// LEFT UNCHANGED here (same value, same computation, live or dead) — the
+/// count is still an honest epoch-scoped figure, just not necessarily a
+/// LIVE one. The new sibling `epoch_ignore_rebuilds_stale` carries that
+/// distinction instead, always present (never only-when-true) so a consumer
+/// can tell the two cases apart without inferring it from field absence.
 fn status_json(root: &Path) -> Result<serde_json::Value, String> {
     let state = read_state(root);
+    let daemon_live = crate::daemon::daemon_is_running(root);
     Ok(serde_json::json!({
         "ignore_rebuilds": state.ignore_rebuilds,
         "epoch_ignore_rebuilds": current_epoch_reloads(&state),
+        "epoch_ignore_rebuilds_stale": !daemon_live,
         "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
             Some(state.last_ignore_rebuild_ms)
         } else {
@@ -307,7 +320,14 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // doc: pid reuse on a long-lived machine could make a later epoch
     // inherit a dead epoch's stale count.)
     let epoch_reloads = current_epoch_reloads(&state);
-    if epoch_reloads > 0 {
+    // Residuals round, Phase 3: a crashed daemon (`kill -9` skips
+    // `release_lock`) leaves `epoch_nonce` stamped, so `epoch_reloads` above
+    // can be nonzero for an epoch that is no longer running. The text line
+    // is a daily-driver surface a human reads as "current" — so it is
+    // gated on an actual liveness probe (the same non-blocking flock check
+    // `doctor`/`purge` already use), not just on the epoch-nonce match.
+    let daemon_live = crate::daemon::daemon_is_running(root);
+    if daemon_live && epoch_reloads > 0 {
         let when = fmt::relative_time(
             &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
             wall_now_ms(),
@@ -916,6 +936,36 @@ pub(crate) fn config_values<'a>(text: &'a str, key: &'a str) -> impl Iterator<It
 mod tests {
     use super::*;
     use agentrec_core::record::{append_log, FileEntry};
+    use std::os::unix::io::AsRawFd;
+
+    /// Residuals round, Phase 3: `status_report`/`status_json` now gate the
+    /// reload line/field on `daemon::daemon_is_running`, a REAL non-blocking
+    /// `libc::flock` probe against `.agentrec/daemon.lock` — not an
+    /// injection seam (this repo's release-`strings` audits exist
+    /// specifically to keep test-only seams out of the shipped binary, and
+    /// `daemon_is_running`'s premise is already proven in-process by
+    /// `daemon_is_running_true_while_held_false_after_release`,
+    /// `daemon.rs:2599`: a same-process flock on a distinct `File`/fd
+    /// defeats `LOCK_EX|LOCK_NB` exactly like a second process would). This
+    /// helper creates the lock file and takes a real exclusive flock on it,
+    /// returning the open `File` so the caller holds the lock for as long as
+    /// it's kept alive — deliberately WITHOUT going through `daemon::
+    /// acquire_lock`, which is private to `daemon.rs` and also mutates
+    /// `state.json` (stamping a fresh `epoch_nonce`), which these fixtures
+    /// must not have happen out from under their own hand-built `State`.
+    fn hold_daemon_lock(root: &std::path::Path) -> std::fs::File {
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        let path = crate::agentrec_dir(root).join("daemon.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test helper failed to acquire its own daemon.lock");
+        file
+    }
 
     /// In a release build, `TEST_STORE_BUDGET_BYTES_VAR` must be a no-op —
     /// proves the `#[cfg(debug_assertions)]` arm actually compiles out the
@@ -1213,6 +1263,11 @@ mod tests {
             "no reload line expected when ignore_rebuilds is 0: {out}"
         );
 
+        // Residuals round, Phase 3: the reload line now also requires a live
+        // daemon (`daemon_is_running`'s real flock probe) — hold the lock so
+        // this presence assertion still discriminates the thing it always
+        // meant to discriminate (a nonzero epoch count), not liveness.
+        let _guard = hold_daemon_lock(root);
         let mut state = crate::state::State {
             pid: 111,
             epoch_nonce: "epoch-a".to_string(),
@@ -1245,6 +1300,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(objects_dir(root)).unwrap();
+        // Residuals round, Phase 3: presence assertion below now also needs
+        // a live daemon.
+        let _guard = hold_daemon_lock(root);
 
         let mut state = crate::state::State {
             pid: 111,
@@ -1362,6 +1420,10 @@ mod tests {
         // ONLY the new epoch's count, never the old one. Restart: pid 222
         // again under the same live epoch it was stamped with in Case A
         // (status was merely checked once while stopped in between).
+        // Residuals round, Phase 3: this restart is a live daemon again —
+        // hold the lock so this presence assertion still discriminates
+        // epoch-scoping, not liveness.
+        let _guard = hold_daemon_lock(root);
         state.pid = 222;
         state.epoch_nonce = "epoch-b".to_string();
         crate::state::record_ignore_rebuild(&mut state, 6_000);
@@ -1418,6 +1480,10 @@ mod tests {
 
         // Its own first rebuild must start counting from 1, not accumulate
         // onto the dead epoch's 3.
+        // Residuals round, Phase 3: this rebuild belongs to a live epoch —
+        // hold the lock so the presence assertion below discriminates
+        // pid-reuse-vs-nonce, not liveness.
+        let _guard = hold_daemon_lock(root);
         let mut state = read_state(root);
         crate::state::record_ignore_rebuild(&mut state, 4_000);
         write_state(root, &state).unwrap();

@@ -1260,6 +1260,101 @@ fn rebuild_count_is_bounded_by_writes() {
     );
 }
 
+// Residuals round, Phase 3: `release_lock` never runs on `kill -9`, so a
+// crashed daemon leaves `epoch_nonce`/`epoch_reload_nonce` stamped on disk
+// exactly as if that epoch were still live — `current_epoch_reloads` (which
+// has no `root` to probe liveness with) then renders the DEAD epoch's
+// reload count as though it belonged to whatever daemon is (or isn't)
+// running now. Both `status` readers (text + `--json`) must gate on an
+// actual liveness probe (`daemon::daemon_is_running`'s real flock check),
+// not just the epoch-nonce match. BOTH seams are asserted in ONE test —
+// the honesty-fixes round already learned the hard way (`0f3b474`) that
+// neutering only the json seam can survive a suite that only ever pins the
+// text seam, or vice versa.
+#[test]
+fn status_suppresses_reload_line_after_daemon_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    // Force at least one real ignore-set rebuild while genuinely live —
+    // mirrors `daemon_counts_ignore_rebuilds`'s two-write shape.
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let saw_rebuild = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? >= 1).then_some(())
+    });
+    assert!(
+        saw_rebuild.is_some(),
+        "no ignore-set rebuild observed at all — rest of the test is moot"
+    );
+
+    // Confirm the line genuinely renders while the daemon is still alive —
+    // otherwise the later "absent after crash" assertion would be vacuous
+    // (it could be absent for the wrong reason, e.g. the rebuild never
+    // landed at all).
+    let live_out = agentrec(root, &["status"]);
+    assert!(live_out.status.success(), "status failed: {live_out:?}");
+    let live_stdout = String::from_utf8_lossy(&live_out.stdout);
+    assert!(
+        live_stdout.to_lowercase().contains("reload"),
+        "expected the reload line to render while the daemon is genuinely live: {live_stdout}"
+    );
+
+    // Pin the json seam's LIVE direction too — `epoch_ignore_rebuilds_stale`
+    // is always present per Q3(c), so it must be assertable both ways; a
+    // version of `status_json` that hardcodes `true` unconditionally would
+    // otherwise survive this whole test (the dead-epoch assertion further
+    // down would still pass for the wrong reason).
+    let live_json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        live_json_out.status.success(),
+        "status --json failed: {live_json_out:?}"
+    );
+    let live_json: serde_json::Value = serde_json::from_slice(&live_json_out.stdout)
+        .unwrap_or_else(|e| {
+            panic!("status --json did not emit valid JSON ({e}): {live_json_out:?}")
+        });
+    assert_eq!(
+        live_json
+            .get("epoch_ignore_rebuilds_stale")
+            .and_then(|b| b.as_bool()),
+        Some(false),
+        "a genuinely live daemon must not be flagged stale: {live_json}"
+    );
+
+    // Hard crash: no graceful shutdown, no `release_lock`, epoch_nonce stays
+    // stamped on disk. `sigkill` + `wait()` (not `Child::kill()`, which is
+    // merely graceful on some platforms, and which wouldn't reap the
+    // process either) — same pattern as `closed_turn_survives_kill9`.
+    sigkill(&daemon);
+    let _ = daemon.wait();
+
+    let dead_out = agentrec(root, &["status"]);
+    assert!(dead_out.status.success(), "status failed: {dead_out:?}");
+    let dead_stdout = String::from_utf8_lossy(&dead_out.stdout);
+    assert!(
+        !dead_stdout.to_lowercase().contains("reload"),
+        "a crashed daemon's dead epoch must not render as though it were current: {dead_stdout}"
+    );
+
+    let json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        json_out.status.success(),
+        "status --json failed: {json_out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout)
+        .unwrap_or_else(|e| panic!("status --json did not emit valid JSON ({e}): {json_out:?}"));
+    assert_eq!(
+        v.get("epoch_ignore_rebuilds_stale")
+            .and_then(|b| b.as_bool()),
+        Some(true),
+        "status --json must flag the epoch figure as stale once no daemon is running: {v}"
+    );
+}
+
 // A pre-existing state.json written by an OLDER binary (before Phase 2) has
 // neither field at all. `#[serde(default)]` must let it still parse, render
 // as never-reloaded in text `status`, and `status --json` must carry the
