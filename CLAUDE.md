@@ -14,9 +14,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 1 ignored**; clippy `-D warnings` + fmt clean **debug and release**; release `strings` carries no
 `AGENTREC_TEST`. Sonnet implementers one per phase, orchestrator re-ran the full suite after every
 phase independent of every implementer (each count agreed twice), one binding **fable
-skeptical-reviewer** done-gate in an isolated worktree. **Verdict PASS on the first pass** — the
-first round in this repo's recorded history to do so — with 3 NON-BLOCKING findings, all fixed at
-`8f89775` rather than recorded, because two were false claims in shipped artifacts.
+skeptical-reviewer** done-gate in an isolated worktree. **Verdict PASS on the first pass** (as the
+ignore-rebuild-gate round also did — an earlier draft of this entry called that a first in this
+repo's history, which is false; the rounds that needed a FAIL→fix→re-gate loop were blame-honesty
+and honesty-fixes), with 3 NON-BLOCKING findings, all fixed at `8f89775` rather than recorded,
+because two were false claims in shipped artifacts.
 **The measurement-first ordering is what earned the pass, and it should be the template.** Phase 1
 was a pure spike: no repo code, a standalone probe against the raw `notify` crate, 4 probes, ~100
 trials, ending in a machine-checkable `VERDICT:` token that Phase 2's entire shape branched on.

@@ -55,6 +55,16 @@
 #      this script, confirm the value actually took inside the container
 #      before trusting a green leg.
 #
+# STATUS: THIS SCRIPT HAS NEVER BEEN EXECUTED. It was written in the
+# residuals round while colima was not running, and the round's gate then
+# found two real defects in it by reading alone (a `chown -R` that rewrote the
+# HOST repo's ownership through the rw bind mount, and a container `target/`
+# landing on the host's own `target/debug` and clobbering the macOS build
+# cache). Both are fixed — but the fix made this script structurally MORE
+# complex (read-only mount, tar copy, two directories, `CARGO_TARGET_DIR`
+# redirect) and it is still unexercised. `shellcheck` clean is not a run.
+# Treat the first execution as a debugging session, not a verification.
+#
 # Fails loudly and early on any unmet precondition (no colima, colima not
 # running, wrong arch, no docker) rather than silently running a degraded
 # leg — a script that quietly falls back to root or amd64 would reintroduce
@@ -122,7 +132,14 @@ docker run --rm --name "$CONTAINER_NAME" \
     id -u builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
 
     mkdir -p /work /work-target
-    tar -C /src --exclude=./target -cf - . | tar -C /work -xf -
+    # `.agentrec` is this repo dogfooding itself — a ~75 MiB content-addressed
+    # blob store the suite never reads (every test builds its own tempdir
+    # root), so copying it in is pure cost. `target` is the host`s macOS
+    # artifacts. `.git` IS kept: cheap (~13 MiB) and `ignore::WalkBuilder`
+    # honors `require_git`, so removing it could silently change ignore
+    # behavior — the exact class of vacuous-fixture bug this repo has already
+    # shipped once.
+    tar -C /src --exclude=./target --exclude=./.agentrec -cf - . | tar -C /work -xf -
     chown -R builder:builder /work /work-target /usr/local/cargo /usr/local/rustup
 
     su builder -s /bin/bash -c "
