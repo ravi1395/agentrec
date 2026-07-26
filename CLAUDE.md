@@ -8,6 +8,104 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Residuals round — GATE PASS (2026-07-27, branch `fix/residuals-round` cut from
+`fix/honesty-round`, `3477781..8f89775`, not pushed, no PR):** All 5 phases of
+`docs/superpowers/plans/2026-07-26-agentrec-residuals-round.md`. macOS **422 → 428, 0 failed,
+1 ignored**; clippy `-D warnings` + fmt clean **debug and release**; release `strings` carries no
+`AGENTREC_TEST`. Sonnet implementers one per phase, orchestrator re-ran the full suite after every
+phase independent of every implementer (each count agreed twice), one binding **fable
+skeptical-reviewer** done-gate in an isolated worktree. **Verdict PASS on the first pass** — the
+first round in this repo's recorded history to do so — with 3 NON-BLOCKING findings, all fixed at
+`8f89775` rather than recorded, because two were false claims in shipped artifacts.
+**The measurement-first ordering is what earned the pass, and it should be the template.** Phase 1
+was a pure spike: no repo code, a standalone probe against the raw `notify` crate, 4 probes, ~100
+trials, ending in a machine-checkable `VERDICT:` token that Phase 2's entire shape branched on.
+**(P1) `4b9e6da`.** Probe A **10/10** rename-ins deliver `Modify(Name(Any))`; Probe B **0/80**
+(2 fixtures × 4 stimuli × 10) spurious rename kinds; Probe C **0/5** delayed replays over a 68s
+hold; Probe D **5/5** rename-outs deliver with `is_dir()` false. **The load-bearing result is the
+one nobody asked for:** Probe B's `touch` stimulus produced a spurious `Create(Folder)` on **2/10**
+fresh-fixture trials — independently reproducing the prior round's fabrication measurement on a
+brand-new harness. That is what makes the 0/80 rename null trustworthy rather than a dead watcher
+reporting silence: the probe demonstrably sees coalesced historical flags. Create axis poisoned,
+Name axis clean — exactly the discrimination the fix needed.
+**(P2) `3b3062b` — the headline defect, closed.** A directory **moved into** the watched root lost
+its contents on macOS (3/3 at HEAD, 2/2 at the pre-round baseline — pre-existing, not a regression),
+the sharpest known silent-loss hole in the core claim, on the majority platform. `admit_existing_
+contents` is no longer `#[cfg(target_os = "linux")]`; the **gate** is now platform-split instead:
+Linux keeps `Create(_) | Modify(Name(_))`, macOS admits on `Modify(Name(_))` **only**. Decisions-log
+#2 survives intact and is directly pinned by `create_kind_does_not_admit_on_macos`.
+**(P3) `bd92964`** liveness-gates the stale reload line: `release_lock` never runs on kill-9, so
+`epoch_nonce` stayed stamped and a **dead** epoch's rebuild count rendered as current in *both*
+readers. `status` is now the fourth caller of the proven `daemon_is_running` flock probe. Founder
+answered open question 3 with **option (c)**: json keeps the count and gains an always-present
+`epoch_ignore_rebuilds_stale` boolean; the text line is suppressed outright.
+**(P4) `d940ac9`** closes the `wait_for_live_daemon` race — the pid was written ~4.3ms before the
+watcher armed, so every live-daemon test nominally raced it. The daemon now stamps
+`watcher_armed_nonce` after `.watch()` succeeds; **keying on the epoch nonce rather than a bool is
+what makes a crashed run's stale value self-invalidating.** **(P5) `31a2eba`** adds
+`workflow_dispatch` (founder answered Q1 with **(b)+(c)**) plus `scripts/linux-leg.sh` codifying the
+Colima ritual, and makes the rebuild bound *evidenced on green* — the count previously surfaced only
+in the assert-**failure** message, and cargo captures stdout on pass, so a green CI run carried no
+number at all.
+**The skeptic ran the one thing no fixture can prove.** Live daemon, real repos, agent bracket open:
+`touch <pre-existing dir>` **5/5 trials, 0 fabricated entries**, `blame` naming nobody — **plus a
+control-included trial** (`fabricated=0 control_recorded=1`) proving the daemon was recording during
+the exact window the absence claim covers, which is the vacuity objection this repo has been burned
+by. And `mv dir-in` **5/5, all contents recorded**. A single clean run was explicitly not accepted.
+**Two false claims shipped inside this round and the gate caught both — worth keeping.** (a) The
+rename-out test's comment claimed "two independent discriminators" unconditionally. **False on
+macOS**, demonstrated by the skeptic: the unconditional `admitted_dirs` clear for any
+`Modify(Name(_))` runs **before** the admission gate, and macOS's follow-up leg is itself
+`Modify(Name(RenameMode::To))` — so that clear wipes the leg-1 poison, `insert` returns true, and the
+staging assertion **passes even under the neuter**. Only `is_empty` discriminates on macOS; both do
+on Linux. The clear it collides with is *last round's own fix* (`f4bca8a` finding 2) — i.e. the plan
+reasoned about a neuter without checking its interaction with the code the previous round added, the
+"reasoned safe, unobserved" class this round existed to kill, reproduced inside the plan meant to
+close it. The implementer disclosed it unprompted rather than working around it. (b) A VERIFY-LEDGER
+row cited a "Local Colima-VM number … recorded below" that **exists nowhere**, while the same row
+stated the container was never run. The only figure measured was a macOS one, which is not a data
+point for a row about Linux.
+**A third finding was a real host-mutation bug in a script that had never been executed:**
+`scripts/linux-leg.sh` ran `chown -R` on an **rw bind mount**, rewriting the *host* repo's ownership
+through virtiofs, and put the container's `target/` on the host's own non-triple `target/debug`
+path, clobbering the macOS build cache. Now mounted read-only and copied to container-native storage
+with `target/` excluded, `CARGO_TARGET_DIR` off the mount. Its `sysctl` mechanism now carries an
+explicit **UNVERIFIED-inference** caveat — the round recorded the *value* (1048576), never how it was
+applied, and the implementer flagged its own reasoning as inference rather than recovered history.
+**Process debt, recorded not papered over: claimd declare-first held for P4 and P5 only.** P1–P3
+were implemented with no claims declared beforehand; `claimd lint --range` reports **two**
+touched-but-uncovered files (`cli/src/cmds.rs` from P3 and `scripts/linux-leg.sh` from P5 — the
+orchestrator's own self-report to the gate named only the first, and the skeptic found the second).
+Retroactive declaration was **refused**, per the skill: a declare-record postdating the code makes
+the log lie about ordering, the one property claimd provides. 8 claims declared this round (4 for
+P4, 3 for P5, plus the P4 manual), 5 EVIDENCED, 2 left DECLARED as `manual` awaiting founder
+attestation — **never self-attested**. A pre-existing `illegal transition: evidence from EVIDENCED
+at seq 4` warning on `clm_0TRSZXYXZBBV092VF8D1RXF7PD` (an ignore-rebuild-gate-round claim) predates
+this session entirely; two independent implementers traced it to the same claim.
+**Environmental incident worth recording, because it wasted a phase and the wrong diagnosis was
+tempting:** mid-round every shell died — `posix_spawn failed: Resource temporarily unavailable`,
+symmetric across the orchestrator, a subagent's `clang` linker, and background spawns. This repo's
+memory records leaked `agentrec record` daemons as *the* known process leak, so that was the obvious
+suspect; it was **wrong**. The machine held **3607 orphaned `tail -f -n +1 /dev/null`** processes
+(ppid 1, one-second burst) against `kern.maxprocperuid=4000`, and exactly **one** agentrec daemon was
+running — the legitimate launchd service. Contributing cause was ours: P1's first harness revision
+created a fresh `notify` watcher **per trial** (80 for Probe B alone) and exhausted the process table
+around trial 9. Redesigned to one watcher per probe, which also matches how the real daemon behaves.
+**Every measurement taken before the cleanup was discarded and the trial counts restarted from
+zero** — a fork-starved machine perturbs FSEvents delivery timing, which is precisely the quantity
+P1 exists to measure.
+**Still open, none blocking:** P5's AC1 (a GitHub run URL) is **structurally unclosable from a
+branch** — GitHub only offers `workflow_dispatch` for workflows already on the default branch — so
+it is an honest OPEN ledger row, not a pass; landing the trigger on `main` is a founder decision and
+nothing was pushed. No Linux number of any kind exists for the rebuild bound yet (`1..=45` Linux /
+`1..=10` macOS untouched — no runner means no new measurement, and the plan permits re-derivation
+only *from* a measurement). P4's population-level flake claim closes only over CI history. P1's
+verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
+is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
+directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the
+natural observatory. Two leaked test daemons from prior sessions (pids 26258, 70800, watching dead
+tempdirs) were live during the review and left running.
+
 **Epoch nonce + the Linux leg — GATE PASS (2026-07-26, branch `fix/honesty-round`,
 `f8c6cc9..f4bca8a`, pushed, no PR):** Two founder asks. The nonce was routine; **the Linux leg,
 recorded as "owed" for three rounds, found a shipping product defect within minutes of first
