@@ -196,6 +196,39 @@ Workspace → **411 passed, 0 failed, 1 ignored**.
 
 ---
 
+## Delivered
+
+| Phase | Commit | Suite | Note |
+|---|---|---|---|
+| 1 — `enforce_budget` protect-set | `2d1bd78` | 395 → **401** | on target |
+| 2 — `read_state` per-field | `7474e26` | **407** | +1 over target, an extra real test kept |
+| 3 — epoch counter + honest `--json` | `22b085f` | **412** | |
+| 4 — narrowing asymmetry pinned | `6234612` | **413** | |
+
+Every figure re-run by the orchestrator independently of the implementer. clippy `-D warnings` + fmt
+clean on debug and release; the Phase 1 test seam is `#[cfg(debug_assertions)]`-gated and `strings`
+on the release binary contains no `AGENTREC_TEST`. 15 claims declared per criterion **before**
+implementing, each at its phase's parent commit, all evidenced at exit 0.
+
+**Three plan defects the implementers caught, all disclosed rather than worked around:**
+1. **Phase 1's obvious implementation is a trap.** Passing the full `purgecmd::referenced_hashes`
+   as `extra_protected` protects every validly-referenced hash and **permanently defeats budget
+   eviction** — it broke `status_prints_over_budget_notice`. The correct cut is narrower:
+   `open.json` + `memory.jsonl` scanned raw unconditionally, plus only those `log.jsonl` hashes on
+   lines that **fail to parse**. Validly-parsed lines are already covered by `enforce_budget`'s own
+   age-ordered walk. The plan did not say this; it should have.
+2. **Phase 2's taken decision was wrong.** `#[serde(default)]` on every field rescues a *missing*
+   field only — a struct-level `from_str::<State>` still fails outright the moment one *present*
+   field has the wrong type, which is exactly what every criterion required to survive. The
+   implementer used the plan's stated fallback (`serde_json::Value` + per-field extraction) and said
+   so, rather than silently switching.
+3. **Phase 4's own named neuter is structurally vacuous.** Reverting the loop-tick move does **not**
+   red the test: `gitignore_dirty` is tracked independently of `pending`, and the criterion itself
+   requires the `.gitignore` edit to land before the target's flush — which is what consumes the flag
+   in *either* call-site position. Substituted a neuter of the **trigger** (deleting
+   `*gitignore_dirty = true`), which reds at an added precondition assert. Third time in three rounds
+   that an AC could not have proven itself as written.
+
 ## Then: item 3 — the Linux CI leg (not a code phase)
 
 Push `fix/honesty-round` so `.github/workflows/ci.yml`'s existing matrix (macOS-14 + Ubuntu-22.04 +
@@ -204,6 +237,16 @@ Ubuntu-24.04) runs everything. Every piece of evidence in the rebuild-gate round
 RED, inotify widens the margins) but unobserved. This also clears the older owed Linux leg for the
 `unreadable`/`io_failed` producers. Report the run URL and the per-job result; a red Linux leg is a
 finding for this round, not a separate one.
+
+**OUTCOME: NOT DONE — deliberately, founder decision.** The branch is pushed
+(`origin/fix/honesty-round`), but `.github/workflows/ci.yml` fires only on `push: branches: [main]`
+and on `pull_request` — there is no `workflow_dispatch` — so **a branch push alone runs nothing**.
+The only route is a PR, and because this branch stacks on two earlier unmerged branches
+(`fix/blame-attribution-and-noise-folding` → `fix/ignore-rebuild-gate` → here), a PR to `main` would
+carry all three rounds at once. Offered: draft PR to `main`, PR onto the parent branch, or skip.
+**Founder chose skip.** So the Linux leg remains **owed**, and every timing margin in this round and
+the previous two is macOS/FSEvents evidence only. Same posture the repo already carries for the
+`unreadable`/`io_failed` producers — recorded, not pretended.
 
 ## Edge cases considered
 
