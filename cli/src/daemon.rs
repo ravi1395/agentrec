@@ -10,20 +10,22 @@
 
 use crate::cmds::wall_now_ms;
 use crate::state::{
-    read_state, record_io_failure, record_non_utf8_path_skip, record_prompt_put_failure,
-    write_state, State,
+    read_state, record_ignore_rebuild, record_io_failure, record_non_utf8_path_skip,
+    record_prompt_put_failure, write_state, State,
 };
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
 use agentrec_core::record::{
-    append_log, parse_signals, EpochRecord, FileEntry, LogRecord, SignalEvent, TurnRecord,
+    append_log, parse_signals, skip_reason, EpochRecord, FileEntry, LogRecord, SignalEvent,
+    TurnRecord,
 };
 use agentrec_core::scrub;
-use agentrec_core::store::{BlobStore, PutResult};
+use agentrec_core::store::{hash_bytes, BlobStore, PutResult};
 use agentrec_core::time::rfc3339;
 use agentrec_core::MAX_SNAPSHOT_BYTES;
-use notify::{RecursiveMode, Watcher};
+use notify::event::{ModifyKind, RemoveKind};
+use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -83,6 +85,12 @@ pub fn run(root: &Path) -> Result<(), String> {
     watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| watch_error(&e))?;
+    // Residuals round, Phase 4: stamp the armed signal immediately after the
+    // watcher is confirmed listening — see `stamp_watcher_armed`'s doc for
+    // why this closes the `wait_for_live_daemon` race without moving
+    // `acquire_lock` (rejected: the flock IS the single-daemon gate, and
+    // arming before holding it would let two daemons watch concurrently).
+    stamp_watcher_armed(&root);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_h = stop.clone();
@@ -101,8 +109,92 @@ pub fn run(root: &Path) -> Result<(), String> {
     // Set whenever a `.gitignore` event is observed, regardless of its own
     // ignore verdict; cleared after the ignore set is rebuilt.
     let mut gitignore_dirty = false;
+    // Directories `admit_existing_contents` has already walked this daemon
+    // run. Honesty-round gate finding 1 (`247df9e` review) compiled the whole
+    // admission ACTION out on macOS because gating on `Create(_)` there
+    // fabricated: FSEvents delivers coalesced per-path flag unions, so the
+    // FIRST event a pre-existing directory receives after daemon start
+    // routinely carries historical `ItemCreated` alongside the real change,
+    // which `notify` reports as `Create(Folder)` — measured live, 2/2 probe
+    // runs. Residuals round: that Create-axis poisoning is still real
+    // (Phase 1's spike re-measured it, 2/10 fresh-fixture `touch` trials
+    // producing a spurious `Create(Folder)` — see
+    // docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md),
+    // but the same spike measured the RENAME axis clean (0/80 spurious
+    // `Modify(Name(_))` across 2 fixtures x 4 stimuli x 10 trials, 0/5
+    // delayed replays over a 68s hold) — clean enough to close a real,
+    // independently-measured silent-loss hole: a directory moved INTO the
+    // watched root lost its contents on macOS (3/3 at HEAD). So admission is
+    // no longer Linux-only: `admitted_dirs` is now populated on BOTH
+    // platforms, but the GATE that feeds it is platform-split at the call
+    // site — Linux keeps `Create(_) | Modify(Name(_))`, macOS/non-Linux
+    // admits on `Modify(Name(_))` ONLY, never `Create(_)`. Cleared on
+    // `Remove(Folder)` (and on any rename event, see the clear below) so a
+    // directory removed/renamed away and genuinely recreated at the same
+    // path within one run is still walked again — unconditional on both
+    // platforms rather than adding a second cfg split for a clear that costs
+    // nothing.
+    let mut admitted_dirs: HashSet<PathBuf> = HashSet::new();
 
     loop {
+        // A touched `.gitignore` changes the filter, and is consumed HERE —
+        // at the top of the tick, before this iteration's
+        // `drain_watch_events` runs `classify` on anything — not inside the
+        // `settled || capped` flush block below. The rebuild used to live in
+        // that block, implicitly gated on `pending` becoming non-empty; but
+        // `pending` only ever receives `Class::Watch` paths, and a path the
+        // STALE ignore set still classifies `Ignore` (e.g. one a
+        // `.gitignore` edit just re-included) never arms the debounce — so
+        // the flush block, and the rebuild inside it, could go unreached
+        // forever while the flag sat `true`. Moving the rebuild here means
+        // it runs on the very next tick regardless of whether anything else
+        // is pending.
+        //
+        // Residual window (stated, not eliminated): classification happens
+        // inside `drain_watch_events`, which runs AFTER this. An event for
+        // the same path arriving in the SAME drain batch as the `.gitignore`
+        // edit is still classified against the pre-edit set. After this fix
+        // the hole is "the next mutation of that path is honored" (≤1 POLL
+        // tick + notify latency), not "never, until unrelated watched
+        // activity." Closing it fully would mean reclassifying `pending` at
+        // flush time — a larger change, deliberately not taken here.
+        //
+        // Mirror residual window, the OTHER direction (over-record, untested
+        // before Phase 4 of the honesty-fixes plan): a path already sitting
+        // in `pending`, admitted under the OLDER, WIDER rules, is still
+        // staged at the next flush even if a `.gitignore` edit narrows it out
+        // mid-debounce — `Recorder::stage` reads whatever `pending` holds and
+        // never re-consults `ignore_set`. Magnitude is bounded: one extra
+        // snapshot, never more. This is NOT the same failure mode as the
+        // under-record residual above and has no analogous deadlock —
+        // `gitignore_dirty` is an independent flag, and the very fact that
+        // the pre-edit admission is present is what settles the debounce and
+        // runs this rebuild, so by the time that flush completes `ignore_set`
+        // is already current for every subsequent tick. There is no
+        // "unrelated watched activity" escape hatch to close here; the next
+        // mutation of that path, whenever it comes, is classified against the
+        // fresh set. See `narrowing_mid_debounce_still_stages_pending_paths`
+        // (`cli/tests/integration.rs`), which pins the one-extra-snapshot
+        // behavior deliberately rather than treating it as a defect to fix.
+        //
+        // Consequence of losing the triggering event itself: harmless.
+        // `Recorder::stage` reads *current* file bytes at flush time, so a
+        // dropped intermediate event costs an intermediate snapshot, never
+        // the file's content — the next mutation snapshots it as it then
+        // stands.
+        //
+        // Walk-rate cost of this move (Phase 2 of the rebuild-gate fix):
+        // pre-fix, a repo where only `.gitignore` churns did ZERO
+        // `IgnoreSet::build` full-repo walks (the flush block never ran);
+        // post-fix it can do up to one per `POLL` tick (250ms) indefinitely —
+        // `state.json`'s `ignore_rebuilds`/`last_ignore_rebuild_ms` (surfaced
+        // by `status`) is what makes that rate observable rather than
+        // theoretical.
+        if let Some(fresh) = maybe_rebuild(&mut gitignore_dirty, &root) {
+            log_ignore_rebuild(&root, fresh.matchers.len(), clock.wall_ms(clock.now_ms()));
+            ignore_set = fresh;
+        }
+
         // D9: block for the first message, then drain everything already
         // queued via `try_recv` before moving on to flush logic. The old
         // one-event-per-250ms-tick shape let a large burst dribble in over
@@ -118,6 +210,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             &mut first_event,
             &mut git_hit,
             &mut gitignore_dirty,
+            &mut admitted_dirs,
         ) {
             break; // channel disconnected — the watcher thread is gone
         }
@@ -142,11 +235,6 @@ pub fn run(root: &Path) -> Result<(), String> {
             .map(|t| t.elapsed() >= MAX_DEBOUNCE)
             .unwrap_or(false);
         if settled || capped {
-            // A touched `.gitignore` changes the filter — rebuild after staging.
-            // The flag is set at event-ingest time, NOT derived from `pending`:
-            // `pending` holds watched content only, and a `.gitignore` may
-            // legitimately be ignored by its own rules.
-            let gitignore_touched = gitignore_dirty;
             // H7: exclude paths a concurrent `undo --confirm` is writing to —
             // those are undo's own mutation, not agent/human activity, and
             // must never mint a spurious bare turn.
@@ -164,10 +252,6 @@ pub fn run(root: &Path) -> Result<(), String> {
             pending.clear();
             last_event = None;
             first_event = None;
-            if gitignore_touched {
-                ignore_set = IgnoreSet::build(&root);
-                gitignore_dirty = false;
-            }
         }
 
         // Consume any new hook signals (start/stop brackets). Fill missing
@@ -318,6 +402,7 @@ fn drain_watch_events(
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
     gitignore_dirty: &mut bool,
+    admitted_dirs: &mut HashSet<PathBuf>,
 ) -> bool {
     match rx.recv_timeout(POLL) {
         Ok(res) => apply_watch_result(
@@ -329,6 +414,7 @@ fn drain_watch_events(
             first_event,
             git_hit,
             gitignore_dirty,
+            admitted_dirs,
         ),
         Err(RecvTimeoutError::Timeout) => {}
         Err(RecvTimeoutError::Disconnected) => return true,
@@ -344,6 +430,7 @@ fn drain_watch_events(
                 first_event,
                 git_hit,
                 gitignore_dirty,
+                admitted_dirs,
             ),
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => return true,
@@ -361,9 +448,15 @@ fn apply_watch_result(
     first_event: &mut Option<Instant>,
     git_hit: &mut bool,
     gitignore_dirty: &mut bool,
+    admitted_dirs: &mut HashSet<PathBuf>,
 ) {
     match res {
         Ok(event) => {
+            // Captured once: `event.kind` describes the whole batch (a rename
+            // even carries two paths, from/to, under one kind), not a
+            // per-path property, so it must be read before `event.paths` is
+            // moved out below.
+            let kind = event.kind;
             for path in event.paths {
                 // A `.gitignore` is filter *configuration*, not watched content,
                 // so the rebuild trigger must not depend on its own ignore
@@ -374,13 +467,156 @@ fn apply_watch_result(
                 if path.file_name().and_then(|n| n.to_str()) == Some(".gitignore") {
                     *gitignore_dirty = true;
                 }
+                // A directory genuinely removed can be genuinely recreated at
+                // the same path later in this same daemon run — forget it was
+                // ever admitted so a real recreation is walked again, not
+                // silently skipped by the dedup below. Unconditional (not
+                // gated on `classify`): the directory may have been ignored
+                // when admitted and watched now, or vice versa, and either
+                // way a stale dedup entry must not survive its removal.
+                if matches!(kind, EventKind::Remove(RemoveKind::Folder)) {
+                    admitted_dirs.remove(&path);
+                }
+                // Honesty-round gate finding 2: `IN_MOVED_FROM` maps to
+                // `Modify(Name(RenameMode::From))`, not `Remove(Folder)` — the
+                // clear above never fires for a directory renamed AWAY, so
+                // `mv admitted_dir admitted_dir.bak && mkdir admitted_dir`
+                // left the stale entry in place, `admitted_dirs.insert`
+                // returned `false` for the recreated directory, and its
+                // contents were silently never admitted — reopening the
+                // original Linux event-loss class for a common pattern. Any
+                // `Modify(Name(_))` for a path clears it here, before the
+                // admission check below decides whether to (re-)admit: the
+                // from-side of a rename stops referring to that directory
+                // (this path may not even resolve on disk anymore, so it
+                // cannot rely on `path.is_dir()`), and the to-side then
+                // legitimately re-admits under its own `Create`/`Modify(Name)`
+                // event. FSEvents' `RenameMode::Any` (both sides
+                // indistinguishable) is handled the same way — clearing an
+                // already-absent or not-yet-admitted entry is a harmless
+                // no-op either way.
+                if matches!(kind, EventKind::Modify(ModifyKind::Name(_))) {
+                    admitted_dirs.remove(&path);
+                }
                 match classify(root, &path, ignore_set) {
                     Class::GitRef => *git_hit = true,
                     Class::Watch => {
-                        pending.insert(path);
                         let at = Instant::now();
                         first_event.get_or_insert(at);
                         *last_event = Some(at);
+                        // Linux/inotify gap (confirmed against the raw `notify`
+                        // crate in isolation, and against this daemon, before
+                        // this fix landed): `RecursiveMode::Recursive` arms a
+                        // watch for a NEWLY created directory only after the
+                        // crate has finished processing the batch containing
+                        // its `Create(Folder)` event — not synchronously as the
+                        // directory appears. A file written into that directory
+                        // in the same burst (`mkdir foo && write foo/bar`, no
+                        // other watched activity in between) can land on disk
+                        // before the watch exists; inotify is edge-triggered at
+                        // the kernel level (a watch must predate an event, there
+                        // is no catch-up), so that write then generates NO
+                        // notify event — not late, never. FSEvents does not
+                        // show the same gap. Whenever a Watch-classified path
+                        // currently IS a directory, proactively admit whatever
+                        // it already contains — a self-catch-up for exactly
+                        // this race, scoped to the one new subtree, mirroring
+                        // `Recorder::scan`'s startup walk rather than a general
+                        // poll fallback.
+                        //
+                        // Gated on `kind`, not `path.is_dir()` alone (the
+                        // gate this replaced): `is_dir()` alone can't tell a
+                        // directory that just materialized from one that
+                        // always existed and merely had a metadata-only event
+                        // (`touch`, `chmod`, an xattr change) — a real, live
+                        // gate review caught this walking a whole unchanged
+                        // subtree and fabricating `op: "modify"` for every
+                        // file in it, including into rich agent turns via
+                        // `blame`. `Create(_)` covers `mkdir`. `Modify(Name(_))`
+                        // is included deliberately for rename-in: a directory
+                        // *moved* into the watched root genuinely materializes
+                        // its contents at this path, and inotify reports that
+                        // as `IN_MOVED_TO` -> `Modify(Name(RenameMode::To))`
+                        // (confirmed against notify's inotify.rs source),
+                        // never `Create` — a strict `Create`-only gate would
+                        // silently reopen the same event-loss class for
+                        // moved-in directories. Measured directly against the
+                        // real Linux daemon: a metadata-only event on an
+                        // existing, unchanged directory is
+                        // `Modify(Metadata(_))` — never `Create` or
+                        // `Modify(Name(_))` — so on inotify this gate excludes
+                        // exactly the fabricating case without narrowing the
+                        // fix this replaced.
+                        //
+                        // Platform-split (residuals round, gated on Phase 1's
+                        // measurement — docs/superpowers/specs/
+                        // 2026-07-26-fsevents-rename-measurements.md,
+                        // VERDICT: CLEAN — before this arm existed): honesty-
+                        // round gate finding 1 (review of `247df9e`) compiled
+                        // the whole admission ACTION out on macOS because
+                        // FSEvents delivers coalesced per-path flag UNIONS —
+                        // the first event a directory receives after daemon
+                        // start routinely carries historical `ItemCreated`
+                        // alongside an unrelated real change, and `notify`
+                        // reports that union as `Create(Folder)` regardless
+                        // of the directory's real age (measured live at
+                        // `247df9e`, 2/2; re-measured at Phase 1, 2/10 on a
+                        // fresh fixture's first `touch`). `Create(_)` stays
+                        // excluded here on every non-Linux platform for
+                        // exactly that reason — Decisions log #2, not
+                        // reopened by this round.
+                        //
+                        // The RENAME axis is different: Phase 1 measured it
+                        // directly (not reasoned from FSEvents docs — this
+                        // repo's prior FSEvents intuition has been wrong
+                        // every time it went unmeasured) and found it clean:
+                        // 0/80 spurious `Modify(Name(_))` across 2 fixtures x
+                        // 4 stimuli x 10 trials (fresh tempdir AND an aged
+                        // real-repo copy), 0/5 delayed replays over a 68s
+                        // hold, plus a positive control (10/10 genuine
+                        // rename-ins deliver `Modify(Name(Any))`) proving the
+                        // measurement harness itself worked. That is clean
+                        // enough to close a real, independently-measured
+                        // macOS silent-loss hole — a directory moved INTO the
+                        // watched root lost its contents (3/3 at HEAD) — by
+                        // admitting on rename kinds only, never `Create(_)`.
+                        #[cfg(target_os = "linux")]
+                        if path.is_dir()
+                            && matches!(
+                                kind,
+                                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+                            )
+                            && admitted_dirs.insert(path.clone())
+                        {
+                            admit_existing_contents(
+                                root,
+                                &path,
+                                ignore_set,
+                                pending,
+                                first_event,
+                                last_event,
+                            );
+                        }
+                        // macOS / any non-Linux platform: rename kinds ONLY —
+                        // see the comment above this `cfg` pair. Never
+                        // `Create(_)` here; `create_kind_does_not_admit_on_macos`
+                        // pins that a `Create(Folder)` for a real, populated,
+                        // pre-existing directory admits nothing.
+                        #[cfg(not(target_os = "linux"))]
+                        if path.is_dir()
+                            && matches!(kind, EventKind::Modify(ModifyKind::Name(_)))
+                            && admitted_dirs.insert(path.clone())
+                        {
+                            admit_existing_contents(
+                                root,
+                                &path,
+                                ignore_set,
+                                pending,
+                                first_event,
+                                last_event,
+                            );
+                        }
+                        pending.insert(path);
                     }
                     Class::Ignore => {}
                 }
@@ -481,6 +717,52 @@ fn prune_git_and_agentrec(entry: &ignore::DirEntry) -> bool {
     !matches!(entry.file_name().to_str(), Some(".git") | Some(".agentrec"))
 }
 
+/// Proactively stage whatever a newly-observed directory currently
+/// contains. See the call site's comment in `apply_watch_result` for why
+/// this exists — a real Linux/inotify event-loss gap for content written
+/// into a brand-new directory before its watch is armed. Walks `dir` only
+/// (never `root` — bounded to the one new subtree), running every found
+/// file through the same `classify` every other event goes through, so
+/// nothing this walk would otherwise exclude (denylist, gitignore) gets
+/// staged under different rules than normal events.
+///
+/// Called from both platform arms at the call site (see the comment there):
+/// Linux on `Create(_) | Modify(Name(_))`, macOS/non-Linux on
+/// `Modify(Name(_))` ONLY — residuals round, gated on the FSEvents
+/// rename-kind measurement at
+/// docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md
+/// (VERDICT: CLEAN). Previously `#[cfg(target_os = "linux")]`-only
+/// (honesty-round gate finding 1) because gating macOS admission on
+/// `Create(_)` fabricated; the rename-only gate does not reopen that —
+/// `Create(_)` stays excluded on non-Linux platforms.
+fn admit_existing_contents(
+    root: &Path,
+    dir: &Path,
+    ignore_set: &IgnoreSet,
+    pending: &mut HashSet<PathBuf>,
+    first_event: &mut Option<Instant>,
+    last_event: &mut Option<Instant>,
+) {
+    for entry in ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .parents(false)
+        .filter_entry(prune_git_and_agentrec)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            continue; // recurse only; only files are staged directly
+        }
+        let p = entry.into_path();
+        if classify(root, &p, ignore_set) == Class::Watch {
+            let at = Instant::now();
+            first_event.get_or_insert(at);
+            *last_event = Some(at);
+            pending.insert(p);
+        }
+    }
+}
+
 impl IgnoreSet {
     fn build(root: &Path) -> Self {
         let mut matchers = vec![];
@@ -534,6 +816,35 @@ impl IgnoreSet {
             }
         }
         false
+    }
+}
+
+/// Rebuild the `IgnoreSet` iff `dirty` is set, clearing it in the same call.
+/// Exists so the loop tick's rate rule — at most one full-repo walk per
+/// `POLL` — has a unit-reachable target: `run`'s loop body itself is not
+/// unit-testable, which is exactly how the unconsumed-flag bug survived a
+/// prior round undetected.
+fn maybe_rebuild(dirty: &mut bool, root: &Path) -> Option<IgnoreSet> {
+    if !*dirty {
+        return None;
+    }
+    *dirty = false;
+    Some(IgnoreSet::build(root))
+}
+
+/// Persist + log a completed ignore-set rebuild (Phase 2 of the
+/// rebuild-gate fix — this class shipped twice partly because nothing
+/// reported whether a reload ever happened). Bumps `state.json`'s
+/// `ignore_rebuilds`/`last_ignore_rebuild_ms` and prints one stderr line
+/// naming the matcher count, mirroring `drain_io_failures`'s
+/// read-mutate-log-write shape. Called only from the `Some(fresh)` arm of
+/// `maybe_rebuild`'s caller, so the increment tracks REBUILDS, never events.
+fn log_ignore_rebuild(root: &Path, matcher_count: usize, wall_ms: u64) {
+    let mut state = read_state(root);
+    record_ignore_rebuild(&mut state, wall_ms);
+    eprintln!("agentrec: ignore rules reloaded ({matcher_count} matchers)");
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist ignore-rebuild state: {e}");
     }
 }
 
@@ -654,36 +965,68 @@ impl Recorder {
                 continue; // directory mtime churn is not a file change
             }
 
-            // Compute the `after` snapshot.
-            let (after, snapshotted, withheld) = if secret {
-                (None, false, true) // never snapshotted (D31)
+            // Compute the `after` snapshot. The 4th element is
+            // `FileEntry::skipped_reason` (SR-B): which of the three genuinely
+            // different causes made `snapshotted` false. SR-C: whenever the
+            // content bytes were actually read (over-cap, I/O-failed-write),
+            // a hash IS computable even though nothing was stored — record it
+            // as `after` so `modified-since` doesn't false-positive forever on
+            // an unmodified skipped file. `unreadable` never has bytes, so its
+            // `after` honestly stays `None` — never fabricate a hash we don't
+            // have.
+            let (after, snapshotted, withheld, skip_cause) = if secret {
+                (None, false, true, None) // never snapshotted (D31)
             } else if deleted {
-                (None, true, false) // delete: no content, but not "skipped"
+                (None, true, false, None) // delete: no content, but not "skipped"
             } else if is_symlink {
                 // Not followed (AC B5): snapshot the link *target string*, so the
                 // symlink change is recorded without reading the pointed-to file.
-                match std::fs::read_link(abs) {
-                    Ok(target) => (
-                        self.store.put(target.to_string_lossy().as_bytes()),
-                        true,
-                        false,
-                    ),
-                    Err(_) => (None, false, false),
-                }
+                symlink_change(&self.store, std::fs::read_link(abs))
             } else {
                 match std::fs::read(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
                         match self.store.put_result(&bytes) {
-                            PutResult::Stored(h) => (Some(h), true, false),
-                            PutResult::OverCap => (None, false, false), // over cap → skipped
+                            PutResult::Stored(h) => (Some(h), true, false, None),
+                            // Unreachable given the `<= MAX_SNAPSHOT_BYTES` guard
+                            // above (store.put_result's own over-cap check can
+                            // never trip here) — handled anyway, symmetrically
+                            // with the pre-check arm below, per SR-B/C.
+                            PutResult::OverCap => (
+                                Some(hash_bytes(&bytes)),
+                                false,
+                                false,
+                                Some(skip_reason::OVER_CAP.to_string()),
+                            ),
                             PutResult::IoError(cause) => {
                                 self.io_failures.push((rel_str.clone(), cause));
-                                (None, false, false) // write failed → skipped
+                                // The write failed, but the bytes were read
+                                // successfully — the content hash is still
+                                // honestly knowable (SR-C).
+                                (
+                                    Some(hash_bytes(&bytes)),
+                                    false,
+                                    false,
+                                    Some(skip_reason::IO_FAILED.to_string()),
+                                )
                             }
                         }
                     }
-                    Ok(_) => (None, false, false), // over cap → skipped
-                    Err(_) => (None, false, false), // unreadable → skipped
+                    // Over cap: bytes were read (hash computable) but never
+                    // stored (SR-C).
+                    Ok(bytes) => (
+                        Some(hash_bytes(&bytes)),
+                        false,
+                        false,
+                        Some(skip_reason::OVER_CAP.to_string()),
+                    ),
+                    // Unreadable: no bytes were ever obtained, so no hash can
+                    // be honestly recorded (SR-C — never fabricate one).
+                    Err(_) => (
+                        None,
+                        false,
+                        false,
+                        Some(skip_reason::UNREADABLE.to_string()),
+                    ),
                 }
             };
 
@@ -720,6 +1063,7 @@ impl Recorder {
                 withheld,
                 baseline_unknown,
                 deleted,
+                skip_reason: skip_cause,
             });
         }
         out
@@ -730,8 +1074,10 @@ impl Recorder {
         let after = self.after.get(&obs.path).cloned().flatten();
         let before = obs.before_hash.clone();
         // `op` keys on whether the file is actually gone, NOT on `after.is_none()`
-        // — an over-cap or unreadable *modify* has no `after` snapshot yet still
-        // exists, and must never be logged as a delete.
+        // — an unreadable *modify* has no `after` snapshot yet still exists
+        // (an over-cap modify DOES have an `after` hash since SR-C — content was
+        // read even though it wasn't stored), and neither must ever be logged
+        // as a delete.
         let op = if obs.deleted {
             "delete"
         } else if before.is_none() && !obs.baseline_unknown {
@@ -747,7 +1093,39 @@ impl Recorder {
             skipped: !obs.snapshotted && !obs.withheld,
             withheld: obs.withheld,
             baseline_unknown: obs.baseline_unknown,
+            skipped_reason: obs.skip_reason.clone(),
         }
+    }
+}
+
+/// Classify a symlink's `read_link` outcome into `stage`'s
+/// `(after, snapshotted, withheld, skip_reason)` shape. Pulled out to a
+/// standalone, deterministically-testable function rather than inlined:
+/// the failure arm is a TOCTOU race (the dirent can vanish, or change kind,
+/// in the gap between the `symlink_metadata` check above and this
+/// `read_link` call) that real threads can't be made to reliably win in a
+/// test, but the classification logic itself — a `read_link` error is the
+/// `unreadable` cause, exactly like a regular file's unreadable `fs::read`
+/// (finding #2: previously left `skip_reason: None`, rendering as the
+/// unclassified "reason unrecorded" instead of naming the plainly-known
+/// cause) — is ordinary pure logic that doesn't need the race to verify.
+fn symlink_change(
+    store: &BlobStore,
+    read_result: std::io::Result<std::path::PathBuf>,
+) -> (Option<String>, bool, bool, Option<String>) {
+    match read_result {
+        Ok(target) => (
+            store.put(target.to_string_lossy().as_bytes()),
+            true,
+            false,
+            None,
+        ),
+        Err(_) => (
+            None,
+            false,
+            false,
+            Some(skip_reason::UNREADABLE.to_string()),
+        ),
     }
 }
 
@@ -1529,6 +1907,14 @@ fn acquire_lock(root: &Path) -> Result<std::fs::File, String> {
     }
     let mut state = read_state(root);
     state.pid = std::process::id();
+    // Honesty round: stamp a fresh epoch identity alongside the pid. Pid
+    // alone is unsafe here — it is reused by the OS over a long-lived
+    // machine, so a later epoch could otherwise inherit a dead epoch's
+    // `state.epoch_ignore_rebuilds` count (see `State::epoch_nonce`'s doc).
+    // `agentrec_core::id::ulid()` is the same collision-resistant machinery
+    // already used for turn ids — reused here rather than inventing a
+    // second id scheme.
+    state.epoch_nonce = agentrec_core::id::ulid();
     // D2: persistence failure here is fatal — an "acquired" lock the daemon
     // can't record its own pid into would still function (the flock IS the
     // gate), but silently leaving a stale/wrong pid on disk would mislead
@@ -1542,12 +1928,49 @@ fn release_lock(root: &Path) {
     let mut state = read_state(root);
     if state.pid == std::process::id() {
         state.pid = 0;
+        // Clear the epoch nonce alongside the pid — same sentinel shape as
+        // `pid = 0` — so a reader (`current_epoch_reloads`) never mistakes
+        // this epoch's last reload count for still-current once the daemon
+        // has genuinely stopped.
+        state.epoch_nonce.clear();
+        // Clear the watcher-armed nonce too — a stopped daemon must never
+        // leave a value a later reader (`wait_for_live_daemon`) could read
+        // as "armed" for its own (already-dead) epoch. In practice this is
+        // belt-and-suspenders: a dead epoch's nonce can never equal a NEW
+        // epoch's fresh `epoch_nonce` anyway (see `watcher_armed_nonce`'s
+        // field doc), but a clean stop should not leave stale bookkeeping
+        // lying around when there's an obvious moment to clear it.
+        state.watcher_armed_nonce.clear();
         if let Err(e) = write_state(root, &state) {
             eprintln!("agentrec: warning: failed to clear pid in state.json: {e}");
         }
     }
     // The flock itself releases when `_lock`'s `File` drops at the end of
     // `run()` (fd close) — nothing to do here for the actual mutex.
+}
+
+/// Stamp `state.watcher_armed_nonce = state.epoch_nonce`, marking the CURRENT
+/// epoch's watcher as actually listening (residuals round, Phase 4). Must be
+/// called only after `.watch()` has returned `Ok` — calling it earlier would
+/// make `wait_for_live_daemon` believe the watcher is armed before it is,
+/// reopening the exact race this exists to close.
+///
+/// Extracted as its own function — same shape as `acquire_lock`/
+/// `release_lock` — specifically so it is unit-testable in isolation; an
+/// inline stamp at the `run()` call site would not be (there is no seam to
+/// drive it from a unit test without spawning a real watcher).
+///
+/// Keying on the epoch nonce rather than a bare bool is load-bearing: a
+/// stale `watcher_armed_nonce` left behind by a crashed prior run still
+/// names that DEAD epoch's nonce, which can never equal a fresh epoch's
+/// nonce (`acquire_lock` always mints a new one) — so the stale value reads
+/// as "not armed for THIS epoch" with no separate reset needed.
+fn stamp_watcher_armed(root: &Path) {
+    let mut state = read_state(root);
+    state.watcher_armed_nonce = state.epoch_nonce.clone();
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to stamp watcher-armed nonce in state.json: {e}");
+    }
 }
 
 /// Non-blocking liveness probe (D2) for `doctor`: if we can acquire the lock
@@ -1619,16 +2042,49 @@ mod tests {
     // B+ / D29: nested `.gitignore` precedence follows git's rules — deeper
     // files override shallower ones, `!` re-includes, and a matched directory
     // ignores everything beneath it.
+    //
+    // `git init` here is hygiene, not a vacuity fix, and the widely-repeated
+    // claim that this test "passed vacuously in a non-git tempdir" is simply
+    // FALSE — measured, not argued. `matchers.len()` is **2** in all four
+    // cells: {pre-D29 `build` body, post-D29} × {`git init`, none}, and every
+    // precedence assertion passes in all four. The claim is also self-
+    // refuting: it rests on the walk still *yielding* both `.gitignore` files
+    // without git, which is exactly the condition under which matchers get
+    // collected and the assertions are real.
+    //
+    // What `require_git` genuinely governs is whether ignore rules prune the
+    // *traversal* — which is why `git init` belongs here (it makes the fixture
+    // match production) and why it is load-bearing in the live-daemon tests,
+    // where a matcher-less walk really would prove nothing. The precondition
+    // assert below states what this test depends on so the question never has
+    // to be re-litigated from prose.
     #[test]
     fn nested_gitignore_precedence() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
         std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/.gitignore"), "!keep.log\n*.tmp\n").unwrap();
         std::fs::create_dir_all(root.join("build")).unwrap();
 
         let set = IgnoreSet::build(root);
+        eprintln!(
+            "nested_gitignore_precedence: matchers.len() = {}",
+            set.matchers.len()
+        );
+        assert!(
+            set.matchers.len() >= 2,
+            "expected at least the root and sub/ matchers, got {}",
+            set.matchers.len()
+        );
         let ig = |p: &str, is_dir: bool| set.is_ignored(&root.join(p), is_dir);
 
         assert!(ig("a.log", false), "root *.log ignored");
@@ -1757,6 +2213,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             deleted,
+            skip_reason: None,
         }
     }
 
@@ -1787,6 +2244,239 @@ mod tests {
         let entry = rec.resolve(&change("c.rs", None, true, false));
         assert_eq!(entry.op, "create");
         assert_eq!(entry.after.as_deref(), Some("sha256:new"));
+    }
+
+    // SR2 (over_cap producer) + SR-C (after-hash honesty gain): a real
+    // over-cap file, staged through the actual `Recorder::stage` production
+    // path (not a synthetic `ChangeObs`) — bytes ARE read here, so the
+    // resulting `FileEntry` must carry `skipped_reason: over_cap` AND a real
+    // `after` hash matching the content, even though the blob itself was
+    // never stored (the store never saw it — RED-relevant: pre-SR-C this
+    // asserted `entry.after == None`, which made `modified_since` a
+    // permanent false positive for every never-modified over-cap file).
+    #[test]
+    fn stage_over_cap_sets_reason_and_recoverable_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let content = vec![b'x'; MAX_SNAPSHOT_BYTES + 1];
+        let file = root.join("huge.bin");
+        std::fs::write(&file, &content).unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+        assert_eq!(
+            changes.len(),
+            1,
+            "must still produce an observation: {changes:?}"
+        );
+        assert!(!changes[0].snapshotted, "over cap must not be snapshotted");
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::OVER_CAP),
+            "changes: {:?}",
+            changes[0]
+        );
+
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(entry.skipped_reason.as_deref(), Some(skip_reason::OVER_CAP));
+        let expected_hash = hash_bytes(&content);
+        assert_eq!(
+            entry.after.as_deref(),
+            Some(expected_hash.as_str()),
+            "a computable hash must be recorded even though nothing was stored"
+        );
+        // Precondition this test depends on: the blob genuinely never landed
+        // in the store (the honesty gain is recording a KNOWN hash, not
+        // claiming content was captured).
+        let store2 = BlobStore::new(root.join(".agentrec/objects"));
+        assert!(
+            store2.get(&expected_hash).is_err(),
+            "over-cap content must never actually be stored"
+        );
+    }
+
+    // SR2 (unreadable producer): no bytes were ever obtained, so `after`
+    // must honestly stay `None` — never fabricate a hash for content that
+    // was never read (SR-C's other half).
+    #[cfg(unix)]
+    #[test]
+    fn stage_unreadable_sets_reason_and_no_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let file = root.join("secret.rs");
+        std::fs::write(&file, b"can't read me").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(file.clone());
+        let changes = recorder.stage(&paths);
+
+        // restore perms so tempdir cleanup can remove it
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert!(!changes[0].snapshotted);
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::UNREADABLE),
+            "changes: {:?}",
+            changes[0]
+        );
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(
+            entry.skipped_reason.as_deref(),
+            Some(skip_reason::UNREADABLE)
+        );
+        assert_eq!(
+            entry.after, None,
+            "no bytes were ever read — a hash must never be fabricated"
+        );
+    }
+
+    // Finding #2 (symlink producer, previously unclassified): a symlink
+    // whose `read_link` fails (a TOCTOU race against the `symlink_metadata`
+    // check that decided `is_symlink` — the dirent can vanish or change
+    // kind in the gap between the two calls) must set `unreadable`, not
+    // leave `skipped_reason: None` (which rendered as "reason unrecorded"
+    // even though the cause — no bytes obtained — is exactly the same as
+    // the regular-file unreadable case above). The race itself can't be
+    // deterministically won against a real filesystem in a test, so this
+    // exercises `symlink_change` — the actual production classification
+    // function `stage` calls — directly with a synthetic `read_link`
+    // error, rather than asserting on a flaky real race.
+    #[test]
+    fn stage_symlink_unreadable_sets_unreadable_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path().join("objects"));
+
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "race: link vanished");
+        let (after, snapshotted, withheld, skip_cause) = symlink_change(&store, Err(err));
+
+        assert_eq!(
+            after, None,
+            "no bytes were ever read for a failed read_link — a hash must never be fabricated"
+        );
+        assert!(!snapshotted);
+        assert!(!withheld);
+        assert_eq!(skip_cause.as_deref(), Some(skip_reason::UNREADABLE));
+    }
+
+    // SR2 (io_failed producer): the write itself fails, but the bytes WERE
+    // read successfully first — so a hash is knowable here too, same as the
+    // over-cap case (a judgment call: the task text only worked through
+    // over_cap/unreadable explicitly, but io_failed's bytes are equally in
+    // hand at the point `put_result` returns `IoError`).
+    #[cfg(unix)]
+    #[test]
+    fn stage_io_failed_sets_reason_and_recoverable_hash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        // store dir does not exist yet; `locked` will be made read-only so
+        // `put_result`'s `create_dir_all` of the fan-out dir must fail
+        // (mirrors `store::tests::io_error_is_typed`).
+        let store_dir = locked.join("store");
+        let store = BlobStore::new(&store_dir);
+        let mut recorder = Recorder::scan(&root, store);
+
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let content = b"some real content".to_vec();
+        let file = root.join("a.rs");
+        std::fs::write(&file, &content).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+
+        // restore perms first so tempdir cleanup can remove `locked`
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert!(!changes[0].snapshotted);
+        assert_eq!(
+            changes[0].skip_reason.as_deref(),
+            Some(skip_reason::IO_FAILED),
+            "changes: {:?}",
+            changes[0]
+        );
+        assert_eq!(
+            recorder.io_failures.len(),
+            1,
+            "must record the D35 operational failure too"
+        );
+
+        let entry = recorder.resolve(&changes[0]);
+        assert!(entry.skipped);
+        assert_eq!(
+            entry.skipped_reason.as_deref(),
+            Some(skip_reason::IO_FAILED)
+        );
+        assert_eq!(
+            entry.after.as_deref(),
+            Some(hash_bytes(&content).as_str()),
+            "the write failed, but the bytes were read — a hash is still knowable"
+        );
+    }
+
+    // SR5: the false-positive fix, end to end at the producer level — an
+    // over-cap file that is NEVER modified after being recorded must not be
+    // reported as `modified_since` (the exact bug: `after` used to be `None`
+    // forever, so `current_hash != None` was always true). This exercises
+    // the real producer's output against `modified_since`'s actual
+    // comparison rule (mirrored inline — `readcmds::modified_since` is
+    // private to a different module — its rule is a one-line hash
+    // comparison, asserted identically to its real implementation).
+    #[test]
+    fn sr5_over_cap_after_hash_makes_modified_since_false_for_unmodified_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let content = vec![b'z'; MAX_SNAPSHOT_BYTES + 1];
+        let file = root.join("huge.bin");
+        std::fs::write(&file, &content).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(file);
+        let changes = recorder.stage(&paths);
+        let entry = recorder.resolve(&changes[0]);
+        assert!(
+            entry.skipped,
+            "precondition: this entry is over-cap-skipped"
+        );
+
+        // The file on disk is untouched since recording — re-hash it exactly
+        // as `readcmds::modified_since` does for the live worktree.
+        let current_hash = Some(hash_bytes(&content));
+        let modified_since = current_hash.as_deref() != entry.after.as_deref();
+        assert!(
+            !modified_since,
+            "an unmodified over-cap file must not be reported as modified: after={:?} current={:?}",
+            entry.after, current_hash
+        );
     }
 
     // Item 2 (non-UTF8 path handling): a path whose raw OS bytes are not
@@ -1884,6 +2574,118 @@ mod tests {
         assert!(
             second.is_ok(),
             "a fresh acquire after the holder released must succeed"
+        );
+    }
+
+    // Honesty round: epoch identity was previously the pid, and pid reuse
+    // (real over a long-lived machine, same recycling class `doctor`'s
+    // liveness check already handles) let a later daemon epoch inherit a
+    // dead epoch's stale reload count. `acquire_lock` must stamp a fresh,
+    // distinct `epoch_nonce` every time an epoch begins, and `release_lock`
+    // must clear it back to empty on a clean stop — mirroring the existing
+    // `pid = 0` sentinel — so a reader never mistakes a stopped daemon's
+    // last epoch for the current one. Neuter: remove the `epoch_nonce`
+    // stamp/clear lines → RED (nonce stays empty forever, or never clears).
+    #[test]
+    fn acquire_lock_stamps_a_fresh_epoch_nonce_and_release_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let first_nonce = {
+            let _first = acquire_lock(root).expect("first acquire succeeds");
+            let mut state = read_state(root);
+            assert!(
+                !state.epoch_nonce.is_empty(),
+                "acquire_lock must stamp a non-empty epoch nonce"
+            );
+            // Residuals round, Phase 4: simulate the watcher having armed
+            // for this epoch (the real call site is `run()`, unreachable
+            // from a unit test — `stamp_watcher_armed` itself is exercised
+            // directly in `watcher_arm_stamp_keys_on_current_epoch_nonce`
+            // below). Seeding it here is what makes THIS test able to prove
+            // `release_lock` clears it, not just `epoch_nonce`.
+            state.watcher_armed_nonce = state.epoch_nonce.clone();
+            write_state(root, &state).unwrap();
+            state.epoch_nonce
+        };
+        // `_first` (the flock-holding File) has already dropped by now, but
+        // `release_lock`'s state.json cleanup is a distinct step `run()`
+        // calls explicitly on a clean stop — invoke it directly here.
+        release_lock(root);
+        let stopped = read_state(root);
+        assert_eq!(
+            stopped.pid, 0,
+            "release_lock must clear pid on a clean stop"
+        );
+        assert!(
+            stopped.watcher_armed_nonce.is_empty(),
+            "release_lock must also clear the watcher-armed nonce — a stopped daemon must \
+             never leave a value a later reader could mistake for this epoch still being armed"
+        );
+        assert!(
+            stopped.epoch_nonce.is_empty(),
+            "release_lock must also clear the epoch nonce — a stopped daemon must never let \
+             a later reader treat the last epoch's reload count as still current"
+        );
+
+        let _second = acquire_lock(root).expect("second acquire succeeds after release");
+        let second = read_state(root);
+        assert!(!second.epoch_nonce.is_empty());
+        assert_ne!(
+            second.epoch_nonce, first_nonce,
+            "each new epoch must get its own distinct nonce"
+        );
+    }
+
+    // Residuals round, Phase 4: `stamp_watcher_armed` must key on the
+    // CURRENT `epoch_nonce`, not a bare bool — a stale `watcher_armed_nonce`
+    // left by a crashed prior epoch must never read as "armed" for a fresh
+    // epoch that hasn't actually stamped it yet. Calls the REAL
+    // `stamp_watcher_armed` (not a re-implementation or a simulation).
+    // Neuter 1: make the helper write a constant string instead of
+    // `state.epoch_nonce` → REDs the final equality assertion (a constant
+    // never equals the real nonce). Neuter 2: make the helper a no-op →
+    // REDs (the armed nonce stays the stale PREVIOUS epoch's value forever).
+    // Note: this test does NOT cover the `run()` call site invoking the
+    // helper after `.watch()` — that deletion is covered only by the
+    // integration test `live_daemon_reports_watcher_armed`.
+    #[test]
+    fn watcher_arm_stamp_keys_on_current_epoch_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // Seed a state carrying a PREVIOUS epoch's armed nonce, as a
+        // crashed prior run would leave behind.
+        let mut state = State {
+            epoch_nonce: "previous-epoch-nonce".to_string(),
+            watcher_armed_nonce: "previous-epoch-nonce".to_string(),
+            ..State::default()
+        };
+        write_state(root, &state).unwrap();
+
+        // A fresh epoch begins: acquire_lock stamps a brand-new nonce.
+        let _lock = acquire_lock(root).expect("acquire succeeds");
+        state = read_state(root);
+        let fresh_nonce = state.epoch_nonce.clone();
+        assert_ne!(
+            fresh_nonce, "previous-epoch-nonce",
+            "acquire_lock must mint a distinct nonce for the new epoch"
+        );
+        assert_ne!(
+            state.watcher_armed_nonce, fresh_nonce,
+            "before the watcher arms, the armed nonce must NOT equal the fresh epoch's nonce \
+             — it is still the stale previous epoch's value, which is exactly why it must not \
+             equal the new one"
+        );
+
+        stamp_watcher_armed(root);
+
+        let armed = read_state(root);
+        assert_eq!(
+            armed.watcher_armed_nonce, fresh_nonce,
+            "stamp_watcher_armed must set watcher_armed_nonce to the CURRENT epoch_nonce"
         );
     }
 
@@ -2218,6 +3020,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 deleted: false,
+                skip_reason: None,
             },
             ChangeObs {
                 path: "src/b.rs".into(),
@@ -2226,6 +3029,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 deleted: false,
+                skip_reason: None,
             },
         ];
         engine.observe_changes(500, &changes);
@@ -2236,6 +3040,466 @@ mod tests {
         assert_eq!(closed[0].grade, "rich");
         assert_eq!(closed[0].boundary, "git");
         assert_eq!(closed[0].files.len(), 2);
+    }
+
+    // ---- honesty-round gate finding: admit_existing_contents event-kind gate --
+
+    // The blocking finding from the honesty-round gate review of `034c883`:
+    // `admit_existing_contents` was called whenever the event path merely
+    // `is_dir()`, with no look at what KIND of event this was. A metadata-only
+    // event on an EXISTING, unchanged directory (`touch`, `chmod`, an xattr
+    // write) walked its whole subtree and staged every file in it as
+    // `op: "modify"` — a live, reproducible fabrication (verified against the
+    // real binary this round: `touch src` on an untouched repo claimed 3
+    // files "modified"; with an agent bracket open, `blame` attributed those
+    // files to the agent). This test drives `apply_watch_result` directly
+    // with a synthetic `Modify(Metadata(_))` event — bypassing the real
+    // watcher entirely — so it is deterministic regardless of platform/OS
+    // event-delivery quirks (FSEvents vs inotify): a pure unit test of the
+    // gate itself, independent of the `admitted_dirs` de-dup test below.
+    //
+    // Left un-gated (unlike its sibling below): still true and meaningful on
+    // Linux (the `kind` gate this pins is compiled in and must still exclude
+    // `Modify(Metadata(_))`), but has no discriminating power on macOS since
+    // honesty-round gate finding 1 — there the whole admission action is
+    // `#[cfg(target_os = "linux")]`'d out, so this passes vacuously
+    // regardless of event kind. That is expected, not a gap: macOS's real
+    // regression coverage for the fabrication this test names is the
+    // integration-level `metadata_only_event_on_directory_that_predates_
+    // daemon_stages_nothing` (needs a real, pre-existing-at-daemon-start
+    // directory and real FSEvents delivery — unreproducible through this
+    // synthetic single-event harness).
+    #[test]
+    fn metadata_only_event_does_not_admit_existing_directory_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        // Content already on disk — nothing about it is new; the event below
+        // is the ONLY thing the daemon ever observes for this directory.
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        tx.send(Ok(notify::Event::new(EventKind::Modify(
+            ModifyKind::Metadata(notify::event::MetadataKind::Any),
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+
+        // The directory path itself is still queued (it IS a real,
+        // Watch-classified mutation of some kind — `Recorder::stage` drops
+        // bare directory entries at flush time, see its `is_dir { continue }`
+        // arm) — but its CONTENTS must never have been walked.
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a metadata-only event admitted srcdir/a.rs into pending: {pending:?}"
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/b.rs")),
+            "a metadata-only event admitted srcdir/b.rs into pending: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a metadata-only event must not mark the directory as admitted: {admitted_dirs:?}"
+        );
+    }
+
+    // Residuals round, Decisions log #2 pin: un-cfg'ing `admit_existing_contents`
+    // for macOS (this round closed the moved-in-directory silent-loss hole)
+    // must NOT resurrect a `Create(_)`-gated macOS admission — that was
+    // measured fabricating 2/2 at `f4bca8a` and re-measured fabricating 2/10
+    // at this round's Phase 1 spike (see
+    // docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md).
+    // macOS's gate admits on `Modify(Name(_))` ONLY; a synthetic
+    // `Create(Folder)` for a real, populated, pre-existing directory here
+    // must stage nothing and leave `admitted_dirs` empty — the direct
+    // discriminator proving the platform split, not a blanket un-cfg, is
+    // what protects macOS post-fix.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn create_kind_does_not_admit_on_macos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+        let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
+        tx.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+        drain_watch_events(
+            &rx,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a Create(Folder) event admitted srcdir/a.rs on macOS: {pending:?}"
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/b.rs")),
+            "a Create(Folder) event admitted srcdir/b.rs on macOS: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a Create(Folder) event must not mark the directory as admitted on macOS: \
+             {admitted_dirs:?}"
+        );
+    }
+
+    // A second, independently measured fabrication source the event-kind gate
+    // alone does not close: measured live on macOS/FSEvents in the fix round
+    // that introduced this test (3 of 5 trials, no bracket, no hook, no other
+    // watched activity involved), the SAME directory can receive a further
+    // `Create(Folder)` event long after its real creation — a delayed
+    // replay, not new content — alongside an ordinary later `touch`'s
+    // genuine `Modify(Metadata)`. `admitted_dirs` closes this: once a
+    // directory has been walked once this daemon run, a further
+    // `Create`/`Modify(Name)` event for the SAME path is not re-admitted.
+    // Deterministic here by construction — two synthetic `Create(Folder)`
+    // events for the same path, no reliance on real OS event timing.
+    //
+    // Linux-only (honesty-round gate finding 1): that 3/5-macOS observation
+    // is now moot ON macOS specifically — finding 1 established that the
+    // whole admission ACTION — the thing `admitted_dirs` dedups — is
+    // `#[cfg(target_os = "linux")]`'d out there, so the first `Create
+    // (Folder)` in this test would no longer admit anything on macOS
+    // either; the assertion below (`pending.contains(.../a.rs)` after the
+    // FIRST event) would be false on macOS post-fix, not because the de-dup
+    // regressed but because admission itself never runs there. The de-dup
+    // mechanism itself still matters on Linux (a delayed-replay-style
+    // duplicate `Create(Folder)` is not something inotify is documented to
+    // rule out either), so testing it only makes sense on the one platform
+    // where it's compiled in.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_dirs_prevents_a_second_admission_of_the_same_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("srcdir")).unwrap();
+        std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // First Create(Folder): a genuine first-ever observation — must admit.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("srcdir/a.rs")),
+            "the first Create(Folder) for a never-seen directory must admit its contents: \
+             {pending:?}"
+        );
+
+        // Simulate the intervening flush that would normally clear `pending`.
+        pending.clear();
+
+        // Second Create(Folder) for the SAME path — the measured replay.
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        tx2.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("srcdir"))))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !pending.contains(&root.join("srcdir/a.rs")),
+            "a SECOND Create(Folder) for an already-admitted directory re-staged its contents: \
+             {pending:?}"
+        );
+    }
+
+    // Honesty-round gate finding 2: `IN_MOVED_FROM` maps to
+    // `Modify(Name(RenameMode::From))`, not `Remove(Folder)`
+    // (`notify-6.1.1/src/inotify.rs:222-231`) — before this fix, the
+    // `admitted_dirs` clear only fired on `Remove(Folder)`, so a directory
+    // renamed away kept its stale entry. Reviewer's deterministic repro:
+    // admit `build` -> rename to `build.bak` -> recreate `build` containing
+    // `build/new.rs` -> the `Create(Folder)` for the recreated `build`
+    // arrives, `admitted_dirs.insert` returns `false` (the entry from the
+    // original admission is still present), admission is silently
+    // suppressed, and `build/new.rs` is never staged — reopening the
+    // original Linux event-loss class for the common
+    // `mv dir dir.bak && mkdir dir` pattern. Deterministic by construction:
+    // three synthetic events (`Create(Folder)`, `Modify(Name(From))`,
+    // `Create(Folder)` again, all for `build`), no reliance on real OS
+    // rename delivery. Linux-only for the same reason as its sibling above
+    // — the admission action this pins is compiled out on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admitted_dirs_re_admits_a_directory_renamed_away_and_recreated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/old.rs"), "fn old() {}").unwrap();
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // First Create(Folder): a genuine first-ever observation — admits.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("build/old.rs")),
+            "the first Create(Folder) must admit build/old.rs: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.contains(&root.join("build")),
+            "build must be marked admitted after its first Create(Folder): {admitted_dirs:?}"
+        );
+        pending.clear();
+
+        // Rename `build` away on disk, mirroring the real `mv` this test
+        // reproduces, then deliver the `IN_MOVED_FROM`-shaped event
+        // (`Modify(Name(From))`) for the OLD path.
+        std::fs::rename(root.join("build"), root.join("build.bak")).unwrap();
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        tx2.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !admitted_dirs.contains(&root.join("build")),
+            "a directory renamed away must be cleared from admitted_dirs so a genuine \
+             recreation at the same path is re-admitted: {admitted_dirs:?}"
+        );
+        pending.clear();
+
+        // Recreate `build` with different contents — the reviewer's repro
+        // shape — and deliver the recreation's Create(Folder).
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/new.rs"), "fn new() {}").unwrap();
+        let (tx3, rx3) = channel::<Result<notify::Event, notify::Error>>();
+        tx3.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(root.join("build"))))
+            .unwrap();
+        drain_watch_events(
+            &rx3,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&root.join("build/new.rs")),
+            "a directory renamed away and recreated at the same path must still be admitted: \
+             {pending:?}"
+        );
+    }
+
+    // Residuals round, rename-out safety: a `Modify(Name(RenameMode::From))`
+    // for a path that does not (yet) resolve on disk must not walk anything
+    // — the walk itself yields nothing regardless (`ignore::WalkBuilder`
+    // over a nonexistent path produces an error entry that `.flatten()`
+    // silently swallows), so "nothing staged" ALONE cannot discriminate a
+    // regression here — AND must not poison `admitted_dirs` with a bogus
+    // entry for a path that was never really admitted. Dropping the
+    // `is_dir()` conjunct inserts the nonexistent path into `admitted_dirs`
+    // anyway, which then SUPPRESSES the legitimate follow-up admission when
+    // the real directory materializes moments later at the same path
+    // (`insert` returns `false` for an already-present entry).
+    //
+    // How many discriminators that gives you is PLATFORM-DEPENDENT, and an
+    // earlier revision of this comment claimed "two independent
+    // discriminators" unconditionally — false on macOS, measured at the
+    // round's gate. The `admitted_dirs` clear for any `Modify(Name(_))`
+    // (see `apply_watch_result`) runs BEFORE this gate, and macOS's
+    // follow-up leg is itself `Modify(Name(RenameMode::To))` — so on macOS
+    // that clear wipes the leg-1 poison and `insert` returns `true`, and the
+    // staging assertion passes even under the neuter. Only the `is_empty`
+    // assertion discriminates here. On Linux the follow-up is
+    // `Create(Folder)`, which never touches that clear, so `insert` returns
+    // `false` and BOTH assertions discriminate. The neuter turns this test
+    // RED on both platforms either way — but do not rely on the staging
+    // assertion alone to catch it on macOS.
+    //
+    // The follow-up event kind is platform-split: Linux's gate additionally admits on
+    // `Create(_)`, so a plain `mkdir`-shaped follow-up exercises the same
+    // gate Linux uses in production; macOS's gate excludes `Create(_)` by
+    // design (`create_kind_does_not_admit_on_macos` pins that), so the
+    // follow-up there must be the rename-TO kind macOS actually receives.
+    #[test]
+    fn rename_out_of_nonexistent_path_does_not_poison_admitted_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ignore_set = IgnoreSet::build(&root);
+
+        let ghost = root.join("ghost");
+        assert!(!ghost.exists(), "ghost must not exist yet: {ghost:?}");
+
+        let mut pending = HashSet::new();
+        let mut last_event = None;
+        let mut first_event = None;
+        let mut git_hit = false;
+        let mut admitted_dirs = HashSet::new();
+
+        // Leg 1: rename-out of a path that never existed here.
+        let (tx1, rx1) = channel::<Result<notify::Event, notify::Error>>();
+        tx1.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(ghost.clone())))
+            .unwrap();
+        drain_watch_events(
+            &rx1,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            !pending.iter().any(|p| p.starts_with(&ghost) && p != &ghost),
+            "a rename-out of a nonexistent path staged content under it: {pending:?}"
+        );
+        assert!(
+            admitted_dirs.is_empty(),
+            "a rename-out of a nonexistent path must not poison admitted_dirs: \
+             {admitted_dirs:?}"
+        );
+
+        // The path now genuinely materializes — the follow-up admission
+        // MUST stage its contents.
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(ghost.join("new.rs"), "fn new() {}").unwrap();
+
+        let (tx2, rx2) = channel::<Result<notify::Event, notify::Error>>();
+        #[cfg(target_os = "linux")]
+        tx2.send(Ok(notify::Event::new(EventKind::Create(
+            notify::event::CreateKind::Folder,
+        ))
+        .add_path(ghost.clone())))
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        tx2.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::To,
+        )))
+        .add_path(ghost.clone())))
+            .unwrap();
+        drain_watch_events(
+            &rx2,
+            &root,
+            &ignore_set,
+            &mut pending,
+            &mut last_event,
+            &mut first_event,
+            &mut git_hit,
+            &mut false,
+            &mut admitted_dirs,
+        );
+        assert!(
+            pending.contains(&ghost.join("new.rs")),
+            "the follow-up admission after a rename-out/rename-in at the same path did not \
+             stage the real directory's contents: {pending:?}"
+        );
     }
 
     // The watch-event path (not just the pure classifier) must flip
@@ -2266,6 +3530,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
 
         assert!(git_hit, "a packed-refs transition must set git_hit");
@@ -2280,11 +3545,14 @@ mod tests {
     // content only — so a `.gitignore` whose own rules match it (`*`) classified
     // `Ignore`, never entered `pending`, and could never announce its own edit.
     // Editing it (adding `!keep.log`) went unhonored until a daemon restart.
-    //
-    // Regression introduced alongside the self-matching-gitignore fix and caught
-    // by the done-gate. Fails if the trigger is derived from `pending` again.
+    // `e453e86` fixed that trigger — this test used to assert only that the
+    // flag got SET, which left the *consumption* half (nothing ever read the
+    // flag unless something else was also pending) entirely uncaught; that's
+    // the bug this plan's Phase 1 fixes. Now also drives `maybe_rebuild`, the
+    // loop tick's consumer, and checks the rebuilt set actually reflects the
+    // edit — not just that a rebuild happened.
     #[test]
-    fn self_matching_gitignore_edit_still_flags_a_rebuild() {
+    fn self_matching_gitignore_edit_flags_and_rebuild_consumes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let initialized = std::process::Command::new("git")
@@ -2300,12 +3568,20 @@ mod tests {
         let ignore_set = IgnoreSet::build(&root);
 
         // Precondition: this is exactly the file that classifies `Ignore`, so a
-        // `pending`-derived trigger cannot see it.
+        // `pending`-derived trigger cannot see it — and `keep.log` is ignored
+        // under this STALE set too, the fact the rebuild below must flip.
         let gi = root.join("cache/.gitignore");
         assert!(
             matches!(classify(&root, &gi, &ignore_set), Class::Ignore),
             "a self-matching .gitignore must classify Ignore (else this test proves nothing)"
         );
+        assert!(
+            ignore_set.is_ignored(&root.join("cache/keep.log"), false),
+            "keep.log must be ignored under the pre-edit set (else the rebuild proves nothing)"
+        );
+
+        // The edit under test: negate one file.
+        std::fs::write(&gi, "*\n!keep.log\n").unwrap();
 
         let (tx, rx) = channel::<Result<notify::Event, notify::Error>>();
         tx.send(Ok(notify::Event::default().add_path(gi))).unwrap();
@@ -2324,6 +3600,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut gitignore_dirty,
+            &mut HashSet::new(),
         );
 
         assert!(
@@ -2334,6 +3611,64 @@ mod tests {
             pending.is_empty(),
             "the .gitignore itself is still not recorded as watched content"
         );
+
+        // Consumption: `maybe_rebuild` is the loop tick's rate-limited reader
+        // of the flag. This is the part the old test never reached.
+        let rebuilt = maybe_rebuild(&mut gitignore_dirty, &root);
+        assert!(
+            rebuilt.is_some(),
+            "a set dirty flag must produce a rebuilt IgnoreSet"
+        );
+        assert!(
+            !gitignore_dirty,
+            "maybe_rebuild must clear the flag it just consumed"
+        );
+        assert!(
+            !rebuilt
+                .unwrap()
+                .is_ignored(&root.join("cache/keep.log"), false),
+            "the rebuilt IgnoreSet must reflect the edited rules (keep.log re-included)"
+        );
+    }
+
+    // `maybe_rebuild` is the unit-reachable target for the loop tick's rate
+    // rule (at most one full-repo walk per dirty flag) — `run`'s loop body
+    // itself cannot be driven from a unit test.
+    #[test]
+    fn maybe_rebuild_runs_once_per_dirty_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("init")
+            .arg(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(initialized, "git must be available to run this test");
+
+        let mut dirty = false;
+        assert!(
+            maybe_rebuild(&mut dirty, &root).is_none(),
+            "a clear flag must never rebuild"
+        );
+
+        // First dirty setting: rebuilds exactly once, then goes quiet.
+        dirty = true;
+        assert!(maybe_rebuild(&mut dirty, &root).is_some());
+        assert!(
+            !dirty,
+            "the flag must be cleared by the call that consumed it"
+        );
+        assert!(
+            maybe_rebuild(&mut dirty, &root).is_none(),
+            "an immediate second call on a now-clean flag must not rebuild again"
+        );
+
+        // A second, independent dirty setting: still exactly one `Some`.
+        dirty = true;
+        assert!(maybe_rebuild(&mut dirty, &root).is_some());
+        assert!(!dirty);
+        assert!(maybe_rebuild(&mut dirty, &root).is_none());
     }
 
     // ---- D9: event-channel draining + walk exclusion -------------------------
@@ -2368,6 +3703,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
 
         assert!(!disconnected);
@@ -2402,6 +3738,7 @@ mod tests {
             &mut first_event,
             &mut git_hit,
             &mut false,
+            &mut HashSet::new(),
         );
         assert!(disconnected);
     }
@@ -2468,6 +3805,7 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }];
 
         let existing = TurnRecord {
@@ -2545,6 +3883,7 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }];
 
         let id = turn_id();
@@ -2627,6 +3966,7 @@ mod tests {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
             id: turn_id(),
         };

@@ -19,6 +19,7 @@ ttl_days = 90
 mcp_destructive = \"off\"   # off | confirm | auto (used from v2)
 memory_enabled = true      # inject recalled memories into UserPromptSubmit hooks
 memory_inject_max = 5      # max facts injected per hook call
+# noise_globs = [\".remember/**\"]  # fold matching file entries out of log/show (see README); --all-files to reveal
 ";
 
 pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Result<(), String> {

@@ -345,6 +345,1082 @@ fn self_ignoring_gitignore_dir_is_not_recorded_by_a_real_daemon() {
     );
 }
 
+// The trigger fix (`e453e86`) sets `gitignore_dirty` at event-ingest time,
+// independent of the touched path's own ignore verdict — but nothing then
+// consumed that flag unless some OTHER path also classified `Watch` and drove
+// the debounce to settle. So editing a `.gitignore` to re-include a path,
+// then only ever touching THAT path, never rebuilds: the re-included path
+// still classifies against the stale (pre-edit) set, never arms the
+// debounce, and the flush block — where the rebuild used to live — never
+// runs. This proves the *consumption* half is fixed, not just the trigger
+// the unit test already covers.
+#[test]
+fn unignore_is_honored_without_other_watched_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+
+    // `SingleDaemonGuard`, not a bare `Child`: the control assert below runs
+    // BEFORE any kill, and `Child::drop` does not reap — a RED run (which
+    // this test sees by design during TDD and every neuter check) would
+    // otherwise leak a live daemon per run.
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Positive control, written BEFORE the ignore-rule edit. A control
+    // written afterward would itself be a Class::Watch path — it would arm
+    // the debounce, `settled` would fire, and (under the pre-fix code) the
+    // rebuild would run inside that same flush block, making the test pass
+    // before the fix and prove nothing. This ordering is load-bearing.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("src/control.rs")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Re-widen: negate the self-matching rule for one file.
+    std::fs::write(root.join("cache/.gitignore"), "*\n!keep.log\n").unwrap();
+
+    // Touch NOTHING else from here on — that is the defect's escape hatch
+    // ("some unrelated watched path changed"), and the test must not contain
+    // it. Two writes, spaced past one POLL tick (250ms, `daemon::POLL`), so
+    // they don't collapse into a single notify batch.
+    std::fs::write(root.join("cache/keep.log"), "one").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("cache/keep.log"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_keep = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("cache/keep.log")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_keep.is_some(),
+        "cache/keep.log, re-included by a mid-run .gitignore edit, was never recorded — \
+         the ignore-set rebuild was never consumed"
+    );
+}
+
+// AC: a file written into a brand-new directory, in the same burst as the
+// directory's own creation, must still be recorded. No `.gitignore` appears
+// anywhere in this fixture — unlike its neighbors above/below, this test is
+// not exercising ignore-set semantics at all; it pins a lower-level watcher
+// gap that `unignore_is_honored_without_other_watched_activity`'s positive
+// control was incidentally ALSO exercising (that test's name, comments, and
+// failure message are all about ignore-set rebuild consumption — a reader
+// chasing its failure would never land on watch-arming without this test).
+//
+// Real defect found running this repo's Linux integration leg for the first
+// time (previously exercised only on macOS/FSEvents): `notify`'s
+// `RecursiveMode::Recursive` arms a watch for a NEWLY created directory only
+// AFTER the crate finishes processing the batch containing its
+// `Create(Folder)` event — not synchronously as the directory appears.
+// `mkdir foo && write foo/bar`, issued back-to-back with no delay, can
+// therefore write `foo/bar` before inotify has a watch on `foo` at all;
+// inotify is edge-triggered at the kernel level (a watch must predate an
+// event — there is no catch-up), so that write generates NO notify event,
+// ever, not just late. Confirmed directly against the raw `notify` crate in
+// an isolated standalone repro (mkdir+write, no daemon involved) before
+// attributing it to this daemon. Fixed by `admit_existing_contents` in
+// `daemon.rs`: whenever a Watch-classified event path currently IS a
+// directory, its current contents are walked and staged immediately,
+// exactly like `Recorder::scan`'s startup walk but scoped to the one new
+// subtree — self-catch-up for the specific race above.
+//
+// macOS readers: this test passes unconditionally there too — FSEvents does
+// not show the same gap (confirmed: the pre-fix daemon already passed this
+// exact scenario on macOS), so it has no discriminating power on macOS. Its
+// value is entirely the Linux leg, the same posture this repo already uses
+// for its other `#[cfg(target_os = "linux")]`-only-meaningful tests (e.g.
+// `doctor_inotify_low_watches_fails`), except this one is cheap enough to
+// run everywhere rather than gating it out.
+//
+// Residual window, stated not eliminated: the catch-up walk below runs on
+// THIS daemon's main thread, when it drains the `Create(Folder)` event;
+// `notify`'s own `add_watch` runs asynchronously on notify's internal
+// thread, after ITS batch. A third write landing in the gap between this
+// walk completing and notify's watch actually arming is still missed — this
+// closes the specific race the test above exercises (nothing written before
+// the directory's own creation event is drained), not every conceivable
+// timing of writes into a directory that is still mid-registration.
+#[test]
+fn file_written_into_brand_new_directory_is_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // No sleep between mkdir and write — the tight sequence is the point;
+    // it is exactly the race window `admit_existing_contents` closes.
+    std::fs::create_dir_all(root.join("newdir")).unwrap();
+    std::fs::write(root.join("newdir/fresh.rs"), "fn main() {}").unwrap();
+
+    let saw = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "newdir/fresh.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw.is_some(),
+        "newdir/fresh.rs, written in the same burst as its own directory's creation, was \
+         never recorded — the new-directory watch-arming gap was not closed"
+    );
+}
+
+// The blocking finding from the binding gate review of `034c883`:
+// `admit_existing_contents` was called whenever the event path `is_dir()`,
+// with no look at what KIND of notify event this was. A metadata-only event
+// on an EXISTING, already-recorded directory — `touch`, `chmod`, an xattr
+// write, no content change anywhere inside it — walked the WHOLE subtree
+// again and staged every file in it as `op: "modify"`. Verified live against
+// the real binary before this fix: `touch src` on an untouched 3-file repo
+// produced a turn claiming all 3 files "modified"; with an agent bracket
+// open (`UserPromptSubmit` -> touch -> `Stop`, no other filesystem activity
+// at all), the fabricated files folded into the rich `tool:"claude"` turn
+// and `agentrec blame` attributed files the agent never touched. Fixed by
+// gating the walk on `event.kind` (`daemon.rs::apply_watch_result`) plus an
+// `admitted_dirs` de-dup set closing a second, independently measured
+// fabrication source on macOS: FSEvents can redeliver a `Create(Folder)` for
+// an already-admitted directory many seconds after its real creation,
+// alongside an ordinary later `touch`'s genuine `Modify(Metadata)` — measured
+// in 3 of 5 trials with no bracket and no other watched activity at all.
+//
+// Shaped like the gate's own probe: create a directory with files, let the
+// daemon record them (establishing a REAL baseline, not `baseline_unknown` —
+// a re-admission after this point is guaranteed to be DETECTABLE, even if
+// same-hash, never silently absorbed), then mutate only the directory's own
+// metadata and assert nothing about its contents is re-staged.
+#[cfg(unix)]
+#[test]
+fn metadata_only_event_on_existing_directory_stages_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    std::fs::create_dir_all(root.join("srcdir")).unwrap();
+    std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+
+    // Positive control: the directory's real creation, with a REAL baseline
+    // for both files (`op: "create"`, not `baseline_unknown`) — also proves
+    // the daemon is alive and recording before anything else is asserted.
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "srcdir/a.rs") && turn_has_file(t, "srcdir/b.rs"))
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+    let turns_before = turns(root).len();
+
+    // Metadata-only mutations on the DIRECTORY itself — no content change
+    // anywhere inside it. `touch`(1) rather than a std::fs call: this crate
+    // has no `filetime` dependency, and a real external syscall is a more
+    // faithful probe of what the daemon actually observes than anything
+    // achievable purely through `std::fs`.
+    let touch_status = std::process::Command::new("touch")
+        .arg(root.join("srcdir"))
+        .status()
+        .unwrap();
+    assert!(touch_status.success(), "touch(1) must be available");
+    std::thread::sleep(Duration::from_millis(400));
+    let mut perms = std::fs::metadata(root.join("srcdir"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(root.join("srcdir"), perms).unwrap();
+
+    // Positive control IN THE SAME WINDOW as the absence assert below —
+    // without it, a dead or unarmed daemon would also satisfy "no new turn
+    // names srcdir's files," exactly the gap this repo has been burned by
+    // before (see `unignore_is_honored_without_other_watched_activity`).
+    std::fs::write(root.join("control.rs"), "fn main() {}").unwrap();
+    let saw_control2 = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "control.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_control2.is_some(),
+        "control.rs, written after the directory's metadata-only mutations, was never \
+         recorded — daemon not alive/recording during the assertion window, rest of the \
+         test is moot"
+    );
+
+    let after = turns(root);
+    let refabricated = after
+        .iter()
+        .skip(turns_before)
+        .any(|t| turn_has_file(t, "srcdir/a.rs") || turn_has_file(t, "srcdir/b.rs"));
+    assert!(
+        !refabricated,
+        "touch(1)/chmod on an existing, content-unchanged directory re-staged its contents \
+         as modified: {after:#?}"
+    );
+}
+
+// Honesty-round gate finding 1 (blocking, review of `247df9e`): the prior
+// test's directory is created AFTER `SingleDaemonGuard::spawn`, so it is
+// structurally unable to catch this — FSEvents delivers coalesced per-path
+// flag UNIONS, not descriptions of a single event, and the fabrication only
+// shows up on a directory's FIRST event since daemon start when that
+// directory already existed before the daemon began watching it. Measured
+// live before this fix (real binary, this exact shape): `touch src` on a
+// pre-existing, untouched 3-file directory fabricated all 3 files as
+// `op: "modify"` in 2 of 2 probe runs. This test creates its directory
+// BEFORE spawning the daemon — the load-bearing difference from
+// `metadata_only_event_on_existing_directory_stages_nothing` above — so the
+// directory's first-ever watched event is exactly the metadata-only `touch`
+// under test, reproducing the coalesced-flags condition rather than a clean
+// `Modify(Metadata)` on an already-admitted directory.
+//
+// `touch srcdir` must be the very first thing that happens to any watched
+// path after spawn — no pre-touch positive control — because the historical
+// `ItemCreated` flag rides the directory's first FSEvents delivery since
+// daemon start; draining that first event with unrelated activity first
+// would destroy the exact condition under test. The positive control
+// (`control.rs`) therefore runs AFTER the touch, in the same window as the
+// absence assertion, so a dead/unarmed daemon can't be mistaken for a fixed
+// one.
+//
+// Linux readers: this test has no discriminating power there — inotify
+// never had this gap (a real `mkdir` fires `Create(Folder)` exactly once,
+// and the `kind` gate already excludes `Modify(Metadata)` on every
+// platform) — but it costs nothing to run everywhere and pins the macOS
+// case in the same suite as its sibling.
+#[test]
+fn metadata_only_event_on_directory_that_predates_daemon_stages_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    // Created and committed BEFORE the daemon ever starts — this directory
+    // is old news to the daemon from its very first tick.
+    std::fs::create_dir_all(root.join("srcdir")).unwrap();
+    std::fs::write(root.join("srcdir/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("srcdir/b.rs"), "fn b() {}").unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+    std::thread::sleep(Duration::from_millis(800));
+
+    // The ONLY thing that happens to `srcdir` this whole test — no content
+    // change anywhere inside it, ever.
+    let touch_status = std::process::Command::new("touch")
+        .arg(root.join("srcdir"))
+        .status()
+        .unwrap();
+    assert!(touch_status.success(), "touch(1) must be available");
+
+    // Let the daemon's debounce (1.5s) + quiet window (10s) fully settle
+    // before the control, so a fabricated turn (if any) has already closed.
+    // Generous margin (not just 11.5s + a hair): this suite has documented
+    // FSEvents contention under full parallelism, and a too-tight margin
+    // would risk the fabricated turn folding into the control's turn under
+    // load — still caught by the `fabricated` check below, but the failure
+    // mode to avoid is the daemon not having processed the touch AT ALL yet.
+    std::thread::sleep(Duration::from_secs(20));
+
+    // In-window positive control, AFTER the touch — proves the daemon is
+    // alive and recording during the exact window the absence assert below
+    // relies on.
+    std::fs::write(root.join("control.rs"), "fn main() {}").unwrap();
+    let saw_control = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "control.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_control.is_some(),
+        "control.rs, written after the directory touch, was never recorded — daemon not \
+         alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let fabricated = turns(root)
+        .iter()
+        .any(|t| turn_has_file(t, "srcdir/a.rs") || turn_has_file(t, "srcdir/b.rs"));
+    assert!(
+        !fabricated,
+        "a metadata-only event on a directory that predates the daemon fabricated its \
+         contents as modified: {:#?}",
+        turns(root)
+    );
+}
+
+// Residuals round: the sharpest known silent-loss hole in the product's core
+// "who broke my repo" claim, on the majority platform — a directory moved
+// INTO the watched root lost its contents SILENTLY on macOS (measured 3/3 at
+// HEAD, 2/2 at the pre-round baseline; not a regression). The admission
+// machinery (`admit_existing_contents`) already existed but was
+// `#[cfg(target_os = "linux")]`-only. Phase 1 of this round measured FSEvents
+// rename-kind semantics directly before any code changed
+// (docs/superpowers/specs/2026-07-26-fsevents-rename-measurements.md,
+// VERDICT: CLEAN: 10/10 rename-ins deliver `Modify(Name(Any))`, 0/80 spurious
+// rename kinds across 2 fixtures x 4 stimuli x 10 trials, 0/5 delayed replays
+// over a 68s hold) — clean enough to extend admission to macOS gated on
+// rename kinds ONLY, never `Create(_)` (the Create axis stays measured
+// poisoned: 2/10 fresh-fixture `touch` trials in that same spike produced a
+// spurious `Create(Folder)`, matching the 2/2 fabrication that got the whole
+// action compiled out of macOS in the first place — Decisions log #2, not
+// reopened here).
+//
+// On Linux this exercises the PRE-EXISTING `Modify(Name(_))` arm of the same
+// gate (`daemon.rs::apply_watch_result`) — not new coverage there, but this
+// test pins that arm too since nothing else in this suite builds a directory
+// entirely outside the root and moves it in.
+#[test]
+fn directory_moved_into_root_records_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q`
+
+    let outside = tempfile::tempdir().unwrap();
+    let src_dir = outside.path().join("moved_in");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("one.rs"), "fn one() {}").unwrap();
+    std::fs::write(src_dir.join("two.rs"), "fn two() {}").unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // The directory materializes at this path for the very first time in
+    // this daemon's run — a genuine rename-in, built entirely outside the
+    // watched root beforehand so nothing about it was ever recorded before
+    // the move.
+    std::fs::rename(&src_dir, root.join("moved_in")).unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "moved_in/one.rs") && turn_has_file(t, "moved_in/two.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    let all = turns(root);
+    assert!(
+        saw.is_some(),
+        "a directory moved into the watched root lost its contents — neither \
+         moved_in/one.rs nor moved_in/two.rs was ever recorded: {all:#?}"
+    );
+
+    let op_of = |path: &str| -> Option<String> {
+        all.iter().find_map(|t| {
+            t.get("files")?.as_array()?.iter().find_map(|f| {
+                if f.get("path").and_then(|p| p.as_str()) == Some(path) {
+                    f.get("op").and_then(|o| o.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
+    };
+    assert_eq!(
+        op_of("moved_in/one.rs").as_deref(),
+        Some("create"),
+        "moved_in/one.rs did not record op:\"create\": {all:#?}"
+    );
+    assert_eq!(
+        op_of("moved_in/two.rs").as_deref(),
+        Some("create"),
+        "moved_in/two.rs did not record op:\"create\": {all:#?}"
+    );
+}
+
+// Phase 3 of the rebuild-gate plan — the mirror of
+// `unignore_is_honored_without_other_watched_activity`: a `.gitignore` DELETE
+// event carries the filename too (`apply_watch_result`'s filename check
+// precedes `classify`), so it sets `gitignore_dirty` exactly like an edit.
+// Nothing pinned that path before this test.
+#[test]
+fn deleted_gitignore_rewidens_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    // Self-matching, self-ignoring: `*` matches `cache/.gitignore` itself, so
+    // its own DELETE event classifies `Ignore` and (pre-fix) never arms
+    // `pending` on its own — exactly the escape hatch this test must not
+    // route around.
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/.gitignore"), "*\n").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Positive control, written BEFORE the deletion. A control written
+    // afterward would itself be a Class::Watch path — it would arm the
+    // debounce and (under pre-fix code) drive the flush block where the
+    // rebuild used to live, making the test pass before the fix and prove
+    // nothing. This ordering is load-bearing, exactly as in
+    // `unignore_is_honored_without_other_watched_activity`.
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("src/control.rs")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Re-widen by deletion instead of edit.
+    std::fs::remove_file(root.join("cache/.gitignore")).unwrap();
+
+    // Touch NOTHING else from here on. Two writes, spaced past one POLL tick
+    // (250ms, `daemon::POLL`), so they don't collapse into a single notify
+    // batch with the deletion event.
+    std::fs::write(root.join("cache/keep.log"), "one").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("cache/keep.log"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_keep = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("cache/keep.log")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_keep.is_some(),
+        "cache/keep.log, re-included by deleting cache/.gitignore mid-run, was never recorded — \
+         the ignore-set rebuild was never consumed"
+    );
+}
+
+// Phase 3 of the rebuild-gate plan: the case nothing covered was a rule
+// re-widening an already-known path. This covers the opposite direction — a
+// `.gitignore` CREATED under a directory that had none, honored without a
+// daemon restart.
+#[test]
+fn new_gitignore_honored_without_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Positive control, written before any `.gitignore` exists under data/ —
+    // proves the daemon is alive and watching this directory from the start.
+    std::fs::write(root.join("data/control1.txt"), "one").unwrap();
+    let saw_control1 = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("data/control1.txt")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+    assert!(
+        saw_control1.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Create the `.gitignore` mid-run: only `block.log` is ignored (the file
+    // itself doesn't match its own rule, unlike the self-matching fixtures
+    // elsewhere in this suite).
+    std::fs::write(root.join("data/.gitignore"), "block.log\n").unwrap();
+
+    // Wait past one POLL tick (250ms, `daemon::POLL`) before touching
+    // block.log/control2, so the top-of-tick rebuild has a chance to consume
+    // the dirty flag before these events are classified — otherwise they can
+    // land in the SAME drain batch as the `.gitignore` create and still be
+    // classified against the stale (pre-rule) set, which is decision 2's
+    // documented residual window, not what this test is proving.
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join("data/block.log"), "should be ignored now").unwrap();
+    std::fs::write(root.join("data/control2.txt"), "two").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack.
+    let saw_control2 = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| {
+                t.get("files")
+                    .and_then(|f| f.as_array())
+                    .map(|fs| {
+                        fs.iter().any(|f| {
+                            f.get("path").and_then(|p| p.as_str()) == Some("data/control2.txt")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    // Positive control IN THE SAME WINDOW as the absence assertion below —
+    // without it, a dead or unarmed daemon would also satisfy "block.log was
+    // never recorded", which is exactly the gap that let two green gitignore
+    // tests coexist with a 764 MiB leak in this repo.
+    assert!(
+        saw_control2.is_some(),
+        "control2.txt, written after the new .gitignore existed, was never recorded — \
+         daemon not alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let leaked_block_log = turns(root).iter().any(|t| {
+        t.get("files")
+            .and_then(|f| f.as_array())
+            .map(|fs| {
+                fs.iter()
+                    .any(|f| f.get("path").and_then(|p| p.as_str()) == Some("data/block.log"))
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        !leaked_block_log,
+        "data/block.log, ignored by a .gitignore created mid-run, leaked into a turn — \
+         the new rule was not honored without a daemon restart"
+    );
+}
+
+/// True if a turn record's `files` array names `path`.
+fn turn_has_file(t: &serde_json::Value, path: &str) -> bool {
+    t.get("files")
+        .and_then(|f| f.as_array())
+        .map(|fs| {
+            fs.iter()
+                .any(|f| f.get("path").and_then(|p| p.as_str()) == Some(path))
+        })
+        .unwrap_or(false)
+}
+
+// Phase 4 of the honesty-fixes plan — the untested MIRROR of
+// `unignore_is_honored_without_other_watched_activity`/`new_gitignore_honored_
+// without_restart` above. Those cover WIDENING (a path becomes watched);
+// nothing covered NARROWING while a path already sits in `pending`. Because
+// classification happens at ingest (`apply_watch_result` -> `classify`) and
+// staging happens later at flush (`Recorder::stage`, which reads current
+// bytes and never re-consults the ignore set), a path admitted to `pending`
+// under the OLDER, wider rules is still staged at the next flush even if a
+// `.gitignore` edit lands mid-debounce and now ignores it. This first half is
+// NOT a bug and has NO neuter — it pins the current, deliberate behavior (see
+// the extended `daemon.rs` comment at the `maybe_rebuild` call site). The
+// second half (a LATER, separate mutation of the same now-ignored path) DOES
+// have a neuter: it must stop being recorded once the rebuild has actually
+// run, and reverting the rebuild-gate fix (moving `maybe_rebuild` back inside
+// `if settled || capped`) reproduces the old unconsumed-flag deadlock and
+// reds it.
+#[test]
+fn narrowing_mid_debounce_still_stages_pending_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // In-window positive control, written before anything else — proves the
+    // daemon is alive and actually flushing during the window the first
+    // (over-record) assertion below depends on.
+    std::fs::write(root.join("src/control.rs"), "fn main() {}").unwrap();
+
+    // The path under test: admitted to `pending` under the WIDE (no rule yet)
+    // ignore set.
+    std::fs::write(root.join("src/target.txt"), "one").unwrap();
+
+    // Within the debounce window (1.5s, `daemon::DEBOUNCE`), narrow the rules
+    // to ignore it. `gitignore_dirty` is set at ingest time regardless of
+    // this event's own verdict, but the path is already sitting in `pending`
+    // by now and `Recorder::stage` never re-classifies it — this is the
+    // over-record direction under test.
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(root.join("src/.gitignore"), "target.txt\n").unwrap();
+
+    let saw_control = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "src/control.rs"))
+            .then_some(())
+    });
+    assert!(
+        saw_control.is_some(),
+        "positive control never recorded — daemon not alive/recording, rest of the test is moot"
+    );
+
+    // Debounce (1.5s) + slack: by now the burst that admitted target.txt
+    // (and the .gitignore edit itself) must have settled and flushed.
+    let flushed_once = poll_until(Duration::from_secs(20), || {
+        let hits = turns(root)
+            .iter()
+            .filter(|t| turn_has_file(t, "src/target.txt"))
+            .count();
+        (hits >= 1).then_some(hits)
+    });
+    let first_hits = flushed_once.unwrap_or(0);
+    assert_eq!(
+        first_hits, 1,
+        "src/target.txt, already pending before the mid-debounce narrowing rule, must be \
+         staged exactly once — this pins the documented over-record residual, it is not a bug"
+    );
+
+    // Precondition for the absence assertion below: the rebuild this test
+    // depends on must have actually happened at least once, and not merely
+    // that the daemon happened not to re-admit the path. Without this, "not
+    // recorded again" could pass vacuously if the rebuild mechanism were
+    // disabled entirely (nothing would ever narrow anything, and the second
+    // mutation's absence would prove nothing) — the same discipline this
+    // repo's own `self_matching_gitignore_edit_still_flags_a_rebuild`-style
+    // unit tests apply to their own preconditions.
+    let rebuilds_after_first_flush = ignore_rebuilds(root);
+    assert!(
+        rebuilds_after_first_flush.unwrap_or(0) >= 1,
+        "ignore_rebuilds counter is {rebuilds_after_first_flush:?} — the rebuild this test's \
+         second half depends on never ran, so 'not recorded again' would prove nothing"
+    );
+
+    // A second, separate mutation of the same path, well after the rule has
+    // had time to land (multiple `daemon::POLL` ticks, 250ms each) — this
+    // half DOES have a neuter (see module comment above).
+    std::thread::sleep(Duration::from_secs(2));
+    std::fs::write(root.join("src/target.txt"), "two").unwrap();
+    std::fs::write(root.join("src/control2.rs"), "fn main() {}").unwrap();
+
+    let saw_control2 = poll_until(Duration::from_secs(20), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_has_file(t, "src/control2.rs"))
+            .then_some(())
+    });
+
+    daemon.kill();
+
+    // Positive control IN THE SAME WINDOW as the absence assertion below —
+    // without it, a dead or unarmed daemon would also satisfy "never recorded
+    // again," exactly the gap that once let two green gitignore tests
+    // coexist with a 764 MiB live leak in this repo.
+    assert!(
+        saw_control2.is_some(),
+        "control2.rs, written after the narrowing rule had time to land, was never recorded — \
+         daemon not alive/recording during the assertion window, rest of the test is moot"
+    );
+
+    let final_hits = turns(root)
+        .iter()
+        .filter(|t| turn_has_file(t, "src/target.txt"))
+        .count();
+    assert_eq!(
+        final_hits, 1,
+        "src/target.txt was recorded again after the narrowing rule had time to land — \
+         the ignore-set rebuild was never consumed for the second mutation"
+    );
+}
+
+/// Read `.agentrec/state.json`'s `ignore_rebuilds` counter, or `None` if the
+/// file is missing/unparseable/lacks the key.
+fn ignore_rebuilds(root: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("ignore_rebuilds")?.as_u64()
+}
+
+// Phase 2 of the rebuild-gate fix: nothing anywhere reported whether the
+// filter configuration was ever reloaded, which is part of why this defect
+// class shipped twice. `state.json`'s `ignore_rebuilds` is the instrument —
+// it must count actual REBUILDS (one per `.gitignore` edit that lands in its
+// own tick), not raw filesystem events.
+#[test]
+fn daemon_counts_ignore_rebuilds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    // `SingleDaemonGuard`, not a bare `Child`: the first assert below precedes
+    // any kill, and `Child::drop` does NOT reap — a RED run (which this test
+    // sees by design during TDD and every neuter check) would otherwise leak a
+    // live daemon per run. Leaked test daemons have already cost this repo a
+    // diagnosis round via FSEvents contention.
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let saw_one = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? == 1).then_some(())
+    });
+    assert!(
+        saw_one.is_some(),
+        "expected ignore_rebuilds to reach 1 after the first .gitignore edit, got {:?}",
+        ignore_rebuilds(root)
+    );
+
+    // Spaced past one POLL tick (250ms) so it doesn't collapse into the same
+    // notify batch as the first edit.
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(root.join(".gitignore"), "*.log\n*.tmp\n").unwrap();
+    let saw_two = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? == 2).then_some(())
+    });
+
+    daemon.kill();
+
+    assert!(
+        saw_two.is_some(),
+        "expected ignore_rebuilds to reach 2 after the second .gitignore edit, got {:?}",
+        ignore_rebuilds(root)
+    );
+}
+
+// AC: rebuild rate is bounded by the dirty flag (at most one `IgnoreSet::build`
+// walk per `POLL` tick), never by raw event count. Asserted on the PERSISTED
+// counter only — never by counting stderr lines inside a fixed window, which
+// this repo has documented FSEvents flake from (see CLAUDE.md's
+// daemon-test-FSEvents-contention note).
+//
+// Deviation from the plan's literal "5 writes -> 1..=5", recorded because it
+// was measured, not assumed: on this macOS/FSEvents setup, 5 back-to-back
+// `.gitignore` writes already coalesce to ~3 raw notify events, so a
+// per-EVENT counter (the neuter this test exists to catch) also lands
+// <= 5 and the test would never go red. Empirically, 40 writes yields ~3-4
+// rebuilds under the correct per-TICK counter (repeatedly measured) vs.
+// ~15-18 under the per-event neuter on macOS/FSEvents.
+//
+// Why the bound isn't derived from `elapsed_wall_time / POLL` (the obvious
+// first idea, and the one this repo's Linux gap report suggested): `run`'s
+// `recv_timeout(POLL)` call returns THE INSTANT a message is already queued
+// — it only blocks the full `POLL` when the channel is empty. During a
+// dense burst (this test's 40 back-to-back writes), the loop can tick far
+// faster than one per `POLL`; `POLL` floors idle latency, not busy-burst
+// tick rate. So `elapsed_ms / POLL_ms` UNDERESTIMATES the real tick count
+// during a burst and cannot be used as an upper bound — confirmed by
+// measurement, not assumed: the write+settle window here is on the order of
+// 2.2s wall time, `2200 / 250 ≈ 9`, yet the CORRECT per-tick counter alone
+// measures up to 21 on Linux, already past that formula's ceiling.
+//
+// The bound is PER-PLATFORM, not one shared constant — each half measured
+// directly on its own platform, not assumed. An earlier draft of this test
+// reasoned that Linux/inotify would move *both* sides in the safe direction
+// ("fewer rebuilds, since inotify doesn't add FSEvents' ~1s batching
+// latency"); that reasoning was backwards and never actually run on Linux.
+// FSEvents coalesces the 40 writes into a handful of batches — only ~3-4
+// ticks ever see the dirty flag set. inotify does the opposite: it delivers
+// the writes as many separate wake-ups (a single `fs::write` yields more
+// than one raw inotify event — ~90 total for 40 writes, confirmed by
+// instrumenting the per-event neuter below), so on Linux the *correct*
+// per-TICK counter itself measures ~13-21 (15 runs), already above the
+// macOS-tuned `1..=10` bound this test used to carry. The per-EVENT neuter
+// on Linux measures ~87-93 (11 runs) — still cleanly separated from the
+// correct range, just not by the macOS bound. This is why a single global
+// bound is impossible, not just inconvenient: Linux's correct ceiling (21)
+// EXCEEDS macOS's neutered floor (15), so any one fixed number that passes
+// correct-Linux also passes neutered-macOS — there is no number that can sit
+// above 21 and below 15 at once. Hence the `cfg!(target_os = "linux")` split
+// below, each half carrying its own wide margin measured on that platform
+// (macOS: neutered floor 15 vs bound 10; Linux: correct ceiling 21 and
+// neutered floor 87 vs bound 45 — roughly 2x clearance on both sides).
+//
+// Direction of safety for 45 on unseen CI hardware (this was measured on one
+// colima Linux VM, not a fleet): a slower or more contended runner makes
+// `drain_watch_events`'s per-tick batch-drain scoop up MORE already-queued
+// events before returning to the top of the loop, which means FEWER ticks
+// see the dirty flag freshly set per unit of real work — the correct-code
+// count moves DOWN, away from 45, on slower hardware. The neutered count is
+// keyed to raw event volume (~90, driven by how many raw events 40 writes
+// produce, not by how fast the loop drains them) and is comparatively
+// machine-independent. Both sides move away from the boundary in the safe
+// direction as hardware gets slower, not toward it.
+#[test]
+fn rebuild_count_is_bounded_by_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    for i in 0..40 {
+        std::fs::write(root.join(".gitignore"), format!("*.log{i}\n")).unwrap();
+    }
+
+    // Prove at least one rebuild happened at all (daemon liveness), then let
+    // any still-in-flight rebuild settle before the final read.
+    let saw_rebuild = poll_until(Duration::from_secs(10), || {
+        let n = ignore_rebuilds(root)?;
+        (n >= 1).then_some(n)
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let count = ignore_rebuilds(root).unwrap_or(0);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    // Residuals round, Phase 5: a green run of this test previously carried NO
+    // number — the count only ever surfaced inside the assert-failure message
+    // below, and cargo captures stdout on a passing test. Print it
+    // unconditionally so a green CI run (with `-- --nocapture`) leaves the
+    // observed count in the log, closing the single-VM-statistics residual on
+    // this bound.
+    eprintln!("rebuild_count observed: {count}");
+
+    assert!(
+        saw_rebuild.is_some(),
+        "no ignore-set rebuild observed at all — rest of the test is moot"
+    );
+    // See the platform-measurement comment above the test: a single
+    // constant cannot separate correct-vs-neutered on both platforms, so
+    // the bound is conditioned on the OS actually running the test.
+    let bound: std::ops::RangeInclusive<u64> = if cfg!(target_os = "linux") {
+        1..=45
+    } else {
+        1..=10
+    };
+    assert!(
+        bound.contains(&count),
+        "expected ignore_rebuilds bounded to {bound:?} for 40 writes (rate-limited by the dirty \
+         flag, not per-event), got {count}"
+    );
+}
+
+// Residuals round, Phase 3: `release_lock` never runs on `kill -9`, so a
+// crashed daemon leaves `epoch_nonce`/`epoch_reload_nonce` stamped on disk
+// exactly as if that epoch were still live — `current_epoch_reloads` (which
+// has no `root` to probe liveness with) then renders the DEAD epoch's
+// reload count as though it belonged to whatever daemon is (or isn't)
+// running now. Both `status` readers (text + `--json`) must gate on an
+// actual liveness probe (`daemon::daemon_is_running`'s real flock check),
+// not just the epoch-nonce match. BOTH seams are asserted in ONE test —
+// the honesty-fixes round already learned the hard way (`0f3b474`) that
+// neutering only the json seam can survive a suite that only ever pins the
+// text seam, or vice versa.
+#[test]
+fn status_suppresses_reload_line_after_daemon_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // real `git init -q` — WalkBuilder::require_git needs it
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    // Force at least one real ignore-set rebuild while genuinely live —
+    // mirrors `daemon_counts_ignore_rebuilds`'s two-write shape.
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    let saw_rebuild = poll_until(Duration::from_secs(10), || {
+        (ignore_rebuilds(root)? >= 1).then_some(())
+    });
+    assert!(
+        saw_rebuild.is_some(),
+        "no ignore-set rebuild observed at all — rest of the test is moot"
+    );
+
+    // Confirm the line genuinely renders while the daemon is still alive —
+    // otherwise the later "absent after crash" assertion would be vacuous
+    // (it could be absent for the wrong reason, e.g. the rebuild never
+    // landed at all).
+    let live_out = agentrec(root, &["status"]);
+    assert!(live_out.status.success(), "status failed: {live_out:?}");
+    let live_stdout = String::from_utf8_lossy(&live_out.stdout);
+    assert!(
+        live_stdout.to_lowercase().contains("reload"),
+        "expected the reload line to render while the daemon is genuinely live: {live_stdout}"
+    );
+
+    // Pin the json seam's LIVE direction too — `epoch_ignore_rebuilds_stale`
+    // is always present per Q3(c), so it must be assertable both ways; a
+    // version of `status_json` that hardcodes `true` unconditionally would
+    // otherwise survive this whole test (the dead-epoch assertion further
+    // down would still pass for the wrong reason).
+    let live_json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        live_json_out.status.success(),
+        "status --json failed: {live_json_out:?}"
+    );
+    let live_json: serde_json::Value = serde_json::from_slice(&live_json_out.stdout)
+        .unwrap_or_else(|e| {
+            panic!("status --json did not emit valid JSON ({e}): {live_json_out:?}")
+        });
+    assert_eq!(
+        live_json
+            .get("epoch_ignore_rebuilds_stale")
+            .and_then(|b| b.as_bool()),
+        Some(false),
+        "a genuinely live daemon must not be flagged stale: {live_json}"
+    );
+
+    // Hard crash: no graceful shutdown, no `release_lock`, epoch_nonce stays
+    // stamped on disk. `sigkill` + `wait()` (not `Child::kill()`, which is
+    // merely graceful on some platforms, and which wouldn't reap the
+    // process either) — same pattern as `closed_turn_survives_kill9`.
+    sigkill(&daemon);
+    let _ = daemon.wait();
+
+    let dead_out = agentrec(root, &["status"]);
+    assert!(dead_out.status.success(), "status failed: {dead_out:?}");
+    let dead_stdout = String::from_utf8_lossy(&dead_out.stdout);
+    assert!(
+        !dead_stdout.to_lowercase().contains("reload"),
+        "a crashed daemon's dead epoch must not render as though it were current: {dead_stdout}"
+    );
+
+    let json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        json_out.status.success(),
+        "status --json failed: {json_out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout)
+        .unwrap_or_else(|e| panic!("status --json did not emit valid JSON ({e}): {json_out:?}"));
+    assert_eq!(
+        v.get("epoch_ignore_rebuilds_stale")
+            .and_then(|b| b.as_bool()),
+        Some(true),
+        "status --json must flag the epoch figure as stale once no daemon is running: {v}"
+    );
+}
+
+// A pre-existing state.json written by an OLDER binary (before Phase 2) has
+// neither field at all. `#[serde(default)]` must let it still parse, render
+// as never-reloaded in text `status`, and `status --json` must carry the
+// new field regardless.
+//
+// `snapshot_failures`/`io_failed` are planted alongside the missing fields
+// and asserted to survive — `State` derives `Default`, so a version of this
+// fix that drops `#[serde(default)]` (making the field required) doesn't
+// fail to parse in an obviously-visible way: `read_state` swallows any
+// deserialize error via `.ok()` and falls back to `State::default()`, whose
+// `ignore_rebuilds` is ALSO 0. Asserting only `ignore_rebuilds == 0` would
+// pass identically whether the JSON parsed field-by-field or failed whole
+// and silently reset every OTHER field too (losing `snapshot_failures`,
+// `pid`, everything) — this is exactly the vacuity trap the DEGRADED-banner
+// assertion below closes.
+#[test]
+fn status_tolerates_state_without_rebuild_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":0,"signal_offset":0,"snapshot_failures":3,"io_failed":["src/a.rs"]}"#,
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["status"]);
+    assert!(
+        out.status.success(),
+        "status failed on a state.json missing the new fields: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.to_lowercase().contains("reload"),
+        "a state.json without ignore_rebuilds must render as never-reloaded: {stdout}"
+    );
+    assert!(
+        stdout.contains("DEGRADED") && stdout.contains('3') && stdout.contains("src/a.rs"),
+        "pre-existing fields (snapshot_failures/io_failed) must survive parsing a state.json \
+         missing the new ignore-rebuild fields — a whole-struct parse failure falling back to \
+         State::default() would silently lose them too: {stdout}"
+    );
+
+    let json_out = agentrec(root, &["status", "--json"]);
+    assert!(
+        json_out.status.success(),
+        "status --json failed: {json_out:?}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout)
+        .unwrap_or_else(|e| panic!("status --json did not emit valid JSON ({e}): {json_out:?}"));
+    assert_eq!(
+        v.get("ignore_rebuilds").and_then(|c| c.as_u64()),
+        Some(0),
+        "status --json must carry ignore_rebuilds even from a pre-existing state.json: {v}"
+    );
+}
+
 #[test]
 fn second_record_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -564,6 +1640,37 @@ fn status_shows_prompt_degraded_banner_and_ack_clears_it_too() {
     assert!(!stdout.contains("DEGRADED"), "stdout: {stdout}");
 }
 
+// Phase 3 (honesty-fixes round): `status --ack-degraded --json` must never
+// print prose on stdout under a `--json` flag — the ack branch previously
+// returned before the json branch ran, so a script piping this combination
+// to `jq` would get "acknowledged — DEGRADED cleared" instead of JSON.
+// Fixed via a clap conflict (rejected at parse time, before any repo state
+// is even read) rather than inventing a JSON shape for an action verb.
+// Neuter: restore the early text-return branch (drop the clap conflict) →
+// this test's exit-code/stdout-prose assertions fail RED.
+#[test]
+fn ack_degraded_json_is_not_prose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let out = agentrec(root, &["status", "--ack-degraded", "--json"]);
+    assert!(
+        !out.status.success(),
+        "the combination must be rejected, not silently accepted: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "must never print prose (or anything else) on stdout under --json: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict message on stderr: {stderr:?}"
+    );
+}
+
 // D-PD3: an empty store has zero agent turns, so a rich-rate percentage would
 // be vacuous (100% over 0 turns misleadingly reads as "healthy"). `status`
 // must print an honest "n/a" instead of fabricating a rate.
@@ -641,6 +1748,7 @@ fn diff_text_modify_shows_unified() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "src/new.rs".into(),
@@ -650,6 +1758,7 @@ fn diff_text_modify_shows_unified() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -688,6 +1797,7 @@ fn diff_binary_file_message() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -725,6 +1835,7 @@ fn diff_skipped_file_notice() {
             skipped: true,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
         }],
     );
     seed_turn(root, &turn);
@@ -735,6 +1846,349 @@ fn diff_skipped_file_notice() {
     assert!(
         stdout.contains("(content not snapshotted — over size cap)"),
         "stdout: {stdout}"
+    );
+}
+
+// SR4: `print_entry` must name the REAL cause, not always "over size cap" —
+// a sibling coverage gap to `diff_skipped_file_notice` above (which only
+// ever exercised the over-cap text). Also covers the absent/unknown-value
+// fallback ("reason unrecorded") and the distinct "snapshot unavailable"
+// (no suffix) message for a present-but-unresolvable hash — SR-D's other
+// honesty fix: the old text asserted a specific cause ("purged or missing")
+// that this repo cannot actually distinguish.
+#[test]
+fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::hash_bytes;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = base_turn(
+        "t_SKIPCAUSE000000000000000001",
+        vec![
+            FileEntry {
+                path: "io.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: Some(skip_reason::IO_FAILED.to_string()),
+            },
+            FileEntry {
+                path: "unreadable.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: Some(skip_reason::UNREADABLE.to_string()),
+            },
+            FileEntry {
+                path: "legacy.rs".into(),
+                before: None,
+                after: None,
+                op: "modify".into(),
+                skipped: true,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None, // pre-this-round log entry
+            },
+            FileEntry {
+                // hash recorded, but no such blob was ever put in the store —
+                // cause genuinely unknown, must NOT assert "purged or missing".
+                path: "gone.rs".into(),
+                before: None,
+                after: Some(hash_bytes(b"never actually stored")),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            },
+        ],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert!(out.status.success(), "diff failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let io_line = stdout.lines().find(|l| l.contains("io.rs")).unwrap_or("");
+    assert!(
+        io_line.contains("(content not snapshotted — write failed at record time)"),
+        "io.rs line: {io_line}"
+    );
+    let unreadable_line = stdout
+        .lines()
+        .find(|l| l.contains("unreadable.rs"))
+        .unwrap_or("");
+    assert!(
+        unreadable_line.contains("(content not snapshotted — file unreadable at record time)"),
+        "unreadable.rs line: {unreadable_line}"
+    );
+    let legacy_line = stdout
+        .lines()
+        .find(|l| l.contains("legacy.rs"))
+        .unwrap_or("");
+    assert!(
+        legacy_line.contains("(content not snapshotted — reason unrecorded)"),
+        "legacy.rs line: {legacy_line}"
+    );
+    let gone_line = stdout.lines().find(|l| l.contains("gone.rs")).unwrap_or("");
+    assert!(
+        gone_line.contains("(snapshot unavailable)"),
+        "gone.rs line: {gone_line}"
+    );
+    assert!(
+        !gone_line.contains("purged or missing"),
+        "cause is genuinely unknown here — must not assert one: {gone_line}"
+    );
+}
+
+// Finding #5(b): `print_entry` (the `diff` renderer) must distinguish
+// `StoreError::Missing` from `StoreError::Corrupt`, the same way
+// `build_plan` (the `undo` renderer) already does — before this fix both
+// collapsed to the same generic "(snapshot unavailable)", so `diff` was
+// LESS specific than `undo` about the identical condition. This test
+// covers ONLY the Corrupt leg (the Missing leg is already pinned by
+// `diff_names_the_real_skip_cause_and_unresolvable_blob`'s `gone.rs` case
+// above, which never even puts the blob — genuinely missing, not
+// tampered).
+#[test]
+fn diff_reports_corrupt_blob_distinctly_from_missing() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"will be tampered\n").unwrap();
+    // Tamper the object's bytes on disk so the stored hash no longer
+    // matches (mirrors `show_prompt_corrupt_blob_reports_hash_mismatch_on_stderr`
+    // and `agentrec_core::store::tests::corrupt_object_detected`).
+    let hex = after.strip_prefix("sha256:").unwrap();
+    let path = root
+        .join(".agentrec/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::write(&path, b"tampered").unwrap();
+    // Precondition: the store must genuinely report Corrupt for this hash,
+    // not some other error, before asserting on `diff`'s rendering of it.
+    assert!(
+        matches!(
+            store.get(&after),
+            Err(agentrec_core::store::StoreError::Corrupt(_))
+        ),
+        "precondition: tampered blob must be genuinely Corrupt"
+    );
+
+    let turn = base_turn(
+        "t_DIFFCORRUPT000000000000001",
+        vec![FileEntry {
+            path: "tampered.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert!(out.status.success(), "diff failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("tampered.rs"))
+        .unwrap_or("");
+    assert!(
+        line.contains("(snapshot corrupt — hash mismatch)"),
+        "tampered.rs line: {line}"
+    );
+    assert!(
+        !line.contains("(snapshot unavailable)"),
+        "a Corrupt blob must not render the same message as a genuinely Missing one: {line}"
+    );
+}
+
+// Finding #3 (cross-seam: change C x change A) + finding #4 (untested
+// message string): change C gave over-cap/io-failed `FileEntry`s a real
+// `after` hash even though the blob was never stored (SR-C's honesty
+// gain). That hash still advances `Recorder::baseline` in `daemon.rs`, so
+// the NEXT turn touching that path carries `before: Some(<hash that was
+// never actually stored>)` — a "ghost hash". Nothing joins the producer
+// test (which only checks `daemon.rs`'s own output) with the read-side
+// tests (which only ever seed already-resolvable hashes), so this scenario
+// — genuinely reachable in production, never exercised end to end — went
+// untested. Seeds turn1 (over-cap create, ghost `after`) + turn2 (modify,
+// `before` = that same ghost hash) and asserts every read verb degrades
+// honestly rather than lying: `blame <file>` still reports the correct
+// fact from the log alone (no blob load needed), `blame <file>:<line>`
+// honestly can't attribute, `diff` shows the blob as unavailable, and
+// `undo` REFUSES with the exact "prior snapshot unavailable — refusing to
+// restore" string — which is finding #4's target message; `git grep
+// "prior snapshot unavailable" -- cli/tests` was empty before this test,
+// so this closes that finding too (no redundant second test added).
+// `doctor`'s "store health" check is asserted passing too, proving the
+// ghost hash is a read-side degradation only, never a DEGRADED-store
+// false positive (state.json's counters are untouched by directly seeding
+// the log — this scenario never goes through the daemon's write path).
+#[test]
+fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // A hash that was computed (SR-C) but genuinely never `put` into the
+    // store — exactly what an over-cap file's `after` looks like.
+    let ghost_hash = hash_bytes(b"over-cap content, never actually stored");
+    // Precondition this whole test depends on: the store must genuinely
+    // fail to resolve the ghost hash before any output is asserted.
+    assert!(
+        matches!(store.get(&ghost_hash), Err(StoreError::Missing(_))),
+        "precondition: ghost_hash must be genuinely unresolvable"
+    );
+
+    let final_content = b"final content\n".to_vec();
+    let final_hash = store.put(&final_content).unwrap();
+    std::fs::write(root.join("f.txt"), &final_content).unwrap();
+
+    // turn1: over-cap create — `after` is the ghost hash (SR-C: computed,
+    // never stored). Seeded first so it's the OLDER turn in append order.
+    let turn1 = base_turn(
+        "t_GHOSTBASE0000000000000001",
+        vec![FileEntry {
+            path: "f.txt".into(),
+            before: None,
+            after: Some(ghost_hash.clone()),
+            op: "create".into(),
+            skipped: true,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+        }],
+    );
+    seed_turn(root, &turn1);
+
+    // turn2: a normal modify whose `before` is that same ghost hash — the
+    // baseline `daemon.rs` advanced to it, exactly as `Recorder::stage`
+    // does for any snapshotted-or-not `after`. `after` here IS a real,
+    // stored hash (this turn's own write succeeded), so the file is
+    // genuinely unmodified-since on disk.
+    let turn2 = base_turn(
+        "t_GHOSTNEXT00000000000000002",
+        vec![FileEntry {
+            path: "f.txt".into(),
+            before: Some(ghost_hash),
+            after: Some(final_hash),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn2);
+
+    // blame f.txt: the log fact alone (no blob load) is correct — must
+    // name turn2 and must NOT claim anything is unavailable.
+    let blame_file_out = agentrec(root, &["blame", "f.txt"]);
+    assert!(
+        blame_file_out.status.success(),
+        "blame f.txt failed: {blame_file_out:?}"
+    );
+    let blame_file_stdout = String::from_utf8_lossy(&blame_file_out.stdout);
+    assert!(
+        blame_file_stdout.contains(&short_id_of(&turn2.id)),
+        "blame f.txt must still attribute correctly from the log alone: {blame_file_stdout}"
+    );
+    assert!(
+        !blame_file_stdout.to_lowercase().contains("unavailable"),
+        "blame f.txt needs no blob load and must not degrade: {blame_file_stdout}"
+    );
+
+    // blame f.txt:1: line-level attribution DOES need to load blobs for
+    // both candidate turns, and both cite the same unresolvable ghost hash
+    // — must honestly refuse, never guess.
+    let blame_line_out = agentrec(root, &["blame", "f.txt:1"]);
+    assert!(
+        blame_line_out.status.success(),
+        "blame f.txt:1 failed: {blame_line_out:?}"
+    );
+    let blame_line_stdout = String::from_utf8_lossy(&blame_line_out.stdout);
+    assert!(
+        blame_line_stdout.contains("f.txt:1: attribution unavailable — snapshot unavailable"),
+        "blame_line stdout: {blame_line_stdout}"
+    );
+
+    // diff turn2: `before` doesn't resolve — must say so, not crash or
+    // silently show an empty diff.
+    let diff_out = agentrec(root, &["diff", &turn2.id]);
+    assert!(diff_out.status.success(), "diff failed: {diff_out:?}");
+    let diff_stdout = String::from_utf8_lossy(&diff_out.stdout);
+    let diff_line = diff_stdout
+        .lines()
+        .find(|l| l.contains("f.txt"))
+        .unwrap_or("");
+    assert!(
+        diff_line.contains("(snapshot unavailable)"),
+        "diff line: {diff_line}"
+    );
+
+    // undo turn2: build_plan's `StoreError::Missing` arm on a `before` hash
+    // (finding #4's untested message) — must REFUSE with the exact
+    // established string, never attempt a restore.
+    let undo_out = agentrec(root, &["undo", &turn2.id, "--confirm"]);
+    assert!(undo_out.status.success(), "undo failed: {undo_out:?}");
+    let undo_stdout = String::from_utf8_lossy(&undo_out.stdout);
+    let undo_line = undo_stdout
+        .lines()
+        .find(|l| l.contains("f.txt"))
+        .unwrap_or("");
+    assert!(
+        undo_line.trim_start().starts_with("REFUSE"),
+        "undo line: {undo_line}"
+    );
+    assert!(
+        undo_line.contains("prior snapshot unavailable — refusing to restore"),
+        "undo line: {undo_line}"
+    );
+    // The file must be completely untouched by the refused undo.
+    assert_eq!(
+        std::fs::read(root.join("f.txt")).unwrap(),
+        final_content,
+        "a refused ghost-hash entry must never touch the worktree file"
+    );
+
+    // doctor store health: a ghost hash is a read-side degradation only —
+    // it must never masquerade as a DEGRADED store (state.json's counters
+    // are untouched; these turns were seeded directly, not written by the
+    // daemon's own fault-tracking write path).
+    let doctor_json = doctor_json_value(root);
+    let checks = doctor_json["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a checks array: {doctor_json}"));
+    let store_health = checks
+        .iter()
+        .find(|c| c["name"] == "store health")
+        .unwrap_or_else(|| panic!("expected a 'store health' check: {doctor_json}"));
+    assert_eq!(
+        store_health["status"], "pass",
+        "store health: {store_health}"
     );
 }
 
@@ -1166,6 +2620,7 @@ fn blame_file_reports_last_rich_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -1184,6 +2639,7 @@ fn blame_file_reports_last_rich_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -1250,6 +2706,7 @@ fn blame_bare_turn_no_fabrication() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1288,6 +2745,7 @@ fn blame_deleted_file_resolves() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     // z.rs is never written to disk — absent, as expected post-delete.
@@ -1327,6 +2785,7 @@ fn blame_line_level_added_and_predating() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1376,6 +2835,7 @@ fn blame_gap_is_stale() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1393,6 +2853,196 @@ fn blame_gap_is_stale() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("attribution stale — recording gap"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
+    // BL2/BL3: a turn whose `before` blob doesn't resolve must never be
+    // credited for a line it merely happens to still contain. T1 genuinely
+    // introduced "a"; T2's own `before` snapshot is gone, so whether T2
+    // changed line 1 is unknown, not "definitely not" — blame must refuse
+    // rather than guess T1 either.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::{hash_bytes, BlobStore};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after1 = store.put(b"a\nb\n").unwrap();
+    let turn1 = make_turn(
+        "t_BLUNRESOLVE1000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("first pass introduces a and b"),
+        vec![FileEntry {
+            path: "f.rs".into(),
+            before: None,
+            after: Some(after1),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn1);
+
+    // A well-formed hash that was never actually written to the store —
+    // proves the "unresolvable" precondition for real rather than assuming
+    // it (a torn/absent-by-construction hash would test nothing).
+    let ghost_hash = hash_bytes(b"never-actually-stored");
+    assert!(
+        store.get(&ghost_hash).is_err(),
+        "precondition: ghost_hash must be genuinely unresolvable"
+    );
+
+    let after2 = store.put(b"a\nb\n").unwrap(); // textually unchanged from turn1
+    let turn2 = make_turn(
+        "t_BLUNRESOLVE2000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T10:00:00.000Z",
+        Some("second pass unresolvable before"),
+        vec![FileEntry {
+            path: "f.rs".into(),
+            before: Some(ghost_hash),
+            after: Some(after2),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn2);
+
+    std::fs::write(root.join("f.rs"), b"a\nb\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f.rs:1"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("f.rs:1: attribution unavailable — snapshot unavailable"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("second pass unresolvable before"),
+        "must not credit T2 (unresolvable before): stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("first pass introduces a and b"),
+        "must not silently credit T1 either — a newer unresolvable turn could \
+         have overwritten this line: stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("before recording began"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("attribution stale — recording gap"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn blame_line_create_turn_still_credited() {
+    // BL4 regression guard: a `create` turn (before == None) is legitimately
+    // empty-before, not unresolvable — every line of its `after` really was
+    // introduced by it. Must keep working exactly as before the fix.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"x\ny\n").unwrap();
+    let turn = make_turn(
+        "t_BLCREATE0000000000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("create f2.rs"),
+        vec![FileEntry {
+            path: "f2.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+    std::fs::write(root.join("f2.rs"), b"x\ny\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f2.rs:2"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("create f2.rs"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("attribution unavailable"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn blame_line_unresolvable_after_not_false_predating() {
+    // BL5: an unresolvable `after` must not silently degrade to "before
+    // recording began" — that would be a confident false negative. The
+    // turn genuinely touched this file; its outcome just isn't provable.
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::{hash_bytes, BlobStore};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"a\nb\n").unwrap();
+    let ghost_after = hash_bytes(b"never-actually-stored-after");
+    assert!(
+        store.get(&ghost_after).is_err(),
+        "precondition: ghost_after must be genuinely unresolvable"
+    );
+
+    let turn = make_turn(
+        "t_BLAFTERGHOST00000000000001",
+        "rich",
+        Some("claude"),
+        "2026-07-05T09:00:00.000Z",
+        Some("edit with lost after snapshot"),
+        vec![FileEntry {
+            path: "f3.rs".into(),
+            before: Some(before),
+            after: Some(ghost_after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    std::fs::write(root.join("f3.rs"), b"a\nb\n").unwrap();
+
+    let out = agentrec(root, &["blame", "f3.rs:1"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("f3.rs:1: attribution unavailable — snapshot unavailable"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("before recording began"),
         "stdout: {stdout}"
     );
 }
@@ -1435,6 +3085,7 @@ fn undo_clean_revert_byte_exact() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1483,6 +3134,7 @@ fn undo_preview_does_not_mutate() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1529,6 +3181,7 @@ fn undo_file_subset() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "b.rs".into(),
@@ -1538,6 +3191,7 @@ fn undo_file_subset() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -1579,6 +3233,7 @@ fn undo_modified_since_excluded_then_allowed() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1623,9 +3278,14 @@ fn undo_skipped_and_withheld_refused() {
     let root = tmp.path();
     init(root);
 
+    // SR-E: `state.json`'s `io_failed` is a SEPARATE, aggregate/operational
+    // channel (drives the DEGRADED banner) — deliberately populated here with
+    // a path that is NOT the one under test, to prove `undo`'s per-entry
+    // message is driven only by the wire `skipped_reason` field below, never
+    // derived from this list.
     std::fs::write(
         root.join(".agentrec/state.json"),
-        r#"{"pid":0,"signal_offset":0,"snapshot_failures":1,"io_failed":["s.rs"]}"#,
+        r#"{"pid":0,"signal_offset":0,"snapshot_failures":1,"io_failed":["some-other-file.rs"]}"#,
     )
     .unwrap();
 
@@ -1640,6 +3300,7 @@ fn undo_skipped_and_withheld_refused() {
                 skipped: true,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: Some(agentrec_core::record::skip_reason::IO_FAILED.to_string()),
             },
             FileEntry {
                 path: "w.rs".into(),
@@ -1649,6 +3310,7 @@ fn undo_skipped_and_withheld_refused() {
                 skipped: false,
                 withheld: true,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -1673,7 +3335,9 @@ fn undo_skipped_and_withheld_refused() {
         "an all-refused plan must not record a turn"
     );
 
-    // Second turn: a skipped path NOT in io_failed reports the over-cap reason.
+    // Second turn: a skipped path whose wire-recorded cause is over_cap
+    // reports the over-cap reason — again independent of state.json, which
+    // doesn't mention o.rs at all.
     let turn2 = base_turn(
         "t_UNDOREFUSE20000000000000001",
         vec![FileEntry {
@@ -1684,6 +3348,7 @@ fn undo_skipped_and_withheld_refused() {
             skipped: true,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
         }],
     );
     seed_turn(root, &turn2);
@@ -1696,6 +3361,96 @@ fn undo_skipped_and_withheld_refused() {
     assert!(
         !o_line.contains("write failed at record time"),
         "o.rs line: {o_line}"
+    );
+}
+
+// SR6: the `skipped` gate must stay ABOVE the modified-since check in
+// `build_plan`. This is the data-loss-shaped scenario SR-C's honesty gain
+// makes newly reachable — an over-cap entry now carries a real `after` hash
+// (SR-C), so a naive reordering of the two checks would let an unmodified
+// skipped file's `is_modified` come out `false` and fall through into the
+// Revert plan, where undo would then try to restore a `before` blob that
+// was never stored. Pinned here at the CLI level: the file must be REFUSED
+// (never appear as a revert) and must be byte-identical on disk afterward.
+//
+// The fixture below MUST use `op: "create"` (before: None), not `op:
+// "modify"`. A prior version of this test used `op: "modify"` with
+// `before: None`, which is refused by an INDEPENDENT check —
+// `build_plan`'s `op == "modify"` before-blob branch (`None => "no prior
+// snapshot to restore"`) fires before the `entry.skipped` gate is ever
+// reached, so that fixture pinned nothing: a done-gate review deleted the
+// `skipped` gate entirely and the test still passed. `op == "create"`
+// skips the before-blob branch entirely (it only runs for
+// `"modify"`/`"delete"`), so the `skipped` gate is the ONLY thing standing
+// between this fixture and `execute_revert`'s create-inverse, which
+// deletes the file on disk — reproduced live against a gate-removed build:
+// `undo t_SR6P…0002 (claude)` / `  revert  big.bin (create)` /
+// `reverted 1 file(s)` / file gone from disk.
+#[test]
+fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
+    use agentrec_core::record::{skip_reason, FileEntry};
+    use agentrec_core::store::hash_bytes;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // Precondition this test depends on: the on-disk file's CURRENT hash
+    // matches the turn's recorded `after` exactly — i.e. genuinely
+    // unmodified since the turn, the one case a reordered gate would
+    // misclassify as revertible.
+    let content = b"over-cap content, never actually stored".to_vec();
+    let after_hash = hash_bytes(&content);
+    std::fs::write(root.join("big.bin"), &content).unwrap();
+    let current_hash = hash_bytes(&std::fs::read(root.join("big.bin")).unwrap());
+    assert_eq!(
+        current_hash, after_hash,
+        "precondition: current on-disk hash must equal the turn's `after`"
+    );
+
+    let turn = base_turn(
+        "t_SR6GATE0000000000000000001",
+        vec![FileEntry {
+            path: "big.bin".into(),
+            before: None,
+            after: Some(after_hash),
+            op: "create".into(),
+            skipped: true,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+    assert!(out.status.success(), "undo failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.contains("big.bin")).unwrap_or("");
+    assert!(
+        line.trim_start().starts_with("REFUSE"),
+        "an over-cap entry must always refuse, even when unmodified: {line}"
+    );
+    assert!(
+        !line.contains("EXCLUDE") && !stdout.contains("REVERT  big.bin"),
+        "must never be classified as a revert candidate: stdout: {stdout}"
+    );
+
+    // The file must be completely untouched — no attempted restore, no
+    // partial mutation, and (the reachable data-loss shape this test
+    // exists to catch) it must not have been DELETED by a create-inverse.
+    assert!(
+        root.join("big.bin").exists(),
+        "a refused skipped `create` entry must never be deleted from the worktree"
+    );
+    assert_eq!(
+        std::fs::read(root.join("big.bin")).unwrap(),
+        content,
+        "a refused skipped entry must never touch the worktree file"
+    );
+    assert!(
+        agentrec_turns(root).is_empty(),
+        "an all-refused plan must not record a turn"
     );
 }
 
@@ -1722,6 +3477,7 @@ fn undo_create_and_delete_inverse() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -1745,6 +3501,7 @@ fn undo_create_and_delete_inverse() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_b);
@@ -1782,6 +3539,7 @@ fn undo_is_a_turn_and_reversible() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1839,6 +3597,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn1);
@@ -1857,6 +3616,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn2);
@@ -1902,6 +3662,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn_rich);
@@ -1920,6 +3681,7 @@ fn panic_undo_targets_last_rich() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         );
         seed_turn(root, &turn_bare);
@@ -2355,6 +4117,7 @@ fn panic_undo_skips_git_turn() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_claude);
@@ -2376,6 +4139,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "checkout_b.rs".into(),
@@ -2385,6 +4149,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
             FileEntry {
                 path: "checkout_c.rs".into(),
@@ -2394,6 +4159,7 @@ fn panic_undo_skips_git_turn() {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             },
         ],
     );
@@ -2485,6 +4251,7 @@ fn purge_removes_expired_prompt_blob_keeps_shared() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     old_shared.started = days_ago_rfc3339(200);
@@ -2609,6 +4376,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_old1.started = "2024-01-01T00:00:00.000Z".into();
@@ -2625,6 +4393,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_old2.started = "2024-02-01T00:00:00.000Z".into();
@@ -2643,6 +4412,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     turn_new.started = "2024-06-01T00:00:00.000Z".into();
@@ -3021,17 +4791,65 @@ fn doctor_json_value(root: &Path) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("doctor --json did not emit valid JSON ({e}): {out:?}"))
 }
 
-/// Poll `.agentrec/state.json` until the daemon has written a nonzero pid
-/// (i.e. it holds the lock), so `doctor`'s liveness check has something real
-/// to observe.
+/// Poll `.agentrec/state.json` until the daemon has actually ARMED its
+/// watcher, not merely written a nonzero pid. Residuals round, Phase 4: the
+/// pid is written by `acquire_lock` roughly 4.3ms BEFORE `daemon::run` calls
+/// `.watch()` — a helper that stopped at "pid != 0" nominally raced the
+/// watcher, so any fs event a test emitted right after this returned could
+/// be silently lost before the watcher was actually listening. Waiting for
+/// `watcher_armed_nonce == epoch_nonce` (both non-empty) instead pins the
+/// real moment `daemon::stamp_watcher_armed` runs, immediately after
+/// `.watch()` succeeds.
 fn wait_for_live_daemon(root: &Path) {
     let ok = poll_until(Duration::from_secs(10), || {
         let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
         let pid = v.get("pid")?.as_u64()?;
-        (pid != 0).then_some(())
+        let epoch_nonce = v.get("epoch_nonce")?.as_str()?;
+        let armed_nonce = v.get("watcher_armed_nonce")?.as_str()?;
+        (pid != 0 && !epoch_nonce.is_empty() && armed_nonce == epoch_nonce).then_some(())
     });
-    assert!(ok.is_some(), "daemon never wrote a live pid to state.json");
+    assert!(
+        ok.is_some(),
+        "daemon never reached watcher-armed state in state.json"
+    );
+}
+
+// Residuals round, Phase 4: proves `daemon::run` actually CALLS
+// `stamp_watcher_armed` after `.watch()` succeeds against a REAL daemon —
+// the one call site no unit test can reach (there is no real `notify`
+// watcher without spawning an actual daemon process). `SingleDaemonGuard::
+// spawn` already blocks on `wait_for_live_daemon`, which polls for exactly
+// this condition; this test additionally re-reads `state.json` afterward
+// and asserts the fields explicitly by name, so a regression here fails as
+// THIS test rather than only via a generic timeout panic buried inside
+// `spawn()`. Neuter: delete the `stamp_watcher_armed(&root)` call after
+// `.watch()` in `daemon::run` -> this test times out loudly at the 10s
+// bound (and so does every other live-daemon test that spawns via
+// `SingleDaemonGuard`/`wait_for_live_daemon` — loud, not silent).
+#[test]
+fn live_daemon_reports_watcher_armed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = SingleDaemonGuard::spawn(root); // blocks until armed
+
+    let text = std::fs::read_to_string(root.join(".agentrec/state.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let epoch_nonce = v["epoch_nonce"].as_str().unwrap_or("").to_string();
+    let armed_nonce = v["watcher_armed_nonce"].as_str().unwrap_or("").to_string();
+
+    daemon.kill();
+
+    assert!(
+        !epoch_nonce.is_empty(),
+        "epoch_nonce must be stamped once the daemon is live"
+    );
+    assert_eq!(
+        armed_nonce, epoch_nonce,
+        "watcher_armed_nonce must equal the current epoch_nonce once the daemon is live"
+    );
 }
 
 #[test]
@@ -3425,6 +5243,96 @@ fn doctor_inotify_low_watches_fails() {
     assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
 }
 
+// Phase 2 (honesty-fixes round): a corrupt `state.json` field (e.g.
+// signal_offset written as a string) must surface as an ADVISORY-only
+// doctor finding — reported, but never flips the overall exit code or `ok`.
+// `doctor` all-pass exit 0 is this repo's production deploy gate; treating
+// this as a Fail would block deploys on a condition the daemon's own
+// per-field degrade already recovered from.
+#[test]
+fn doctor_state_parse_advisory_never_flips_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Real hooks installed (matches doctor_healthy_all_pass_exit_0's fixture)
+    // so every OTHER check genuinely passes, isolating the assertion to the
+    // new state-parse finding.
+    let out = agentrec(root, &["init", "--no-service"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let mut daemon = spawn_record(root);
+    wait_for_live_daemon(root);
+
+    // Corrupt exactly one field (signal_offset) while every other
+    // DEGRADED-triggering counter stays 0 — an exit-1 here could only come
+    // from the new check itself, not from a pre-existing failure mode.
+    // `daemon_is_running` is a flock probe (not this pid value), so
+    // clobbering state.json here doesn't disturb the liveness check.
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":123,"signal_offset":"not-a-number","snapshot_failures":0,"io_failed":[]}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["doctor", "--root", root.to_str().unwrap()])
+        .env(
+            "AGENTREC_CLAUDE_PROJECTS_DIR",
+            tmp.path().join("no-transcripts-here"),
+        )
+        .output()
+        .expect("run agentrec doctor");
+    // Capture --json while the daemon is still alive too — killing it first
+    // would make `daemon liveness` genuinely fail and pollute this test's
+    // `ok:true` assertion with an unrelated failure mode.
+    let v = Command::new(bin())
+        .args(["doctor", "--json", "--root", root.to_str().unwrap()])
+        .env(
+            "AGENTREC_CLAUDE_PROJECTS_DIR",
+            tmp.path().join("no-transcripts-here"),
+        )
+        .output()
+        .map(|o| {
+            serde_json::from_slice::<serde_json::Value>(&o.stdout)
+                .unwrap_or_else(|e| panic!("doctor --json did not emit valid JSON ({e}): {o:?}"))
+        })
+        .expect("run agentrec doctor --json");
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "an advisory state-parse finding must never flip doctor's exit code: {out:?}\nstdout={stdout}"
+    );
+    assert!(
+        stdout.contains("signal_offset"),
+        "expected the bad field named: {stdout}"
+    );
+    assert!(
+        stdout.contains("state.json"),
+        "expected the file named: {stdout}"
+    );
+
+    assert_eq!(v["ok"], true, "advisory finding must not flip ok: {v}");
+    let checks = v["checks"].as_array().unwrap();
+    let state_check = checks
+        .iter()
+        .find(|c| c["name"] == "state parse")
+        .unwrap_or_else(|| panic!("no 'state parse' check in {v}"));
+    assert_eq!(
+        state_check["status"], "pass",
+        "advisory finding must render as pass — a Fail here would flip exit: {v}"
+    );
+    assert!(
+        state_check["remedy"]
+            .as_str()
+            .unwrap_or("")
+            .contains("signal_offset"),
+        "expected the remedy to name the bad field: {v}"
+    );
+}
+
 // --- AC-Z+2, AC-Z+3, AC-Z+4 (D42/D43): relative-time default / --utc
 // absolute, color gated off when piped or under NO_COLOR, and the
 // `--explain` glossary only ever mentions terms present in this listing.
@@ -3548,6 +5456,501 @@ fn log_and_show_render_turn_header_with_identical_formatting() {
     assert!(
         show_stdout.contains(&short),
         "show id format: {show_stdout:?}"
+    );
+}
+
+// --- NF1–NF9: `noise_globs` fold (display-only). Declaratively-configured
+// glob-matched file entries are folded out of `log`/`show`'s HUMAN rendering
+// only — never `--json`, never `diff`/`blame`/`undo`. Precedent: `log`
+// already hides an entire class by default (git turns via the `tool != "git"`
+// filter, `--all` reveals) — this is the same idea one level down, from
+// turns to individual file entries within a turn, with `--all-files` as the
+// orthogonal reveal flag.
+
+fn set_noise_globs(root: &Path, globs: &[&str]) {
+    let config_path = root.join(".agentrec/config.toml");
+    let mut text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let items: Vec<String> = globs.iter().map(|g| format!("\"{g}\"")).collect();
+    text.push_str(&format!("\nnoise_globs = [{}]\n", items.join(", ")));
+    std::fs::write(&config_path, text).unwrap();
+}
+
+fn short_id_of(id: &str) -> String {
+    let body = id.strip_prefix("t_").unwrap();
+    format!("t_{}…{}", &body[..4], &body[body.len() - 4..])
+}
+
+/// A rich turn touching 1 ordinary file + 2 files under `.remember/` (the
+/// measured real-world noise class from CLAUDE.md's store-bloat notes).
+fn noise_turn(id: &str) -> agentrec_core::record::TurnRecord {
+    use agentrec_core::record::FileEntry;
+    let entry = |path: &str| FileEntry {
+        path: path.to_string(),
+        before: None,
+        after: Some(agentrec_core::store::hash_bytes(path.as_bytes())),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+        skipped_reason: None,
+    };
+    base_turn(
+        id,
+        vec![
+            entry("src/main.rs"),
+            entry(".remember/session.log"),
+            entry(".remember/session.pid"),
+        ],
+    )
+}
+
+// NF1: regression guard — no `noise_globs` configured (or empty) means `log`
+// and `show` are completely unaffected by this feature's existence.
+#[test]
+fn nf1_log_and_show_unaffected_when_noise_globs_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF1BASELINE00000000000001");
+    seed_turn(root, &turn);
+
+    let log_out = agentrec(root, &["log", "--utc"]);
+    assert!(log_out.status.success(), "log failed: {log_out:?}");
+    let log_stdout = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        log_stdout.contains("3 files"),
+        "expected the unreduced 3-file count with no noise_globs: {log_stdout}"
+    );
+    assert!(
+        !log_stdout.contains("noise files"),
+        "no fold line must ever print with no noise_globs configured: {log_stdout}"
+    );
+
+    let show_out = agentrec(root, &["show", &turn.id]);
+    assert!(show_out.status.success(), "show failed: {show_out:?}");
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    assert!(
+        !show_stdout.contains("noise files"),
+        "show must not print a fold line with no noise_globs configured: {show_stdout}"
+    );
+}
+
+// Advisor-surfaced: `log.jsonl` is a trust boundary (the P0 in the 2026-07-11
+// hardening round was exactly this — an unvalidated hash/path read from the
+// log). A `FileEntry.path` is normally repo-relative, but nothing in the wire
+// format enforces that — a hand-edited or foreign-tool-written log line could
+// carry an absolute path. `Gitignore::matched_path_or_any_parents` panics
+// (`assert!(!path.has_root())`) when the given path shares no common prefix
+// with the matcher's root, which an absolute path never will. This must
+// degrade (fold nothing) rather than crash `log`/`show`.
+#[test]
+fn nf_is_noise_does_not_panic_on_absolute_path() {
+    use agentrec_core::record::FileEntry;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let turn = base_turn(
+        "t_NFABSPATH00000000000001",
+        vec![FileEntry {
+            path: "/etc/passwd".into(),
+            before: None,
+            after: Some(agentrec_core::store::hash_bytes(b"/etc/passwd")),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["log"]);
+    assert!(
+        out.status.success(),
+        "log must not crash on an absolute FileEntry.path: {out:?}"
+    );
+    let show_out = agentrec(root, &["show", &turn.id]);
+    assert!(
+        show_out.status.success(),
+        "show must not crash on an absolute FileEntry.path: {show_out:?}"
+    );
+}
+
+// NF2: with a matching glob configured, `log` folds the matched entries out
+// of the visible count and prints the exact mandated line. The --all-files
+// cross-check proves the glob genuinely matched this fixture (not a
+// coincidental 0) rather than assuming it.
+#[test]
+fn nf2_log_folds_matching_entries_and_prints_exact_count_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+    let turn = noise_turn("t_NF2FOLDCOUNT0000000000001");
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["log", "--utc"]);
+    assert!(out.status.success(), "log failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 file"),
+        "folded count must be 3 total - 2 noise = 1: {stdout}"
+    );
+    assert!(
+        stdout.contains("+2 noise files (--all-files to show)"),
+        "expected the exact mandated fold line: {stdout}"
+    );
+
+    let unfolded = agentrec(root, &["log", "--utc", "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout);
+    assert!(
+        unfolded_stdout.contains("3 files"),
+        "precondition: --all-files must show the real unreduced count \
+         (proves the glob genuinely matched, not a coincidental 0): {unfolded_stdout}"
+    );
+}
+
+// NF3: `--all-files` output must match the no-`noise_globs` baseline exactly
+// — folding fully reversed, byte for byte.
+#[test]
+fn nf3_all_files_matches_unfolded_rendering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF3ALLFILES0000000000001");
+    seed_turn(root, &turn);
+
+    let baseline = agentrec(root, &["log", "--utc"]);
+    assert!(baseline.status.success());
+    let baseline_stdout = String::from_utf8_lossy(&baseline.stdout).to_string();
+
+    set_noise_globs(root, &[".remember/**"]);
+    let folded = agentrec(root, &["log", "--utc"]);
+    assert!(folded.status.success());
+    let folded_stdout = String::from_utf8_lossy(&folded.stdout).to_string();
+    assert_ne!(
+        folded_stdout, baseline_stdout,
+        "sanity: folding must actually change output before --all-files un-does it"
+    );
+
+    let unfolded = agentrec(root, &["log", "--utc", "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout).to_string();
+    assert_eq!(
+        unfolded_stdout, baseline_stdout,
+        "--all-files output must match the no-noise_globs baseline exactly"
+    );
+}
+
+// NF4: `--json` is the machine contract — byte-identical with and without
+// `noise_globs` configured. Folding is human-render only.
+#[test]
+fn nf4_json_output_byte_identical_regardless_of_noise_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let turn = noise_turn("t_NF4JSONSTABLE000000000001");
+    seed_turn(root, &turn);
+
+    let before = agentrec(root, &["log", "--json"]);
+    assert!(before.status.success());
+
+    set_noise_globs(root, &[".remember/**"]);
+    let after = agentrec(root, &["log", "--json"]);
+    assert!(after.status.success());
+
+    assert_eq!(
+        before.stdout, after.stdout,
+        "log --json must be byte-identical with and without noise_globs"
+    );
+}
+
+// NF5: `blame` and `undo` never consult `noise_globs` — attribution and
+// revert are completely unaffected for a file that matches it.
+#[test]
+fn nf5_blame_and_undo_unaffected_by_noise_globs() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    std::fs::create_dir_all(root.join(".remember")).unwrap();
+    let before = store.put(b"before\n").unwrap();
+    let after = store.put(b"after\n").unwrap();
+    std::fs::write(root.join(".remember/session.log"), b"after\n").unwrap();
+
+    let turn = base_turn(
+        "t_NF5BLAMEUNDO0000000000001",
+        vec![FileEntry {
+            path: ".remember/session.log".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let blame_out = agentrec(root, &["blame", ".remember/session.log"]);
+    assert!(blame_out.status.success(), "blame failed: {blame_out:?}");
+    let blame_stdout = String::from_utf8_lossy(&blame_out.stdout);
+    assert!(
+        blame_stdout.contains(&short_id_of(&turn.id)),
+        "blame must still attribute the noise-matched file normally: {blame_stdout}"
+    );
+    assert!(
+        !blame_stdout.contains("no recorded turn"),
+        "blame must not treat a noise-matched file as untouched: {blame_stdout}"
+    );
+
+    let undo_out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+    assert!(undo_out.status.success(), "undo failed: {undo_out:?}");
+    let reverted = std::fs::read(root.join(".remember/session.log")).unwrap();
+    assert_eq!(
+        reverted, b"before\n",
+        "undo must still revert a noise-matched file"
+    );
+}
+
+// NF6: a turn whose entries are ALL noise still appears in `log` (turn
+// selection is untouched — only individual file entries fold), and
+// `status`'s rich-rate is completely unaffected either way.
+#[test]
+fn nf6_all_noise_turn_still_appears_and_rich_rate_unaffected() {
+    use agentrec_core::record::FileEntry;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let entry = |path: &str| FileEntry {
+        path: path.to_string(),
+        before: None,
+        after: Some(agentrec_core::store::hash_bytes(path.as_bytes())),
+        op: "create".into(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+        skipped_reason: None,
+    };
+    let all_noise_turn = base_turn(
+        "t_NF6ALLNOISE00000000000001",
+        vec![entry(".remember/a.log"), entry(".remember/b.log")],
+    );
+    seed_turn(root, &all_noise_turn);
+
+    let status_before = agentrec(root, &["status"]);
+    assert!(status_before.status.success());
+    let status_before_stdout = String::from_utf8_lossy(&status_before.stdout).to_string();
+
+    set_noise_globs(root, &[".remember/**"]);
+
+    let log_out = agentrec(root, &["log", "--utc"]);
+    assert!(log_out.status.success(), "log failed: {log_out:?}");
+    let log_stdout = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        log_stdout.contains(&short_id_of(&all_noise_turn.id)),
+        "an all-noise turn must still appear in log: {log_stdout}"
+    );
+    assert!(
+        log_stdout.contains("+2 noise files (--all-files to show)"),
+        "expected the fold line even when every entry is noise: {log_stdout}"
+    );
+
+    let status_after = agentrec(root, &["status"]);
+    assert!(status_after.status.success());
+    let status_after_stdout = String::from_utf8_lossy(&status_after.stdout);
+    assert_eq!(
+        status_after_stdout, status_before_stdout,
+        "status rich-rate must be completely unaffected by noise_globs"
+    );
+}
+
+// NF7: `--all` (turn-grade axis) and `--all-files` (file-class axis) are
+// orthogonal — neither flag's behavior leaks into the other's.
+#[test]
+fn nf7_all_and_all_files_flags_are_orthogonal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let mut git_turn = noise_turn("t_NF7GITTURN0000000000001");
+    git_turn.tool = Some("git".to_string());
+    seed_turn(root, &git_turn);
+
+    // --all-files alone: git turn stays hidden.
+    let all_files_only = agentrec(root, &["log", "--all-files"]);
+    assert!(all_files_only.status.success());
+    let stdout = String::from_utf8_lossy(&all_files_only.stdout);
+    assert!(
+        !stdout.contains(&short_id_of(&git_turn.id)),
+        "--all-files must not reveal a git turn: {stdout}"
+    );
+
+    // --all alone: git turn revealed, but its noise files still folded.
+    let all_only = agentrec(root, &["log", "--all"]);
+    assert!(all_only.status.success());
+    let stdout2 = String::from_utf8_lossy(&all_only.stdout);
+    assert!(
+        stdout2.contains(&short_id_of(&git_turn.id)),
+        "--all must reveal the git turn: {stdout2}"
+    );
+    assert!(
+        stdout2.contains("noise files"),
+        "--all alone must leave noise files folded (fold notice still prints): {stdout2}"
+    );
+
+    // Finding #6: both flags together. They are orthogonal axes (`--all` =
+    // turn grade, `--all-files` = file class), so combining them must
+    // reveal everything either flag alone reveals — the git turn AND its
+    // unfolded file count — never have one flag suppress the other.
+    let both = agentrec(root, &["log", "--all", "--all-files"]);
+    assert!(both.status.success());
+    let stdout3 = String::from_utf8_lossy(&both.stdout);
+    assert!(
+        stdout3.contains(&short_id_of(&git_turn.id)),
+        "--all --all-files together must still reveal the git turn: {stdout3}"
+    );
+    assert!(
+        !stdout3.contains("noise files"),
+        "--all-files must unfold noise even when combined with --all: {stdout3}"
+    );
+    assert!(
+        stdout3.contains("3 files"),
+        "combined flags must show the full unreduced file count: {stdout3}"
+    );
+}
+
+// NF8: `init`'s default config.toml mentions `noise_globs`, and a
+// pre-existing config lacking the key still works and is never clobbered.
+#[test]
+fn nf8_init_default_config_mentions_noise_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let config = std::fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
+    assert!(
+        config.contains("noise_globs"),
+        "default config.toml must mention noise_globs: {config}"
+    );
+}
+
+#[test]
+fn nf8_existing_config_missing_noise_globs_key_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // Simulate a pre-existing repo's config.toml written before this
+    // feature existed — no noise_globs key at all.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "ttl_days = 90\nmcp_destructive = \"off\"\n",
+    )
+    .unwrap();
+
+    let turn = noise_turn("t_NF8OLDCONFIG00000000001");
+    seed_turn(root, &turn);
+    let out = agentrec(root, &["log", "--utc"]);
+    assert!(out.status.success(), "log must still work: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("3 files"), "stdout: {stdout}");
+
+    // Re-running init on this pre-existing config must not clobber it.
+    let init_out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(init_out.status.success());
+    let config_after = std::fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
+    assert!(
+        !config_after.contains("noise_globs"),
+        "init must not clobber a pre-existing config.toml lacking the key: {config_after}"
+    );
+}
+
+// `show`: same fold behavior as `log`, plus --all-files suppresses it.
+#[test]
+fn nf_show_folds_and_all_files_reveals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+    let turn = noise_turn("t_NFSHOWFOLD0000000000001");
+    seed_turn(root, &turn);
+
+    let folded = agentrec(root, &["show", &turn.id]);
+    assert!(folded.status.success());
+    let folded_stdout = String::from_utf8_lossy(&folded.stdout);
+    assert!(
+        folded_stdout.contains("+2 noise files (--all-files to show)"),
+        "show must print the fold line: {folded_stdout}"
+    );
+
+    let unfolded = agentrec(root, &["show", &turn.id, "--all-files"]);
+    assert!(unfolded.status.success());
+    let unfolded_stdout = String::from_utf8_lossy(&unfolded.stdout);
+    assert!(
+        !unfolded_stdout.contains("noise files"),
+        "show --all-files must suppress the fold line: {unfolded_stdout}"
+    );
+}
+
+// Judgement call (not a named AC, but load-bearing): `show --prompt` writes
+// raw post-scrub prompt bytes to stdout — the fold line must never leak into
+// that path, or it silently corrupts the printed prompt.
+#[test]
+fn nf_show_prompt_output_never_gets_fold_line() {
+    use agentrec_core::store::BlobStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    set_noise_globs(root, &[".remember/**"]);
+
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let prompt_hash = store.put(b"do the thing").unwrap();
+    let mut turn = noise_turn("t_NFSHOWPROMPT000000000001");
+    turn.prompt_ref = Some(prompt_hash);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["show", &turn.id, "--prompt"]);
+    assert!(out.status.success(), "show --prompt failed: {out:?}");
+    assert_eq!(out.stdout, b"do the thing", "stdout: {:?}", out.stdout);
+}
+
+// NF-E: `--explain`'s glossary only explains noise-folding when a fold
+// actually occurred in this invocation's output (D43's existing rule,
+// extended to the new term).
+#[test]
+fn nf_explain_explains_noise_fold_only_when_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = noise_turn("t_NFEXPLAINNONE0000000001");
+    seed_turn(root, &turn);
+
+    let without = agentrec(root, &["log", "--explain"]);
+    assert!(without.status.success());
+    let without_stdout = String::from_utf8_lossy(&without.stdout).to_lowercase();
+    assert!(
+        !without_stdout.contains("noise files:"),
+        "must not explain noise folding when none occurred: {without_stdout}"
+    );
+
+    set_noise_globs(root, &[".remember/**"]);
+    let with = agentrec(root, &["log", "--explain"]);
+    assert!(with.status.success());
+    let with_stdout = String::from_utf8_lossy(&with.stdout).to_lowercase();
+    assert!(
+        with_stdout.contains("noise files:"),
+        "must explain noise folding once a fold occurred: {with_stdout}"
     );
 }
 
@@ -4364,6 +6767,7 @@ fn memories_stale_shows_drifted_pin_and_when() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -6372,4 +8776,104 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
         store_corrupt as u64, iterations,
         "expected every failure stat to be tagged reason:store_corrupt: {stats:?}"
     );
+}
+
+// Phase 1 (honesty-fixes round) — call-site wiring: proves `status`
+// actually threads its harvested protect-set into `enforce_budget`, not
+// just that the core mechanism honors one when handed one directly (that's
+// already unit-tested in `cli/src/cmds.rs`'s `eviction_keeps_*` tests). A
+// real ~2 GiB store is infeasible here, so this drives the real binary with
+// the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` override (compiled out
+// of release — see `cmds::effective_store_budget`), seeding an old,
+// otherwise-evictable turn whose blob is ALSO the in-flight open turn's
+// `before` — exactly the live-daemon scenario this phase's defect
+// describes (open.json's before is typically the previous committed
+// turn's after for the same file).
+#[test]
+fn status_eviction_keeps_open_turn_blob() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let old = store.put(&[0xAAu8; 500]).unwrap();
+    // Backdate well before `enforce_budget`'s internal `pass_start` so the
+    // pre-existing A3(c) freshness guard can't rescue it vacuously.
+    {
+        let hex = old.strip_prefix("sha256:").unwrap();
+        let path = root
+            .join(".agentrec/objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+
+    seed_turn(
+        root,
+        &base_turn(
+            "t_OPENWIRE0000000000000001",
+            vec![FileEntry {
+                path: "old.bin".into(),
+                before: None,
+                after: Some(old.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            }],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn(
+            "t_OPENWIRENEW000000000001",
+            vec![FileEntry {
+                path: "new.bin".into(),
+                before: None,
+                after: Some(new.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            }],
+        ),
+    );
+
+    // Simulates the daemon's crash journal: the in-flight open turn's
+    // `before` cites the same blob as the old committed turn's `after`.
+    std::fs::write(
+        root.join(".agentrec/open.json"),
+        format!(r#"{{"before":"{old}"}}"#),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["status", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")
+        .output()
+        .expect("run agentrec status");
+    assert!(out.status.success(), "status failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("over"),
+        "expected over-budget notice: {stdout}"
+    );
+
+    assert!(
+        store.contains(&old),
+        "the in-flight turn's blob must survive a real `status` eviction pass: {stdout}"
+    );
+    assert!(store.contains(&new));
 }

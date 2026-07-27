@@ -71,6 +71,33 @@ pub struct FileEntry {
     pub withheld: bool, // secret-pattern file, never snapshotted
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub baseline_unknown: bool, // before unrecoverable (first seen post-change)
+    /// Why `skipped` is set (PROTOCOL §5, additive, open string enum — unknown
+    /// values MUST degrade to plain `skipped` behavior in consumers). `None`
+    /// on every entry where `skipped` is false, and on logs written before
+    /// this field existed. Permanent per-entry historical truth — see
+    /// `skip_reason` in `agentrec-core::skip_reason` for the defined values
+    /// and `cli/src/fmt.rs::skip_reason_text` for the one place that renders
+    /// them. Distinct from (and must never be derived from, or derive)
+    /// `state.json`'s `io_failed`/`snapshot_failures`, which stay operational
+    /// and aggregate, driving the DEGRADED banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+}
+
+/// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
+/// Unknown/absent values MUST degrade to plain `skipped` behavior in every
+/// consumer — never match exhaustively on these.
+pub mod skip_reason {
+    /// Content exceeded the per-blob size cap (`MAX_SNAPSHOT_BYTES`).
+    pub const OVER_CAP: &str = "over_cap";
+    /// The snapshot write itself failed at record time (`PutResult::IoError`).
+    pub const IO_FAILED: &str = "io_failed";
+    /// The file could not be read at record time (`fs::read` / `read_link` error).
+    pub const UNREADABLE: &str = "unreadable";
+    /// RESERVED, no producer yet — a future rate/size-demotion feature will
+    /// emit this. Reserved now so the frozen protocol has room (PROTOCOL §5).
+    #[allow(dead_code)]
+    pub const POLICY: &str = "policy";
 }
 
 /// A log line: turn or epoch (PROTOCOL §5). `type` defaults to "turn".
@@ -268,6 +295,7 @@ mod tests {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         };
         append_log(&path, &LogRecord::Turn(turn)).unwrap();
@@ -305,10 +333,59 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("skipped"));
         assert!(!json.contains("withheld"));
+    }
+
+    // SR1: a record WITHOUT `skipped_reason` at all (pre-this-round wire
+    // shape) deserializes fine, and a `None` entry serializes byte-identical
+    // to the pre-change output — the additive-field promise PROTOCOL.md makes
+    // for every wire type.
+    #[test]
+    fn skipped_reason_golden_roundtrip() {
+        // Old-shape JSON, no `skipped_reason` key at all.
+        let old_shape =
+            r#"{"path":"a.rs","before":null,"after":null,"op":"modify","skipped":true}"#;
+        let entry: FileEntry = serde_json::from_str(old_shape).unwrap();
+        assert_eq!(
+            entry.skipped_reason, None,
+            "absent field must default to None"
+        );
+        assert!(entry.skipped);
+
+        // A `None`-reason entry serializes byte-identical to the pre-change
+        // shape: no `skipped_reason` key appears at all.
+        let entry_none = FileEntry {
+            path: "a.rs".into(),
+            before: None,
+            after: None,
+            op: "modify".into(),
+            skipped: true,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        };
+        let json = serde_json::to_string(&entry_none).unwrap();
+        assert_eq!(
+            json, old_shape,
+            "None skipped_reason must not appear on the wire"
+        );
+
+        // A `Some`-reason entry round-trips exactly.
+        let entry_some = FileEntry {
+            skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+            ..entry_none
+        };
+        let json2 = serde_json::to_string(&entry_some).unwrap();
+        assert!(
+            json2.contains(r#""skipped_reason":"over_cap""#),
+            "json: {json2}"
+        );
+        let back: FileEntry = serde_json::from_str(&json2).unwrap();
+        assert_eq!(back.skipped_reason.as_deref(), Some(skip_reason::OVER_CAP));
     }
 
     #[test]

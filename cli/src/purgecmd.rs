@@ -875,8 +875,14 @@ pub(crate) fn orphan_bytes(root: &Path, store: &BlobStore) -> u64 {
 /// chars, inserting each as a `sha256:<hex>` ref. Anchored on the literal
 /// `sha256:` prefix (not a bare 64-hex match) so an unrelated hex run can't
 /// fool it, yet oblivious to JSON structure so a torn line still yields its
-/// hashes.
-fn harvest_refs(text: &str, out: &mut HashSet<String>) {
+/// hashes. `pub(crate)` (mech, Phase 1): `cmds::status_report` reuses this
+/// same primitive to build its OWN narrower protect-set — unlike
+/// `referenced_hashes` above (which deliberately folds in every VALID
+/// log.jsonl reference too, correct for `--orphans`' absence test), budget
+/// eviction's own age-based walk already decides a validly-referenced
+/// blob's fate; only refs invisible to that walk (open.json, memory.jsonl,
+/// torn log.jsonl lines) need harvesting separately.
+pub(crate) fn harvest_refs(text: &str, out: &mut HashSet<String>) {
     const PREFIX: &[u8] = b"sha256:";
     let bytes = text.as_bytes();
     let mut i = 0;

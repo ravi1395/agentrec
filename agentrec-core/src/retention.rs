@@ -14,6 +14,12 @@ use std::collections::HashSet;
 pub struct Evicted {
     pub count: usize,
     pub bytes: u64,
+    /// Bytes of candidates that would otherwise have been evicted but were
+    /// saved by `extra_protected` (Phase 1 honesty fix) — surfaced so a
+    /// caller can explain a low/zero `bytes` figure instead of reporting
+    /// "0 freed" with no reason, the exact dishonest-status shape an
+    /// earlier round already fixed for the orphan-bloat case.
+    pub protected_bytes: u64,
 }
 
 /// Evict snapshot blobs (each turn's `FileEntry.before`/`after`) belonging to
@@ -40,7 +46,23 @@ pub struct Evicted {
 /// apply — there is nothing else to sacrifice, so budget enforcement falls
 /// back to evicting it (see `cmds::tests::status_prints_over_budget_notice`,
 /// which asserts exactly this single-turn case).
-pub fn enforce_budget(store: &BlobStore, entries: &[TurnRecord], budget: u64) -> Evicted {
+///
+/// `extra_protected` (Phase 1 honesty fix): a caller-supplied set of hashes
+/// that must never be evicted regardless of the above, subtracted from
+/// `candidates` immediately before the remove loop. This module only knows
+/// about *parsed* `TurnRecord`s, so it cannot on its own see a blob cited
+/// only by the in-flight turn's crash journal (`open.json`), a memory pin
+/// (`memory.jsonl`), or a torn/unparseable `log.jsonl` line — exactly the
+/// classes `cli/src/purgecmd.rs::referenced_hashes` (this repo's own stated
+/// safety standard for CAS deletion) protects via a raw, non-parsing
+/// `sha256:` byte-scan. `agentrec-core` stays dependency-free of that CLI
+/// module, so the caller harvests the set and passes it in.
+pub fn enforce_budget(
+    store: &BlobStore,
+    entries: &[TurnRecord],
+    budget: u64,
+    extra_protected: &HashSet<String>,
+) -> Evicted {
     // A3(c): a candidate touched *during this pass* — e.g. a concurrent
     // daemon's dedup-hit landing between the caller's log.jsonl read and
     // this call — must never be evicted even though the keep-set computed
@@ -99,7 +121,25 @@ pub fn enforce_budget(store: &BlobStore, entries: &[TurnRecord], budget: u64) ->
         }
     }
 
-    let mut evicted = Evicted::default();
+    // Phase 1: subtract the caller's protect-set from `candidates`
+    // immediately before the remove loop — as late as possible, so a
+    // narrower window exists between harvesting refs and this pass
+    // deleting anything. Tally the bytes saved so the caller can attribute
+    // a low/zero `evicted.bytes` instead of reporting it unexplained.
+    let mut protected_bytes = 0u64;
+    candidates.retain(|hash| {
+        if extra_protected.contains(hash) {
+            protected_bytes += store.size(hash).unwrap_or(0);
+            false
+        } else {
+            true
+        }
+    });
+
+    let mut evicted = Evicted {
+        protected_bytes,
+        ..Evicted::default()
+    };
     for hash in candidates {
         if keep.contains(&hash) {
             continue; // referenced by a kept (newer) turn — never evict
@@ -168,6 +208,7 @@ mod tests {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }
     }
 
@@ -203,9 +244,16 @@ mod tests {
         let entries = vec![t1, t2, t3];
 
         // Budget fits exactly the newest turn's unique bytes (shared + new = 15).
-        let evicted = enforce_budget(&store, &entries, 15);
+        let evicted = enforce_budget(&store, &entries, 15, &HashSet::new());
 
-        assert_eq!(evicted, Evicted { count: 1, bytes: 8 });
+        assert_eq!(
+            evicted,
+            Evicted {
+                count: 1,
+                bytes: 8,
+                protected_bytes: 0
+            }
+        );
         assert!(!store.contains(&old), "oldest unique blob evicted");
         assert!(
             store.contains(&shared),
@@ -225,7 +273,7 @@ mod tests {
             vec![entry("x", None, Some(&h), "create")],
         )];
 
-        let evicted = enforce_budget(&store, &entries, 1_000_000);
+        let evicted = enforce_budget(&store, &entries, 1_000_000, &HashSet::new());
 
         assert_eq!(evicted, Evicted::default());
         assert!(store.contains(&h));
@@ -258,11 +306,15 @@ mod tests {
         ];
 
         // Budget smaller than even the newest turn's own blob alone.
-        let evicted = enforce_budget(&store, &entries, 10);
+        let evicted = enforce_budget(&store, &entries, 10, &HashSet::new());
 
         assert_eq!(
             evicted,
-            Evicted { count: 1, bytes: 3 },
+            Evicted {
+                count: 1,
+                bytes: 3,
+                protected_bytes: 0
+            },
             "only the older turn's blob is sacrificed"
         );
         assert!(
@@ -293,13 +345,14 @@ mod tests {
             vec![entry("x", None, Some(&big), "create")],
         )];
 
-        let evicted = enforce_budget(&store, &entries, 10);
+        let evicted = enforce_budget(&store, &entries, 10, &HashSet::new());
 
         assert_eq!(
             evicted,
             Evicted {
                 count: 1,
-                bytes: 100
+                bytes: 100,
+                protected_bytes: 0
             }
         );
         assert!(!store.contains(&big));
@@ -327,13 +380,14 @@ mod tests {
             ),
         ];
 
-        let evicted = enforce_budget(&store, &entries, 5);
+        let evicted = enforce_budget(&store, &entries, 5, &HashSet::new());
 
         assert_eq!(
             evicted,
             Evicted {
                 count: 1,
-                bytes: 50
+                bytes: 50,
+                protected_bytes: 0
             }
         );
         assert!(!store.contains(&old));
@@ -369,7 +423,7 @@ mod tests {
 
         // Budget fits only the newest turn's unique bytes — `shared` would
         // normally be evicted as the old turn's blob.
-        let evicted = enforce_budget(&store, &entries, 5);
+        let evicted = enforce_budget(&store, &entries, 5, &HashSet::new());
 
         assert_eq!(
             evicted,
@@ -415,7 +469,7 @@ mod tests {
             .set_modified(future)
             .unwrap();
 
-        let evicted = enforce_budget(&store, &entries, 5);
+        let evicted = enforce_budget(&store, &entries, 5, &HashSet::new());
 
         assert_eq!(
             evicted,
@@ -423,5 +477,58 @@ mod tests {
             "future-touched (racing) candidate must be skipped"
         );
         assert!(store.contains(&old), "old blob survives due to fresh mtime");
+    }
+
+    // Phase 1 (core mechanism): `extra_protected` must save a genuine
+    // eviction candidate — a blob referenced only by an OLD turn, backdated
+    // well before `pass_start` so A3(c)'s freshness guard cannot rescue it
+    // vacuously — regardless of what real-world file the caller harvested
+    // that hash from (open.json / memory.jsonl / a torn log.jsonl line all
+    // funnel into the same set from the CLI side; this module only cares
+    // that the hash is IN the set). `eviction.protected_bytes` also reports
+    // what was saved, for the caller's status attribution message.
+    #[test]
+    fn enforce_budget_honors_extra_protected_argument() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let old = store.put(&[0xAAu8; 50]).unwrap();
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+        let entries = vec![
+            turn(
+                "t_EXTRAOLD00000000000001",
+                "2026-01-01T00:00:00.000Z",
+                vec![entry("x", None, Some(&old), "create")],
+            ),
+            turn(
+                "t_EXTRANEW00000000000001",
+                "2026-01-02T00:00:00.000Z",
+                vec![entry("y", None, Some(&new), "create")],
+            ),
+        ];
+
+        let hex = old.strip_prefix("sha256:").unwrap();
+        let path = tmp.path().join(&hex[..2]).join(&hex[2..]);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let extra_protected: HashSet<String> = [old.clone()].into_iter().collect();
+        let evicted = enforce_budget(&store, &entries, 5, &extra_protected);
+
+        assert_eq!(
+            evicted,
+            Evicted {
+                count: 0,
+                bytes: 0,
+                protected_bytes: 50
+            },
+            "the sole candidate was saved by extra_protected, not evicted"
+        );
+        assert!(store.contains(&old), "extra_protected blob must survive");
+        assert!(store.contains(&new));
     }
 }

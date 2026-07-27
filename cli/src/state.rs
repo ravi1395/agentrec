@@ -59,13 +59,182 @@ pub struct State {
     /// evidence the write was attempted and failed, not silently absent.
     #[serde(default)]
     pub prompt_put_failures: u64,
+    /// Count of times the daemon rebuilt its in-memory `IgnoreSet` after a
+    /// `.gitignore` change (Phase 1 of the rebuild-gate fix, `0a7b279`, made
+    /// this happen reliably; this counter makes its RATE observable rather
+    /// than theoretical — see `daemon::run`'s loop-tick comment for why that
+    /// rate matters). Same `snapshot_failures` honesty pattern as every
+    /// other counter here: nothing else on disk shows whether a filter
+    /// reload ever happened, so a user cannot otherwise tell "my new rule is
+    /// active" from "the daemon is still running last week's rules".
+    /// OPERATIONAL state only — never part of the PROTOCOL wire format
+    /// (PROTOCOL §5 deliberately keeps `state.json` off the wire).
+    #[serde(default)]
+    pub ignore_rebuilds: u64,
+    /// Wall-clock ms of the most recent ignore-set rebuild, or 0 when
+    /// `ignore_rebuilds` is 0 (never happened). Same operational, off-wire
+    /// posture as `ignore_rebuilds`.
+    #[serde(default)]
+    pub last_ignore_rebuild_ms: u64,
+    /// Ignore-set rebuilds since the CURRENT daemon epoch started (Phase 3,
+    /// honesty-fixes round — open question 1 answered as option (a)).
+    /// `status` renders THIS figure, never `ignore_rebuilds`: a long-lived
+    /// repo would otherwise eventually render `reloaded 4821 time(s)` in a
+    /// daily-driver surface whose line budget is contested. `ignore_rebuilds`
+    /// itself is untouched by the reset below and keeps accumulating — it is
+    /// real lifetime history and must not be destroyed.
+    #[serde(default)]
+    pub epoch_ignore_rebuilds: u64,
+    /// Collision-resistant identity of the CURRENT daemon epoch. Stamped by
+    /// `acquire_lock` (daemon.rs) at the moment a fresh epoch begins, using
+    /// the same ULID machinery `agentrec_core::id::ulid()` already uses for
+    /// turn ids (48-bit wall-clock ms + 80 random bits) — deliberately NOT
+    /// the pid. Pid is reused by the OS over a long-lived machine (the same
+    /// recycling class `doctor`'s daemon-liveness check already handles via
+    /// flock rather than pid comparison); keying epoch identity on pid let a
+    /// later epoch that happened to reuse a dead epoch's pid inherit its
+    /// stale reload count. A bare wall-clock-ms stamp alone could still
+    /// collide if two epochs started within the same millisecond (e.g. rapid
+    /// record/stop/record cycles in a test loop); the ULID's random suffix
+    /// rules that out. Empty string is the sentinel for "no epoch is
+    /// currently live" — `release_lock` clears it back to empty on a clean
+    /// stop, and it is also what a pre-this-field `state.json` deserializes
+    /// to (never confusable with a real epoch: `ulid()` never returns an
+    /// empty string). Not surfaced to `status`/`--json`; purely bookkeeping.
+    #[serde(default)]
+    pub epoch_nonce: String,
+    /// The `epoch_nonce` `epoch_ignore_rebuilds` was last reset for (replaces
+    /// the old pid-keyed `epoch_pid` field for the same reason described on
+    /// `epoch_nonce` above). Not surfaced to `status`/`--json`; purely
+    /// bookkeeping.
+    #[serde(default)]
+    pub epoch_reload_nonce: String,
+    /// Count of individual `state.json` FIELDS that failed to parse and fell
+    /// back to their default (Phase 2, honesty-fixes round). Distinct from
+    /// every other counter here in one way: it counts a failure in reading
+    /// this very struct, not a failure in some other subsystem. Persisted
+    /// like the rest — a corrupt field heals itself the next time any code
+    /// path calls `write_state` (the in-memory default gets serialized back),
+    /// so this counter is the only durable evidence the corruption ever
+    /// happened once that heal fires.
+    #[serde(default)]
+    pub state_parse_failures: u64,
+    /// Name of the last field that failed to parse (e.g. `"signal_offset"`),
+    /// or the sentinel below when the whole file was unreadable/not JSON.
+    /// `None` only when `state_parse_failures` is 0.
+    #[serde(default)]
+    pub last_bad_field: Option<String>,
+    /// The `epoch_nonce` the watcher has actually finished arming for
+    /// (residuals round, Phase 4). `acquire_lock` stamps `epoch_nonce` ~4.3ms
+    /// BEFORE the watcher is armed (`daemon::run`'s `.watch()` call) — a test
+    /// helper that treats a non-zero `pid` alone as "daemon ready" nominally
+    /// races the watcher, silently dropping any event emitted in that window.
+    /// `daemon::stamp_watcher_armed` sets this to the CURRENT `epoch_nonce`
+    /// immediately after `.watch()` returns `Ok`; a caller is safe to assume
+    /// the watcher is listening only once `watcher_armed_nonce ==
+    /// epoch_nonce`. Keyed on the nonce rather than a bare bool for the same
+    /// reason `epoch_reload_nonce` is: a stale value left by a crashed prior
+    /// run names a DEAD epoch's nonce, so it can never equal a fresh epoch's
+    /// nonce and is self-invalidating by construction — no explicit reset
+    /// needed beyond `release_lock` clearing it on a clean stop. Empty string
+    /// (the shared default with every other nonce field here) means "not
+    /// armed / unknown", including for a pre-this-field `state.json`.
+    #[serde(default)]
+    pub watcher_armed_nonce: String,
 }
 
+/// Sentinel `last_bad_field` value for a file that could not be parsed as a
+/// JSON object at all (unreadable, truncated, or valid JSON of the wrong
+/// shape) — there is no single field name to blame.
+const WHOLE_FILE_SENTINEL: &str = "<state.json: unreadable or not a JSON object>";
+
+/// Read `state.json`, degrading PER FIELD rather than resetting the whole
+/// struct on one bad value (Phase 2, honesty-fixes round). A single corrupt
+/// field — e.g. `signal_offset` written as a string — must cost only that
+/// field: every sibling field (`pid`, `snapshot_failures`, `io_failed`, ...)
+/// keeps its real persisted value. This matters most for `signal_offset`
+/// itself: resetting it to 0 on an unrelated field's corruption would replay
+/// the entire `signal.jsonl` hook inbox from byte zero.
+///
+/// `#[serde(default)]` alone (the taken plan decision) only rescues a field
+/// that is MISSING from the JSON — a struct-level `serde_json::from_str::
+/// <State>` still fails outright the instant one PRESENT field has the wrong
+/// type (e.g. a string where a `u64` is expected), which is exactly the shape
+/// every acceptance criterion here needs to survive. So this parses into a
+/// generic `serde_json::Value` first and converts each field independently,
+/// falling back to that field's `Default` and counting the miss. This is the
+/// case flagged in the plan's open question: per-field `#[serde(default)]`
+/// alone cannot cover a wrong-TYPE field, only a missing one.
+///
+/// A missing `state.json` (first run, nothing to degrade) returns plain
+/// defaults with no counter bump — that is normal, not a failure. A file that
+/// exists but is unreadable, or whose content is not a JSON object at all, is
+/// genuinely unrecoverable field-by-field; it still degrades to defaults, but
+/// counts as exactly one failure (`state_parse_failures = 1`,
+/// `last_bad_field` = the whole-file sentinel) rather than being silent.
 pub fn read_state(root: &Path) -> State {
-    std::fs::read_to_string(state_path(root))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let text = match std::fs::read_to_string(state_path(root)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+        Err(_) => return whole_file_failure(), // exists but unreadable (e.g. permissions)
+    };
+    let obj = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(obj)) => obj,
+        _ => return whole_file_failure(), // not JSON, or valid JSON that isn't an object
+    };
+
+    let mut failures = 0u64;
+    let mut last_bad: Option<String> = None;
+    macro_rules! field {
+        ($name:literal) => {
+            match obj.get($name) {
+                None => Default::default(),
+                Some(v) => match serde_json::from_value(v.clone()) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        failures += 1;
+                        last_bad = Some($name.to_string());
+                        Default::default()
+                    }
+                },
+            }
+        };
+    }
+
+    let mut state = State {
+        pid: field!("pid"),
+        signal_offset: field!("signal_offset"),
+        snapshot_failures: field!("snapshot_failures"),
+        io_failed: field!("io_failed"),
+        memory_rejects: field!("memory_rejects"),
+        unknown_signal_ignored: field!("unknown_signal_ignored"),
+        non_utf8_path_skips: field!("non_utf8_path_skips"),
+        prompt_put_failures: field!("prompt_put_failures"),
+        ignore_rebuilds: field!("ignore_rebuilds"),
+        last_ignore_rebuild_ms: field!("last_ignore_rebuild_ms"),
+        state_parse_failures: field!("state_parse_failures"),
+        last_bad_field: field!("last_bad_field"),
+        epoch_ignore_rebuilds: field!("epoch_ignore_rebuilds"),
+        epoch_nonce: field!("epoch_nonce"),
+        epoch_reload_nonce: field!("epoch_reload_nonce"),
+        watcher_armed_nonce: field!("watcher_armed_nonce"),
+    };
+
+    // Accumulate onto whatever count was already persisted (itself read
+    // tolerantly above) — same accumulation pattern as `record_io_failure`.
+    state.state_parse_failures += failures;
+    if last_bad.is_some() {
+        state.last_bad_field = last_bad;
+    }
+    state
+}
+
+fn whole_file_failure() -> State {
+    State {
+        state_parse_failures: 1,
+        last_bad_field: Some(WHOLE_FILE_SENTINEL.to_string()),
+        ..State::default()
+    }
 }
 
 /// Persist `state` atomically (tmp+rename): a crash mid-write must not leave
@@ -111,6 +280,76 @@ pub fn record_prompt_put_failure(state: &mut State) {
     state.prompt_put_failures += 1;
 }
 
+/// Record a completed `IgnoreSet` rebuild: bumps the lifetime and epoch
+/// counters and stamps the wall-clock time it happened, so `status` can
+/// render "reloaded N time(s), last ... ago" — and print nothing at all when
+/// the epoch counter is still 0 (never a vacuous "0 reloads" line).
+///
+/// Epoch detection (Phase 3, revised in the honesty round to use a nonce
+/// instead of the pid — see `State::epoch_nonce`'s doc for why pid identity
+/// was unsafe): if `state.epoch_nonce` (set by `acquire_lock` before
+/// anything else runs in a fresh daemon process) no longer matches
+/// `state.epoch_reload_nonce` (the nonce the epoch counter was last reset
+/// for), a new daemon epoch has begun since the last rebuild — reset
+/// `epoch_ignore_rebuilds` to 0 and adopt the new nonce before incrementing.
+/// `ignore_rebuilds` (lifetime) is never reset.
+pub fn record_ignore_rebuild(state: &mut State, wall_ms: u64) {
+    if state.epoch_reload_nonce != state.epoch_nonce {
+        state.epoch_ignore_rebuilds = 0;
+        state.epoch_reload_nonce = state.epoch_nonce.clone();
+    }
+    state.ignore_rebuilds += 1;
+    state.epoch_ignore_rebuilds += 1;
+    state.last_ignore_rebuild_ms = wall_ms;
+}
+
+/// The genuinely-current-epoch reload count, for every reader of `state.json`
+/// (`status` text and `status --json` alike) — not just `record_ignore_
+/// rebuild`'s writer side.
+///
+/// The reset in `record_ignore_rebuild` above only fires the next time a
+/// rebuild happens; it does nothing at the moment a new epoch actually
+/// *starts* (`acquire_lock` stamping a fresh `state.epoch_nonce`), and
+/// nothing at all while the daemon is stopped. In both windows,
+/// `epoch_ignore_rebuilds` and `epoch_reload_nonce` on disk still describe
+/// whichever epoch last rebuilt — which may be a dead epoch (possibly one
+/// whose pid has since been reused by an unrelated process, or reused by a
+/// later agentrec daemon epoch — pid identity cannot distinguish the two),
+/// or (when stopped) `state.epoch_nonce == ""` while `epoch_reload_nonce` is
+/// still the last live epoch's nonce. A reader that used
+/// `state.epoch_ignore_rebuilds` directly would attribute that stale epoch's
+/// reloads to "now".
+///
+/// So every reader must ask the same question `record_ignore_rebuild` asks
+/// before trusting the field: does `epoch_reload_nonce` still match the
+/// CURRENT `epoch_nonce`? If not, no rebuild has happened in the current
+/// epoch yet, and the true current-epoch count is 0 — not "unknown", not the
+/// stale figure. The empty-string sentinel is checked explicitly (`!state.
+/// epoch_nonce.is_empty()`), not left to fall out of the equality check
+/// alone: a `state.json` written by a pre-nonce binary has neither field at
+/// all, so BOTH `epoch_nonce` and `epoch_reload_nonce` deserialize to their
+/// shared default `""` and would compare equal — while `epoch_ignore_
+/// rebuilds` could still hold a real accumulated figure from that older
+/// binary's pid-keyed bookkeeping. Without the explicit non-empty check,
+/// that stale figure would render as "current".
+///
+/// Residuals round, Phase 3: this function CANNOT close the crashed-daemon
+/// window by itself — `release_lock` never runs on `kill -9`, so a dead
+/// epoch's `epoch_nonce`/`epoch_reload_nonce` stay matched on disk exactly
+/// as if the epoch were still live, and this function has no `root` to probe
+/// liveness with. Callers (`status` text and `status --json` alike) MUST
+/// additionally gate on an actual liveness check (`daemon::daemon_is_running`)
+/// before trusting this return value as "the current daemon's count" — this
+/// function only answers "what does the on-disk epoch bookkeeping say",
+/// never "is anything actually running".
+pub fn current_epoch_reloads(state: &State) -> u64 {
+    if !state.epoch_nonce.is_empty() && state.epoch_reload_nonce == state.epoch_nonce {
+        state.epoch_ignore_rebuilds
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +392,73 @@ mod tests {
         assert!(state.io_failed.is_empty());
         assert_eq!(state.non_utf8_path_skips, 0);
         assert_eq!(state.prompt_put_failures, 0);
+        assert_eq!(state.ignore_rebuilds, 0);
+        assert_eq!(state.last_ignore_rebuild_ms, 0);
+        assert_eq!(state.epoch_ignore_rebuilds, 0);
+        assert_eq!(state.epoch_nonce, "");
+        assert_eq!(state.epoch_reload_nonce, "");
+        assert_eq!(state.watcher_armed_nonce, "");
+    }
+
+    // Phase 3 (honesty-fixes round), revised in the follow-up honesty round:
+    // the epoch counter must reset when the EPOCH NONCE changes (simulating
+    // a daemon restart via `acquire_lock` stamping a fresh
+    // `state.epoch_nonce`), NOT the pid — keying on pid let a later epoch
+    // that reused a dead epoch's pid (real over a long-lived machine)
+    // inherit its stale count; see `State::epoch_nonce`'s doc. The lifetime
+    // counter keeps accumulating across the epoch boundary rather than
+    // resetting too. Sibling non-default value pinned per the vacuity trap:
+    // `ignore_rebuilds` (5, non-zero) is asserted in the SAME test as
+    // `epoch_ignore_rebuilds` reading a smaller, epoch-only figure (2) — a
+    // version of `record_ignore_rebuild` that never resets would show 5 for
+    // both. Pid is deliberately left UNCHANGED (111 throughout) to prove the
+    // reset is keyed on the nonce, not on pid — this is the exact reused-pid
+    // shape the fix exists for. Neuter: key the reset back on `state.pid`
+    // (compare `epoch_pid` again) → RED (pid never changes here, so a
+    // pid-keyed version never resets).
+    #[test]
+    fn record_ignore_rebuild_resets_epoch_counter_on_nonce_change() {
+        let mut state = State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..State::default()
+        };
+        record_ignore_rebuild(&mut state, 1_000);
+        record_ignore_rebuild(&mut state, 2_000);
+        record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.ignore_rebuilds, 3);
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // Simulate a daemon restart that REUSES the same pid but is stamped
+        // with a fresh nonce by acquire_lock before any rebuild in the new
+        // epoch can happen.
+        state.epoch_nonce = "epoch-b".to_string();
+        record_ignore_rebuild(&mut state, 4_000);
+        record_ignore_rebuild(&mut state, 5_000);
+
+        assert_eq!(
+            state.ignore_rebuilds, 5,
+            "lifetime total must keep accumulating across the epoch boundary"
+        );
+        assert_eq!(
+            state.epoch_ignore_rebuilds, 2,
+            "epoch counter must have restarted from zero at the new epoch, keyed on the \
+             nonce even though pid (111) never changed"
+        );
+    }
+
+    #[test]
+    fn record_ignore_rebuild_increments_and_stamps_time_and_round_trips() {
+        let mut state = State::default();
+        record_ignore_rebuild(&mut state, 1_000);
+        record_ignore_rebuild(&mut state, 2_000);
+        assert_eq!(state.ignore_rebuilds, 2);
+        assert_eq!(state.last_ignore_rebuild_ms, 2_000);
+
+        let text = serde_json::to_string(&state).unwrap();
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.ignore_rebuilds, 2);
+        assert_eq!(back.last_ignore_rebuild_ms, 2_000);
     }
 
     #[test]
@@ -187,5 +493,123 @@ mod tests {
         let text = serde_json::to_string(&state).unwrap();
         let back: State = serde_json::from_str(&text).unwrap();
         assert_eq!(back.prompt_put_failures, 1);
+    }
+
+    // Phase 2 (honesty-fixes round): `read_state` must degrade PER FIELD, not
+    // reset the whole struct on one bad field. A `signal_offset` that fails
+    // to parse must not cost `pid`/`snapshot_failures`/`io_failed` — those
+    // are sibling fields with no relationship to the corrupt one. Neuter:
+    // restore the old `.ok().and_then(...).unwrap_or_default()` chain (which
+    // discards the entire struct on any single field error) → RED.
+    #[test]
+    fn state_survives_one_bad_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":7,"signal_offset":"not-a-number","snapshot_failures":2,"io_failed":["a.rs"]}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.pid, 7,
+            "sibling field pid must survive a corrupt signal_offset"
+        );
+        assert_eq!(
+            state.snapshot_failures, 2,
+            "sibling field snapshot_failures must survive"
+        );
+        assert_eq!(
+            state.io_failed,
+            vec!["a.rs".to_string()],
+            "sibling field io_failed must survive"
+        );
+        assert_eq!(
+            state.signal_offset, 0,
+            "the corrupt field itself falls back to its default"
+        );
+        assert_eq!(
+            state.state_parse_failures, 1,
+            "the corrupt field must be counted, not silent"
+        );
+        assert_eq!(state.last_bad_field.as_deref(), Some("signal_offset"));
+    }
+
+    // The criterion that matters most: a corrupt field OTHER than
+    // signal_offset must never reset signal_offset to 0, because that
+    // replays the entire signal.jsonl inbox from byte 0. Neuter: same whole-
+    // struct reset → RED.
+    #[test]
+    fn corrupt_field_does_not_replay_signal_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":1,"signal_offset":4096,"io_failed":"not-an-array"}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.signal_offset, 4096,
+            "a corrupt UNRELATED field must never reset signal_offset — \
+             that would replay the whole signal inbox"
+        );
+        assert_eq!(state.state_parse_failures, 1);
+        assert_eq!(state.last_bad_field.as_deref(), Some("io_failed"));
+    }
+
+    // A file that is not JSON at all (or unreadable) genuinely cannot be
+    // recovered field-by-field — but that must still be COUNTED, never
+    // silent. Neuter: drop the counter increment on this path → RED.
+    #[test]
+    fn wholly_unparseable_state_counts_failure_and_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(state_path(root), "not json at all { garbage").unwrap();
+
+        let state = read_state(root);
+        assert_eq!(state.pid, 0);
+        assert_eq!(state.signal_offset, 0);
+        assert_eq!(
+            state.state_parse_failures, 1,
+            "a wholly unparseable file must still be counted, not silent"
+        );
+        assert!(state.last_bad_field.is_some());
+    }
+
+    // A healthy state.json (nothing corrupt) must round-trip byte-identically
+    // through read_state -> write_state: the per-field extraction must not
+    // introduce drift for the common case.
+    #[test]
+    fn read_state_round_trips_healthy_file_byte_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut state = State {
+            pid: 55,
+            signal_offset: 999,
+            ..State::default()
+        };
+        record_io_failure(&mut state, "x.rs");
+        write_state(root, &state).unwrap();
+
+        let text_before = std::fs::read_to_string(state_path(root)).unwrap();
+        let reloaded = read_state(root);
+        assert_eq!(
+            reloaded.state_parse_failures, 0,
+            "no failures on a healthy file"
+        );
+        write_state(root, &reloaded).unwrap();
+        let text_after = std::fs::read_to_string(state_path(root)).unwrap();
+
+        assert_eq!(
+            text_before, text_after,
+            "a healthy state.json must round-trip byte-identically"
+        );
     }
 }

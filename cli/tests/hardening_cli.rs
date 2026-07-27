@@ -160,6 +160,7 @@ fn e1_corrupt_before_blob_refuses_and_mutates_nothing() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -213,6 +214,7 @@ fn e1_create_inverse_with_already_deleted_file_succeeds() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -255,6 +257,7 @@ fn e2_clean_stop_start_gap_after_turn_marks_blame_stale() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -305,6 +308,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -333,6 +337,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_c);
@@ -379,6 +384,7 @@ fn e6_undo_files_unmatched_path_refuses_and_mutates_nothing() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -423,6 +429,7 @@ fn e7_prompt_escape_sequence_never_reaches_stdout_raw() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -493,6 +500,7 @@ fn e8_live_guard_refuses_concurrent_undo() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -537,6 +545,7 @@ fn e8_expired_guard_does_not_block_undo() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1276,6 +1285,7 @@ fn undo_collapses_orphan_recovery_duplicate_same_id() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     // The steady `persist` close of a bracket turn carries an attributed model
@@ -1339,6 +1349,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     let b = base_turn(
@@ -1353,6 +1364,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &a);
@@ -1418,6 +1430,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
         skipped: false,
         withheld: false,
         baseline_unknown: false,
+        skipped_reason: None,
     }];
     let mut turn1 = base_turn(dup_id, dup_files);
     turn1.model = Some("claude-opus-4".into());
@@ -1445,6 +1458,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     let turn_c2 = base_turn(
@@ -1459,6 +1473,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn_c1);
@@ -1582,6 +1597,7 @@ fn purge_log_duplicates_refuses_while_daemon_running() {
         skipped: false,
         withheld: false,
         baseline_unknown: false,
+        skipped_reason: None,
     }];
     let turn = base_turn(dup_id, files);
     // Exact identical dup — WOULD be removed if the daemon-liveness guard
@@ -1664,6 +1680,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
         skipped: false,
         withheld: false,
         baseline_unknown: false,
+        skipped_reason: None,
     }];
     let turn = base_turn(dup_id, files);
     seed_turn(root, &turn);
@@ -1705,6 +1722,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &extra_turn);
@@ -1775,6 +1793,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &dup);
@@ -1795,6 +1814,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &target);
@@ -1877,6 +1897,7 @@ fn purge_orphans_archives_unreferenced_and_keeps_referenced() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     seed_turn(root, &turn);

@@ -7,7 +7,9 @@
     "ignore": [
       "CLAUDE.md",
       "VERIFY-LEDGER.md",
-      "docs/**"
+      "IMPLEMENTATION.md",
+      "docs/**",
+      "scripts/**"
     ],
     "denylist": [
       "true",

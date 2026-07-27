@@ -2,7 +2,7 @@
 //! are file-based — they never need the daemon running.
 
 use crate::fmt;
-use crate::state::{read_state, write_state};
+use crate::state::{current_epoch_reloads, read_state, write_state};
 use crate::{log_path, memorycmds, objects_dir, signal_path};
 use agentrec_core::record::{append_log_line, LogRecord, SignalEvent, TurnRecord};
 use agentrec_core::scrub;
@@ -38,6 +38,13 @@ const RECALL_BUDGET_MS: u128 = 50;
 /// RFC 3339 timestamp instead (`--json` already emits absolute timestamps and
 /// is unaffected by either). `--explain` appends a glossary of only the
 /// domain terms that appear in this invocation's rendered output (D43).
+///
+/// NF-C: `--all-files` is orthogonal to `--all` — `--all` controls which
+/// TURNS are visible (git/superseded), `--all-files` controls which FILE
+/// ENTRIES within a visible turn are counted individually vs. folded into a
+/// `noise_globs` (config.toml) summary line (NF-A/NF-B). Folding is
+/// human-render only: `--json` output is never touched by either the
+/// matching or the flag (NF-D.1).
 pub fn log(
     root: &Path,
     all: bool,
@@ -45,6 +52,7 @@ pub fn log(
     limit: usize,
     utc: bool,
     explain: bool,
+    all_files: bool,
 ) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let superseded = merged_ids(&records);
@@ -74,6 +82,13 @@ pub fn log(
         std::env::var_os("NO_COLOR").is_some(),
     );
 
+    // NF1: absent/empty `noise_globs` yields `None` here, so every branch
+    // below that consults `noise_matcher` behaves exactly as it did before
+    // this feature existed — no separate "is the feature configured" flag
+    // needed anywhere else in this function.
+    let noise_globs = crate::noise::read_noise_globs(root);
+    let noise_matcher = crate::noise::NoiseMatcher::build(root, &noise_globs);
+
     // Rendered lines (non-JSON only) are accumulated so `--explain` can scan
     // exactly what this invocation printed, not every term that ever exists.
     let mut rendered = String::new();
@@ -84,10 +99,30 @@ pub fn log(
             let line = serde_json::to_string(turn).map_err(|e| e.to_string())?;
             println!("{line}");
         } else {
-            let line = format_turn(turn, now_ms, utc, color);
+            // NF-B/NF-D.4: fold counts a matched entry out of the visible
+            // count regardless of the turn's grade/tool — a turn whose
+            // entries are ALL noise still prints its own list line (turn
+            // selection above is untouched) plus this fold line, never
+            // silently disappears.
+            let noise_n = if all_files {
+                0
+            } else {
+                noise_matcher
+                    .as_ref()
+                    .map(|m| turn.files.iter().filter(|f| m.is_noise(&f.path)).count())
+                    .unwrap_or(0)
+            };
+            let visible_files = turn.files.len() - noise_n;
+            let line = format_turn(turn, now_ms, utc, color, visible_files);
             println!("{line}");
             rendered.push_str(&line);
             rendered.push('\n');
+            if noise_n > 0 {
+                let fold_line = format!("+{noise_n} noise files (--all-files to show)");
+                println!("{fold_line}");
+                rendered.push_str(&fold_line);
+                rendered.push('\n');
+            }
         }
     }
 
@@ -107,25 +142,41 @@ pub fn log(
 /// Thin wrapper: computes `log`'s caller-owned fields (relative/UTC time,
 /// file count) and hands off to the shared [`fmt::turn_list_line`] renderer
 /// (D-PD6 — this used to be a fully independent implementation).
-fn format_turn(t: &TurnRecord, now_ms: u64, utc: bool, color: bool) -> String {
+///
+/// `visible_files` is the caller-computed count AFTER any `noise_globs`
+/// fold (NF-B) — `format_turn` itself stays ignorant of noise matching, same
+/// as it was ignorant of turn-grade filtering before this feature existed.
+fn format_turn(
+    t: &TurnRecord,
+    now_ms: u64,
+    utc: bool,
+    color: bool,
+    visible_files: usize,
+) -> String {
     let when = if utc {
         t.started.clone()
     } else {
         fmt::relative_time(&t.started, now_ms)
     };
-    let n = t.files.len();
-    let files = if n == 1 {
+    let files = if visible_files == 1 {
         "1 file".to_string()
     } else {
-        format!("{n} files")
+        format!("{visible_files} files")
     };
     fmt::turn_list_line(t, &when, &files, color)
 }
 
 /// `status`: store size, recording gaps, and rich-rate (the health stat that
 /// catches silently broken hooks). `ack_degraded` clears a prior DEGRADED
-/// snapshot-failure banner (D35) instead of printing status.
-pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
+/// snapshot-failure banner (D35) instead of printing status; clap rejects
+/// combining it with `json` (see `main.rs`'s `Status` variant) — the ack
+/// path is prose-on-success by design, and prose on stdout under a `--json`
+/// flag would break any consumer piping to `jq`. `json` emits
+/// machine-readable operational fields instead of the text report: the
+/// ignore-reload counters (lifetime + epoch-scoped) plus, since Phase 3 of
+/// the honesty-fixes round, every DEGRADED field the text banner reports
+/// (additive; more fields can join later).
+pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String> {
     if ack_degraded {
         let mut state = read_state(root);
         state.snapshot_failures = 0;
@@ -145,8 +196,65 @@ pub fn status(root: &Path, ack_degraded: bool) -> Result<(), String> {
         println!("acknowledged — DEGRADED cleared");
         return Ok(());
     }
-    print!("{}", status_report(root, agentrec_core::MAX_STORE_BYTES)?);
+    if json {
+        println!("{}", status_json(root)?);
+        return Ok(());
+    }
+    print!("{}", status_report(root, effective_store_budget())?);
     Ok(())
+}
+
+/// Builds `status --json`'s payload (split out from [`status`] so it's
+/// unit-testable without capturing stdout). `state.json` is OPERATIONAL
+/// data, not the PROTOCOL wire format (PROTOCOL §5 deliberately keeps it off
+/// the wire) — this is a separate, additive JSON surface, not a
+/// serialization of a wire record.
+///
+/// Phase 3 (honesty-fixes round): before this phase, this payload carried
+/// only the ignore-reload counters, while the text `status` report also
+/// prints a DEGRADED banner — a monitoring script running
+/// `status --json | jq .snapshot_failures` got `null`, indistinguishable
+/// from healthy, while a human running bare `status` saw the banner. Every
+/// field the text banner reports is now here too: `snapshot_failures` +
+/// `io_failed` (the affected-files list), `prompt_put_failures`,
+/// `state_parse_failures` + `last_bad_field` (Phase 2's per-field-degrade
+/// counter). `ignore_rebuilds` keeps its established lifetime-cumulative
+/// meaning (additive field, unchanged); `epoch_ignore_rebuilds` is the new
+/// current-epoch figure `status`'s text report now renders instead — and,
+/// like the text report, it goes through `current_epoch_reloads` rather than
+/// the raw field, so a monitoring script sees the same epoch-scoped truth a
+/// human sees, including in the stale-epoch window right after a restart or
+/// while the daemon is stopped (raw field still holds the previous epoch's
+/// count there).
+///
+/// Residuals round, Phase 3 (Q3 answered as option (c)): `release_lock`
+/// never runs on `kill -9`, so a crashed daemon leaves `epoch_nonce` stamped
+/// on disk — `current_epoch_reloads` (which has no `root` and therefore
+/// cannot probe liveness itself) then renders the dead epoch's count as if
+/// it were the live daemon's. `epoch_ignore_rebuilds` itself is deliberately
+/// LEFT UNCHANGED here (same value, same computation, live or dead) — the
+/// count is still an honest epoch-scoped figure, just not necessarily a
+/// LIVE one. The new sibling `epoch_ignore_rebuilds_stale` carries that
+/// distinction instead, always present (never only-when-true) so a consumer
+/// can tell the two cases apart without inferring it from field absence.
+fn status_json(root: &Path) -> Result<serde_json::Value, String> {
+    let state = read_state(root);
+    let daemon_live = crate::daemon::daemon_is_running(root);
+    Ok(serde_json::json!({
+        "ignore_rebuilds": state.ignore_rebuilds,
+        "epoch_ignore_rebuilds": current_epoch_reloads(&state),
+        "epoch_ignore_rebuilds_stale": !daemon_live,
+        "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
+            Some(state.last_ignore_rebuild_ms)
+        } else {
+            None
+        },
+        "snapshot_failures": state.snapshot_failures,
+        "io_failed": state.io_failed,
+        "prompt_put_failures": state.prompt_put_failures,
+        "state_parse_failures": state.state_parse_failures,
+        "last_bad_field": state.last_bad_field,
+    }))
 }
 
 /// Builds `status`'s full output as a string (split out from [`status`] so
@@ -173,6 +281,11 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
 
     let gaps = count_gaps(&records);
 
+    // Read once, reused below for the ignore-reload line and (further down)
+    // the memory/DEGRADED sections — same single-read pattern those already
+    // used, just hoisted so this line can consult it too.
+    let state = read_state(root);
+
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
@@ -185,6 +298,44 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         turns.len()
     ));
     out.push_str(&format!("gaps:       {gaps} recording gap(s)\n"));
+    // Only rendered once a rebuild has ever happened THIS DAEMON EPOCH — a
+    // repo whose .gitignore never churned since the daemon last started has
+    // nothing to report, and printing "0 reloads" would be exactly the
+    // vacuous line the zero-turn rich-rate line above already refuses to
+    // print (D-PD3 precedent). Phase 3 (honesty-fixes round, open question 1
+    // option (a)): deliberately `epoch_ignore_rebuilds`, not the lifetime
+    // `ignore_rebuilds` — a long-lived repo would otherwise eventually render
+    // "reloaded 4821 time(s)" in this daily-driver surface. The lifetime
+    // total is still preserved in `state.json` (and in `status --json`); it
+    // is just not what this line renders.
+    //
+    // Blocking gate finding (honesty-round follow-up): the raw field alone is
+    // not enough — `record_ignore_rebuild`'s epoch reset only fires on the
+    // NEXT rebuild, so right after a restart (or while stopped) the field
+    // still holds the previous epoch's count under the previous epoch's
+    // identity. `current_epoch_reloads` re-checks `epoch_reload_nonce ==
+    // epoch_nonce` at render time — the state needed to detect this was
+    // already on disk, nothing read it. (A second honesty-round finding
+    // replaced pid identity with a nonce here — see `State::epoch_nonce`'s
+    // doc: pid reuse on a long-lived machine could make a later epoch
+    // inherit a dead epoch's stale count.)
+    let epoch_reloads = current_epoch_reloads(&state);
+    // Residuals round, Phase 3: a crashed daemon (`kill -9` skips
+    // `release_lock`) leaves `epoch_nonce` stamped, so `epoch_reloads` above
+    // can be nonzero for an epoch that is no longer running. The text line
+    // is a daily-driver surface a human reads as "current" — so it is
+    // gated on an actual liveness probe (the same non-blocking flock check
+    // `doctor`/`purge` already use), not just on the epoch-nonce match.
+    let daemon_live = crate::daemon::daemon_is_running(root);
+    if daemon_live && epoch_reloads > 0 {
+        let when = fmt::relative_time(
+            &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
+            wall_now_ms(),
+        );
+        out.push_str(&format!(
+            "ignore:     reloaded {epoch_reloads} time(s), last {when}\n"
+        ));
+    }
     if trailing.is_empty() {
         out.push_str("rich-rate:  n/a (no agent turns yet)\n");
     } else {
@@ -217,7 +368,6 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             | agentrec_core::memory::Freshness::Orphaned => mem_stale += 1,
         }
     }
-    let state = read_state(root);
     // I = memory-stats.jsonl lines that recorded a real injection (carry
     // `n`) — the hook-owned injection log (Task 9); this is the only
     // visible evidence recall actually fired into a prompt, so status
@@ -268,7 +418,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // receipt for why. Prompt blobs are exempt; only snapshot blobs evict.
     if size > budget {
         let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
-        let evicted = agentrec_core::retention::enforce_budget(&store, &owned_turns, budget);
+        // SAFETY (Phase 1 honesty fix): harvest the protect-set as late as
+        // possible, immediately before calling `enforce_budget`, to narrow
+        // the window a live daemon (running continuously under launchd —
+        // Decisions log #2, no liveness refusal here) could append a new
+        // in-flight blob after we've read log.jsonl/open.json but before the
+        // remove loop runs.
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns,
+            budget,
+            &extra_protected,
+        );
         // Honesty (B): budget enforcement here only evicts turn-referenced
         // snapshot blobs. Most store bloat is usually ORPHANED blobs —
         // superseded intermediate snapshots the daemon `put` for crash
@@ -283,6 +445,16 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             human_bytes(budget),
             human_bytes(evicted.bytes)
         ));
+        // Honesty (Phase 1): protecting pinned/in-flight refs shrinks
+        // `evicted.bytes` — sometimes to 0 even while genuinely over
+        // budget — and an unexplained "0 freed" is exactly the dishonest
+        // status class the orphan-bloat attribution above already fixed.
+        if evicted.protected_bytes > 0 {
+            out.push_str(&format!(
+                "; {} protected (pinned or in-flight — never evicted)",
+                human_bytes(evicted.protected_bytes)
+            ));
+        }
         if orphans > 0 {
             out.push_str(&format!(
                 "; {} is unreferenced (superseded snapshots) — run `agentrec purge --orphans` to reclaim",
@@ -333,7 +505,83 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
             state.prompt_put_failures
         ));
     }
+    // Phase 2 (honesty-fixes round): `read_state` degrades per FIELD instead
+    // of resetting the whole `state.json` struct on one bad value — this is
+    // the visible evidence that happened. Deliberately not folded into the
+    // "DEGRADED" banners above and not cleared by `--ack-degraded`: unlike a
+    // failed write, a corrupt field self-heals the moment any code path next
+    // calls `write_state` (the in-memory default gets serialized back), so
+    // there is nothing here for a human to acknowledge — only to notice.
+    if state.state_parse_failures > 0 {
+        out.push('\n');
+        out.push_str(&format!(
+            "state.json had {} field(s) fall back to defaults (last: {}) — \
+             self-heals on the next write; run `agentrec doctor` for detail.\n",
+            state.state_parse_failures,
+            state.last_bad_field.as_deref().unwrap_or("unknown"),
+        ));
+    }
     Ok(out)
+}
+
+/// Phase 1 honesty fix: hashes `enforce_budget`'s own structured walk over
+/// its `entries` argument cannot see, so must be protected separately —
+/// `open.json` (the in-flight turn's crash journal), `memory.jsonl` (pin
+/// hashes `verify`'s pin-diff resolves as CAS blobs), and any `log.jsonl`
+/// line `load_log` silently dropped as torn/unparseable.
+///
+/// Deliberately NOT `purgecmd::referenced_hashes` wholesale: that function
+/// also folds in every VALIDLY-referenced `log.jsonl` hash, which is
+/// correct for `--orphans`' absence-based test (anything cited anywhere,
+/// however old, must survive) but wrong here — `enforce_budget`'s own
+/// age-based walk already decided a validly-referenced blob's fate
+/// (including evicting a sole old turn's blob when nothing older exists to
+/// sacrifice, `status_prints_over_budget_notice`); passing the FULL
+/// referenced-anywhere set as `extra_protected` would protect every
+/// snapshot ever committed and silently defeat the budget. Only refs
+/// invisible to a structured `load_log` parse are "extra".
+///
+/// Honesty note (blocking-gate follow-up): the "only torn lines can hide a
+/// hash" premise holds for TORN lines specifically, not as a general
+/// guarantee. A line that parses fine as `LogRecord` but carries a hash on
+/// some field this struct doesn't model (e.g. a future additive PROTOCOL
+/// field) would be invisible here — `load_log` succeeds, so `owned_turns`
+/// never sees the unmodeled field, and this function only re-scans lines
+/// `serde_json::from_str::<LogRecord>` failed on. `purge --orphans`' raw
+/// byte-scan has no such blind spot (any `sha256:`-shaped substring counts,
+/// parse success or not), so the two would disagree on that hash. No
+/// producer emits such a field today; a future additive protocol field
+/// carrying a hash needs revisiting this function, not just PROTOCOL.md.
+fn extra_protected_refs(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    // open.json + memory.jsonl are never themselves a `TurnRecord`, so
+    // every ref in them is "extra" by construction — no validity filter
+    // needed (mirrors `recover_orphan`'s own tolerance of a corrupt
+    // journal: raw bytes are scanned whether or not they parse).
+    for path in [
+        crate::open_path(root),
+        agentrec_core::memory::memory_path(root),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            crate::purgecmd::harvest_refs(&text, &mut out);
+        }
+    }
+    // log.jsonl: only lines `load_log` could NOT parse contribute — a
+    // validly-parsed line's hashes are already reachable through
+    // `owned_turns`, so re-adding them here would over-protect (see the
+    // doc comment above).
+    if let Ok(text) = std::fs::read_to_string(log_path(root)) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<LogRecord>(trimmed).is_err() {
+                crate::purgecmd::harvest_refs(trimmed, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// `hook`: invoked by a Claude Code lifecycle hook with the JSON payload on
@@ -395,6 +643,31 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Test-only override (Phase 1, `cli/tests/integration.rs`,
+/// `status_eviction_keeps_open_turn_blob`) that lets an integration test
+/// exercise the real `status` verb's over-budget/eviction path — the AC
+/// this test proves is call-site wiring (does `status` actually pass the
+/// harvested protect-set into `enforce_budget`?), not the eviction
+/// mechanism itself (already core-unit-tested), and a genuine ~2 GiB store
+/// is infeasible to build in a test. Same `#[cfg(debug_assertions)]`
+/// fail-safe class as [`TEST_FORCE_BUDGET_EXCEEDED_VAR`] below — compiled
+/// out of release builds, so it can never override a real user's budget.
+#[cfg(debug_assertions)]
+const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
+
+/// [`agentrec_core::MAX_STORE_BYTES`] unless [`TEST_STORE_BUDGET_BYTES_VAR`]
+/// is set to a valid `u64`, in which case that value is used instead. The
+/// override is a no-op — the env is never read — in release builds.
+fn effective_store_budget() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
+        if let Ok(n) = v.parse::<u64>() {
+            return n;
+        }
+    }
+    agentrec_core::MAX_STORE_BYTES
 }
 
 /// Test-only override (`cli/tests/integration.rs`,
@@ -663,6 +936,54 @@ pub(crate) fn config_values<'a>(text: &'a str, key: &'a str) -> impl Iterator<It
 mod tests {
     use super::*;
     use agentrec_core::record::{append_log, FileEntry};
+    use std::os::unix::io::AsRawFd;
+
+    /// Residuals round, Phase 3: `status_report`/`status_json` now gate the
+    /// reload line/field on `daemon::daemon_is_running`, a REAL non-blocking
+    /// `libc::flock` probe against `.agentrec/daemon.lock` — not an
+    /// injection seam (this repo's release-`strings` audits exist
+    /// specifically to keep test-only seams out of the shipped binary, and
+    /// `daemon_is_running`'s premise is already proven in-process by
+    /// `daemon_is_running_true_while_held_false_after_release`,
+    /// `daemon.rs:2599`: a same-process flock on a distinct `File`/fd
+    /// defeats `LOCK_EX|LOCK_NB` exactly like a second process would). This
+    /// helper creates the lock file and takes a real exclusive flock on it,
+    /// returning the open `File` so the caller holds the lock for as long as
+    /// it's kept alive — deliberately WITHOUT going through `daemon::
+    /// acquire_lock`, which is private to `daemon.rs` and also mutates
+    /// `state.json` (stamping a fresh `epoch_nonce`), which these fixtures
+    /// must not have happen out from under their own hand-built `State`.
+    fn hold_daemon_lock(root: &std::path::Path) -> std::fs::File {
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        let path = crate::agentrec_dir(root).join("daemon.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "test helper failed to acquire its own daemon.lock");
+        file
+    }
+
+    /// In a release build, `TEST_STORE_BUDGET_BYTES_VAR` must be a no-op —
+    /// proves the `#[cfg(debug_assertions)]` arm actually compiles out the
+    /// env read rather than merely being unreachable dead code. Only runs
+    /// under `cargo test --release` (the debug test build never exercises
+    /// this arm at all). Same fail-safe class as
+    /// `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn store_budget_override_is_a_no_op_in_release() {
+        std::env::set_var("AGENTREC_TEST_STORE_BUDGET_BYTES", "5");
+        assert_eq!(
+            effective_store_budget(),
+            agentrec_core::MAX_STORE_BYTES,
+            "release builds must never honor AGENTREC_TEST_STORE_BUDGET_BYTES"
+        );
+        std::env::remove_var("AGENTREC_TEST_STORE_BUDGET_BYTES");
+    }
 
     fn turn_with_snapshot(id: &str, path: &str, hash: &str) -> TurnRecord {
         TurnRecord {
@@ -687,6 +1008,7 @@ mod tests {
                 skipped: false,
                 withheld: false,
                 baseline_unknown: false,
+                skipped_reason: None,
             }],
         }
     }
@@ -792,10 +1114,36 @@ mod tests {
         crate::state::record_non_utf8_path_skip(&mut state);
         write_state(root, &state).unwrap();
 
-        status(root, true).unwrap();
+        status(root, true, false).unwrap();
 
         let after = read_state(root);
         assert_eq!(after.non_utf8_path_skips, 0);
+    }
+
+    // Phase 2 (honesty-fixes round): a corrupt state.json field bumps
+    // `state_parse_failures` (via `read_state`'s per-field degrade), and
+    // `status` must say so — silent loss of this counter is exactly the
+    // failure shape every other counter on this page exists to prevent.
+    #[test]
+    fn status_report_surfaces_state_parse_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":0,"signal_offset":"nope"}"#,
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("fall back to defaults"),
+            "expected the state-parse notice: {out}"
+        );
+        assert!(
+            out.contains("signal_offset"),
+            "expected the bad field named: {out}"
+        );
     }
 
     // D-PD5: the turns line drops implementer jargon ("agent, git/merged
@@ -889,6 +1237,712 @@ mod tests {
         assert!(
             out.contains("2 failures"),
             "expected exactly 2 memory-store failures counted, malformed lines ignored: {out}"
+        );
+    }
+
+    // Phase 2 of the rebuild-gate fix: a repo whose `.gitignore` never
+    // churned must never print a vacuous "0 reloads" line (the zero-turn
+    // `rich-rate: n/a` precedent, D-PD3). The second half of this test
+    // (nonzero counter -> line DOES appear) is load-bearing, not padding: a
+    // version of `status_report` that never prints a reload line at all
+    // would pass the first half for the wrong reason. The second half stamps
+    // a real `epoch_nonce` (mirroring what `acquire_lock` does at epoch
+    // start) rather than relying on `State::default()`'s empty-string nonce
+    // — a genuinely live epoch always has a non-empty nonce; using the
+    // default here would only coincidentally match `current_epoch_reloads`'s
+    // own default and wouldn't represent a real daemon epoch.
+    #[test]
+    fn status_omits_reload_line_when_never_reloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.to_lowercase().contains("reload"),
+            "no reload line expected when ignore_rebuilds is 0: {out}"
+        );
+
+        // Residuals round, Phase 3: the reload line now also requires a live
+        // daemon (`daemon_is_running`'s real flock probe) — hold the lock so
+        // this presence assertion still discriminates the thing it always
+        // meant to discriminate (a nonzero epoch count), not liveness.
+        let _guard = hold_daemon_lock(root);
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.to_lowercase().contains("reload"),
+            "expected a reload line once ignore_rebuilds > 0: {out}"
+        );
+    }
+
+    // Phase 3 (honesty-fixes round), open question 1 answered as option (a):
+    // the rendered reload figure must be scoped to the CURRENT daemon epoch,
+    // not the lifetime total, once a daemon restart has happened. Simulates
+    // an old epoch (nonce "epoch-a", 3 rebuilds) followed by a restart
+    // (nonce "epoch-b", 2 more rebuilds) — the same shape `acquire_lock` +
+    // `record_ignore_rebuild` produce in production (honesty round: epoch
+    // identity is the nonce, not the pid — see `State::epoch_nonce`'s doc).
+    // Sibling non-default value pinned per the vacuity trap: `ignore_rebuilds`
+    // (5, lifetime) is asserted alongside the rendered epoch figure (2) — a
+    // version of `status_report` that renders the lifetime total would print
+    // "5", not "2", and this test would catch it. Neuter: render
+    // `state.ignore_rebuilds` instead of `state.epoch_ignore_rebuilds` →
+    // RED.
+    #[test]
+    fn status_reload_line_is_epoch_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        // Residuals round, Phase 3: presence assertion below now also needs
+        // a live daemon.
+        let _guard = hold_daemon_lock(root);
+
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        // Simulate the daemon restart `acquire_lock` performs: a fresh pid
+        // AND a fresh nonce stamped before any rebuild in the new epoch
+        // happens.
+        state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
+        crate::state::record_ignore_rebuild(&mut state, 4_000);
+        crate::state::record_ignore_rebuild(&mut state, 5_000);
+        write_state(root, &state).unwrap();
+
+        assert_eq!(
+            read_state(root).ignore_rebuilds,
+            5,
+            "lifetime total must be preserved across the simulated restart"
+        );
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 2 time(s)"),
+            "expected the CURRENT-EPOCH figure (2), not the lifetime total: {out}"
+        );
+        assert!(
+            !out.contains("reloaded 5 time(s)"),
+            "must not render the lifetime-cumulative figure: {out}"
+        );
+    }
+
+    // Blocking gate finding (honesty-round follow-up): `status_reload_line_is_
+    // epoch_scoped` above only covers a restart that has ALREADY seen a
+    // rebuild in the new epoch (record_ignore_rebuild does the reset+bump
+    // together). The gate found the real hole is the window BEFORE that:
+    // right after a restart, or while the daemon is stopped, nothing has
+    // called `record_ignore_rebuild` yet, so `epoch_ignore_rebuilds`/
+    // `epoch_reload_nonce` on disk still belong to the OLD epoch — and the
+    // old `status_report` rendered them unconditionally, attributing a dead
+    // daemon's reloads to the live one. Neuter: remove the
+    // epoch_reload_nonce==epoch_nonce gate (render `state.
+    // epoch_ignore_rebuilds` unconditionally again) → RED on both sub-cases
+    // below.
+    #[test]
+    fn status_omits_stale_epoch_reload_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Old epoch (pid 111, nonce "epoch-a") rebuilt 3 times; nothing has
+        // rebuilt yet since.
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.epoch_reload_nonce, "epoch-a");
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // Case A: daemon restarted under a NEW pid AND a NEW nonce
+        // (acquire_lock already stamped both) but no rebuild has happened in
+        // the new epoch yet.
+        state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
+        write_state(root, &state).unwrap();
+
+        assert_eq!(
+            read_state(root).ignore_rebuilds,
+            3,
+            "lifetime total must still be on disk — this is not a wipe"
+        );
+        let payload = status_json(root).unwrap();
+        assert_eq!(
+            payload["ignore_rebuilds"], 3,
+            "status --json lifetime total must survive the stale-epoch window"
+        );
+        // The `--json` seam needs its own assert, not just the lifetime one:
+        // `status_report` and `status_json` are two independent readers of
+        // `epoch_ignore_rebuilds`, and the gate review proved that neutering
+        // ONLY `status_json` back to the raw field survived the whole suite.
+        // Correct behavior was live-observed; nothing pinned it, so a refactor
+        // could have silently reverted this seam alone.
+        assert_eq!(
+            payload["epoch_ignore_rebuilds"], 0,
+            "status --json must not attribute the dead epoch's reloads to the live one"
+        );
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "no rebuild has happened in the NEW epoch (pid 222) yet — the \
+             line must be omitted, not attribute pid 111's reloads to it: {out}"
+        );
+
+        // Case B: daemon is stopped — release_lock clears BOTH pid and the
+        // epoch nonce (its own "no live epoch" sentinel, same shape as
+        // pid == 0).
+        state.pid = 0;
+        state.epoch_nonce = String::new();
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "daemon stopped — must not render the last epoch's reload count: {out}"
+        );
+
+        // Once the new epoch actually rebuilds, the line must reappear with
+        // ONLY the new epoch's count, never the old one. Restart: pid 222
+        // again under the same live epoch it was stamped with in Case A
+        // (status was merely checked once while stopped in between).
+        // Residuals round, Phase 3: this restart is a live daemon again —
+        // hold the lock so this presence assertion still discriminates
+        // epoch-scoping, not liveness.
+        let _guard = hold_daemon_lock(root);
+        state.pid = 222;
+        state.epoch_nonce = "epoch-b".to_string();
+        crate::state::record_ignore_rebuild(&mut state, 6_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 1 time(s)"),
+            "expected the new epoch's own count (1): {out}"
+        );
+        assert!(
+            !out.contains("reloaded 3 time(s)") && !out.contains("reloaded 4 time(s)"),
+            "must never blend in the old epoch's count: {out}"
+        );
+    }
+
+    // Honesty round: epoch identity was previously the pid, and pid reuse
+    // (real on a long-lived machine — the same recycling class `doctor`'s
+    // daemon-liveness check already handles via flock, not pid comparison)
+    // let a later daemon epoch inherit a dead epoch's stale reload count.
+    // Simulates a dead epoch (pid 111, nonce "epoch-a", 3 rebuilds) followed
+    // by a new epoch that reuses pid 111 but is stamped with a fresh nonce
+    // ("epoch-b") — the case pid alone cannot distinguish. Neuter: key
+    // either side (`record_ignore_rebuild` or `current_epoch_reloads`) back
+    // on `pid` instead of the nonce → RED (the reused pid makes the new
+    // epoch look like a continuation of the old one).
+    #[test]
+    fn pid_reuse_does_not_resurrect_a_dead_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Dead epoch: pid 111, nonce "epoch-a", rebuilt 3 times.
+        let mut state = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut state, 1_000);
+        crate::state::record_ignore_rebuild(&mut state, 2_000);
+        crate::state::record_ignore_rebuild(&mut state, 3_000);
+        assert_eq!(state.epoch_ignore_rebuilds, 3);
+
+        // New epoch REUSES the same pid (111) — pid wraparound — but
+        // acquire_lock stamps a fresh, distinct nonce.
+        state.epoch_nonce = "epoch-b".to_string();
+        write_state(root, &state).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "a new epoch that reused the dead epoch's pid must render zero reloads until its \
+             own first rebuild, not the dead epoch's 3: {out}"
+        );
+
+        // Its own first rebuild must start counting from 1, not accumulate
+        // onto the dead epoch's 3.
+        // Residuals round, Phase 3: this rebuild belongs to a live epoch —
+        // hold the lock so the presence assertion below discriminates
+        // pid-reuse-vs-nonce, not liveness.
+        let _guard = hold_daemon_lock(root);
+        let mut state = read_state(root);
+        crate::state::record_ignore_rebuild(&mut state, 4_000);
+        write_state(root, &state).unwrap();
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("reloaded 1 time(s)"),
+            "the reused-pid epoch's first rebuild must read 1, not accumulate onto the dead \
+             epoch's count: {out}"
+        );
+        assert!(
+            !out.contains("reloaded 4 time(s)"),
+            "must never blend the dead epoch's 3 into the new epoch's count: {out}"
+        );
+    }
+
+    // Honesty round: reader (`current_epoch_reloads`) and writer
+    // (`record_ignore_rebuild`) must agree on what counts as "a new epoch"
+    // using the SAME identity (the nonce) — whether or not the pid also
+    // happened to change alongside it. Two fixtures that differ only in
+    // whether pid changed must render byte-identical `status` output.
+    // Neuter: make one side compare `pid` and the other compare
+    // `epoch_nonce` (i.e. revert just one of the two functions) → RED, both
+    // because the two scenarios stop matching each other and because the
+    // "no rebuild yet in the new epoch" assertion fails.
+    #[test]
+    fn epoch_detection_is_symmetric_regardless_of_whether_pid_also_changed() {
+        // Scenario 1: nonce changes, pid does NOT (pid reuse).
+        let tmp1 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path();
+        std::fs::create_dir_all(objects_dir(root1)).unwrap();
+        let mut s1 = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut s1, 1_000);
+        s1.epoch_nonce = "epoch-b".to_string(); // new epoch, pid unchanged
+        write_state(root1, &s1).unwrap();
+        let out1 = status_report(root1, agentrec_core::MAX_STORE_BYTES).unwrap();
+
+        // Scenario 2: both nonce and pid change (the ordinary restart case).
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path();
+        std::fs::create_dir_all(objects_dir(root2)).unwrap();
+        let mut s2 = crate::state::State {
+            pid: 111,
+            epoch_nonce: "epoch-a".to_string(),
+            ..crate::state::State::default()
+        };
+        crate::state::record_ignore_rebuild(&mut s2, 1_000);
+        s2.pid = 222;
+        s2.epoch_nonce = "epoch-b".to_string(); // new epoch, pid also changed
+        write_state(root2, &s2).unwrap();
+        let out2 = status_report(root2, agentrec_core::MAX_STORE_BYTES).unwrap();
+
+        assert_eq!(
+            out1, out2,
+            "epoch detection must depend only on the nonce — whether pid also happened to \
+             change must not change the rendered output"
+        );
+        assert!(
+            !out1.contains("ignore:"),
+            "a brand-new epoch nonce with no rebuild yet must render nothing: {out1}"
+        );
+    }
+
+    // Honesty round, AC #3: a `state.json` written by a binary that predates
+    // the nonce field entirely has neither `epoch_nonce` nor
+    // `epoch_reload_nonce` — both deserialize to their shared default `""`.
+    // A reader that treated that coincidental match as "current epoch" would
+    // resurrect whatever `epoch_ignore_rebuilds` figure an OLD, pid-keyed
+    // binary had accumulated. Neuter: drop the `!epoch_nonce.is_empty()`
+    // guard in `current_epoch_reloads` (treat empty-equals-empty as a match)
+    // → RED.
+    #[test]
+    fn pre_nonce_state_json_renders_no_reload_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // Simulate a state.json written by an OLDER binary: it has
+        // accumulated real lifetime + "epoch" history under its old
+        // pid-keyed bookkeeping (the now-unused `epoch_pid` key included, to
+        // prove it's simply ignored), but no `epoch_nonce` /
+        // `epoch_reload_nonce` keys at all — those fields didn't exist yet.
+        std::fs::write(
+            crate::state_path(root),
+            r#"{"pid":111,"ignore_rebuilds":4821,"epoch_ignore_rebuilds":37,
+                "epoch_pid":111,"last_ignore_rebuild_ms":123456}"#,
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            !out.contains("ignore:"),
+            "a pre-nonce state.json must not claim the old epoch's count is current: {out}"
+        );
+
+        let payload = status_json(root).unwrap();
+        assert_eq!(
+            payload["ignore_rebuilds"], 4821,
+            "the lifetime total must still survive"
+        );
+        assert_eq!(
+            payload["epoch_ignore_rebuilds"], 0,
+            "must not resurrect the pre-nonce file's stale epoch count"
+        );
+    }
+
+    // Phase 3: `status --json` must carry every field the text DEGRADED
+    // banner reports, not just the ignore-reload counters — a monitoring
+    // script piping `--json` to `jq` must never see less than a human running
+    // bare `status` sees. Neuter: drop one field from the payload's
+    // construction → this loop's named assert fires for exactly that field.
+    #[test]
+    fn status_json_carries_degraded_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let mut state = crate::state::State::default();
+        crate::state::record_io_failure(&mut state, "src/a.rs");
+        crate::state::record_prompt_put_failure(&mut state);
+        state.state_parse_failures = 3;
+        state.last_bad_field = Some("signal_offset".to_string());
+        write_state(root, &state).unwrap();
+
+        let payload = status_json(root).unwrap();
+        for field in [
+            "snapshot_failures",
+            "prompt_put_failures",
+            "io_failed",
+            "state_parse_failures",
+        ] {
+            assert!(
+                payload.get(field).is_some(),
+                "status --json missing field: {field} (payload: {payload})"
+            );
+        }
+        assert_eq!(payload["snapshot_failures"], 1);
+        assert_eq!(payload["prompt_put_failures"], 1);
+        assert_eq!(payload["io_failed"], serde_json::json!(["src/a.rs"]));
+        assert_eq!(payload["state_parse_failures"], 3);
+    }
+
+    // Bare `status` output for a healthy store must be unchanged by this
+    // phase — three renderers (text, --json, --ack-degraded --json) now read
+    // the same `State`, so pin the plain case to catch any of them drifting
+    // it.
+    #[test]
+    fn status_healthy_store_output_is_pinned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert_eq!(
+            out,
+            "store:      0 B\n\
+             turns:      0 (agent turns; git activity hidden)\n\
+             gaps:       0 recording gap(s)\n\
+             rich-rate:  n/a (no agent turns yet)\n\
+             memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures\n",
+            "healthy-store status output must be unchanged: {out}"
+        );
+    }
+
+    // ---- Phase 1: enforce_budget's extra_protected wiring -----------------
+    //
+    // Backdates a blob's mtime well before `enforce_budget`'s internal
+    // `pass_start` so the pre-existing A3(c) freshness guard cannot rescue
+    // it vacuously — these fixtures must genuinely be old, evictable
+    // candidates that only survive because of the Phase 1 protect-set.
+    fn backdate(objects_dir: &std::path::Path, hash: &str, secs_ago: u64) {
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    fn owned_turns(root: &Path) -> Vec<TurnRecord> {
+        agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect()
+    }
+
+    // A blob cited only by the in-flight turn's crash journal (`open.json`)
+    // and one otherwise-evictable OLD turn must survive: `open.json`'s
+    // `before` for a file is exactly the prior committed turn's `after` for
+    // that same file, so a live daemon's in-flight state and an "old"
+    // budget-eviction candidate are frequently the SAME blob. Neuter: drop
+    // `open.json` from `purgecmd::referenced_hashes`'s scanned paths.
+    #[test]
+    fn eviction_keeps_open_turn_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 500]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_OPENOLD00000000000000001",
+                "old.bin",
+                &old,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_OPENNEW00000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // Simulates the daemon's crash journal: the in-flight open turn's
+        // `before` cites the same blob. Raw text is enough here —
+        // `referenced_hashes` scans for `sha256:<hex>` regardless of JSON
+        // shape.
+        std::fs::write(crate::open_path(root), format!(r#"{{"before":"{old}"}}"#)).unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(
+            store.contains(&old),
+            "blob cited by the in-flight turn must survive"
+        );
+        assert!(store.contains(&new));
+        assert_eq!(evicted.bytes, 0, "nothing freed — old blob was protected");
+    }
+
+    // A blob cited only by a `memory.jsonl` pin (which `verify`'s pin-diff
+    // resolves as a CAS blob to render old content) must survive the same
+    // way. Neuter: drop `memory.jsonl` from the scanned paths.
+    #[test]
+    fn eviction_keeps_pinned_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xBBu8; 500]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_PINOLD00000000000000001",
+                "old.bin",
+                &old,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_PINNEW00000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // A real, parseable memory pin citing `old` — exactly the shape
+        // `verify`'s pin-diff resolves.
+        agentrec_core::memory::append_memory(
+            root,
+            &agentrec_core::memory::MemoryRecord {
+                v: 1,
+                kind: "memory".into(),
+                id: "mem_TESTPIN000000000000001".into(),
+                op: agentrec_core::memory::MemoryOp::Assert,
+                fact: "test pinned fact".into(),
+                pins: vec![agentrec_core::memory::Pin {
+                    path: "old.bin".into(),
+                    hash: old.clone(),
+                }],
+                source_turns: vec![],
+                origin: "human".into(),
+                ts: 0,
+                reason: None,
+            },
+        )
+        .unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(store.contains(&old), "pinned blob must survive");
+        assert!(store.contains(&new));
+        assert_eq!(
+            evicted.bytes, 0,
+            "nothing freed — pinned blob was protected"
+        );
+    }
+
+    // A blob cited only by a torn/unparseable line survives too — in
+    // log.jsonl (a corrupted committed-turn line `load_log` silently drops)
+    // and, separately, in a truncated open.json (which `recover_orphan`
+    // itself already treats as discardable, per its own comment). This is
+    // the criterion that lifts eviction to purge's own guarantee: the
+    // protect-set must come from the RAW scan, never from re-parsing.
+    // Neuter: build the protect-set from `load_log`/serde instead of the
+    // raw scan (both for log.jsonl and open.json).
+    #[test]
+    fn eviction_keeps_torn_line_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        // Sub-case 1: a torn log.jsonl line.
+        let torn_log = store.put(&[0x11u8; 500]).unwrap();
+        backdate(&objects_dir(root), &torn_log, 3600);
+        // Sub-case 2: a truncated open.json.
+        let torn_open = store.put(&[0x22u8; 500]).unwrap();
+        backdate(&objects_dir(root), &torn_open, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        // Each torn blob is ALSO a normal, structurally-visible eviction
+        // candidate via one old committed turn — proving survival is due to
+        // the torn-line/open.json ref, not ordinary A5/A2 protection.
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNLOG0000000000000001",
+                "log.bin",
+                &torn_log,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNOPEN00000000000001",
+                "open.bin",
+                &torn_open,
+            )),
+        )
+        .unwrap();
+        append_log(
+            &log_path(root),
+            &LogRecord::Turn(turn_with_snapshot(
+                "t_TORNNEW0000000000000001",
+                "new.bin",
+                &new,
+            )),
+        )
+        .unwrap();
+
+        // A truncated mid-JSON line, invalid on its own — `load_log` skips
+        // it — but carrying a valid `sha256:<64hex>` the raw scan finds.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_path(root))
+            .unwrap();
+        use std::io::Write;
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_TORN","files":[{{"before":"{torn_log}"#
+        )
+        .unwrap();
+
+        // A truncated open.json — not valid `OrphanJournal` JSON, but still
+        // carrying the hash.
+        std::fs::write(
+            crate::open_path(root),
+            format!(r#"{{"files":[{{"before":"{torn_open}"#),
+        )
+        .unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        let evicted = agentrec_core::retention::enforce_budget(
+            &store,
+            &owned_turns(root),
+            5,
+            &extra_protected,
+        );
+
+        assert!(
+            store.contains(&torn_log),
+            "blob cited only by a torn log.jsonl line must survive"
+        );
+        assert!(
+            store.contains(&torn_open),
+            "blob cited only by a truncated open.json must survive"
+        );
+        assert!(store.contains(&new));
+        assert_eq!(
+            evicted.bytes, 0,
+            "nothing freed — both torn-cited blobs were protected"
+        );
+    }
+
+    // Over-budget status where EVERY eviction candidate is protected must
+    // explain why 0 bytes were freed, naming pinned/in-flight refs — "over
+    // budget, 0 freed" with no explanation is the exact dishonest-status
+    // shape an earlier round fixed for the orphan-bloat case. Neuter: delete
+    // the attribution clause.
+    #[test]
+    fn status_attributes_protected_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 800]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+
+        let turn = turn_with_snapshot("t_ALLPROTECTED0000000000001", "old.bin", &old);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        // The sole turn's own blob is protected via A5 (newest-turn), so
+        // exercise the in-flight path instead by seeding open.json with the
+        // SAME hash after also making it look like a low-budget candidate
+        // via a second, newer turn that pushes it out of `keep`.
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+        let newer = turn_with_snapshot("t_ALLPROTECTEDNEW000000001", "new.bin", &new);
+        append_log(&log_path(root), &LogRecord::Turn(newer)).unwrap();
+        std::fs::write(crate::open_path(root), format!(r#"{{"before":"{old}"}}"#)).unwrap();
+
+        // Budget small enough that `old` is a candidate.
+        let out = status_report(root, 5).unwrap();
+        assert!(out.contains("over"), "expected over-budget notice: {out}");
+        assert!(
+            out.contains("snapshot eviction freed 0 B"),
+            "expected 0 freed: {out}"
+        );
+        assert!(
+            out.contains("protected") && (out.contains("pinned") || out.contains("in-flight")),
+            "expected a protected-bytes attribution naming pinned/in-flight: {out}"
         );
     }
 }

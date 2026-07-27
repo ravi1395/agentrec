@@ -108,6 +108,7 @@ fn purge_snapshots_before_ignores_planted_malformed_hash() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     old_turn.started = "2020-01-01T00:00:00.000Z".into();
@@ -166,6 +167,7 @@ fn default_purge_keeps_prompt_blob_also_referenced_as_a_snapshot() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     snapshot_turn.started = days_ago_rfc3339(1);
@@ -205,6 +207,7 @@ fn purge_snapshots_before_keeps_snapshot_blob_also_referenced_as_a_prompt() {
             skipped: false,
             withheld: false,
             baseline_unknown: false,
+            skipped_reason: None,
         }],
     );
     old_snapshot_turn.started = "2020-01-01T00:00:00.000Z".into();

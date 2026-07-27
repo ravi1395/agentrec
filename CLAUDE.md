@@ -8,6 +8,525 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Residuals round — GATE PASS (2026-07-27, branch `fix/residuals-round` cut from
+`fix/honesty-round`, `3477781..8f89775`, not pushed, no PR):** All 5 phases of
+`docs/superpowers/plans/2026-07-26-agentrec-residuals-round.md`. macOS **422 → 428, 0 failed,
+1 ignored**; clippy `-D warnings` + fmt clean **debug and release**; release `strings` carries no
+`AGENTREC_TEST`. Sonnet implementers one per phase, orchestrator re-ran the full suite after every
+phase independent of every implementer (each count agreed twice), one binding **fable
+skeptical-reviewer** done-gate in an isolated worktree. **Verdict PASS on the first pass** (as the
+ignore-rebuild-gate round also did — an earlier draft of this entry called that a first in this
+repo's history, which is false; the rounds that needed a FAIL→fix→re-gate loop were blame-honesty
+and honesty-fixes), with 3 NON-BLOCKING findings, all fixed at `8f89775` rather than recorded,
+because two were false claims in shipped artifacts.
+**The measurement-first ordering is what earned the pass, and it should be the template.** Phase 1
+was a pure spike: no repo code, a standalone probe against the raw `notify` crate, 4 probes, ~100
+trials, ending in a machine-checkable `VERDICT:` token that Phase 2's entire shape branched on.
+**(P1) `4b9e6da`.** Probe A **10/10** rename-ins deliver `Modify(Name(Any))`; Probe B **0/80**
+(2 fixtures × 4 stimuli × 10) spurious rename kinds; Probe C **0/5** delayed replays over a 68s
+hold; Probe D **5/5** rename-outs deliver with `is_dir()` false. **The load-bearing result is the
+one nobody asked for:** Probe B's `touch` stimulus produced a spurious `Create(Folder)` on **2/10**
+fresh-fixture trials — independently reproducing the prior round's fabrication measurement on a
+brand-new harness. That is what makes the 0/80 rename null trustworthy rather than a dead watcher
+reporting silence: the probe demonstrably sees coalesced historical flags. Create axis poisoned,
+Name axis clean — exactly the discrimination the fix needed.
+**(P2) `3b3062b` — the headline defect, closed.** A directory **moved into** the watched root lost
+its contents on macOS (3/3 at HEAD, 2/2 at the pre-round baseline — pre-existing, not a regression),
+the sharpest known silent-loss hole in the core claim, on the majority platform. `admit_existing_
+contents` is no longer `#[cfg(target_os = "linux")]`; the **gate** is now platform-split instead:
+Linux keeps `Create(_) | Modify(Name(_))`, macOS admits on `Modify(Name(_))` **only**. Decisions-log
+#2 survives intact and is directly pinned by `create_kind_does_not_admit_on_macos`.
+**(P3) `bd92964`** liveness-gates the stale reload line: `release_lock` never runs on kill-9, so
+`epoch_nonce` stayed stamped and a **dead** epoch's rebuild count rendered as current in *both*
+readers. `status` is now the fourth caller of the proven `daemon_is_running` flock probe. Founder
+answered open question 3 with **option (c)**: json keeps the count and gains an always-present
+`epoch_ignore_rebuilds_stale` boolean; the text line is suppressed outright.
+**(P4) `d940ac9`** closes the `wait_for_live_daemon` race — the pid was written ~4.3ms before the
+watcher armed, so every live-daemon test nominally raced it. The daemon now stamps
+`watcher_armed_nonce` after `.watch()` succeeds; **keying on the epoch nonce rather than a bool is
+what makes a crashed run's stale value self-invalidating.** **(P5) `31a2eba`** adds
+`workflow_dispatch` (founder answered Q1 with **(b)+(c)**) plus `scripts/linux-leg.sh` codifying the
+Colima ritual, and makes the rebuild bound *evidenced on green* — the count previously surfaced only
+in the assert-**failure** message, and cargo captures stdout on pass, so a green CI run carried no
+number at all.
+**The skeptic ran the one thing no fixture can prove.** Live daemon, real repos, agent bracket open:
+`touch <pre-existing dir>` **5/5 trials, 0 fabricated entries**, `blame` naming nobody — **plus a
+control-included trial** (`fabricated=0 control_recorded=1`) proving the daemon was recording during
+the exact window the absence claim covers, which is the vacuity objection this repo has been burned
+by. And `mv dir-in` **5/5, all contents recorded**. A single clean run was explicitly not accepted.
+**Two false claims shipped inside this round and the gate caught both — worth keeping.** (a) The
+rename-out test's comment claimed "two independent discriminators" unconditionally. **False on
+macOS**, demonstrated by the skeptic: the unconditional `admitted_dirs` clear for any
+`Modify(Name(_))` runs **before** the admission gate, and macOS's follow-up leg is itself
+`Modify(Name(RenameMode::To))` — so that clear wipes the leg-1 poison, `insert` returns true, and the
+staging assertion **passes even under the neuter**. Only `is_empty` discriminates on macOS; both do
+on Linux. The clear it collides with is *last round's own fix* (`f4bca8a` finding 2) — i.e. the plan
+reasoned about a neuter without checking its interaction with the code the previous round added, the
+"reasoned safe, unobserved" class this round existed to kill, reproduced inside the plan meant to
+close it. The implementer disclosed it unprompted rather than working around it. (b) A VERIFY-LEDGER
+row cited a "Local Colima-VM number … recorded below" that **exists nowhere**, while the same row
+stated the container was never run. The only figure measured was a macOS one, which is not a data
+point for a row about Linux.
+**A third finding was a real host-mutation bug in a script that had never been executed:**
+`scripts/linux-leg.sh` ran `chown -R` on an **rw bind mount**, rewriting the *host* repo's ownership
+through virtiofs, and put the container's `target/` on the host's own non-triple `target/debug`
+path, clobbering the macOS build cache. Now mounted read-only and copied to container-native storage
+with `target/` excluded, `CARGO_TARGET_DIR` off the mount. Its `sysctl` mechanism now carries an
+explicit **UNVERIFIED-inference** caveat — the round recorded the *value* (1048576), never how it was
+applied, and the implementer flagged its own reasoning as inference rather than recovered history.
+**Process debt, recorded not papered over: claimd declare-first held for P4 and P5 only.** P1–P3
+were implemented with no claims declared beforehand; `claimd lint --range` reports **two**
+touched-but-uncovered files (`cli/src/cmds.rs` from P3 and `scripts/linux-leg.sh` from P5 — the
+orchestrator's own self-report to the gate named only the first, and the skeptic found the second).
+Retroactive declaration was **refused**, per the skill: a declare-record postdating the code makes
+the log lie about ordering, the one property claimd provides. `amend` cannot widen `stale_on`
+either, so the P5 manual claim — declared *before* implementation but with the script omitted from
+its globs — could not be honestly corrected. **`scripts/**` was added to `.claims/config.json`'s
+`lint.ignore` at the FOUNDER's explicit direction** (contrast `IMPLEMENTATION.md`, which the prior
+round records as agent-added and flags for review); the Stop hook was otherwise firing on every
+turn-end with no legitimate remedy available. `cli/src/cmds.rs` is deliberately NOT ignored — it is
+core source, and it stays standing as recorded debt in the same posture as last round's
+`purgecmd.rs`. **The underlying rule is still undecided and will fire again:** `PROTOCOL.md` is not
+ignored, so the next normative-doc edit reproduces this; and the argument *against* ignoring
+`scripts/` is that this very script shipped two real defects while unexercised. 8 claims declared this round (4 for
+P4, 3 for P5, plus the P4 manual), 5 EVIDENCED, 2 left DECLARED as `manual` awaiting founder
+attestation — **never self-attested**. A pre-existing `illegal transition: evidence from EVIDENCED
+at seq 4` warning on `clm_0TRSZXYXZBBV092VF8D1RXF7PD` (an ignore-rebuild-gate-round claim) predates
+this session entirely; two independent implementers traced it to the same claim.
+**Environmental incident worth recording, because it wasted a phase and the wrong diagnosis was
+tempting:** mid-round every shell died — `posix_spawn failed: Resource temporarily unavailable`,
+symmetric across the orchestrator, a subagent's `clang` linker, and background spawns. This repo's
+memory records leaked `agentrec record` daemons as *the* known process leak, so that was the obvious
+suspect; it was **wrong**. The machine held **3607 orphaned `tail -f -n +1 /dev/null`** processes
+(ppid 1, one-second burst) against `kern.maxprocperuid=4000`, and exactly **one** agentrec daemon was
+running — the legitimate launchd service. Contributing cause was ours: P1's first harness revision
+created a fresh `notify` watcher **per trial** (80 for Probe B alone) and exhausted the process table
+around trial 9. Redesigned to one watcher per probe, which also matches how the real daemon behaves.
+**Every measurement taken before the cleanup was discarded and the trial counts restarted from
+zero** — a fork-starved machine perturbs FSEvents delivery timing, which is precisely the quantity
+P1 exists to measure.
+**Still open, none blocking:** P5's AC1 (a GitHub run URL) is **structurally unclosable from a
+branch** — GitHub only offers `workflow_dispatch` for workflows already on the default branch — so
+it is an honest OPEN ledger row, not a pass; landing the trigger on `main` is a founder decision and
+nothing was pushed. **Superseded 2026-07-27:** the first Linux rebuild-bound number now exists —
+`scripts/linux-leg.sh` was executed for the first time (Colima, non-root, overlayfs fixtures, suite
+**431/0/2** green): in-suite count **8** at `--test-threads=3`, solo runs 9–12, all inside `1..=45`
+but *below* the prior round's 13–21 from a different VM — the bound holds in both regimes, nothing
+explains the gap. The first run also found that the shipped script **silently defeated P5's own
+evidence-on-green deliverable**: no `--show-output`, so libtest captured the passing test's
+`rebuild_count` print — the pristine log carries zero such lines (fixed in the same commit as this
+entry, plus a ran-to-completion sentinel after a real silent-truncation false-pass; a
+docker-credsStore workaround was applied env-only, not committed; ledger row updated). A second
+binding fable skeptic gate over the post-gate commits (`8f89775..`) returned **FAIL → all four
+findings fixed at `357bde3` → re-gate by the same skeptic: PASS** (each closure refutation-proven
+firsthand, incl. a fresh-boot probe of the Colima VM confirming 1048576 is the boot default — the
+claim the skeptic most suspected — and a fourth same-VM rebuild count, 13): (F1, blocking) the same commit that recorded the first execution
+shipped the script still claiming `STATUS: THIS SCRIPT HAS NEVER BEEN EXECUTED` — the
+false-claim-in-shipped-artifact class, reproduced by the fix for it; (F2) the sentinel cleared
+itself *inside* the truncation-vulnerable block, so a truncation landing before the clear plus the
+stale sentinel every green run leaves in the persistent volume produced a demonstrated live false
+pass — clear moved host-side into its own container run; (F3) the skeptic's own in-suite run on the
+same VM measured **14** and the post-fix re-run measured **19**, refuting this entry's earlier "two
+VMs, two regimes" framing twice over (the 14 and 19 both fall entirely inside the prior VM's 13–21;
+this VM's observed span is 8–19, and the re-gate's own run added a **13** at the prior range's exact
+floor; spread uninstrumented, all inside `1..=45`); (F4)
+`e3d24d7`'s subject says "30 stale claims re-confirmed" — the true count is **44** (44 STALE →
+44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). P4's population-level flake claim closes only over CI history. P1's
+verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
+is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
+directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the
+natural observatory. Two leaked test daemons from prior sessions (pids 26258, 70800, watching dead
+tempdirs) were live during the review and left running.
+
+**Epoch nonce + the Linux leg — GATE PASS (2026-07-26, branch `fix/honesty-round`,
+`f8c6cc9..f4bca8a`, pushed, no PR):** Two founder asks. The nonce was routine; **the Linux leg,
+recorded as "owed" for three rounds, found a shipping product defect within minutes of first
+running.** macOS **419 → 422**, Linux **first-ever run: 316 passed / 2 failed → 426 passed / 0
+failed / 2 ignored**. Both platforms re-run by the orchestrator after every commit, independent of
+every implementer. Binding fable skeptic: **FAIL → FAIL → PASS** across three rounds.
+**How Linux was run, since this is now load-bearing infrastructure:** `ci.yml` fires only on
+`push: branches: [main]` and `pull_request` and has **no `workflow_dispatch`**, so a branch push runs
+nothing and GitHub only exposes dispatch for workflows already on the default branch — a PR was
+declined, so the leg ran locally in a **Colima Linux VM** (`rust:1-bookworm`, arm64, **non-root**,
+real inotify, `max_user_watches=1048576`). Fixtures land in the container's own `/tmp`, so the daemon
+watches native overlayfs, not the virtiofs mount. **Run it non-root**: as root, `chmod 000` fixtures
+pass vacuously because root bypasses mode bits — that alone made the two `#[cfg(unix)]` permission
+tests fail spuriously on the first attempt.
+**(A) `942985d` epoch nonce.** Epoch identity was the **pid**, which pid reuse defeats: reader and
+writer keyed on the same comparison, so a recycled pid made a dead epoch's reload count render as
+current *and* made the new epoch's first rebuild accumulate onto it. `acquire_lock` now stamps
+`epoch_nonce = ulid()` (a bare ms timestamp can collide across a rapid record→stop→record cycle);
+`release_lock` clears it; a pre-nonce `state.json` renders nothing rather than claiming a stale count.
+Refutation-proven with **writer-only and reader-only** reverts, the asymmetry that caused the
+original bug.
+**(B) `034c883` — the defect Linux found, and it is a real one.** `notify` arms the watch for a
+**newly created directory** only after processing the batch containing its creation event, and
+inotify is edge-triggered with no catch-up — so **a file written into a brand-new directory before
+the watch is armed was never recorded. Permanently, silently.** Proven with an isolated repro against
+the raw `notify` crate (no agentrec code) plus instrumentation showing the watcher arms ~4.3ms after
+the pid is written, which kills the competing "startup scan catches it" explanation. Fixed by
+`admit_existing_contents`, which walks the new subtree and stages it. A dedicated test names the
+defect, because the only assertion previously pointing at it lived inside a test entirely about
+ignore-set rebuilds — it would have been misattributed forever.
+**(C) The fix fabricated attribution — twice — and the gate caught both.** `247df9e` and `f4bca8a`.
+First shape gated on `path.is_dir()` alone, so `touch src` / `chmod src` walked whole unchanged
+subtrees and emitted every file as `op:"modify"`; with a bracket open they folded into the rich
+`tool:"claude"` turn and **`blame` named the agent for files it never touched** — a macOS regression
+at the product's headline surface, undoing what `17657d9` spent a gate cycle fixing. The kind gate
+that followed **also failed**: FSEvents delivers **coalesced per-path flag unions**, so the first
+event for a directory that pre-dates the daemon routinely carries historical `ItemCreated`, and
+`admitted_dirs` is empty for every such directory — i.e. essentially the whole repo. Skeptic measured
+**2 of 4** bracket trials fabricating where the implementer had reported one clean run; **a single
+clean observation of a ~50% behavior**, twice in this round. Final shape: admission is
+**`#[cfg(target_os = "linux")]`** — it only exists where it is load-bearing (premise verified: 10/10
+tight `mkdir && write` bursts recorded on macOS with admission compiled out), plus a rename clear,
+since `IN_MOVED_FROM` maps to `Modify(Name(From))` and **not** `Remove(Folder)`, so a directory
+renamed away left a stale `admitted_dirs` entry that suppressed a legitimate later admission —
+reopening the very event-loss class for `mv dir dir.bak && mkdir dir`. Escalation now **5/5** clean.
+**The measurement that should change how these plans are written:** Linux's *correct* rebuild count
+(13–21) **exceeds macOS's *neutered* count (15–18)**. A bound that discriminated perfectly on one
+platform was worthless on the other, and the prior reviewer's reasoning about which way inotify would
+push it was exactly backwards — FSEvents coalesces, inotify does not. `elapsed/POLL` is not a usable
+derivation either (`recv_timeout` returns immediately when a message is queued). Shipped as a
+`cfg(target_os)` split, each side discriminating its own neuter (Linux neuter measures 87–103).
+Every "reasoned safe, unobserved" margin in the last three rounds rested on that class of intuition.
+**Skeptic ruling worth keeping:** `metadata_only_event_does_not_admit_existing_directory_contents` is
+now vacuous on macOS, and that is **acceptable un-gated** — unlike this repo's past vacuity failures,
+it is vacuous only where the guarded code *cannot compile*, so it masks nothing, and it snaps back to
+load-bearing if anyone deletes the `#[cfg]`. Real macOS coverage lives in the pre-existing-dir test.
+**New residual, measured at HEAD *and* at the pre-round baseline — pre-existing, not a regression:**
+on macOS a directory **moved into** the watched root loses its contents (3/3 at HEAD, 2/2 at
+`f8c6cc9`); the round fixes this case on Linux via the rename-in clause. It is now the sharpest known
+silent-loss hole in the core claim, on the majority platform. Durable fix would be macOS admission
+triggered by rename events only, or a scan-diff on rename — founder call. Also still open: the
+crashed-daemon stale reload line, the bound's single-VM statistics, and `wait_for_live_daemon` gating
+on a pid written ~4.3ms before the watcher arms (every live-daemon test nominally races it).
+**Process note, unflattering and worth keeping:** I repeated within one session the exact error that
+produced this round's first REFUTED claim — two positional filters to `cargo test`, which takes one.
+Caught only because I read the output rather than the exit code. **The whole admission mechanism is
+now testable only on Linux**, so the container leg is load-bearing from here on, not optional.
+
+**Honesty-fixes round — GATE PASS (2026-07-26, branch `fix/honesty-round`, `df442f2..0f3b474`,
+pushed to `origin/fix/honesty-round`, no PR):** Founder-directed sweep of the five items the
+rebuild-gate report left open. **395 → 414 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt
+clean debug and release, release `strings` carries no `AGENTREC_TEST` seam. Sonnet implementers, no
+per-phase reviewer this round, one binding **fable skeptic** — plus an orchestrator re-run of the
+full suite after every phase, independent of every implementer. Round-1 verdict **GATE FAIL** on one
+blocking finding, fixed at `9b1b09b`; re-gate **GATE PASS**.
+**(P1) `2d1bd78` — `enforce_budget` deleted live-cited blobs, and did so from a read verb.** Its
+keep-set came from *parsed* `TurnRecord`s while it hard-deletes (`store.remove` → `fs::remove_file`),
+so `open.json` in-flight refs, `memory.jsonl` pins and torn-line refs were all unprotected — and its
+sole caller is `cmds::status_report`. **Running `agentrec status` on an over-budget store could
+destroy an in-flight turn's snapshot.** Fixed with an `extra_protected` set harvested as late as
+possible before the remove loop. **The obvious implementation is a trap:** passing the full
+`purgecmd::referenced_hashes` protects every validly-referenced hash and **permanently defeats budget
+eviction** — it broke `status_prints_over_budget_notice`. Correct cut is `open.json` + `memory.jsonl`
+scanned raw, plus only those `log.jsonl` hashes on lines that **fail to parse**; validly-parsed lines
+are already covered by the age-ordered walk. Hard-delete deliberately retained (archive-on-evict
+frees zero disk while *reporting* bytes freed, from a habitually-run read verb); no liveness refusal
+(the daemon runs 24/7, so a gate makes the budget fiction). Skeptic proved the cut correct in both
+directions on a live daemon: `freed 19 B; 500 B protected`, blob survived.
+**(P2) `7474e26` — `read_state` reset the entire `State` when one field failed to parse**, losing
+`pid`, the honesty counters, and **`signal_offset`, whose reset replays the whole signal inbox** —
+silently, with no counter. Now parses via `serde_json::Value` with per-field extraction and a
+`state_parse_failures` counter surfaced in `status` and `doctor` (advisory only — `doctor` all-pass
+exit 0 is the deploy gate). **The plan's taken decision was wrong and the implementer said so:**
+`#[serde(default)]` rescues a *missing* field only; a struct-level parse still fails outright on a
+*present* field of the wrong type, which is exactly what every criterion required to survive.
+**(P3) `22b085f` — epoch-scoped the reload counter** (open question 1 answered with option (a),
+reversing last round's default-by-omission) and made `status --json` carry every DEGRADED field the
+text banner reports; `status --ack-degraded --json` now rejected by clap instead of printing prose
+under a `--json` flag. **(P4) `6234612`** pins the over-record asymmetry the previous gate named:
+classification happens at ingest but staging at flush, so a path already in `pending` under wider
+rules is still staged after a mid-debounce narrowing.
+**The blocking finding is the one worth remembering.** P3's epoch reset lived only on the *writer*
+side; `status_report` rendered the raw field. So after a restart — until the next `.gitignore` churn,
+potentially days — `status` attributed the **dead epoch's** count to the live one, and `epoch_pid`
+already held the dead pid on disk with nothing reading it. The README line shipped that round ("the
+text line resets on each daemon restart") was therefore **false as observed**. Fixed at `9b1b09b` by
+gating the render on `epoch_pid == pid`, **not** by rewording the AC or the README — the ratchet
+forbids loosening a criterion to pass. Render-gate was chosen over resetting at `acquire_lock` for a
+reason the plan missed: `release_lock` zeroes `pid` and never touches `epoch_pid`, so a writer-side
+reset fixes the restarted window and leaves the **stopped** window stale.
+**A hole in that fix, found at re-gate and closed at `0f3b474`:** `status_report` and `status_json`
+are independent readers, and neutering **only** the json seam survived the entire suite — the test
+asserted the json *lifetime* total but never the epoch figure. Now pinned; the json-only neuter reds
+it by name.
+**Four process failures this round, all mine, none by the implementers.** (1) The plan was wrong
+three times and each implementer caught and disclosed it rather than working around it — including
+that **Phase 4's own named neuter cannot fail** (`gitignore_dirty` is tracked independently of
+`pending`), the third round running in which an AC could not have proven itself as written; a
+trigger-neuter was substituted with disclosure. (2) A second claim came back **REFUTED**
+(`clm_5PCCRY1K`) — again my replay, not the code: the `awk` scanned the whole of `integration.rs` and
+kept the *last* match, so tests added in later phases flipped the apparent ordering. Property
+verified true by direct read; replaced by the body-scoped `clm_5YTX49CR`. That is **two** replays I
+have authored that failed for reasons unrelated to the property claimed. (3) The seam-pin commit
+edited claim-scoped source **before declaring anything**; both remedies the hook offers were wrong
+(retroactive declare makes the log lie about ordering; `lint.ignore` on `cmds.rs` silences coverage
+on core source), so at the founder's direction it was reverted and redone declare-first — the
+reapplied file hashes identically (`d00d848c…`), only the record's ordering changed. (4) `df442f2..HEAD`
+still flags **`cli/src/purgecmd.rs`**, touched in P1 by a one-token `pub(crate)` visibility widening
+that no claim's scope covered. Left standing and recorded rather than papered over — reverting a
+6-commit phase to re-declare a visibility change would be disproportionate, and the two offered
+remedies remain the wrong ones. **Claim ledger: 36 claims — 27 confirmed, 6 evidenced, 2 refuted, 1
+manual awaiting founder attestation.**
+**Recorded, not fixed.** **Pid reuse defeats the epoch gate:** if a later daemon lands on the same
+pid as the epoch that last rebuilt (macOS wraparound — the same recycling class `doctor` handled via
+flock), the stale count renders as current and the new epoch's first rebuild *accumulates* onto it,
+since the writer reset keys on the same comparison. Cosmetic over-count in one line, self-correcting
+at the next restart under a different pid; predates this commit, shared by reader and writer. Durable
+fix is an epoch nonce (a start-timestamp stamped at `acquire_lock`) instead of pid identity.
+**Eviction still is not purge:** a hash on an *unmodeled field of a line that parses* is protected by
+`purge --orphans`' raw scan and evicted by `enforce_budget` — demonstrated live by the skeptic. No
+producer emits that today, but PROTOCOL's additive rule plus the queued 1.0-freeze fields (§4
+`emitter_turn`, §5 `imported`) are exactly how one appears silently; now documented in
+`extra_protected_refs`, and owed a debt line on the freeze checklist. Also: `status --json` runs no
+eviction and reports no store-size/over-budget state, so the "json sees less than text" class this
+round existed to close is only half closed; `last_ignore_rebuild_ms` remains lifetime-scoped while
+the count is now epoch-scoped.
+**Item 3, the Linux CI leg, is NOT done — founder decision, not an oversight.** `ci.yml` fires only
+on `push: branches: [main]` and `pull_request`, with no `workflow_dispatch`, so the branch push runs
+nothing; a PR would carry three stacked rounds at once. Offered draft-PR-to-main / PR-onto-parent /
+skip; **skip was chosen**. Every timing margin across the last three rounds remains macOS/FSEvents
+evidence only, and the older Linux leg for the `unreadable`/`io_failed` producers stays owed.
+
+**Ignore-set rebuild gate — GATE PASS (2026-07-25, branch `fix/ignore-rebuild-gate`,
+`bdb911c..fe57cda`, not pushed):** All 3 phases delivered against
+`docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`. **386 → 395 tests, 0 failed,
+1 ignored**, clippy `-D warnings` + fmt clean on debug **and** release, release `strings` carries no
+`AGENTREC_TEST` seam. Sonnet implementers, an Opus reviewer per phase in an isolated worktree, and a
+binding **fable skeptic** done-gate — plus an orchestrator re-run of the full suite at every phase,
+independent of every implementer. Each count agreed three ways.
+**The defect, closed:** `e453e86` fixed the *trigger* (`gitignore_dirty` set at event ingest by
+filename, verdict-independent) and left the *consumption* inside `if settled || capped`, whose
+predicates are armed **only** by `Class::Watch` events. Editing `.gitignore` to re-include a path and
+then touching only that path therefore produced **no rebuild, ever** — the path classified against the
+stale set, armed no timer, and the flush block never ran. Under-record direction, so nothing was
+corrupted; the recorder simply, silently, did not record a file the user had explicitly re-enabled.
+Second shipping of this class (`049a4aa` introduced the trigger defect). **(P1) `0a7b279`** moves the
+rebuild to the top of `run`'s loop behind `maybe_rebuild(dirty, root)` — top-of-tick, not inside
+ingest, so a hot `.gitignore` costs at most one full-repo `IgnoreSet::build` per `POLL` rather than
+one per event. **(P2) `b68bc42`+`8cce05a`** makes reloads observable (`ignore_rebuilds` /
+`last_ignore_rebuild_ms` in `state.json`, one stderr line per rebuild, a `status` line shown only when
+the counter is non-zero, and `status --json`, which did not exist before) — the class shipped twice
+partly because nothing anywhere reported whether the filter config was ever reloaded. **(P3)
+`ec2874b`** adds the mid-run coverage that never existed: deletion re-widens, creation is honored
+without restart, `SingleDaemonGuard` hygiene, and a matcher-count precondition.
+**The skeptic verified the product, not the suite:** live binary, real daemon, real repo, all four
+mid-run directions (widen / narrow / delete / create) checked against `.agentrec/log.jsonl` directly,
+`ignore_rebuilds: 4` with matching stderr lines and 0700/0600 perms. It also **empirically confirmed
+the documented residual window** — an event arriving in the same drain batch as the ignore-file edit
+is still classified against the pre-edit set, and is honored on the path's *next* mutation (≤1 `POLL`
+tick), which is the honest claim the plan makes rather than "instant".
+**Three things this round got wrong and corrected rather than buried.** (a) The plan's test-count
+ladder was wrong **twice** (387→388, 391→393→395), both times derivable from the plan's own contents
+before any implementer touched it — Phase 3's original target of 393 was already met by Phase 2, so
+it could have passed having added neither required test. (b) A claim came back **REFUTED**
+(`clm_1H62NAJN`): its replay was authored as `cargo test A B`, and cargo accepts one TESTNAME, so it
+errored instead of running and never proved its property — its own evidence event recorded `exit: 1`
+and the orchestrator reported the ledger clean without checking exit codes. Left REFUTED in the log
+deliberately, replaced by `clm_4H93KXD1`; every other evidence exit was then audited (all 0).
+(c) **`nested_gitignore_precedence` was NEVER vacuous** — see the correction below, now measured in
+four cells and fixed in the test comment, the plan and this file.
+**AC4 could not have proven itself as written:** the plan's literal "5 rapid `.gitignore` rewrites →
+counter in `1..=5`" fails to discriminate its own neuter, because 5 writes coalesce to ~3 FSEvents
+events, so a per-event counter also lands ≤5. Reproduced directly by the reviewer. Delivered form is
+40 writes bounded `1..=10` (correct code measures 3–4; the neuter measures 15–18). The declared claim
+still carried the false text, so it was amended to replay what exists and **superseded** by
+`clm_6SAFG0JJ`, not deleted. **Claim ledger: 17 claims — 10 confirmed, 6 evidenced, 1 deliberately
+refuted**, declare-first per criterion at the parent commit each time (last round skipped this).
+**Coverage gaps the gate names, none blocking:** (1) **narrowing while events are pending** — paths
+already admitted to `pending` under the older, wider rules are still staged at the next flush even if
+a mid-debounce edit now ignores them; the over-record mirror of the documented residual window,
+untested and undescribed in the module comment. (2) **Everything here is macOS/FSEvents** — the
+400 ms margins and the `1..=10` bound are reasoned safe (failures fall RED, and inotify widens the
+margins) but unobserved; Linux CI leg owed, same posture as the `unreadable`/`io_failed` producers.
+(3) counter behavior across a daemon restart never observed. (4) no test pins the sustained walk rate
+on a continuously-rewritten `.gitignore`.
+**Recorded, not fixed:** `status --ack-degraded --json` prints plain text under a `--json` flag;
+`status --json` omits the DEGRADED fields entirely (README now says so), so a monitoring script sees
+less than the text surface; `state::read_state` chains two `.ok()`s into `unwrap_or_default()`, so
+**one** unparseable field silently resets `pid`, `signal_offset`, `snapshot_failures` and `io_failed`
+with no diagnostic — and a reset `signal_offset` replays the entire signal inbox (pre-existing; this
+round did not worsen it, and its own AC3 test is built to discriminate that fallback). Open question 1
+was **resolved by defaulting** to option (c): the reload line shows whenever the counter is non-zero,
+and the counter is lifetime-cumulative and not cleared by `--ack-degraded`, so a long-lived repo
+eventually renders `ignore: reloaded 4821 time(s)` in the daily-driver surface. Option (a),
+epoch-scoping, remains the cheap reversal — founder call. **Favorable fact for the churn-honesty
+plan:** `status --json` performs **zero writes** (returns before `enforce_budget`; mtime and inode
+unchanged across a run), so that plan's Phase 5 criterion starts satisfied on this path.
+
+**Planning round — three plans committed, zero code changed (2026-07-25, branch
+`fix/blame-attribution-and-noise-folding`, `8da3e16..6244afb`, not pushed):** Documented here
+**before** implementation because these plans are the next things to be attacked, and an
+un-registered plan file is not a durable artifact. **Nothing below was implemented at the time of
+writing** — plan (2), the rebuild gate, has since shipped in full; see the GATE PASS entry above.
+Test suite untouched at the prior round's **386 passed / 0 failed / 1 ignored** (a figure carried from that
+round's receipt and marked UNVERIFIED in every plan header — re-run before trusting it).
+
+**(1) Churn-honesty round — `docs/superpowers/plans/2026-07-25-agentrec-churn-honesty-round.md`
+(`8da3e16`), 9 phases.** The 5-item handoff scope (fold `diff`'s per-path renderer · record-time
+`ignore_globs` · `doctor` advisories + a ref→blob presence check · `enforce_budget` protect-set ·
+re-measure), refined by a 3-lens adversarial fable redteam (honesty/attribution ·
+daemon-crash-concurrency · vacuity/measurement/scope) whose lenses **disagreed on two daemon facts**;
+reading the code settled both and one lens was wrong — subagent reports are leads, not evidence.
+Three findings reshaped the scope, each verified firsthand:
+**(a) `enforce_budget` deletes live-cited blobs today — a real bug in shipped code, not a plan
+item.** Its keep-set is built from *parsed* `TurnRecord`s and it hard-deletes (`store.remove` →
+`fs::remove_file`), while `open.json` refs, `memory.jsonl` pins and torn-line refs go unprotected —
+exactly the classes `purgecmd::referenced_hashes`' raw non-parsing `sha256:` byte-scan exists to
+protect. Its sole caller is `cmds::status_report`, so **running `agentrec status` on an over-budget
+store can destroy an in-flight turn's snapshot**, with no daemon-liveness refusal anywhere on that
+path. Fix keeps hard-delete (archive-on-evict frees zero disk — archives sit under `.agentrec/` —
+while *reporting* bytes freed, and eviction fires from a read verb, so it would grow an unbounded
+archive as a side effect of reading status) and adds a raw-scan protect-set harvested as late as
+possible; the residual live-daemon window is narrowed-not-closed, same posture as `purge --orphans`'
+undo race. **(b)** the `e453e86` rebuild-gate defect, pulled out into its own plan (below).
+**(c) record-time exclusion is a non-event**, so `blame` fills the vacuum: `blame_line` falls through
+to `"before recording began"` and a touched-then-excluded path prints `"· human-edited since"` —
+an agent edit attributed to the human, byte-for-byte the confident-false-answer class `17657d9` just
+fixed. Hence item 2 splits into two phases with the honesty surface marked **non-optional** — the
+feature "works" without it, which is exactly why it would get deferred.
+**Ordering deliberately reversed from the handoff's list:** measurement runs **first**, because
+`status` mutates the store, so a measurement taken after any lever measures a store that lever
+already changed; and the owed live-daemon E2E is promoted ahead of feature work because it builds
+the harness two later phases need. **Two zero-yield results are stated up front so no receipt can
+claim otherwise:** folding `diff` is render-time only (`log.jsonl` is append-only; zero bytes, zero
+lines), and record-time globs measure **~0** churn reduction on this corpus (0 churn entries since
+the D29 fix merged; `.claims/`, the named next instance, has 3 tracked files so the rule keeps it) —
+their justification is the PROTOCOL.md:25 promise that no code has ever read, nothing else.
+Every acceptance criterion names the **neuter** that must turn a *named* test RED; criteria
+unprovable by fixture are marked for a live-daemon leg or a VERIFY-LEDGER row, never a PASS.
+**4 open questions**, of which Q1 (config globs vs git-tracked precedence) gates Phase 5 and changes
+its **file count**, not just its fixture — answer before chunking.
+
+**(2) Ignore-set rebuild gate — `docs/superpowers/plans/2026-07-25-agentrec-ignore-rebuild-gate.md`
+(`fba86e9`, corrected `6244afb`), 3 phases.** Pulled out of the above because it is a defect in
+**already-merged** code. `e453e86` fixed the *trigger* (`apply_watch_result` sets `gitignore_dirty`
+at ingest by filename, verdict-independent — correct, and unit-tested). It never fixed the
+*consumption*: the rebuild lives inside `if settled || capped` in `daemon::run`, and both predicates
+derive from `last_event`/`first_event`, armed **only** for `Class::Watch`. So editing `.gitignore` to
+add `!keep.log` and then writing only `keep.log` leaves the rebuild permanently unrun — the file is
+never recorded until some unrelated watched path changes. Direction is under-record, so nothing is
+corrupted, but the recorder silently ignores a file the user explicitly re-enabled. **Second time
+this class has shipped** (`049a4aa` introduced the trigger defect, `e453e86` fixed the trigger and
+left the gate). No existing test can catch it: the unit test drives `drain_watch_events` directly and
+asserts the flag is *set*, never that anything consumes it; the real-daemon test proves *ignoring*,
+never *re-widening*; nothing in the suite exercises a mid-run ignore-rule change at all.
+**`6244afb` corrected the plan's own errors before any code was written:** Phase 1's AC1 and AC2 were
+jointly unsatisfiable (a positive control written *after* the ignore-rule edit is itself
+`Class::Watch` activity — it arms the timer, `settled` fires, the rebuild runs under current code, so
+the RED-first test would have gone green pre-fix and its neuter would have proven nothing); one AC
+named a counter that lands a phase later plus a fallback assert inside a loop body the plan itself
+calls unit-unreachable; and one Phase 2 AC asserted stderr-line counts inside a 250 ms window, which
+is FSEvents-coalescing flake bait this repo has already been burned by.
+**Correction to a claim this file has been repeating, now measured — `nested_gitignore_precedence`
+was NEVER vacuous.** This entry previously said the "passes vacuously in a non-git tempdir" note was
+true pre-D29 and stale after. Both readings are wrong. Phase 3's reviewer measured `matchers.len()`
+across all four cells — {pre-D29 `build` body, post-D29} × {`git init`, none} — and got **2 in every
+cell**, with every precedence assertion passing in every cell. The claim is self-refuting on its own
+terms: it depends on the walk still *yielding* both `.gitignore` files without git, which is exactly
+the condition under which matchers are collected and the assertions are real. What `require_git`
+genuinely governs is whether ignore rules prune the **traversal**, which is why `git init` is
+load-bearing in **live-daemon** fixtures (a matcher-less walk there really does prove nothing) and
+merely hygiene in a unit test that builds its `IgnoreSet` directly. Corrected in three places —
+here, the plan, and the test's own comment — because a false claim in a source comment is the
+doc-drift class that already produced a GATE FAIL in this repo. Also **verified rather than assumed**: `IgnoreSet::is_ignored` maps
+`ignore::Match::Whitelist` to `false`, so the fixture's `!keep.log` genuinely re-widens.
+
+**(3) Phase 2.0 substrate — `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`** (written the
+prior round, left untracked, committed in `8da3e16` so a fresh worktree can see it), 5 phases:
+`import claude` gate → import persist → golden harness → `RepositoryView` → `--json` contracts.
+Unchanged content; its 3 open questions are still open, including whether the 12 unchecked tasks in
+the memory-v1 plan are stale bookkeeping or real work.
+
+**Cross-plan seam, recorded so it cannot be re-fixed in parallel:** churn-honesty Phase 5 now points
+at plan (2) for the loop-placement fix and adds only the `config.toml` trigger on top of it. And
+folding must stay in the CLI adapter — if it migrates into Phase 2.0's `RepositoryView::diff`, then
+`diff --json` and the MCP read surface inherit it silently.
+
+**Blame-honesty + skipped_reason + noise folding — GATE PASS (2026-07-25,
+branch `fix/blame-attribution-and-noise-folding`, `17657d9..c4ada8f`, not pushed):** Three changes
+landed off a 4-lens adversarial redteam of store churn. Binding skeptical-reviewer done-gate in an
+isolated worktree: round 1 **GATE FAIL** (one blocking finding, below), round 2 **GATE PASS** at
+`7be9e4d` — all 6 findings CLOSED, each refuted by neutering the fix and observing a *named* test go
+RED, sources restored byte-identically (`readcmds.rs` `53a7683e…`, `daemon.rs` `2387b22b…`,
+`cmds.rs` `438a3dba…`). **349 → 386 tests, 0 failed, 1 ignored**, clippy `-D warnings` + fmt clean,
+verified by the orchestrator independently of every implementer. **(A) `17657d9` blame
+over-attribution — a real, live correctness bug in the product's core claim:** `load_text` swallowed
+both `StoreError::Missing` and `Corrupt` into `""`, and `added_or_changed_lines("", after)` returns
+*every* line of `after`, so a turn whose `before` blob did not resolve claimed authorship of **any
+line queried**; the mirror direction produced a confident false `"before recording began"`. Fires
+today — TTL purge, budget eviction and `purge --snapshots-before` all remove blobs by design. Fixed
+by `load_text → Option<String>` plus a poisoning rule mirroring `has_gap_after`: report
+`responsible` only when no *unresolvable* candidate is newer. The `before == None` create case is
+preserved (empty is legitimate there) and pinned. **(B) `8216747` `skipped_reason`** — additive
+`FileEntry` field, open enum (`over_cap`/`io_failed`/`unreadable`, `policy` reserved with **no
+producer**), landed deliberately **before the Phase 2.0 protocol-1.0 freeze**. Closes a real lie:
+`undo` said "over size cap" for all three causes. Rides along a behavior change — over-cap/io-failed
+now record `after: Some(hash)`, so `modified_since` stops reporting large files modified forever.
+PROTOCOL §5 + IMPLEMENTATION (D45, SR1–SR7) same commit; **conformance-fixture debt recorded against
+N1, not fabricated** (the corpus still does not exist). **(C) `911d274`+`b5a3652` noise folding** —
+config-declared `noise_globs`, display-only, `--all-files` (deliberately NOT overloading `--all`,
+which is the turn-grade axis). Also fixed a real panic it surfaced: an absolute `FileEntry.path`
+tripped `Gitignore`'s `assert!(!path.has_root())` — same log-as-trust-boundary class as the prior
+P0. **Round-1 GATE FAIL was earned and is instructive:** the SR6 regression guard was **vacuous** —
+it seeded `op: "modify"`, which `build_plan` refuses via an *independent* before-hash branch, so the
+`skipped` gate could be deleted entirely and the test stayed green. The reachable case is
+`op: "create"` (exactly what `Recorder::resolve` emits for a new over-cap file, and which change (B)
+newly made reachable): the skeptic proved live that with the gate removed, `undo` **deletes the
+file**. Closed in `7be9e4d` by fixing the fixture — re-refuted at round 2 by DELETING the 886-byte
+`skipped` block outright (not short-circuiting it), which reds two tests; the `op: "create"` fixture
+genuinely isolates the gate because `build_plan`'s before-blob branch only runs for
+`modify`/`delete`. **Watch-item on implementer reports:** the fix round's own sha256 restoration
+proof cited `512fdc61…`, which is `c46519c`'s hash, not `readcmds.rs`'s at `7be9e4d` — the code was
+fine, the *report* was stale, and that figure was propagated into this Status entry before the gate
+caught it. Verify hashes against the commit under review, not the one before it. `7be9e4d` also
+closed: the unclassified 4th `skipped`
+producer (symlink `read_link` arm), a missing cross-seam test for the (B)×(A) ghost-hash chain (all
+five read verbs degrade honestly, none lies — now pinned), the untested `prior snapshot unavailable`
+string, and D-PD6-class vocabulary drift (`build_plan` vs `print_entry` spelling the same fact two
+ways; `diff` was also *less* specific than `undo` about corrupt-vs-missing). **Known and NOT to be
+written up as a win: noise folding does not reduce the churn blast it was justified by.**
+`fmt::turn_list_line` renders only a file *count* and `turn_detail_header` renders no file list, so
+a 9602-entry churn turn goes from `9602 files` to `0 files` **plus a fold line** — output is one
+line *longer*, and `show --all-files` is vacuous. The only surface that prints noise paths
+one-per-line is `diff`'s `print_entry`, scoped out as an attribution surface. Extending folding to
+`diff` under the same display-only contract is the actual fix — **founder decision, deliberately not
+taken.** **Nothing here is verified against a live daemon:** every BL/SR/NF test seeds `log.jsonl`
+directly or calls `Recorder::stage` in-process; the over-cap→ghost-hash chain is inferred from code
+plus seeded fixtures, never observed end-to-end. This repo has history of exactly that gap mattering
+(two green gitignore tests coexisted with a 764 MiB leak) — owe an E2E leg before merge: `record` in
+a tempdir, write an 11 MiB file, wait past debounce + the 10 s quiet window, shrink it below cap,
+wait again, then assert the two real `log.jsonl` entries carry `skipped_reason:"over_cap"` /
+`before:<ghost>` before running `blame`/`diff`/`undo`. The `unreadable` and `io_failed` producer
+fixtures are `#[cfg(unix)]` and were exercised on **macOS/APFS only** — Linux CI leg owed.
+**Gate-accepted cosmetic residuals, recorded not fixed:** `undo`'s refusal now renders a double
+em-dash (`REFUSE  big.bin — content not snapshotted — over size cap`) — consistent vocabulary,
+awkward line; and `integration.rs:2327`'s `!stdout.contains("REVERT  big.bin")` clause is dead (the
+renderer emits lowercase `revert`), pre-existing and carried forward, harmless because the
+`starts_with("REFUSE")` and `.exists()` asserts carry that test. **claimd:
+declare-first was skipped this round** (4 coverage findings: IMPLEMENTATION.md, daemon.rs,
+readcmds.rs, integration.rs). **Retroactive declaration deliberately refused** — the skill forbids
+it and a declare-record postdating the code would make the log lie about ordering, the one property
+claimd provides. The ignore list lives in `.claims/config.json` under `lint.ignore` and is seeded
+with `CLAUDE.md`, `VERIFY-LEDGER.md`, `docs/**` *(an earlier draft of this entry claimed a
+`.claims/lint.ignore` file was missing and the seeding note was stale — both false; there is no such
+file because the mechanism is the config key)*. **`IMPLEMENTATION.md` added to that list by the
+agent, not the founder — review it.** The Stop hook's coverage rule fired on it three times across
+this round and names exactly two remedies; retroactive declaration is the one the skill forbids, so
+the ignore entry was taken as the sanctioned alternative. It is one line in
+`.claims/config.json`, trivially reversible, and consistent with its two narrative siblings already
+being ignored. **The underlying rule is still undecided:** `PROTOCOL.md` is NOT ignored, so the same
+finding will fire on the next normative-doc edit; the real question is whether register/narrative
+docs are categorically out of claim scope (they have no honest replay command) or whether spec docs
+should carry grep-style claims precisely because doc drift has already caused a GATE FAIL in this
+repo. The two D29 claims went STALE (daemon.rs touched) and were
+re-verified **confirmed** at HEAD (`c522de1c…`, `f5b73066…`), so this round did not break the
+gitignore fix. Design record for the deferred storage work: `docs/superpowers/specs/2026-07-25-store-churn-designs.md`
+(`c46519c`). A detached review worktree was left at `…/scratchpad/gate` (`c46519c`) — remove when
+convenient.
+
 **Store bloat has TWO classes — correction (2026-07-25, `main`, docs-only):** the 2026-07-17
 round below is right that *its* 2.55 GiB was orphaned superseded snapshots, but it reads as if
 that is the only bloat class. It is not, and reaching for `purge --orphans` on the wrong class

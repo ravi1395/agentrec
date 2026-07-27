@@ -9,6 +9,7 @@ mod initcmd;
 mod loglock;
 mod memlock;
 mod memorycmds;
+mod noise;
 mod purgecmd;
 mod readcmds;
 mod service;
@@ -67,12 +68,25 @@ enum Command {
         /// Append a glossary of domain terms present in this output.
         #[arg(long)]
         explain: bool,
+        /// Show file entries folded by `noise_globs` (config.toml) instead
+        /// of collapsing them into a count line. Orthogonal to --all (which
+        /// controls turn visibility, not file-entry visibility).
+        #[arg(long = "all-files")]
+        all_files: bool,
     },
     /// Store size, recording gaps, and rich-rate health.
     Status {
-        /// Acknowledge and clear a DEGRADED snapshot-failure banner.
-        #[arg(long)]
+        /// Acknowledge and clear a DEGRADED snapshot-failure banner. Rejected
+        /// together with `--json` (Phase 3, honesty-fixes round): the ack
+        /// path prints prose ("acknowledged — DEGRADED cleared") on success,
+        /// and prose on stdout under a `--json` flag would break any
+        /// consumer piping to `jq`.
+        #[arg(long, conflicts_with = "json")]
         ack_degraded: bool,
+        /// Emit machine-readable operational fields (state.json data — NOT
+        /// the PROTOCOL wire format) instead of the text report.
+        #[arg(long)]
+        json: bool,
     },
     /// Unified diff of a turn's changes.
     Diff {
@@ -91,6 +105,10 @@ enum Command {
         /// Print the full post-scrub prompt text instead of the header.
         #[arg(long)]
         prompt: bool,
+        /// Show file entries folded by `noise_globs` (config.toml) instead
+        /// of collapsing them into a count line.
+        #[arg(long = "all-files")]
+        all_files: bool,
     },
     /// Revert a turn's changes, per file.
     Undo {
@@ -262,11 +280,16 @@ fn main() {
             limit,
             utc,
             explain,
-        } => cmds::log(&root, all, json, limit, utc, explain),
-        Command::Status { ack_degraded } => cmds::status(&root, ack_degraded),
+            all_files,
+        } => cmds::log(&root, all, json, limit, utc, explain, all_files),
+        Command::Status { ack_degraded, json } => cmds::status(&root, ack_degraded, json),
         Command::Diff { turn } => readcmds::diff(&root, &turn),
         Command::Blame { target } => readcmds::blame(&root, &target),
-        Command::Show { turn, prompt } => readcmds::show(&root, &turn, prompt),
+        Command::Show {
+            turn,
+            prompt,
+            all_files,
+        } => readcmds::show(&root, &turn, prompt, all_files),
         Command::Undo {
             turn,
             confirm,

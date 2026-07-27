@@ -4,7 +4,6 @@
 //! to the worktree but not to the daemon's internal state.
 
 use crate::cmds::wall_now_ms;
-use crate::state::State;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
@@ -37,13 +36,18 @@ pub fn diff(root: &Path, turn_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `show <turn> [--prompt]` (D-PD2, SPEC §Prompt posture item 4): bare form
-/// prints only the turn header, via the same renderer `blame` uses — that
-/// renders `prompt_excerpt` (already post-scrub AND length-capped), never the
-/// full prompt. `--prompt` is the one explicit path to the full post-scrub
-/// prompt text, loaded through the integrity-checked blob store; prompt blobs
-/// are post-scrub at rest, so printing the full text here is safe.
-pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
+/// `show <turn> [--prompt] [--all-files]` (D-PD2, SPEC §Prompt posture item
+/// 4): bare form prints only the turn header, via the same renderer `blame`
+/// uses — that renders `prompt_excerpt` (already post-scrub AND
+/// length-capped), never the full prompt. `--prompt` is the one explicit
+/// path to the full post-scrub prompt text, loaded through the
+/// integrity-checked blob store; prompt blobs are post-scrub at rest, so
+/// printing the full text here is safe. `--all-files` is NF-C's file-class
+/// reveal flag (NF-A/NF-B) — it only ever affects the bare-header branch;
+/// `--prompt` prints raw prompt bytes to stdout and must never gain an
+/// appended line regardless of `all_files` (a fold notice there would
+/// silently corrupt the printed prompt).
+pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = records
         .iter()
@@ -57,6 +61,19 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool) -> Result<(), String> {
 
     if !prompt {
         println!("{}", render_turn(turn));
+        if !all_files {
+            let noise_globs = crate::noise::read_noise_globs(root);
+            if let Some(matcher) = crate::noise::NoiseMatcher::build(root, &noise_globs) {
+                let n = turn
+                    .files
+                    .iter()
+                    .filter(|f| matcher.is_noise(&f.path))
+                    .count();
+                if n > 0 {
+                    println!("+{n} noise files (--all-files to show)");
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -214,29 +231,31 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
     }
     if entry.skipped {
         println!(
-            "  {}: (content not snapshotted — over size cap)",
-            entry.path
+            "  {}: (content not snapshotted — {})",
+            entry.path,
+            fmt::skip_reason_text(entry.skipped_reason.as_deref())
         );
         return;
     }
 
     let before = match load_blob(store, entry.before.as_deref()) {
         Ok(bytes) => bytes,
-        Err(()) => {
-            println!(
-                "  {}: (snapshot unavailable — purged or missing)",
-                entry.path
-            );
+        Err(e) => {
+            // Finding #5(b): distinguish Missing from Corrupt, restoring
+            // parity with `build_plan`'s refusal messages — `diff` was
+            // strictly less specific than `undo` about the exact same
+            // condition. The *cause* of Missing stays genuinely unknown
+            // (never "purged or missing" — that's the SR-D defect); Corrupt
+            // is a distinct, honest fact (a hash mismatch), not folded into
+            // the same generic message.
+            println!("  {}: {}", entry.path, unresolvable_msg(&e));
             return;
         }
     };
     let after = match load_blob(store, entry.after.as_deref()) {
         Ok(bytes) => bytes,
-        Err(()) => {
-            println!(
-                "  {}: (snapshot unavailable — purged or missing)",
-                entry.path
-            );
+        Err(e) => {
+            println!("  {}: {}", entry.path, unresolvable_msg(&e));
             return;
         }
     };
@@ -274,11 +293,28 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
 
 /// Load a blob by its optional hash ref; `None` (e.g. a create's `before`)
 /// yields empty content, not an error. A present hash that the store can't
-/// serve (purged or corrupt) is the only error case.
-fn load_blob(store: &BlobStore, hash: Option<&str>) -> Result<Vec<u8>, ()> {
+/// serve (purged or corrupt) is the only error case — the real
+/// [`StoreError`] is preserved (not collapsed) so the caller can render
+/// Missing and Corrupt distinctly (finding #5(b)).
+fn load_blob(store: &BlobStore, hash: Option<&str>) -> Result<Vec<u8>, StoreError> {
     match hash {
         None => Ok(Vec::new()),
-        Some(h) => store.get(h).map_err(|_| ()),
+        Some(h) => store.get(h),
+    }
+}
+
+/// `diff`'s rendering of an unresolvable blob, mirroring `undo`'s
+/// `build_plan` distinction (finding #5(b)) rather than `diff` collapsing
+/// both into one generic message: `Missing`'s cause stays genuinely
+/// unknown (never "purged or missing"), `Corrupt` is a distinct, honest
+/// fact. `undo`'s established `StoreError::Corrupt` wording is
+/// "prior snapshot corrupt (hash mismatch) — refusing to restore" — kept
+/// as-is there; this is `diff`'s own (shorter, no verb) rendering of the
+/// same fact.
+fn unresolvable_msg(e: &StoreError) -> String {
+    match e {
+        StoreError::Missing(_) => "(snapshot unavailable)".to_string(),
+        StoreError::Corrupt(_) => "(snapshot corrupt — hash mismatch)".to_string(),
     }
 }
 
@@ -502,45 +538,86 @@ fn blame_line(
     }
     let target_text = lines[line_no - 1];
 
-    let mut responsible: Option<&TurnRecord> = None;
-    for t in touching {
+    // `touching` is oldest→newest (append order — see the doc comment
+    // above). `responsible` tracks the newest turn whose recorded diff
+    // introduces `target_text`; `newest_unresolvable_idx` tracks the newest
+    // candidate whose `before`/`after` snapshot didn't resolve, so a turn
+    // can't be silently skipped past — mirrors the `has_gap_after`
+    // poisoning idiom below, but for missing snapshots instead of missing
+    // recording coverage.
+    let mut responsible: Option<(usize, &TurnRecord)> = None;
+    let mut newest_unresolvable_idx: Option<usize> = None;
+    for (idx, t) in touching.iter().enumerate() {
         let Some(entry) = t.files.iter().find(|f| f.path == file) else {
             continue;
         };
         let before = load_text(store, entry.before.as_deref());
         let after = load_text(store, entry.after.as_deref());
+        let (Some(before), Some(after)) = (before, after) else {
+            // Can't compute this turn's diff at all — it might have
+            // introduced or removed `target_text`; treat it as poisoning
+            // rather than silently skipping it (that would either wrongly
+            // credit an older turn or wrongly fall through to "before
+            // recording began").
+            newest_unresolvable_idx = Some(idx);
+            continue;
+        };
         let intro = diff::added_or_changed_lines(&before, &after);
         if intro.iter().any(|l| l == target_text) {
-            responsible = Some(t);
+            responsible = Some((idx, t));
         }
     }
 
+    // A responsible turn is only honestly reportable when no unresolvable
+    // candidate is NEWER than it — a newer unresolvable turn could have
+    // overwritten the line, so naming the older turn would be a guess.
+    let responsible_poisoned = matches!(
+        (responsible, newest_unresolvable_idx),
+        (Some((r_idx, _)), Some(u_idx)) if u_idx > r_idx
+    );
+
     match responsible {
-        Some(t) => println!("{file}:{line_no}: {}", render_turn(t)),
-        // E3: no turn's recorded diff introduces this exact line text. That
-        // is only honestly "before recording began" when the whole history
-        // is actually gap-free — a line that was silently added during an
+        Some((_, t)) if !responsible_poisoned => {
+            println!("{file}:{line_no}: {}", render_turn(t));
+        }
+        // Some candidate's snapshot didn't resolve (whether or not a
+        // now-poisoned `responsible` was also found) — the CRITICAL SCOPE
+        // RULE: this branches only on `store.get` failing, never on why.
+        _ if newest_unresolvable_idx.is_some() => {
+            println!("{file}:{line_no}: attribution unavailable — snapshot unavailable");
+        }
+        // E3: no turn's recorded diff introduces this exact line text, and
+        // every candidate's snapshot resolved cleanly. That is only
+        // honestly "before recording began" when the whole history is
+        // actually gap-free — a line that was silently added during an
         // uncovered interval (then folded into a later turn's unchanged
         // `before`) would otherwise be misreported as predating all
         // recording, when really its origin is just unknown.
         None if has_gap_after(records, "") => {
             println!("{file}:{line_no}: attribution stale — recording gap");
         }
-        None => println!("{file}:{line_no}: before recording began"),
+        _ => println!("{file}:{line_no}: before recording began"),
     }
     Ok(())
 }
 
-/// Loads blob text by optional hash, empty on any read error (purged,
-/// corrupt) or absent hash — line-diffing degrades to "no lines introduced"
-/// rather than failing the whole blame.
-fn load_text(store: &BlobStore, hash: Option<&str>) -> String {
+/// Loads blob text by optional hash, distinguishing two shapes callers must
+/// not conflate: `None` hash is legitimately-empty text (a `create` op has
+/// no `before` — every line of its `after` really was introduced by that
+/// turn, and collapsing that to "unresolvable" would wrongly deny credit
+/// for every file-creating turn). `Some(hash)` that fails to resolve (any
+/// error — the caller must not, and does not, care which) is UNRESOLVABLE
+/// and returned as `None`, never silently coerced to empty text: an
+/// unresolvable snapshot is not "no text there", it's "no idea what text
+/// was there", and must poison the comparison rather than let it pass
+/// through as if nothing changed.
+fn load_text(store: &BlobStore, hash: Option<&str>) -> Option<String> {
     match hash {
-        None => String::new(),
-        Some(h) => match store.get(h) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => String::new(),
-        },
+        None => Some(String::new()),
+        Some(h) => store
+            .get(h)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
     }
 }
 
@@ -596,11 +673,9 @@ pub fn undo(
     }
 
     let store = BlobStore::new(objects_dir(root));
-    let state = crate::state::read_state(root);
     let plans = build_plan(
         root,
         &store,
-        &state,
         target,
         target_idx,
         &turns,
@@ -756,7 +831,6 @@ enum PlanKind {
 fn build_plan(
     root: &Path,
     store: &BlobStore,
-    state: &State,
     target: &TurnRecord,
     target_idx: usize,
     turns: &[&TurnRecord],
@@ -787,12 +861,24 @@ fn build_plan(
             });
             continue;
         }
+        // SR6: the skipped gate MUST stay above modified-since (below). A
+        // skipped entry is refused unconditionally here and `continue`s
+        // before `entry.after` is ever compared against the current on-disk
+        // hash — otherwise an unmodified skipped file (SR-C now gives it a
+        // real `after` hash) could fall through into the revert path and
+        // undo would try to restore a blob that was never stored.
         if entry.skipped {
-            let reason = if state.io_failed.iter().any(|p| p == &entry.path) {
-                "no snapshot exists (write failed at record time)".to_string()
-            } else {
-                "content not snapshotted (over size cap)".to_string()
-            };
+            // SR-D: the wire field is the per-entry authoritative cause —
+            // `state.json`'s `io_failed` is a separate, aggregate/operational
+            // channel (drives the DEGRADED banner) and is deliberately never
+            // consulted here, so the two can't be made to disagree.
+            // Finding #5(a): unified on `print_entry`'s em-dash form (was
+            // parenthesized here) — same fact, one spelling; D-PD6 is the
+            // tracked debt item for exactly this renderer-drift class.
+            let reason = format!(
+                "content not snapshotted — {}",
+                fmt::skip_reason_text(entry.skipped_reason.as_deref())
+            );
             plans.push(Plan {
                 entry: entry.clone(),
                 kind: PlanKind::Refused { reason },
@@ -808,7 +894,9 @@ fn build_plan(
                 None => Some("no prior snapshot to restore".to_string()),
                 Some(h) => match store.get(h) {
                     Ok(_) => None,
-                    Err(StoreError::Missing(_)) => Some("no prior snapshot to restore".to_string()),
+                    Err(StoreError::Missing(_)) => {
+                        Some("prior snapshot unavailable — refusing to restore".to_string())
+                    }
                     Err(StoreError::Corrupt(_)) => Some(
                         "prior snapshot corrupt (hash mismatch) — refusing to restore".to_string(),
                     ),
@@ -1010,6 +1098,7 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
         skipped: false,
         withheld: false,
         baseline_unknown: false,
+        skipped_reason: None,
     })
 }
 
@@ -1094,4 +1183,37 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BL1: `load_text` must tell "legitimately empty" (no hash at all, e.g.
+    // a `create` op's `before`) apart from "unresolvable" (a hash is
+    // recorded but the blob won't load) — collapsing both to `""` is
+    // exactly the bug (blame credits any turn for any line once one
+    // candidate's `before` goes missing).
+    #[test]
+    fn load_text_distinguishes_absent_resolvable_and_unresolvable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path().join("objects"));
+
+        // Absent hash (e.g. a `create` op's `before`) — legitimately empty.
+        assert_eq!(load_text(&store, None), Some(String::new()));
+
+        // Resolvable hash — real content comes back.
+        let hash = store.put(b"hello\n").unwrap();
+        assert_eq!(load_text(&store, Some(&hash)), Some("hello\n".to_string()));
+
+        // Present-but-unresolvable hash: well-formed, genuinely never
+        // stored — proves the store really can't resolve it, rather than
+        // assuming so.
+        let ghost = agentrec_core::store::hash_bytes(b"never-actually-stored");
+        assert!(
+            store.get(&ghost).is_err(),
+            "precondition: ghost must be genuinely unresolvable"
+        );
+        assert_eq!(load_text(&store, Some(&ghost)), None);
+    }
 }

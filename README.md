@@ -89,12 +89,12 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 |---|---|
 | `agentrec init` | Scaffold `.agentrec/`, install agent hooks, install+load a per-repo recorder service. Idempotent. `--no-hook`, `--no-service`, `--dry-run` |
 | `agentrec record` | Run the recorder daemon in the foreground for this repo |
-| `agentrec log` | List recorded turns, newest first (git turns hidden by default). `--all`, `--json`, `--limit`, `--utc`, `--explain` |
+| `agentrec log` | List recorded turns, newest first (git turns hidden by default). `--all`, `--json`, `--limit`, `--utc`, `--explain`, `--all-files` (show file entries `noise_globs` would otherwise fold into a count line) |
 | `agentrec diff <turn>` | Unified diff of a turn's file changes (turn id or unambiguous prefix) |
 | `agentrec blame <file>[:line]` | Which turn last touched a file, or introduced a current line |
-| `agentrec show <turn> [--prompt]` | Print a turn's header (excerpt discipline: no full prompt without the flag); `--prompt` prints the full post-scrub prompt text |
+| `agentrec show <turn> [--prompt]` | Print a turn's header (excerpt discipline: no full prompt without the flag); `--prompt` prints the full post-scrub prompt text. `--all-files` (see `agentrec log`) |
 | `agentrec undo [turn]` | Revert a turn's changes, per file. Preview-only unless `--confirm`. `--allow-modified`, `--files a,b,c`. Omit `turn` for panic mode: targets the most recent non-git rich turn |
-| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot or prompt-blob write failures. `--ack-degraded` clears both |
+| `agentrec status` | Store size, recording gaps, rich-rate, DEGRADED banner on snapshot or prompt-blob write failures, and — only once one has happened this daemon epoch — how many times the ignore rules were reloaded (the lifetime total is preserved in `state.json`/`--json` but the text line resets on each daemon restart). `--ack-degraded` clears the banner; `--json` emits machine-readable operational fields instead of the text report (operational state, not the `log.jsonl` protocol) — this now carries every DEGRADED field the text banner reports (`snapshot_failures`, `io_failed`, `prompt_put_failures`, `state_parse_failures`), not just the ignore-reload counters. `--ack-degraded --json` together is rejected by clap (the ack path is prose-on-success; never combine it with `--json`) |
 | `agentrec doctor` | One-shot diagnosis of the whole recording chain: daemon liveness, hooks, signal freshness, store health, permissions, (Linux) inotify headroom. `--json` |
 | `agentrec purge` | Delete blob objects: expired prompts by default (TTL from `config.toml`). `--all-prompts`, `--snapshots-before <DATE>`, `--memories-retracted` (archives expired retracted memory chains, never deletes), `--log-duplicates` (archives+repairs a `log.jsonl` carrying a pre-fix duplicate turn record, never deletes) |
 | `agentrec uninstall` | Remove hooks + service unit, archive `.agentrec/` to a sibling directory. Nothing is ever deleted. `--no-service` |
@@ -106,6 +106,27 @@ AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 | `agentrec forget <id>` | Retract a memory — recoverable (quarantined, not deleted) until `purge --memories-retracted` archives it past TTL. `--reason <text>` |
 
 Run `agentrec <command> --help` for the full flag reference.
+
+`log.jsonl` is append-only, so a class of file entries that never should have been recorded (a
+tool-generated cache directory, say) can never be *removed* from it — but `log`/`show` can stop
+*rendering* them individually. `config.toml`'s `noise_globs` is an optional array of
+gitignore-style glob patterns (matched against the same repo-relative paths `FileEntry.path`
+carries — a trailing `/**` or a bare directory name both fold everything beneath it):
+
+```toml
+noise_globs = [".remember/**", ".code-review-graph/**"]
+```
+
+When set, `log` and `show` fold matching file entries out of the per-turn count and print
+`+{n} noise files (--all-files to show)` so it's always visible that something was hidden — never
+a silent count drop. `--all-files` reveals them again for that invocation (same idea as `--all`
+already does for whole git/superseded turns, one level down to individual file entries; the two
+flags are independent). This is **display-only**: absent or empty `noise_globs` leaves output
+byte-identical to before the feature existed, `--json` is never affected by it, and `diff` /
+`blame` / `undo` never consult it — a file being visually noisy has nothing to do with whether
+it's revertible or who wrote it. Only a single-line TOML array is recognized (the config parser
+is a hand-rolled scalar-per-line scanner, not a full TOML parser); a multi-line array is not
+picked up and silently behaves as if `noise_globs` were unset.
 
 `log.jsonl` is append-only by design (history is corrected by appending, never rewritten), with one narrow exception: `purge --log-duplicates` repairs a `log.jsonl` that a pre-fix daemon (a since-fixed kill-9 crash window) wrote a same-id duplicate turn record into. It archives the whole file, unmodified, to `.agentrec/log.archived.<ts>.jsonl` before touching anything, then rewrites `log.jsonl` dropping only lines that are exact duplicates of an earlier same-id record — a same-id pair that genuinely touched different files is left untouched rather than guessed at. It refuses outright while the daemon is recording, and a run that finds nothing to fix touches no files and creates no archive.
 
