@@ -116,7 +116,19 @@ explains the gap. The first run also found that the shipped script **silently de
 evidence-on-green deliverable**: no `--show-output`, so libtest captured the passing test's
 `rebuild_count` print — the pristine log carries zero such lines (fixed in the same commit as this
 entry, plus a ran-to-completion sentinel after a real silent-truncation false-pass; a
-docker-credsStore workaround was applied env-only, not committed; ledger row updated). P4's population-level flake claim closes only over CI history. P1's
+docker-credsStore workaround was applied env-only, not committed; ledger row updated). A second
+binding fable skeptic gate over the post-gate commits (`8f89775..`) returned **FAIL → fixed →
+see next entry's re-gate**: (F1, blocking) the same commit that recorded the first execution
+shipped the script still claiming `STATUS: THIS SCRIPT HAS NEVER BEEN EXECUTED` — the
+false-claim-in-shipped-artifact class, reproduced by the fix for it; (F2) the sentinel cleared
+itself *inside* the truncation-vulnerable block, so a truncation landing before the clear plus the
+stale sentinel every green run leaves in the persistent volume produced a demonstrated live false
+pass — clear moved host-side into its own container run; (F3) the skeptic's own in-suite run on the
+same VM measured **14** and the post-fix re-run measured **19**, refuting this entry's earlier "two
+VMs, two regimes" framing twice over (one VM spans 8–19, overlapping the prior VM's 13–21 entirely;
+spread uninstrumented, all inside `1..=45`); (F4)
+`e3d24d7`'s subject says "30 stale claims re-confirmed" — the true count is **44** (44 STALE →
+44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). P4's population-level flake claim closes only over CI history. P1's
 verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
 is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
 directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the

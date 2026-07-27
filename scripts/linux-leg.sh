@@ -49,21 +49,27 @@
 #      was applied. `fs.inotify.max_user_watches` is a VM-wide kernel knob
 #      rather than a per-container-namespaced one, so `docker run --sysctl`
 #      cannot set it; this script therefore sets it on the Colima VM itself
-#      via `colima ssh`. That reasoning is sound but UNVERIFIED against the
-#      original manual session, which may have applied it differently (e.g.
-#      baked into a custom Colima VM template). If you are the first to run
-#      this script, confirm the value actually took inside the container
-#      before trusting a green leg.
+#      via `colima ssh`. That reasoning was originally an UNVERIFIED inference
+#      against the round's manual session; the 2026-07-27 first run VERIFIED
+#      the mechanism itself — the script echoes the value from inside the
+#      container (see below), and propagation was independently probed by
+#      lowering the VM knob and watching the container report the lowered
+#      value. Note the default on that Colima version was already 1048576,
+#      so a green run alone never proves the sysctl call did anything; the
+#      in-container echo is the load-bearing evidence.
 #
-# STATUS: THIS SCRIPT HAS NEVER BEEN EXECUTED. It was written in the
-# residuals round while colima was not running, and the round's gate then
-# found two real defects in it by reading alone (a `chown -R` that rewrote the
-# HOST repo's ownership through the rw bind mount, and a container `target/`
-# landing on the host's own `target/debug` and clobbering the macOS build
-# cache). Both are fixed — but the fix made this script structurally MORE
-# complex (read-only mount, tar copy, two directories, `CARGO_TARGET_DIR`
-# redirect) and it is still unexercised. `shellcheck` clean is not a run.
-# Treat the first execution as a debugging session, not a verification.
+# STATUS: first executed 2026-07-27 (Colima 4-CPU arm64 VM, rust:1-bookworm).
+# Suite green: 431 passed / 0 failed / 2 ignored; host repo untouched (0
+# ownership diffs, macOS target/ mtimes identical) — the two defects the
+# residuals-round gate had found by reading alone (a `chown -R` through the
+# rw bind mount, container `target/` clobbering the host's) stayed fixed at
+# runtime. The first run found two more only execution could surface: the
+# missing `--show-output` (libtest captured the rebuild-count print from a
+# passing test — evidence-on-green silently defeated) and a silent-truncation
+# false pass (inner block truncated -> container exit 0, zero tests run,
+# "linux leg complete" printed), now guarded by the `.suite-ran` sentinel.
+# History kept because it is this repo's sharpest demonstration that
+# `shellcheck` clean is not a run.
 #
 # Fails loudly and early on any unmet precondition (no colima, colima not
 # running, wrong arch, no docker) rather than silently running a degraded
@@ -143,6 +149,19 @@ log "running the suite non-root, fixtures in container-native /tmp"
 #     and can garble the `test result:` summary lines.
 #   - the `.suite-ran` sentinel + its post-run check: proof the suite was
 #     actually reached, rather than inferring it from a 0 exit code.
+#
+# The sentinel CLEAR runs here, host-side, in its own container — NOT inside
+# the fragile block below. The first shape of this guard cleared it inside the
+# block, which defeats itself: a truncation landing before the clear leaves a
+# prior green run's sentinel in the persistent volume, and the check then
+# passes with zero tests run (demonstrated live at the post-run skeptic gate:
+# injected truncation + stale sentinel -> "linux leg complete", exit 0). After
+# the first green run a stale sentinel is the volume's steady state, so an
+# in-block clear guards only truncations that land after itself.
+docker run --rm --platform "$PLATFORM" \
+  -v "${TARGET_VOLUME}:/work-target" "$IMAGE" \
+  rm -f /work-target/.suite-ran
+
 docker run --rm --name "$CONTAINER_NAME" \
   --platform "$PLATFORM" \
   -v "${REPO_ROOT}:/src:ro" \
@@ -158,10 +177,6 @@ docker run --rm --name "$CONTAINER_NAME" \
     id -u builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
 
     mkdir -p /work /work-target
-    # Clear the ran-to-completion sentinel BEFORE the suite. /work-target is a
-    # persistent named volume, so a leftover sentinel from an earlier run would
-    # itself manufacture the false pass this check exists to catch.
-    rm -f /work-target/.suite-ran
     # `.agentrec` is this repo dogfooding itself — a ~75 MiB content-addressed
     # blob store the suite never reads (every test builds its own tempdir
     # root), so copying it in is pure cost. `target` is the host`s macOS
