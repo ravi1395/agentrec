@@ -380,6 +380,18 @@ parts).
 None open. Q1 answered (a) and Q2 answered default by the founder, 2026-07-27 — recorded as
 Decisions 7 and 8. All phases are unblocked once the plan-level skeptic gate passes.
 
+## Pre-round housekeeping (founder-run — blocked for agents by the git-guardrails hook)
+Stale local branches from the four merged/squashed rounds (remote copies already deleted
+2026-07-27; content verified in `main` via PR state before deletion was proposed). The
+`-D` is required because squash-merge breaks `--merged` ancestry — `-d` refuses:
+
+```bash
+git branch -D fix/residuals-round fix/honesty-round fix/blame-attribution-and-noise-folding fix/ignore-rebuild-gate fix/gitignore-self-match fix/review-findings-043c749 feat/memory-v1 fix/purge-orphans-gc gate-review-orphans claude/magical-mendeleev-723a61 claude/strange-gagarin-bbd4af claude/xenodochial-matsumoto-10ff1b worktree-fix-doctor-inotify
+```
+
+Keep: `main`, `old-history-local` (pre-squash history — never push, never delete).
+Not required for any phase to start; the round's worktree cuts from `main` regardless.
+
 ## Time summary
 | Phase | Wall estimate |
 |---|---|
