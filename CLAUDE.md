@@ -108,9 +108,15 @@ P1 exists to measure.
 **Still open, none blocking:** P5's AC1 (a GitHub run URL) is **structurally unclosable from a
 branch** — GitHub only offers `workflow_dispatch` for workflows already on the default branch — so
 it is an honest OPEN ledger row, not a pass; landing the trigger on `main` is a founder decision and
-nothing was pushed. No Linux number of any kind exists for the rebuild bound yet (`1..=45` Linux /
-`1..=10` macOS untouched — no runner means no new measurement, and the plan permits re-derivation
-only *from* a measurement). P4's population-level flake claim closes only over CI history. P1's
+nothing was pushed. **Superseded 2026-07-27:** the first Linux rebuild-bound number now exists —
+`scripts/linux-leg.sh` was executed for the first time (Colima, non-root, overlayfs fixtures, suite
+**431/0/2** green): in-suite count **8** at `--test-threads=3`, solo runs 9–12, all inside `1..=45`
+but *below* the prior round's 13–21 from a different VM — the bound holds in both regimes, nothing
+explains the gap. The first run also found that the shipped script **silently defeated P5's own
+evidence-on-green deliverable**: no `--show-output`, so libtest captured the passing test's
+`rebuild_count` print — the pristine log carries zero such lines (fixed in the same commit as this
+entry, plus a ran-to-completion sentinel after a real silent-truncation false-pass; a
+docker-credsStore workaround was applied env-only, not committed; ledger row updated). P4's population-level flake claim closes only over CI history. P1's
 verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
 is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
 directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the

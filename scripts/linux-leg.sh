@@ -77,6 +77,13 @@ IMAGE="rust:1-bookworm"
 PLATFORM="linux/arm64"
 CONTAINER_NAME="agentrec-linux-leg"
 MAX_USER_WATCHES=1048576
+# Named docker volume (lives in the Colima VM on ext4 — container-native, NOT
+# the virtiofs mount, so item 3's fixture-locality rule is unaffected). This is
+# a build CACHE only. Measured on a 4-CPU arm64 Colima VM: a full cold leg
+# (compile + suite) is ~144s, of which the compile is ~40s — so this saves less
+# than it might seem, and a clean-room run is cheap. `docker volume rm
+# agentrec-linux-leg-target` to force one.
+TARGET_VOLUME="agentrec-linux-leg-target"
 
 log() { printf '[linux-leg] %s\n' "$*" >&2; }
 fail() { printf '[linux-leg] FATAL: %s\n' "$*" >&2; exit 1; }
@@ -118,9 +125,28 @@ log "running the suite non-root, fixtures in container-native /tmp"
 #     container-native storage, off the mount entirely.
 # `target/` is excluded from the copy: it is the host's macOS artifacts, is
 # large, and is exactly what must not travel.
+#
+# QUOTING WARNING — the inner block below is doubly nested: a single-quoted
+# argument to `bash -euxc`, containing a double-quoted argument to `su -c`.
+# Inside it, an apostrophe closes the outer string, and an unescaped double
+# quote or a backtick closes/substitutes inside the inner one. All three were
+# hit for real on the first execution of this script; the failure mode is NOT a
+# loud syntax error but a silently TRUNCATED script that exits 0 having run no
+# tests. Keep the inner block free of prose — explain things out here instead.
+#
+# Two flags on the cargo line, both load-bearing:
+#   - `--show-output`, not `--nocapture`: libtest captures `eprintln!` from a
+#     PASSING test, so `rebuild_count_is_bounded_by_writes` prints its observed
+#     count into a void without it — the residuals round added that print to
+#     make the bound evidenced on green, and this script silently defeated it.
+#     `--nocapture` would work too but interleaves across `--test-threads=3`
+#     and can garble the `test result:` summary lines.
+#   - the `.suite-ran` sentinel + its post-run check: proof the suite was
+#     actually reached, rather than inferring it from a 0 exit code.
 docker run --rm --name "$CONTAINER_NAME" \
   --platform "$PLATFORM" \
   -v "${REPO_ROOT}:/src:ro" \
+  -v "${TARGET_VOLUME}:/work-target" \
   -w /work \
   -e CARGO_TARGET_DIR=/work-target \
   "$IMAGE" \
@@ -132,6 +158,10 @@ docker run --rm --name "$CONTAINER_NAME" \
     id -u builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
 
     mkdir -p /work /work-target
+    # Clear the ran-to-completion sentinel BEFORE the suite. /work-target is a
+    # persistent named volume, so a leftover sentinel from an earlier run would
+    # itself manufacture the false pass this check exists to catch.
+    rm -f /work-target/.suite-ran
     # `.agentrec` is this repo dogfooding itself — a ~75 MiB content-addressed
     # blob store the suite never reads (every test builds its own tempdir
     # root), so copying it in is pure cost. `target` is the host`s macOS
@@ -156,8 +186,21 @@ docker run --rm --name "$CONTAINER_NAME" \
       unset TMPDIR || true
       echo \"TMPDIR unset; tempfile fixtures will land under: \$(df -T /tmp | tail -1)\"
 
-      cargo test --workspace --all-features --no-fail-fast -- --test-threads=3
+      echo \"container fs.inotify.max_user_watches = \$(cat /proc/sys/fs/inotify/max_user_watches)\"
+
+      cargo test --workspace --all-features --no-fail-fast -- --test-threads=3 --show-output
+
+      touch /work-target/.suite-ran
     "
   '
+
+# The inner block ran to completion only if the suite actually executed. Without
+# this, a mid-script syntax break (see the quoting warning above) lets the
+# container exit 0 having run ZERO tests while this script still prints
+# "linux leg complete" — a false PASS observed for real on the first run.
+docker run --rm --platform "$PLATFORM" \
+  -v "${TARGET_VOLUME}:/work-target" "$IMAGE" \
+  test -f /work-target/.suite-ran \
+  || fail "the container exited without reaching the end of the test suite — do NOT read this as a pass"
 
 log "linux leg complete"
