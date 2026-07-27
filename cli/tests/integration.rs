@@ -6789,6 +6789,55 @@ fn memories_stale_shows_drifted_pin_and_when() {
     );
 }
 
+/// Perf-evidence round, AC1.2: `agentrec memories --stats` reads
+/// `memory-stats.jsonl` directly and sorts every non-blank line into exactly
+/// one of three buckets — measurable (parses AND carries `elapsed_ms`),
+/// parseable-pre-upgrade (parses but no `elapsed_ms`), and torn (fails to
+/// parse as a JSON object at all). Fixture: 100 measurable lines with
+/// `elapsed_ms` 1..=100 (so nearest-rank percentiles land on exact,
+/// hand-checkable values), one pre-upgrade line, one torn line. The named
+/// neuter — merging either bucket into another (e.g. counting the
+/// pre-upgrade line as torn, or vice versa, or letting a torn line slip into
+/// the measurable sample) — must red this test.
+#[test]
+fn memories_stats_three_bucket_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut lines: Vec<String> = (1..=100u64)
+        .map(|i| serde_json::json!({ "ts": i, "n": 1, "elapsed_ms": i }).to_string())
+        .collect();
+    // Parseable pre-upgrade: a valid JSON object, no `elapsed_ms` at all —
+    // exactly what every stats line looked like before this phase.
+    lines.push(serde_json::json!({ "ts": 9999, "n": 2 }).to_string());
+    // Torn: not valid JSON at all.
+    lines.push("{not valid json".to_string());
+    let content = lines.join("\n") + "\n";
+    std::fs::write(root.join(".agentrec/memory-stats.jsonl"), content).unwrap();
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert!(out.status.success(), "memories --stats failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("p50=50"),
+        "expected nearest-rank p50=50 over 1..=100: {stdout}"
+    );
+    assert!(
+        stdout.contains("p99=99"),
+        "expected nearest-rank p99=99 over 1..=100: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 pre-upgrade lines (no elapsed_ms)"),
+        "expected exactly one pre-upgrade line reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 unparseable lines skipped"),
+        "expected exactly one torn line reported: {stdout}"
+    );
+}
+
 // F7 part B: design spec §Lifecycle promises `verify <id>` shows a "diff
 // summary via CAS" on drift, not only two hashes. Pre-fix, `verify` prints
 // exactly `old <hash> -> new <hash>` and nothing else.
@@ -8227,6 +8276,131 @@ fn hook_recall_bails_at_injected_deadline() {
     assert!(
         bail.unwrap().get("ts").and_then(|v| v.as_u64()).is_some(),
         "budget_exceeded line must still carry a ts: {stats:?}"
+    );
+}
+
+/// Perf-evidence round, AC1.1: every `memory-stats.jsonl` append site inside
+/// `inject_memory` must carry `elapsed_ms` (monotonic, `started.elapsed()`),
+/// including the two early-bail sites — thread-spawn failure and the
+/// `recv_timeout` hard-wall timeout/disconnect — which previously never
+/// computed it at all. Those two bail sites emit a byte-identical
+/// `{"ts","budget_exceeded":true}` line and RACE under
+/// `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED` (an already-expired deadline
+/// makes `recv_timeout(0)` a coin flip between "the worker already sent"
+/// and "timed out first") — so this test asserts the invariant on whichever
+/// `budget_exceeded` line actually lands, never on a specific arm. The named
+/// neuter (removing `elapsed_ms` from BOTH bail sites) reds this test
+/// deterministically regardless of which side of the race fires on a given
+/// run; removing it from only one side would not, which is exactly why both
+/// must carry it. A second, independent assertion below covers the success
+/// (`n`-bearing) path.
+#[test]
+fn hook_stats_lines_carry_elapsed_ms_on_either_bail_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    agentrec(root, &["init", "--no-service"]);
+
+    // -- Bail-site leg: force an already-expired deadline. --
+    std::fs::write(root.join("bail_fresh.rs"), b"fn bail_fresh() {}\n").unwrap();
+    let bail_hash = memory::hash_pin(root, "bail_fresh.rs").expect("hash bail_fresh.rs");
+    let bail_rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-elapsed-bail",
+        "op": "assert",
+        "fact": "elapsed ms bail probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "bail_fresh.rs", "hash": bail_hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{bail_rec}\n")).unwrap();
+
+    let bail_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"elapsed ms bail probe fact"}"#;
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bail_payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even on a bailed recall: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an already-expired deadline must never print a block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let stats = memory_stats_lines(root);
+    let bail = stats
+        .iter()
+        .find(|l| l.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true))
+        .unwrap_or_else(|| {
+            panic!("expected a budget_exceeded line in memory-stats.jsonl: {stats:?}")
+        });
+    assert!(
+        bail.get("elapsed_ms").and_then(|v| v.as_u64()).is_some(),
+        "budget_exceeded line (whichever bail arm won the race) must carry \
+         elapsed_ms: {bail:?}"
+    );
+
+    // -- Success leg: a normal call, no forced deadline, that really injects
+    // (site 6, the `n`-bearing append). Adds a second, independently-fresh
+    // pinned memory rather than reusing the bail leg's fact, so a match here
+    // cannot be explained by anything left over from the bail call above.
+    std::fs::write(root.join("success_fresh.rs"), b"fn success_fresh() {}\n").unwrap();
+    let ok_hash = memory::hash_pin(root, "success_fresh.rs").expect("hash success_fresh.rs");
+    let ok_rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-elapsed-success",
+        "op": "assert",
+        "fact": "elapsed ms success probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "success_fresh.rs", "hash": ok_hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 2,
+    });
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        format!("{bail_rec}\n{ok_rec}\n"),
+    )
+    .unwrap();
+
+    let ok_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"elapsed ms success probe fact"}"#;
+    let ok_out = send_hook_capture(root, ok_payload);
+    assert!(
+        ok_out.status.success(),
+        "sanity: success-leg hook call failed: {ok_out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&ok_out.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection on the success leg: {:?}",
+        String::from_utf8_lossy(&ok_out.stdout)
+    );
+
+    let stats_after = memory_stats_lines(root);
+    let success = stats_after
+        .iter()
+        .find(|l| l.get("n").is_some())
+        .unwrap_or_else(|| {
+            panic!("expected an n-bearing injection line in memory-stats.jsonl: {stats_after:?}")
+        });
+    assert!(
+        success.get("elapsed_ms").and_then(|v| v.as_u64()).is_some(),
+        "success-path (n-bearing) line must carry elapsed_ms: {success:?}"
     );
 }
 

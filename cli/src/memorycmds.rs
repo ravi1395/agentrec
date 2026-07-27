@@ -676,6 +676,113 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
     Ok(())
 }
 
+/// `memories --stats` (perf-evidence round, AC1.2): summarizes per-hook
+/// recall latency from `memory-stats.jsonl` — the hook-owned append-only log
+/// `cmds::inject_memory` writes on every UserPromptSubmit recall outcome,
+/// carrying `elapsed_ms` on every site since Phase 1 of that round.
+///
+/// **Deliberately does NOT call [`memories`] or `memory::load_effective`.**
+/// This reads `memory-stats.jsonl` directly and only that file — a corrupt
+/// `memory.jsonl` (the file `load_effective` parses) must not poison a stats
+/// readout of a *different*, unrelated file. Getting this wrong (routing
+/// through `memories()`'s preconditions at this function's own `load_effective`
+/// call above) would make `--stats` fail on a store whose memory feature is
+/// broken but whose hook latency log is perfectly readable.
+///
+/// Every line is sorted into exactly one of three buckets:
+/// - **measurable** — parses as a JSON object AND carries `elapsed_ms` as an
+///   integer. Feeds the p50/p90/p99/max (nearest-rank on the sorted sample)
+///   and the per-outcome breakdown (injected / budget_exceeded / failure /
+///   capped, derived from the same fields `status`'s injections/mem_failures
+///   counts key on).
+/// - **parseable-pre-upgrade** — parses as a JSON object but has no
+///   `elapsed_ms` (a line written before this phase). Counted, never
+///   silently dropped or folded into "torn".
+/// - **torn** — fails to parse as a JSON object at all. Counted, never
+///   silently dropped or folded into "pre-upgrade" — conflating the two
+///   would hide real corruption behind an honest-looking version skew.
+///
+/// Blank lines are skipped entirely (not counted in any bucket), matching
+/// the convention `status`'s own memory-stats readers already use. An
+/// empty-or-absent file prints `no hook invocations recorded` and returns —
+/// this is checked before any bucket accounting, so it never fires merely
+/// because every line happened to land in one bucket.
+pub fn memories_stats(root: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(crate::memory_stats_path(root)).unwrap_or_default();
+    if text.trim().is_empty() {
+        println!("no hook invocations recorded");
+        return Ok(());
+    }
+
+    let mut measurable: Vec<u64> = Vec::new();
+    let mut pre_upgrade = 0usize;
+    let mut torn = 0usize;
+    let mut injected = 0usize;
+    let mut budget_exceeded = 0usize;
+    let mut failure = 0usize;
+    let mut capped = 0usize;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                torn += 1;
+                continue;
+            }
+        };
+        match value.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            Some(ms) => {
+                measurable.push(ms);
+                if value.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true) {
+                    budget_exceeded += 1;
+                } else if value.get("failure").and_then(|v| v.as_bool()) == Some(true) {
+                    failure += 1;
+                } else if value.get("n").is_some() {
+                    injected += 1;
+                } else if value.get("capped").and_then(|v| v.as_bool()) == Some(true) {
+                    capped += 1;
+                }
+            }
+            None => pre_upgrade += 1,
+        }
+    }
+
+    if !measurable.is_empty() {
+        measurable.sort_unstable();
+        let n = measurable.len();
+        // Nearest-rank: rank = ceil(p/100 * n), 1-indexed into the sorted
+        // sample, clamped into range (rank can't exceed n or fall below 1).
+        let percentile = |p: f64| -> u64 {
+            let rank = ((p / 100.0) * n as f64).ceil() as usize;
+            let idx = rank.clamp(1, n) - 1;
+            measurable[idx]
+        };
+        let max = *measurable.last().expect("non-empty checked above");
+        println!(
+            "{n} hook invocations recorded — p50={} p90={} p99={} max={}",
+            percentile(50.0),
+            percentile(90.0),
+            percentile(99.0),
+            max,
+        );
+        println!(
+            "  injected={injected} budget_exceeded={budget_exceeded} failure={failure} capped={capped}"
+        );
+    }
+
+    if pre_upgrade > 0 {
+        println!("{pre_upgrade} pre-upgrade lines (no elapsed_ms)");
+    }
+    if torn > 0 {
+        println!("{torn} unparseable lines skipped");
+    }
+
+    Ok(())
+}
+
 /// One drifted pin's turn-log join (design spec §Read path). `current` is
 /// `None` for an orphaned pin (path no longer readable); `turn` is `None`
 /// when neither join strategy in [`find_drift_turn`] finds a candidate — an

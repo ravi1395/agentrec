@@ -708,18 +708,25 @@ fn recall_deadline(started: Instant) -> Instant {
 /// internal loops rather than running to completion; the retrospective
 /// `elapsed_ms` check below is kept only as defense-in-depth. Either a
 /// cooperative bail (`budget_exceeded`) or the retrospective net tripping
-/// appends a `{"ts","budget_exceeded":true}` line to `memory-stats.jsonl` —
-/// visible evidence the budget was actually hit, not silent degradation. On
-/// an actual injection (non-empty block, within budget) appends
-/// `{"ts","n"}` instead, plus `"capped":true` (F3) when the verify walk hit
-/// `RECALL_VERIFY_CAP` — recorded as a stat only, NEVER stdout noise; the
-/// `--for-hook`/hook stdout contract (block or nothing, exit 0 always) is
-/// unconditional. F3 also covers the case a plain `n`-vs-nothing split would
-/// miss: a capped walk that found ZERO fresh hits (`outcome.block.is_empty()`)
-/// is exactly the silent-truncation scenario this fix exists for, so it gets
-/// its own `{"ts","capped":true}` line rather than returning with no stat at
-/// all. Never `state.json`, which only the daemon writes (the hazard this
-/// task is explicitly gated against).
+/// appends a `{"ts","budget_exceeded":true,"elapsed_ms":N}` line to
+/// `memory-stats.jsonl` — visible evidence the budget was actually hit, not
+/// silent degradation. On an actual injection (non-empty block, within
+/// budget) appends `{"ts","n","elapsed_ms":N}` instead, plus `"capped":true`
+/// (F3) when the verify walk hit `RECALL_VERIFY_CAP` — recorded as a stat
+/// only, NEVER stdout noise; the `--for-hook`/hook stdout contract (block or
+/// nothing, exit 0 always) is unconditional. F3 also covers the case a plain
+/// `n`-vs-nothing split would miss: a capped walk that found ZERO fresh hits
+/// (`outcome.block.is_empty()`) is exactly the silent-truncation scenario
+/// this fix exists for, so it gets its own
+/// `{"ts","capped":true,"elapsed_ms":N}` line rather than returning with no
+/// stat at all. `elapsed_ms` (Phase 1, perf-evidence round) is
+/// `started.elapsed().as_millis()` — wall time from the top of this
+/// function to the append, monotonic-clock-derived — and is now carried on
+/// **every** append site in this function, including the two early-bail
+/// sites above (thread-spawn failure, `recv_timeout` timeout/disconnect),
+/// which previously never computed it at all. Never `state.json`, which
+/// only the daemon writes (the hazard this task is explicitly gated
+/// against).
 /// F8: the recall call runs on a detached worker thread; this function
 /// waits only for the REMAINING wall budget (`deadline - now`) via
 /// `mpsc::Receiver::recv_timeout`, not for the worker itself. That is the
@@ -772,8 +779,13 @@ fn inject_memory(root: &Path, query: &str) {
     // an extreme edge. Fail open exactly like a timed-out recv: no stdout,
     // one budget_exceeded stat line.
     if spawn_result.is_err() {
-        let stats_line =
-            serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let stats_line = serde_json::json!({
+            "ts": wall_now_ms(),
+            "budget_exceeded": true,
+            "elapsed_ms": elapsed_ms,
+        })
+        .to_string();
         let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
         return;
     }
@@ -787,8 +799,13 @@ fn inject_memory(root: &Path, query: &str) {
             // identically: no stdout, one budget_exceeded stat line. Any
             // still-running worker is abandoned here, per this function's
             // doc comment.
-            let stats_line =
-                serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let stats_line = serde_json::json!({
+                "ts": wall_now_ms(),
+                "budget_exceeded": true,
+                "elapsed_ms": elapsed_ms,
+            })
+            .to_string();
             let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
             return;
         }
@@ -796,8 +813,12 @@ fn inject_memory(root: &Path, query: &str) {
     let elapsed_ms = started.elapsed().as_millis();
 
     if outcome.budget_exceeded || elapsed_ms > RECALL_BUDGET_MS {
-        let stats_line =
-            serde_json::json!({ "ts": wall_now_ms(), "budget_exceeded": true }).to_string();
+        let stats_line = serde_json::json!({
+            "ts": wall_now_ms(),
+            "budget_exceeded": true,
+            "elapsed_ms": elapsed_ms as u64,
+        })
+        .to_string();
         // Best-effort, same fail-open posture as the recall itself.
         let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
         return;
@@ -814,6 +835,7 @@ fn inject_memory(root: &Path, query: &str) {
             "ts": wall_now_ms(),
             "failure": true,
             "reason": "store_corrupt",
+            "elapsed_ms": elapsed_ms as u64,
         })
         .to_string();
         let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
@@ -825,7 +847,12 @@ fn inject_memory(root: &Path, query: &str) {
         // injection to report. Best-effort, same fail-open posture as
         // everywhere else in this function.
         if outcome.capped {
-            let stats_line = serde_json::json!({ "ts": wall_now_ms(), "capped": true }).to_string();
+            let stats_line = serde_json::json!({
+                "ts": wall_now_ms(),
+                "capped": true,
+                "elapsed_ms": elapsed_ms as u64,
+            })
+            .to_string();
             let _ = append_log_line(&crate::memory_stats_path(root), &stats_line);
         }
         return;
@@ -836,7 +863,8 @@ fn inject_memory(root: &Path, query: &str) {
         .lines()
         .filter(|l| l.starts_with("- "))
         .count();
-    let mut stats = serde_json::json!({ "ts": wall_now_ms(), "n": n });
+    let mut stats =
+        serde_json::json!({ "ts": wall_now_ms(), "n": n, "elapsed_ms": elapsed_ms as u64 });
     if outcome.capped {
         stats["capped"] = serde_json::json!(true);
     }
