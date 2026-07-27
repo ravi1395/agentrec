@@ -117,16 +117,19 @@ evidence-on-green deliverable**: no `--show-output`, so libtest captured the pas
 `rebuild_count` print — the pristine log carries zero such lines (fixed in the same commit as this
 entry, plus a ran-to-completion sentinel after a real silent-truncation false-pass; a
 docker-credsStore workaround was applied env-only, not committed; ledger row updated). A second
-binding fable skeptic gate over the post-gate commits (`8f89775..`) returned **FAIL → fixed →
-see next entry's re-gate**: (F1, blocking) the same commit that recorded the first execution
+binding fable skeptic gate over the post-gate commits (`8f89775..`) returned **FAIL → all four
+findings fixed at `357bde3` → re-gate by the same skeptic: PASS** (each closure refutation-proven
+firsthand, incl. a fresh-boot probe of the Colima VM confirming 1048576 is the boot default — the
+claim the skeptic most suspected — and a fourth same-VM rebuild count, 13): (F1, blocking) the same commit that recorded the first execution
 shipped the script still claiming `STATUS: THIS SCRIPT HAS NEVER BEEN EXECUTED` — the
 false-claim-in-shipped-artifact class, reproduced by the fix for it; (F2) the sentinel cleared
 itself *inside* the truncation-vulnerable block, so a truncation landing before the clear plus the
 stale sentinel every green run leaves in the persistent volume produced a demonstrated live false
 pass — clear moved host-side into its own container run; (F3) the skeptic's own in-suite run on the
 same VM measured **14** and the post-fix re-run measured **19**, refuting this entry's earlier "two
-VMs, two regimes" framing twice over (one VM spans 8–19, overlapping the prior VM's 13–21 entirely;
-spread uninstrumented, all inside `1..=45`); (F4)
+VMs, two regimes" framing twice over (the 14 and 19 both fall entirely inside the prior VM's 13–21;
+this VM's observed span is 8–19, and the re-gate's own run added a **13** at the prior range's exact
+floor; spread uninstrumented, all inside `1..=45`); (F4)
 `e3d24d7`'s subject says "30 stale claims re-confirmed" — the true count is **44** (44 STALE →
 44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). P4's population-level flake claim closes only over CI history. P1's
 verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
