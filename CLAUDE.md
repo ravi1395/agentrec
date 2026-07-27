@@ -131,7 +131,17 @@ VMs, two regimes" framing twice over (the 14 and 19 both fall entirely inside th
 this VM's observed span is 8–19, and the re-gate's own run added a **13** at the prior range's exact
 floor; spread uninstrumented, all inside `1..=45`); (F4)
 `e3d24d7`'s subject says "30 stale claims re-confirmed" — the true count is **44** (44 STALE →
-44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). P4's population-level flake claim closes only over CI history. P1's
+44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). After
+the re-gate PASS the branch was pushed and [PR #7](https://github.com/ravi1395/agentrec/pull/7)
+opened (65 commits, four stacked rounds) and **squash-merged** to `main` as `5ea946b` on 2026-07-27
+— per-phase history survives only in the PR, not on `main` (an earlier draft of this entry, written
+before the merge, claimed "per-phase history kept") — and its `pull_request` trigger
+closed **both** structurally-blocked P5 ledger rows the same evening: run
+[30309231117](https://github.com/ravi1395/agentrec/actions/runs/30309231117), all 5 jobs green,
+ubuntu legs 431/0/2 each, and the `--nocapture` step printed `rebuild_count observed: 11` on both
+ubuntu runners — the "AC1 is unclosable from a branch" analysis was true for `workflow_dispatch`
+but missed that a PR *is* the branch-reachable trigger; the rows closed by the route the round
+declined to take (a PR), taken later with founder approval. P4's population-level flake claim closes only over CI history. P1's
 verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
 is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
 directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the
