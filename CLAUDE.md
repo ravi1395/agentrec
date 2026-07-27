@@ -8,6 +8,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Perf-evidence plan — PLAN-GATE PASS after 6 revisions (2026-07-28, `main`, docs-only, zero
+code changed):** `docs/superpowers/plans/2026-07-27-agentrec-perf-evidence-round.md` — 4 phases
+(recall `elapsed_ms` + `memories --stats` + the 10k ledger measurement; dedup-hit counters on the
+snapshot path; `retention` plan/execute split; eviction relocated from `status` to a daemon tick),
+~9.5–11.5 h wall estimated, gap 4 (inotify watch pruning) explicitly deferred with the race-class
+reason. **The plan itself was skeptic-gated to a PASS verdict as a hard finalisation condition
+(founder /goal), and it took 5 FAIL rounds — 12 blocking findings, every one real and
+refutation-argued against the actual code.** The instructive ones: (B8) the protected-bytes
+honesty line in `status` is *manufactured by the destructive pass* — `enforce_budget` had no
+dry-run, so a read-only `status` would silently kill a shipped honesty surface and red a test the
+plan never named; (B9) a live-daemon fixture seeding `open.json` is destroyed by the daemon's own
+`sync_journal` idle arm within ~250ms — protect-channel fixtures must use files the daemon only
+appends to; (B10) "freshly-staged blob survives the tick" is vacuous — staged blobs aren't in
+`log.jsonl` until the turn closes, so they are never candidates (the SR6 class, caught at plan
+time instead of shipped); (B11) after splitting plan/execute, the *reference timestamp* of
+execute's freshness re-check was unspecified — fresh-`now()` is strictly weaker than the unsplit
+code in a hard-delete path, and the AC's offered future-dated bump could not tell the designs
+apart; (B12) the both-halves guard fix then *masked its own plan-side neuter* from every
+deletion-observable test, requiring a plan-report-leg discriminator. **Net: three of the five
+FAIL rounds found defects in fixes to earlier findings — the loop converged inward, which is what
+distinguishes a gate from a rubber stamp.** Founder decisions recorded in-plan: Q1 = (a)
+(eviction moves to the daemon; `status` becomes a pure read verb; daemon-down + `undo` growth
+accepted as rare/bounded/self-announcing), Q2 = default (a breached 10k p99 leaves the ledger row
+OPEN-with-figure; no criterion loosened). Plan baseline 428/0/1 was re-verified by the gate's own
+suite run at `834f477`, and the gate's parting scope note is preserved in the plan header: two
+things only the code-level skeptic can settle (unbroken harvest→plan→execute call site; AC2b.2's
+timing-coupled ~2s-seam leg, solo + repeated runs required). Also this session, pre-plan: PR #7
+squash-merged (`5ea946b`) — both P5 ledger rows closed by its CI run (`834f477` records this; the
+"per-phase history kept" draft claim was corrected to squash-merge reality before commit); 2
+leaked test daemons killed; 7 remote + 2 local branches deleted (13 stale locals blocked by the
+git-guardrails hook, command handed to founder); read-verb latency measured on the live store
+(`log`/`blame` 10ms @ 2006 turns — the number that killed log-indexing as a gap). **Nothing
+implemented; next step is `/chunker` on the plan.**
+
 **Residuals round — GATE PASS (2026-07-27, branch `fix/residuals-round` cut from
 `fix/honesty-round`, `3477781..8f89775`, not pushed, no PR):** All 5 phases of
 `docs/superpowers/plans/2026-07-26-agentrec-residuals-round.md`. macOS **422 → 428, 0 failed,
