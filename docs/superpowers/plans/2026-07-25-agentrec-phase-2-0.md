@@ -38,6 +38,7 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 10. **(2026-07-28)** MCP read (2.2) is gated on the CLI demand probe: ≥10 **audited** unprompted agent invocations across ≥3 non-agentrec-repo sessions, measured by transcript sweep (never an in-product counter — read verbs stay zero-write) — spec decision 7.
 11. **(2026-07-28)** The import gate gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility %, opaque-call share); no hard threshold until the first real measurement — spec decision 8.
 12. **(2026-07-28)** Sutra parked; Phase 2 re-centered on accessibility (import, trailers, `--json`, distribution, setup, Codex). No Phase 2 work item touches the Sutra repo; the demand probe's treatment site is ledger-named at probe start, Sutra excluded — spec decision 9.
+13. **(2026-07-28)** Founder waived the decision 7 demand probe: MCP read (2.2) is in Phase 2 scope unconditionally; the transcript sweep becomes post-ship evaluation. Decision 6's undo evidence gate on 2.3 stands untouched — spec decision 10. Sequencing unchanged: 2.2 still lands after P4/P5 (consumes `Page<T>` + the `--json` serializer).
 
 ## Infeasible / rejected (killed against real code or measured evidence)
 

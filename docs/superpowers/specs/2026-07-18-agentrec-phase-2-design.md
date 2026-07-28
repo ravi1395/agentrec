@@ -1,4 +1,4 @@
-# agentrec Phase 2 — the record becomes accessible (agents use it when demand is measured)
+# agentrec Phase 2 — the record becomes accessible (read everywhere; agent-driven undo only when evidence arrives)
 
 Date: 2026-07-18
 Status: finalized (founder-confirmed decisions below); **hardened 2026-07-28** after an
@@ -20,10 +20,10 @@ provenance via trailers, machine-readable `--json` contracts, a second emitter
 (Codex), and painless install/setup. It folds the ROADMAP Phase 1 truth substrate
 (import, trailers, machine-readable read contracts; the protocol freeze moved
 behind 2.1 — decision 5) in as Phase 2.0, because everything downstream depends
-on it. The original "infrastructure agents use" ambition — stdio MCP server,
-self-healing loop — survives only behind its evidence gates (decisions 6–7):
-those surfaces are built when demand is measured, not because the phase is named
-after them.
+on it. The stdio MCP **read** server is in scope by founder override (decision
+10) as a thin adapter over the same serializer; the **destructive** surface and
+the self-healing loop remain behind decision 6's evidence gate — built when
+humans demonstrate the verb matters, not because the phase is named after them.
 
 The architecture is one semantic core with thin adapters. CLI and MCP must not
 independently reinterpret turn selection, blame, diff, modified-since, or undo
@@ -43,8 +43,8 @@ At the end of Phase 2:
   Codex emitter validates the two-emitter shape (decision 5).
 - Claude Code and Codex produce L2 records in the same repo with correct bracketing
   under the supported one-active-agent-per-root model.
-- **Conditional on the demand probe (decision 7):** any stdio-MCP host can query
-  log/diff/blame/recall/status.
+- Any stdio-MCP host can query log/diff/blame/recall/status (demand probe waived
+  by decision 10; post-ship usage still measured by the decision 7 sweep).
 - **Conditional on the undo-evidence gate (decision 6):** with explicit consent, an
   agent identifies its own bad turn, safely reverts it, and retries.
 - `npx agentrec` and the mise/asdf plugin install the release binary.
@@ -101,7 +101,10 @@ entries; corpus measurements below).
    human approval (confirm mode); in auto mode, modified-since files are excluded
    unconditionally — the rail exists to protect human edits, and an agent frustrated
    by refusals must never be able to lower it autonomously.
-7. **MCP read (2.2) is gated on a CLI demand probe.** Agents can already run
+7. **MCP read (2.2) is gated on a CLI demand probe.** *(Waived as a gate by
+   decision 10 later the same evening — retained below as the post-ship
+   evaluation method; the instrument and "unprompted" definition still apply to
+   measuring real usage after 2.2 ships.)* Agents can already run
    `agentrec blame|log|status` via shell. Before any MCP server is built, publish a
    CLAUDE.md recipe pointing agents at the read verbs, then measure whether they
    reach for them. **Instrument: the Claude Code transcripts themselves, not the
@@ -133,7 +136,10 @@ entries; corpus measurements below).
    (~30 days rolling), so the sweep must run at least monthly or hits are
    silently lost. If the probe never fires *with the treatment verifiably
    installed*, 2.2 is never built — that outcome is success, not failure: dead
-   weight avoided for the cost of a doc paragraph and a grep.
+   weight avoided for the cost of a doc paragraph and a grep. *(This
+   never-built consequence is the part decision 10 waives — 2.2 builds
+   regardless; the instrument, thresholds, and sweep cadence carry over
+   unchanged into the post-ship evaluation row.)*
 8. **The import gate gains a fidelity report + ledger row (no threshold yet).** The
    ≥90% parse gate says nothing about how much imported history is actually usable.
    The dry-run must additionally report per-tier revertibility (% of extracted
@@ -155,7 +161,22 @@ entries; corpus measurements below).
    Codex capture (a second tool reaching the record is reach). The
    evidence-gated MCP surfaces (decisions 6–7) were already conditional; this
    decision does not reopen them, it just removes Sutra as a reason to build
-   anything early.
+   anything early. *(Decision 10, minutes later, waives decision 7's probe for
+   the read surface — see below; decision 6's undo gate stands untouched.)*
+10. **(2026-07-28, after decision 9) Founder waives the decision 7 demand probe:
+    MCP read (2.2) joins Phase 2 scope unconditionally.** Explicit override,
+    recorded as such: the skeptical case (schemas cost every prompt; the shipped
+    agent-facing surface measured 389 injections of 3 facts; no observed
+    unprompted agent query) was presented and the founder chose to build anyway.
+    The probe machinery above stays in the text as the *evaluation* method — a
+    post-ship transcript sweep still measures whether agents actually call the
+    tools, it just no longer gates the build. Sequencing is unchanged by
+    technical dependency: 2.2 is a thin adapter over the Phase 2.0 `--json`
+    serializer, so seams + `--json` (P4/P5) land first regardless. Decision 6
+    (2.3 destructive, ≥20 human-confirmed undos, allow_modified never in auto)
+    is NOT waived — the read/destructive asymmetry is deliberate: a read tool's
+    failure mode is wasted context; a destructive tool's failure mode lands on
+    the never-destroy-user-work promise.
 
 ## Inherited decisions — confirmed earlier; executors may not re-litigate
 
@@ -329,10 +350,10 @@ Additive protocol changes shipped in Phase 2.0 (pre-freeze, changelog-documented
   honesty model below); imported entries with unreconstructable `before` are
   never revertible. File-entry `baseline_unknown` is NOT reused for
   import-missing-before — it keeps its live-recording first-observation meaning.
-- MCP §8 `agentrec_status` tool-table row: **deferred with 2.2** (decision 7) —
-  no normative wire text for a tool whose phase may never build. Documented in
-  `FORMAT-CHANGELOG.md` as reserved; the §8 row lands in 2.2's first commit, if
-  the demand probe opens it. (Already shipped: `agentrec_recall`.)
+- MCP §8 `agentrec_status` tool-table row: lands in **2.2's first commit**
+  (2.2 in scope per decision 10; documented in `FORMAT-CHANGELOG.md` as reserved
+  until then — normative wire text rides the code it describes, not this spec).
+  (Already shipped: `agentrec_recall`.)
 
 ### `import claude` (K-series ACs)
 
@@ -502,15 +523,19 @@ one `log.jsonl` with both tools attributed correctly and zero cross-attribution.
 
 ## Phase 2.2 — MCP read tools
 
-**Entry precondition — CLI demand probe (decision 7, 2026-07-28; full definition
-there).** No MCP server code is written until agents demonstrably want the data:
-a published CLAUDE.md recipe points agents at `agentrec blame|log|status`, and a
-transcript-sweep audit (instrument and "unprompted" definition in decision 7 —
-deliberately not an in-product counter) must show **≥10 audited unprompted agent
-invocations across ≥3 distinct non-agentrec-repo sessions**. Rationale: MCP tool
-schemas are paid for in every prompt of every session; the nearest shipped
-agent-facing surface (memory injection) measured 389 injections of 3 facts —
-evidence that "available to the agent" is not "used by the agent".
+**Entry precondition: none — the decision 7 demand probe was waived by founder
+override (decision 10, 2026-07-28).** The skeptical record stands: MCP tool
+schemas are paid for in every prompt of every session, and the nearest shipped
+agent-facing surface (memory injection) measured 389 injections of 3 facts. The
+probe's transcript-sweep instrument survives as the **post-ship evaluation**,
+inheriting decision 7's discipline wholesale: same instrument, same "unprompted"
+audit clauses, same ≥10-across-≥3-sessions reference figure, monthly sweep
+cadence (30-day transcript retention loses hits), first sweep dated one month
+after 2.2 ships. The VERIFY-LEDGER row records the observed count against that
+reference — so the question "do agents actually use this?" gets answered by
+measurement either way; it just no longer blocks the build. Technical sequencing unchanged:
+2.2 consumes Phase 2.0's `Page<T>`/cursor types and `--json` serializer, so it
+lands after P4/P5.
 
 Command: `agentrec mcp`, stdio, rooted at its canonical launch cwd. Reads work
 with the daemon stopped (P3). Config loads once at startup; changing destructive
@@ -614,7 +639,7 @@ Claude and Codex config surfaces.
 |---|---|
 | Historical imports cannot reconstruct safe before/after state | Import corpus classifies every item reconstructible or non-revertible; zero fabricated snapshots; ≥90% of real transcripts import; fidelity report figures recorded (decision 8) |
 | Imported history is parseable but useless (all provenance-only) | Fidelity report over the real corpus; founder sets the threshold from measured baseline, then the gate re-runs against it |
-| Agents never query the record unprompted | CLI demand probe (decision 7): ≥10 unprompted agent invocations across ≥3 sessions before any 2.2 code |
+| Agents never query the record unprompted | Accepted risk by founder override (decision 10): 2.2 builds anyway; the decision 7 transcript sweep runs post-ship as evaluation and its figure lands in a VERIFY-LEDGER row |
 | Humans never use undo, so agent self-revert has no base rate | Undo evidence gate (decision 6): ≥20 human-confirmed `undo --confirm` in real use before any 2.3 code |
 | Codex hook/trust behavior drifts by version | Live fixture on minimum + current versions; start/stop correlation and `/hooks` trust observed |
 | MCP host approval differs across clients | Internal off/confirm/auto state machine passes without host UI; host annotations remain additive UX |
@@ -625,8 +650,8 @@ Claude and Codex config surfaces.
 - Unit: typed query/undo interfaces, total error/status enums, importer
   classification.
 - Integration: real binary over temp repos; hook stdin/stdout; config
-  merge/reverse; import idempotency/resume. **Gated on decision 7 (only if 2.2
-  builds):** MCP initialize/list/call/shutdown. **Gated on decision 6 (only if
+  merge/reverse; import idempotency/resume; MCP initialize/list/call/shutdown
+  (2.2 in scope per decision 10). **Gated on decision 6 (only if
   2.3 builds):** pending approvals across restart; simultaneous undo conflict;
   token replay; approval race.
 - Conformance: Protocol 1.0 golden records consumed by every internal reader; the
@@ -635,10 +660,10 @@ Claude and Codex config surfaces.
 - Adversarial: malformed/torn/huge JSONL, cursor invalidation, prompt/ANSI/
   Markdown injection, path traversal, symlink escape, hostile transcript lines
   in importers.
-- Performance: 10k turns; 500 MB transcript import <500 MB RSS. **Gated on
-  decision 7:** MCP p95 read <100 ms warm.
+- Performance: 10k turns; 500 MB transcript import <500 MB RSS; MCP p95 read
+  <100 ms warm.
 - Live behavior: actual Claude/Codex hooks, real-transcript import corpus,
-  npm/mise installs on clean machines. **Gated on decision 7:** MCP host session.
+  npm/mise installs on clean machines, MCP host session.
 
 ## Manual E2E script
 
@@ -651,8 +676,8 @@ Claude and Codex config surfaces.
    imported-history reason.
 3. Commit with trailers enabled; observe `Agent-Turn:` in `git log` and
    `git agentrec blame` resolving it.
-4. **[Gated on decision 7 — runs only if 2.2 builds]** Stop the daemon. From an
-   MCP host, list, diff, blame, recall, and read status successfully.
+4. Stop the daemon. From an MCP host, list, diff, blame, recall, and read status
+   successfully (2.2 in scope per decision 10).
 5. **[Gated on decision 6 — runs only if 2.3 builds]** Break a test from an
    agent; run the self-healing story in confirm mode, then in auto mode (no
    modified-since files in the auto leg — auto never overrides that rail).
@@ -668,15 +693,14 @@ Claude and Codex config surfaces.
 - `PROTOCOL.md` §5: `imported: true` semantics; imported non-reconstructible
   entries never revertible.
 - `PROTOCOL.md` §8: add `agentrec_status` to the normative tool table — **rides
-  2.2's first commit, only if decision 7's probe opens the phase** (no normative
-  text for conditional tools).
+  2.2's first commit** (2.2 unconditional per decision 10).
 - `IMPLEMENTATION.md` §O: Codex capture is `UserPromptSubmit` + `Stop`, not Stop
   only.
-- `IMPLEMENTATION.md` §5: "v2 done =" becomes **O + Q, plus P if decisions 6/7
-  open it** (R deferred, demand-driven; decision 1). P is double-gated as of
-  2026-07-28; if either gate never opens, v2 closes as O + Q with P recorded as
-  evidence-blocked — a founder re-scope note at Phase 2 close, not a silent
-  failure to finish.
+- `IMPLEMENTATION.md` §5: "v2 done =" becomes **O + Q + P-read (2.2, in scope
+  per decision 10), plus P-destructive (2.3) if decision 6's evidence gate
+  opens** (R deferred, demand-driven; decision 1). If the undo gate never opens,
+  v2 closes without 2.3, recorded as evidence-blocked — a founder re-scope note
+  at Phase 2 close, not a silent failure to finish.
 - `ROADMAP.md` Phase 2 "Ships" list: annotate VS Code extension as deferred out
   of v2 by founder decision 2026-07-18.
 - **`ROADMAP.md` cold-start line (currently "import makes `blame` work on last
@@ -684,11 +708,12 @@ Claude and Codex config surfaces.
   the ≤30-day-backfill framing — rides P1's import commit (decision 8's
   prohibition needs a delivery vehicle, and this is it).**
 - **`ROADMAP.md` Phase 2 gate (~line 55, "MCP config appears in strangers'
-  dotfiles… extension installs growing"): two of its clauses are unsatisfiable
-  as written — the extension clause has been stale since decision 1 (2026-07-18)
-  and the MCP-dotfiles clause is now conditional on decision 7. Rewrite the gate
-  to condition the MCP clause on 2.2 building and drop or annotate the extension
-  clause — rides P1's import commit alongside the cold-start rewrite.**
+  dotfiles… extension installs growing"): the extension clause has been
+  unsatisfiable since decision 1 (2026-07-18) — drop or annotate it. The
+  MCP-dotfiles clause stands as written: 2.2 ships unconditionally per decision
+  10, so the clause is measurable again (it was briefly conditional under
+  decision 7's probe, superseded). Rides P1's import commit alongside the
+  cold-start rewrite.**
 - **`PROBLEM.md` cold-start framing: same rewrite, same commit.**
 - **`README.md` import section (when import ships): backfill window stated as
   ≤30 days rolling; no durable-archive claim until a re-import mechanism
@@ -713,10 +738,13 @@ Claude and Codex config surfaces.
   modified-since rail protects human edits; any path where the agent can grant
   itself the override converts refusal friction into data loss on the product's
   one non-negotiable promise (decision 6).
-- **Building MCP read before demand evidence (rejected 2026-07-28):** schemas cost
-  every prompt; the CLI-via-shell probe measures the same demand for free
-  (decision 7). "Available to the agent" has already measured ≠ "used by the
-  agent" on the memory surface.
+- **Building MCP read before demand evidence (rejected 2026-07-28, then
+  overridden by founder decision 10 the same evening):** the skeptical argument
+  — schemas cost every prompt; the CLI-via-shell probe measures the same demand
+  for free; "available to the agent" measured ≠ "used by the agent" on the
+  memory surface — was presented in full and the founder chose to build anyway.
+  Kept here so the record shows the override was informed, not accidental; the
+  probe survives as post-ship evaluation.
 - **Pitching import as full-history cold-start recovery (rejected 2026-07-28):**
   the source corpus is a rolling ≤30-day window (`cleanupPeriodDays`); the honest
   claim is "≤30-day backfill". The durable-archive framing is also embargoed —

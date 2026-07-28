@@ -41,7 +41,17 @@ same stale fact living in two places, three prior gate rounds missed both), fixe
 amended-by-decision-5 parenthetical; final sweep confirmed all 5 remaining freeze mentions
 correct and zero unconditional agent-consumer framing. Probe prerequisite unchanged: no
 non-agentrec repo has an initialized `.agentrec/` yet, so 2.2's window cannot open until the
-ledger row is written (founder picks the repo when ready). (8) The import gate
+ledger row is written (founder picks the repo when ready). **Decision 10 (minutes after 9,
+founder override "you have it"): the decision 7 demand probe is WAIVED as a gate — MCP read
+(2.2) joins Phase 2 scope unconditionally.** The skeptical case was presented in full and
+overridden knowingly; the rejected-approaches entry is annotated (not deleted) so the record
+shows informed override, and the probe survives as post-ship evaluation (same instrument,
+≥10/≥3 reference, monthly sweep, first sweep one month after 2.2 ships, count → VERIFY-LEDGER
+row). **Decision 6's undo gate on 2.3 stands untouched** — deliberate asymmetry: a read tool's
+failure mode is wasted context, a destructive tool's is destroyed work. Sequencing unchanged
+(2.2 = thin adapter over P4/P5's serializer). This round was gated too: FAIL (B1 — the ROADMAP
+companion row still prescribed conditioning the MCP clause on a probe that no longer gates;
+third sibling-leftover catch of the evening) → PASS. (8) The import gate
 gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility, opaque-call share 2.49:1
 baseline); threshold deliberately unset until the first real measurement. **Corpus decay
 measured firsthand and specced:** Claude Code's `cleanupPeriodDays` (default 30) makes the
