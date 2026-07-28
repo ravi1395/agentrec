@@ -27,8 +27,21 @@ agent-grants-itself-the-override hole. (7) MCP read is gated on a CLI demand pro
 recipe + **transcript-sweep audit** (deliberately NOT an in-product counter — that would add an
 unsynchronized `state.json` writer and contradict the pinned zero-write `status --json`
 behavior), ≥10 audited unprompted invocations across ≥3 non-agentrec-repo sessions; treatment
-site named (`~/Projects/sutra` at minimum — which **has no `.agentrec/` today**, so `agentrec
-init` there is a recorded prerequisite before the probe window can open). (8) The import gate
+site originally named `~/Projects/sutra` — **superseded the same evening by decision 9
+(founder): Sutra is PARKED, Phase 2 re-centered on accessibility** (import, trailers, `--json`,
+distribution, setup, Codex — the v0.4 D39–D44 sense of the word); no Phase 2 work item touches
+the Sutra repo, decision 3's seam constraint no longer binds (seams stand on CLI/MCP consumers
+alone), and the probe's treatment site is now **ledger-named at probe start** (≥1 initialized
+non-agentrec repo, recipe-install date recorded — F1's uninstalled-treatment protection kept,
+site choice deferred to the row). Goal section reframed accordingly, title retitled ("the
+record becomes accessible"). **The park round was itself gated: FAIL → PASS** — the skeptic
+found the *sibling* of a leftover I'd just fixed (Goal listed "protocol freeze" inside 2.0;
+decision 4, in the higher-authority executors-may-not-re-litigate block, still did too — the
+same stale fact living in two places, three prior gate rounds missed both), fixed by an
+amended-by-decision-5 parenthetical; final sweep confirmed all 5 remaining freeze mentions
+correct and zero unconditional agent-consumer framing. Probe prerequisite unchanged: no
+non-agentrec repo has an initialized `.agentrec/` yet, so 2.2's window cannot open until the
+ledger row is written (founder picks the repo when ready). (8) The import gate
 gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility, opaque-call share 2.49:1
 baseline); threshold deliberately unset until the first real measurement. **Corpus decay
 measured firsthand and specced:** Claude Code's `cleanupPeriodDays` (default 30) makes the

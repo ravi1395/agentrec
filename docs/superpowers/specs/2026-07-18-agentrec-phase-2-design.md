@@ -1,9 +1,10 @@
-# agentrec Phase 2 — agents use the record
+# agentrec Phase 2 — the record becomes accessible (agents use it when demand is measured)
 
 Date: 2026-07-18
 Status: finalized (founder-confirmed decisions below); **hardened 2026-07-28** after an
 adversarial value/threat analysis — founder decisions 5–8 added, corpus-decay honesty
-measured in, before-ladder amended to four tiers, MCP phases evidence-gated.
+measured in, before-ladder amended to four tiers, MCP phases evidence-gated; **decision 9
+added later the same evening** — Sutra parked, Phase 2 re-centered on accessibility.
 Owner: Ravi
 Supersedes: the Phase 2 half of `2026-07-12-agentrec-phase-2-3-design.md`. That
 document's Phase 3 content (PR report Action, signing, Sutra rebase) remains the
@@ -13,11 +14,16 @@ sections 4–5), `INTEGRATIONS.md`, `ROADMAP.md` (Phase 1 + Phase 2 gates)
 
 ## Goal
 
-Phase 2 turns agentrec from a recorder humans query into infrastructure agents use.
-It folds the ROADMAP Phase 1 truth substrate (import, trailers, protocol freeze,
-machine-readable read contracts) in as Phase 2.0, because every Phase 2 consumer
-depends on it, then ships two rich emitters, one stdio MCP server, and one
-self-healing loop.
+Phase 2 makes the record **accessible** (decision 9, in this repo's v0.4 sense:
+adoption, reach, ease of getting at the data): backfill via import, git-native
+provenance via trailers, machine-readable `--json` contracts, a second emitter
+(Codex), and painless install/setup. It folds the ROADMAP Phase 1 truth substrate
+(import, trailers, machine-readable read contracts; the protocol freeze moved
+behind 2.1 — decision 5) in as Phase 2.0, because everything downstream depends
+on it. The original "infrastructure agents use" ambition — stdio MCP server,
+self-healing loop — survives only behind its evidence gates (decisions 6–7):
+those surfaces are built when demand is measured, not because the phase is named
+after them.
 
 The architecture is one semantic core with thin adapters. CLI and MCP must not
 independently reinterpret turn selection, blame, diff, modified-since, or undo
@@ -53,13 +59,17 @@ At the end of Phase 2:
    association, never a timestamp or file-overlap heuristic. Phase 3 report work
    builds only on this; Phase 2.0 must therefore ship the trailer substrate.
 3. **Sutra ownership: external agentrec recorder + Sutra sidecar.** Sutra does not
-   embed a second active recorder. (Phase 3 executes this; recorded here because
-   it constrains Phase 2 seam design — `RepositoryView`/`UndoCoordinator` are the
-   interfaces Sutra will consume.)
+   embed a second active recorder. *(Superseded in part by decision 9, 2026-07-28:
+   Sutra is parked and this decision no longer binds Phase 2 seam design — the
+   ownership model itself stands for whenever the integration returns, but
+   `RepositoryView`/`UndoCoordinator` are justified in Phase 2 by their CLI/MCP
+   consumers alone.)*
 4. **Phase 2.0 carries the full ROADMAP Phase 1 scope** — `import claude`,
    `import aider`, git trailers, `git-agentrec` shim, protocol freeze + conformance
    fixtures, npm/mise distribution wrappers — plus the seam extraction and JSON
-   read contracts the 2026-07-12 entry gate demanded.
+   read contracts the 2026-07-12 entry gate demanded. *(Amended by decision 5,
+   2026-07-28: the protocol freeze + conformance fixtures moved behind Phase 2.1
+   — 2.0 only starts `FORMAT-CHANGELOG.md`. The rest of this scope stands.)*
 
 ## Founder decisions — hardening round (2026-07-28); executors may not re-litigate
 
@@ -109,12 +119,16 @@ entries; corpus measurements below).
    under test (capability discovery), exactly what MCP schemas would provide at
    ~1000× the context cost. Sessions are transcript files (real session identity).
    **Treatment site (without this, clause (a) disqualifies every natural hit):**
-   the recipe is installed in the founder's active *non-agentrec* development
-   repos — at decision time `~/Projects/sutra` at minimum, plus any other repo
-   that has an initialized `.agentrec/` store and a running daemon; a probe repo
-   without an initialized store is invalid (read verbs must return real data,
-   not init errors). The recipe-install date is recorded in a VERIFY-LEDGER row
-   and starts the sweep window. Probe passes at **≥10 audited invocations across
+   the recipe is installed in ≥1 of the founder's active *non-agentrec*
+   development repos, each with an initialized `.agentrec/` store and a running
+   daemon; a probe repo without an initialized store is invalid (read verbs must
+   return real data, not init errors). **The probe cannot start until a
+   VERIFY-LEDGER row names the chosen repo(s) and records the recipe-install
+   date** — that row is what bounds the sweep window and proves the treatment
+   was installed, so "never fires" can only ever mean measured indifference,
+   never an uninstalled treatment. (Sutra was originally named the minimum site;
+   decision 9 parks all Sutra changes, so the site choice moves to the ledger
+   row at probe start, Sutra excluded while parked.) Probe passes at **≥10 audited invocations across
    ≥3 distinct sessions**; the window is bounded by transcript retention
    (~30 days rolling), so the sweep must run at least monthly or hits are
    silently lost. If the probe never fires *with the treatment verifiably
@@ -127,6 +141,21 @@ entries; corpus measurements below).
    per session; the figures land in a VERIFY-LEDGER row. A hard fidelity threshold is
    deliberately NOT set before the first real measurement — inventing one without
    baseline data would be theater.
+9. **(2026-07-28, later the same evening) Sutra is parked; Phase 2 is re-centered
+   on accessibility.** All Sutra integration work — and every Phase 2 constraint
+   whose only justification was Sutra — is deferred to a later phase, on the
+   founder's direction. Concretely: decision 3 (2026-07-18) no longer binds Phase 2
+   seam design (the seams stand on their own feet: CLI `--json` contracts and the
+   gated MCP surface are their consumers); the demand probe's treatment site is no
+   longer Sutra (see decision 7's amended site rule); and no Phase 2 work item may
+   touch the Sutra repo. Phase 2's center of gravity is **accessibility** in this
+   repo's established sense (the v0.4 D39–D44 axis: adoption, reach, ease of
+   getting at the record): `import claude`/`aider`, git trailers + shim,
+   `--json` read contracts, distribution (npm/mise), setup/packaging (2.4), and
+   Codex capture (a second tool reaching the record is reach). The
+   evidence-gated MCP surfaces (decisions 6–7) were already conditional; this
+   decision does not reopen them, it just removes Sutra as a reason to build
+   anything early.
 
 ## Inherited decisions — confirmed earlier; executors may not re-litigate
 
@@ -151,7 +180,9 @@ entries; corpus measurements below).
 - No VS Code extension (decision 1), no JetBrains/Neovim/Cursor/Windsurf adapter.
 - No HTTP/SSE MCP transport.
 - No hosted service, accounts, telemetry, policy enforcement, or team dashboard.
-- No PR report Action, no signing, no Sutra migration — Phase 3.
+- No PR report Action, no signing, no Sutra migration — Phase 3. **Strengthened
+  by decision 9 (2026-07-28): no Phase 2 work item touches the Sutra repo at
+  all, and no Phase 2 constraint is justified by Sutra.**
 - No prompt text in any generic summary, tool output, or report by default.
 - No second capture engine anywhere.
 

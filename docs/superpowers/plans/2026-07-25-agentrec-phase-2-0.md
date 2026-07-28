@@ -28,7 +28,7 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 
 1. VS Code deferred out of Phase 2 entirely (spec decision 1).
 2. PR↔turn association is exact-only via `Agent-Turn:` trailers — no heuristic mode, ever (decision 2).
-3. Sutra = external agentrec recorder + sidecar; `RepositoryView`/`UndoCoordinator` are the interfaces it will consume (decision 3).
+3. Sutra = external agentrec recorder + sidecar; `RepositoryView`/`UndoCoordinator` are the interfaces it will consume (decision 3). *(Superseded in part 2026-07-28 by spec decision 9: Sutra parked; seams justified by CLI `--json` + gated MCP alone; no Phase 2 work touches the Sutra repo.)*
 4. Phase 2.0 carries full ROADMAP Phase 1 scope (decision 4).
 5. Import never fabricates a revertible snapshot. Unreconstructable `before` → `before: null`, provenance-only, refused by undo with an explicit imported-history reason.
 6. Bare turns stay unattributed windows in every renderer.
@@ -37,6 +37,7 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 9. **(2026-07-28)** MCP destructive (2.3) is evidence-gated: ≥20 human-confirmed `undo --confirm` in real use (audited from `log.jsonl` undo turns, all real repos; window is pre-2.3 by construction; indefinite deferral is an accepted outcome) before any 2.3 code; `allow_modified` is never honored in auto mode — spec decision 6.
 10. **(2026-07-28)** MCP read (2.2) is gated on the CLI demand probe: ≥10 **audited** unprompted agent invocations across ≥3 non-agentrec-repo sessions, measured by transcript sweep (never an in-product counter — read verbs stay zero-write) — spec decision 7.
 11. **(2026-07-28)** The import gate gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility %, opaque-call share); no hard threshold until the first real measurement — spec decision 8.
+12. **(2026-07-28)** Sutra parked; Phase 2 re-centered on accessibility (import, trailers, `--json`, distribution, setup, Codex). No Phase 2 work item touches the Sutra repo; the demand probe's treatment site is ledger-named at probe start, Sutra excluded — spec decision 9.
 
 ## Infeasible / rejected (killed against real code or measured evidence)
 
