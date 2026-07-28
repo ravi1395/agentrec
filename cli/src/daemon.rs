@@ -889,12 +889,20 @@ struct Recorder {
     /// (there is no valid `String` form to store), drained into
     /// `state.json`'s `non_utf8_path_skips` the same way `io_failures` is.
     non_utf8_skips: u64,
-    /// Perf-evidence round: lifetime-for-this-Recorder count of clean
-    /// dedup-hit verification reads on the snapshot path (`stage`'s
-    /// `put_result` calls only — scope deliberately excludes the
-    /// prompt/symlink `put_result` calls in `persist`). Never reset —
-    /// `drain_recorder_stats` mirrors the current value into `state.json`
-    /// rather than incrementally accumulating onto it.
+    /// Epoch-scoped (this `Recorder`'s lifetime, i.e. this daemon run —
+    /// NOT a lifetime-across-restarts total) count of clean dedup-hit
+    /// verification reads on the snapshot path: every `put_result` call
+    /// inside `stage`, including the symlink-target put (`symlink_change`)
+    /// — the two genuine exclusions are the prompt `put_result` calls in
+    /// `persist` and `recover_orphan`, uncounted because prompt content
+    /// isn't snapshot content, not because they're outside `stage`. Never
+    /// reset within an epoch — `drain_recorder_stats` MIRRORS the current
+    /// value into `state.json` (an assignment, not an accumulation), so
+    /// after a restart the previous epoch's figure remains visible in
+    /// `state.json`/`--json` until this epoch's own first dedup hit
+    /// overwrites it (see `dedup_counters_are_epoch_scoped_mirrors`) —
+    /// there is no epoch-nonce gating on this pair, unlike
+    /// `epoch_ignore_rebuilds`.
     dedup_hits: u64,
     /// Total bytes re-read across all clean dedup-hit verifications
     /// counted by `dedup_hits` (Decision 6: the corrupt-fallthrough heal
@@ -1001,7 +1009,14 @@ impl Recorder {
             } else if is_symlink {
                 // Not followed (AC B5): snapshot the link *target string*, so the
                 // symlink change is recorded without reading the pointed-to file.
-                symlink_change(&self.store, std::fs::read_link(abs))
+                let (after, snapshotted, withheld, skip_cause, deduped, reread_bytes) =
+                    symlink_change(&self.store, std::fs::read_link(abs));
+                if deduped {
+                    self.dedup_hits = self.dedup_hits.saturating_add(1);
+                    self.dedup_reread_bytes = self.dedup_reread_bytes.saturating_add(reread_bytes);
+                    self.dedup_stats_dirty = true;
+                }
+                (after, snapshotted, withheld, skip_cause)
             } else {
                 match std::fs::read(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
@@ -1131,7 +1146,13 @@ impl Recorder {
 }
 
 /// Classify a symlink's `read_link` outcome into `stage`'s
-/// `(after, snapshotted, withheld, skip_reason)` shape. Pulled out to a
+/// `(after, snapshotted, withheld, skip_reason)` shape, plus the dedup-hit
+/// info (`deduped`, `reread_bytes`) `stage` needs to feed `Recorder`'s
+/// counters — a symlink-target put goes through the same `put_result` path
+/// as every other `stage` put (perf-evidence review, finding 1: this used
+/// to go through `store.put`, which discards `PutResult::Stored`'s
+/// `deduped`/`reread_bytes`, so a dedup hit on an unchanged symlink paid
+/// the verification re-read but incremented nothing). Pulled out to a
 /// standalone, deterministically-testable function rather than inlined:
 /// the failure arm is a TOCTOU race (the dirent can vanish, or change kind,
 /// in the gap between the `symlink_metadata` check above and this
@@ -1144,19 +1165,28 @@ impl Recorder {
 fn symlink_change(
     store: &BlobStore,
     read_result: std::io::Result<std::path::PathBuf>,
-) -> (Option<String>, bool, bool, Option<String>) {
+) -> (Option<String>, bool, bool, Option<String>, bool, u64) {
     match read_result {
-        Ok(target) => (
-            store.put(target.to_string_lossy().as_bytes()),
-            true,
-            false,
-            None,
-        ),
+        Ok(target) => match store.put_result(target.to_string_lossy().as_bytes()) {
+            PutResult::Stored {
+                hash,
+                deduped,
+                reread_bytes,
+            } => (Some(hash), true, false, None, deduped, reread_bytes),
+            // A symlink target string is a handful of bytes — practically
+            // never over MAX_SNAPSHOT_BYTES — and an IoError here mirrors
+            // the prior `store.put` behavior exactly (both collapsed to
+            // `None`): preserved rather than reasoned about further, since
+            // neither case is what this fix targets.
+            PutResult::OverCap | PutResult::IoError(_) => (None, true, false, None, false, 0),
+        },
         Err(_) => (
             None,
             false,
             false,
             Some(skip_reason::UNREADABLE.to_string()),
+            false,
+            0,
         ),
     }
 }
@@ -2412,7 +2442,8 @@ mod tests {
         let store = BlobStore::new(tmp.path().join("objects"));
 
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "race: link vanished");
-        let (after, snapshotted, withheld, skip_cause) = symlink_change(&store, Err(err));
+        let (after, snapshotted, withheld, skip_cause, deduped, reread_bytes) =
+            symlink_change(&store, Err(err));
 
         assert_eq!(
             after, None,
@@ -2421,6 +2452,8 @@ mod tests {
         assert!(!snapshotted);
         assert!(!withheld);
         assert_eq!(skip_cause.as_deref(), Some(skip_reason::UNREADABLE));
+        assert!(!deduped, "a failed read_link never reaches the put path");
+        assert_eq!(reread_bytes, 0);
     }
 
     // SR2 (io_failed producer): the write itself fails, but the bytes WERE
@@ -2655,6 +2688,56 @@ mod tests {
         assert_eq!(recorder.dedup_reread_bytes, content.len() as u64);
     }
 
+    // Perf-evidence review, finding 1 (blocking): the symlink snapshot put
+    // inside `stage` (`symlink_change` → `store.put`) discarded
+    // `PutResult::Stored`'s `deduped`/`reread_bytes` entirely, so a dedup
+    // hit on an unchanged symlink paid the same verification re-read as
+    // every other dedup hit but incremented neither counter — silently
+    // uncounted despite the doc comment's "stage's put_result calls only"
+    // scope claim (the symlink put IS inside `stage`; nothing ever
+    // deliberately excluded it). Neuter: revert `symlink_change`'s `Ok`
+    // arm to `store.put(...)` (dropping the `put_result`/`deduped`/
+    // `reread_bytes` plumbing) → RED.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dedup_hit_counted_in_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let target = root.join("target-file.txt");
+        std::fs::write(&target, b"target contents").unwrap();
+        let link = root.join("a-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let target_str_len = target.to_string_lossy().len() as u64;
+
+        let mut paths = HashSet::new();
+        paths.insert(link.clone());
+
+        // First stage: fresh put of the link-target string, not a dedup hit.
+        recorder.stage(&paths);
+        assert_eq!(
+            recorder.dedup_hits, 0,
+            "a fresh symlink put is never a dedup hit"
+        );
+        assert_eq!(recorder.dedup_reread_bytes, 0);
+
+        // Second stage of the SAME symlink (unchanged target string): the
+        // target-string hash is unchanged, so `put_result` hits the dedup
+        // path and re-reads the existing object to verify it — exactly
+        // like the regular-file case, and it must be counted the same way.
+        recorder.stage(&paths);
+        assert_eq!(
+            recorder.dedup_hits, 1,
+            "an unchanged symlink re-staged must count as a dedup hit"
+        );
+        assert_eq!(
+            recorder.dedup_reread_bytes, target_str_len,
+            "must count the length of the re-read target-string object"
+        );
+    }
+
     // AC3.4: `stage` alone must never touch `state.json` — only
     // `drain_recorder_stats` does, and at most once per flush. Neuter: move
     // the counter persistence into `stage`'s per-file loop (e.g. call
@@ -2716,6 +2799,52 @@ mod tests {
         assert_eq!(
             mtime_before, mtime_after,
             "a drain with no new stats and no new io_failures/non_utf8_skips must not rewrite state.json"
+        );
+    }
+
+    // Perf-evidence review, finding 2 (non-blocking): `dedup_hits`/
+    // `dedup_reread_bytes` are epoch-scoped MIRRORS of the current daemon
+    // run, not lifetime totals — `drain_recorder_stats` ASSIGNS
+    // (`state.dedup_hits = recorder.dedup_hits`) rather than accumulating
+    // onto whatever a prior epoch already persisted. Pin that explicitly:
+    // a fresh `Recorder` (a new epoch) whose drain OVERWRITES a
+    // pre-existing, larger `state.json` figure rather than adding to it.
+    // If a future change makes this accumulate instead, this test must go
+    // red and force a conscious decision, not a silent drift.
+    #[test]
+    fn dedup_counters_are_epoch_scoped_mirrors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // Simulate a PRIOR epoch's persisted figures — larger than
+        // anything this fresh Recorder will ever produce, so an
+        // accumulate-instead-of-mirror regression would be unmissable.
+        let mut prior_state = read_state(root);
+        prior_state.dedup_hits = 1_000;
+        prior_state.dedup_reread_bytes = 50_000;
+        write_state(root, &prior_state).expect("seed prior-epoch state.json");
+
+        // A brand-new Recorder — a fresh epoch — with exactly one dedup hit.
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+        let path = root.join("a.rs");
+        std::fs::write(&path, b"epoch content").unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(path);
+        recorder.stage(&paths); // fresh write
+        recorder.stage(&paths); // dedup hit: in-memory dedup_hits becomes 1
+
+        drain_recorder_stats(root, &mut recorder);
+        let persisted = read_state(root);
+        assert_eq!(
+            persisted.dedup_hits, 1,
+            "drain must mirror THIS epoch's own count, overwriting the prior epoch's figure — never accumulate onto it"
+        );
+        assert_eq!(
+            persisted.dedup_reread_bytes,
+            "epoch content".len() as u64,
+            "the byte counter mirrors the same way"
         );
     }
 

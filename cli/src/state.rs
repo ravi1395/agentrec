@@ -142,10 +142,16 @@ pub struct State {
     #[serde(default)]
     pub watcher_armed_nonce: String,
     /// Count of clean dedup-hit verification reads on the daemon's
-    /// snapshot path (perf-evidence round, `Recorder::stage` only —
-    /// `persist`'s prompt/symlink `put_result` calls are deliberately
-    /// uncounted). Mirrors `Recorder::dedup_hits` at each
-    /// `drain_recorder_stats`; a pre-instrumentation `state.json` has no
+    /// snapshot path (perf-evidence round): every `put_result` call inside
+    /// `Recorder::stage`, including the symlink-target put — `persist`'s
+    /// and `recover_orphan`'s prompt `put_result` calls are the only
+    /// deliberately-uncounted ones. **Epoch-scoped, not a lifetime total:**
+    /// this field MIRRORS `Recorder::dedup_hits` at each
+    /// `drain_recorder_stats` call (an overwrite, not an accumulation), so
+    /// after a daemon restart the previous epoch's figure stays here,
+    /// unchanged, until the new epoch's first dedup hit overwrites it —
+    /// there is no epoch-nonce gate on this pair the way there is on the
+    /// ignore-reload counters. A pre-instrumentation `state.json` has no
     /// such key and renders 0, same `#[serde(default)]` posture as every
     /// other counter here.
     #[serde(default)]
