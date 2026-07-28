@@ -227,7 +227,10 @@ Each is real Phase 2.0 scope, excluded from this plan for a stated reason:
 | npm/mise distribution wrappers (Z2) | §Phase 2.0 | Release-infra; spec says "may land any time inside Phase 2.0". |
 
 Phases **2.1 (Codex L2) / 2.2 (MCP read) / 2.3 (MCP destructive) / 2.4 (setup+packaging)**
-are out of scope until the 2.0 gate is retired by P1 and the seams exist.
+are out of scope until the 2.0 gate is retired by P1 and the seams exist. *(2.2 is
+unconditional Phase 2 scope per spec decision 10, but still lands after this plan — it
+consumes P4's `Page<T>` types and P5's serializer. 2.3 additionally needs spec decision 6's
+evidence gate to open.)*
 
 ## Edge cases considered
 
@@ -255,3 +258,44 @@ honesty model, whose rule is "never fabricate"; it raises honest reconstructible
 1. **Scope split confirmation.** Is "this plan = gate-critical chain, wave 2 = separate plan after P1's gate" the right cut, or should wave 2's independent items (`import aider`, trailers + shim, npm/mise) run in parallel worktrees *now* since they have no code dependency on the gate?
 2. **`docs/superpowers/plans/2026-07-12-agentrec-memory.md` shows 12 unchecked tasks**, but CLAUDE.md records memory v1 as merged to `main` (PR #2, `7a83628`) with the dogfood clock started 2026-07-18. Are those checkboxes stale bookkeeping (close the plan), or genuinely open work that belongs in Phase 2 scope?
 3. **Store reclaim decision, adjacent to P1's corpus work.** The retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498` (15 MiB) need only an `rm`, and 767.7 MiB of referenced `.remember`/`.code-review-graph` churn has no precise tool (only date-scoped `purge --snapshots-before`, which hard-deletes). Does this plan carry a phase for it, or is it a separate founder-called cleanup?
+
+## Final acceptance — plan exit (added 2026-07-28, founder-directed; the "done" bar for the whole plan)
+
+Per-phase ACs above gate each commit; **this section is the bar for calling the plan itself
+complete.** Verified by the orchestrator independently of every implementer, then a binding
+skeptical-reviewer round in an isolated worktree. No item may be weakened to pass (ratchet).
+
+- [ ] **The Phase 2.0 hard gate is retired with evidence:** `agentrec import claude --dry-run`
+      over the real corpus (denominator re-measured at run time — rolling ≤30-day window)
+      reports ≥90% of top-level sessions importable, **and** the fidelity figures (per-tier
+      T1/T1.5/T2-candidate/T3 %, per-session opaque-call share) are recorded in a
+      VERIFY-LEDGER row (spec decision 8). A parse-only pass without the fidelity row does
+      **not** retire the gate.
+- [ ] **Byte-equivalence holds at exit, not just at P4:** every P3 golden is byte-identical at
+      the plan's final commit (stdout, stderr, exit code).
+- [ ] **Suite green at the re-based ladder** (absolute counts in this plan are stale — see the
+      warning in the header): `cargo test --workspace -- --test-threads=3` → 0 failed on the
+      cut-point branch; clippy `-D warnings` + fmt clean on debug **and** release; release
+      `strings` carries no test seam.
+- [ ] **The pure-read split is proven both ways:** `status --json` / `health()` perform zero
+      writes on an over-budget store while bare `status` in the same fixture still evicts
+      (paired assertion, P4/P5 ACs).
+- [ ] **Import honesty is enforced at the undo boundary:** `undo` on a provenance-only
+      imported turn refuses before any working-tree write, with a message textually distinct
+      from `withheld` / `skipped` / modified-since (P2 AC).
+- [ ] **`--dry-run` wrote zero bytes under `.agentrec/`** — P1's recursive dir-digest AC
+      re-verified at plan exit against the real corpus run, not only the fixture run (the
+      import path's sole destructive-safety check; the one most likely to be satisfied
+      loosely).
+- [ ] **Gap logic was unified, not relocated:** the three former implementations
+      (`has_recording_gap` / `has_gap_after` / `count_gaps`) resolve through ONE `view.rs`
+      primitive — `rg` finds zero copies in `cli/src` (P4 AC), asserted at plan exit because
+      byte-identical goldens pass either way and the spec names relocation as the
+      extraction's failure mode.
+- [ ] **Scope honesty:** no protocol-freeze artifacts (decision 8 / spec D5 — changelog only),
+      no Sutra-repo touches (decision 12 / spec D9), no MCP code in this plan (2.2 is
+      unconditional Phase 2 scope per spec D10 but sequenced **after** P4/P5 as its own
+      round), no founder decision re-litigated.
+- [ ] **Closing bookkeeping (house rule):** CLAUDE.md Status entry + VERIFY-LEDGER updated in
+      the closing commit; open questions 1–3 above either answered or explicitly carried
+      forward — never silently dropped.
