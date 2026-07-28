@@ -8,6 +8,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Phase-2 spec hardening — SPEC-GATE PASS after 3 rounds (2026-07-28, `main`, docs-only, zero
+code changed):** An adversarial value analysis of the shipped product (same skeptic agent
+throughout, measuring the live store rather than arguing theory) found **agent-facing benefit
+today is ~zero** — no MCP surface exists, the memory injection surface delivered 389 injections
+of 3 facts (2 now stale), the store is 9% real-source signal (800 of 8825 file entries), and the
+flagship `undo` verb has **0 confirmed production uses in 17 days** — and a follow-up Phase 2
+threat analysis found every dependency-creating deliverable (MCP read/destructive) speculative
+while import is structurally capped by source retention. **Four founder decisions (5–8) were
+taken and written into `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md`:**
+(5) Protocol 1.0 freeze moves behind Phase 2.1 — a format freezes only after a second emitter
+validates its shape; 2.0 only starts `FORMAT-CHANGELOG.md`. (6) MCP destructive is
+evidence-gated: ≥20 human-confirmed `undo --confirm` in real use (today: 0; counter =
+`log.jsonl` undo turns, window pre-2.3 by construction, `cli|mcp` origin discriminator owed in
+2.3's first commit, indefinite deferral an accepted outcome) AND `allow_modified` is never
+honored in auto mode — the modified-since rail is human-approval-only, closing the
+agent-grants-itself-the-override hole. (7) MCP read is gated on a CLI demand probe: CLAUDE.md
+recipe + **transcript-sweep audit** (deliberately NOT an in-product counter — that would add an
+unsynchronized `state.json` writer and contradict the pinned zero-write `status --json`
+behavior), ≥10 audited unprompted invocations across ≥3 non-agentrec-repo sessions; treatment
+site named (`~/Projects/sutra` at minimum — which **has no `.agentrec/` today**, so `agentrec
+init` there is a recorded prerequisite before the probe window can open). (8) The import gate
+gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility, opaque-call share 2.49:1
+baseline); threshold deliberately unset until the first real measurement. **Corpus decay
+measured firsthand and specced:** Claude Code's `cleanupPeriodDays` (default 30) makes the
+import corpus a rolling ≤30-day window — 1600 top-level transcripts on this machine, oldest
+exactly 30.0 days (613 sidechain files counted separately) — so import is re-pitched
+"≤30-day backfill", the "cold-start killer" ROADMAP line owes a rewrite (companion row, rides
+P1), and the "scheduled re-import = durable archive" claim is **embargoed** until a re-import
+mechanism actually ships (a value claim with no mechanism is the overclaim class this round
+existed to kill — the skeptic caught the fix itself reintroducing it, B3). Spec ladder amended
+3→4 tiers (T1 42.5 / T1.5 25.3 [518 of 2044; the 508/508 figure is a resolve-rate check with
+its own denominator] / T2-candidate 24.5 / T3 7.7; honest figure 67.9% measured on unrounded
+counts, rounded shares sum 67.8; 92.3% stays banned). Plan
+(`docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`) gained decisions 8–11, the
+fidelity + rolling-denominator ACs on P1, and a **stale-ladder warning** (its 349-baseline
+counts predate later rounds; `main` baseline 428/0/1 re-verified at `834f477`, the 443/0/1
+figure belongs to the unmerged `fix/perf-evidence-round` branch — per-phase deltas are the
+plan's real content, re-base at chunking time). **Gate history worth keeping: round 1 FAIL
+(7 blocking — B1 the probe was vacuous as written [recipe-induced calls are by definition
+prompted, dogfood sessions self-satisfy], B2 the probe counter contradicted the read-only
+guarantee and had no writer, B3 durable-archive was a pitch with no mechanism, B4–B6 surviving
+text still instructed executors to build gated work, B7 the undo gate named no counter/scope),
+round 2 FAIL (F1 the probe's treatment site was unspecified and clause (a) disqualified the
+only natural install location — an uninstalled treatment would have killed 2.2 as "no demand";
+F2 ROADMAP's Phase 2 gate is unsatisfiable as written, extension clause stale since decision 1;
+plus the skeptic WITHDREW its own 67.9-vs-67.8 finding after computing from the raw audit —
+gates run both directions), round 3 PASS.** The recurring lesson, again: the decisions were
+sound from round 1; every FAIL was in the **enforcement surfaces** — downstream sentences,
+delivery vehicles, measurable definitions. Nothing implemented; next step unchanged
+(`/chunker` on the perf-evidence plan, or Phase 2.0 P1 once the founder sequences it).
+
 **Perf-evidence plan — PLAN-GATE PASS after 6 revisions (2026-07-28, `main`, docs-only, zero
 code changed):** `docs/superpowers/plans/2026-07-27-agentrec-perf-evidence-round.md` — 4 phases
 (recall `elapsed_ms` + `memories --stats` + the 10k ledger measurement; dedup-hit counters on the

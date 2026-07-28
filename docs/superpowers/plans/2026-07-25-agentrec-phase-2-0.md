@@ -1,8 +1,18 @@
 # Plan: agentrec Phase 2.0 — truth substrate, gate-critical chain (5 phases, worktree/branch: `feat/phase-2-0-substrate`)
 
-Spec: `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Phase 2.0).
+Spec: `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Phase 2.0,
+hardened 2026-07-28 — decisions 5–8 bind this plan).
 Evidence: `docs/2026-07-24-phase-2-0-entry-gate-measurement.md`.
 Conflict order: PROTOCOL.md > IMPLEMENTATION.md > spec > this plan.
+
+**STALE LADDER WARNING (2026-07-28):** every absolute test count below (349 baseline,
+361/371/392/410/424 per phase) predates later rounds — `main`'s recorded baseline is
+**428 passed / 0 failed / 1 ignored** (re-verified at `834f477` per CLAUDE.md), and
+the unmerged `fix/perf-evidence-round` branch measured **443/0/1**. The per-phase
+*deltas* (+12, +10, +21, +18, +14) are the plan's real content; re-base the ladder
+against a fresh `cargo test --workspace -- --test-threads=3` run on the actual
+cut-point branch at chunking time. This repo's rebuild-gate round shipped a wrong
+ladder twice; do not repeat it by trusting these absolutes.
 
 **Goal:** retire the Phase 2.0 hard stop (import honesty) and land the read seam +
 machine-readable contracts every Phase 2 consumer depends on. Architecture: one
@@ -23,6 +33,10 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 5. Import never fabricates a revertible snapshot. Unreconstructable `before` → `before: null`, provenance-only, refused by undo with an explicit imported-history reason.
 6. Bare turns stay unattributed windows in every renderer.
 7. `baseline_unknown` is NOT reused for import-missing-`before` — it keeps its live first-observation meaning (spec line 229).
+8. **(2026-07-28)** Protocol 1.0 freeze moves behind Phase 2.1 (Codex) — spec decision 5. `FORMAT-CHANGELOG.md` still starts in 2.0; fixtures ship with the freeze.
+9. **(2026-07-28)** MCP destructive (2.3) is evidence-gated: ≥20 human-confirmed `undo --confirm` in real use (audited from `log.jsonl` undo turns, all real repos; window is pre-2.3 by construction; indefinite deferral is an accepted outcome) before any 2.3 code; `allow_modified` is never honored in auto mode — spec decision 6.
+10. **(2026-07-28)** MCP read (2.2) is gated on the CLI demand probe: ≥10 **audited** unprompted agent invocations across ≥3 non-agentrec-repo sessions, measured by transcript sweep (never an in-product counter — read verbs stay zero-write) — spec decision 7.
+11. **(2026-07-28)** The import gate gains a fidelity report + VERIFY-LEDGER row (per-tier revertibility %, opaque-call share); no hard threshold until the first real measurement — spec decision 8.
 
 ## Infeasible / rejected (killed against real code or measured evidence)
 
@@ -73,7 +87,8 @@ spec's table: "historical imports cannot reconstruct safe before/after state".
 - `agentrec import claude --dry-run [--source <dir>] [--json]` prints per-tier counts, per-file skip counts, session totals, peak RSS.
 
 **Acceptance criteria:**
-- [ ] `agentrec import claude --dry-run` over the real `~/.claude/projects` corpus reports **≥90% of top-level sessions importable** (measurement baseline: 1266/1277); the printed denominator is top-level sessions, not all `.jsonl` files.
+- [ ] `agentrec import claude --dry-run` over the real `~/.claude/projects` corpus reports **≥90% of top-level sessions importable**; the printed denominator is top-level sessions, not all `.jsonl` files, and is **re-measured at run time** — the corpus is a rolling ≤30-day window (`cleanupPeriodDays` default 30; oldest transcript measured exactly 30.0 days on 2026-07-28), so the 2026-07-18 baseline (1266/1277) is a shape reference, never an assertable count.
+- [ ] The dry-run report includes the **fidelity figures** (spec decision 8): % of extracted entries at T1, T1.5, T2-candidate, T3, and per-session opaque-call share; the figures land in a VERIFY-LEDGER row. No fidelity threshold is asserted — the founder sets one from this first measurement.
 - [ ] The command creates or modifies **zero** bytes under `.agentrec/` — asserted by a recursive dir digest taken before and after the run.
 - [ ] Every extracted file entry carries exactly one tier tag `T1|T1.5|T2|T3`. Fixture entries resolved at T1 and at T1.5 have `sha256(resolved before bytes)` byte-equal to the known-good pre-edit content; T2 entries are reported as **candidates** (path git-tracked in the session's repo), never as resolved bytes. No tier ever yields bytes it did not read from a source.
 - [ ] A `subagents/agent-*.jsonl` file and an inline `isSidechain: true` line are both excluded, counted under `skipped_sidechain`, and produce zero top-level turns.
@@ -204,7 +219,7 @@ Each is real Phase 2.0 scope, excluded from this plan for a stated reason:
 | Item | Spec ref | Why not here |
 |---|---|---|
 | `UndoCoordinator` extraction (`preview`/`execute` **only** — no pending ledger, no `undo.lock` reservations, no confirm tokens) | §Deep module 2 | Its full contract exists to serve MCP destructive (2.3). Bound it explicitly or a fresh-context executor builds the whole 2.3 ledger early. |
-| Protocol 1.0 freeze + conformance fixtures + `FORMAT-CHANGELOG.md` | §Phase 2.0 (N) | Must fold in *this plan's* additive fields (`imported`, `files_complete`, `emitter_turn`); freezing before P2 lands would freeze a stale schema. |
+| `FORMAT-CHANGELOG.md` start (freeze itself REMOVED from 2.0 — decision 8 above / spec decision 5, 2026-07-28) | §Phase 2.0 (N) | The freeze + conformance fixtures now land **after Phase 2.1's Codex exit** — a format is frozen only once a second emitter validates its shape. 2.0 only starts the changelog and documents this plan's additive fields (`imported`, `files_complete`, `emitter_turn`) as unfrozen. |
 | `import aider` | §Phase 2.0 (L) | Fully reconstructible by construction (git parents) — carries no gate risk; sequence after the Claude importer proves the shared append path. |
 | Git trailers + `git-agentrec` shim | §Phase 2.0 (M) | Zero code dependency on the seams. The only sanctioned PR↔turn substrate (decision 2). |
 | npm/mise distribution wrappers (Z2) | §Phase 2.0 | Release-infra; spec says "may land any time inside Phase 2.0". |
@@ -223,6 +238,8 @@ are out of scope until the 2.0 gate is retired by P1 and the seams exist.
 ## Recommendation taken (not a blocking question — P1 assumes it; say so to reverse)
 
 **T1.5 (`~/.claude/file-history/`) is IN, and the spec's 3-tier ladder is amended to four.**
+*(Update 2026-07-28: the spec amendment landed in the hardening round — the spec now carries
+the four-tier ladder with measured shares; P1's commit no longer owes it.)*
 The corpus audit found this undocumented source covering 25.3% of entries at a 100% on-disk
 resolve rate (508/508 referenced backups), holding verbatim pre-edit bytes. It is
 retention-limited (~30 days, 102 of 1277 sessions), so it is treated as **opportunistic** —
