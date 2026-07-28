@@ -120,17 +120,49 @@ measurement, record the figure under Decision 3.
   over bucket (i) + per-outcome counts. Empty/absent → `no hook invocations recorded`,
   exit 0. Percentiles: nearest-rank, sorted sample.
 **Acceptance criteria:**
-- [ ] AC1.1: forced-bail seam active → appended line carries `elapsed_ms` whichever bail
-      site wins. Neuter: remove from **both** :792 and :802 → red deterministically.
-      Separate assertion covers the success path (:847).
-- [ ] AC1.2: fixture with elapsed values 1..=100 + one pre-upgrade line + one torn line →
-      exactly p50=50, p99=99, `1 pre-upgrade lines (no elapsed_ms)`, `1 unparseable lines
-      skipped`. Neuter: merge either bucket into another → red.
-- [ ] AC1.3 (ledger, not CI): release build, 10k-record `memory.jsonl` (schema per
-      `seed_capped_stale_heavy_corpus`, integration.rs:6196; seeding commands verbatim in
-      the ledger row), ≥100 real `agentrec hook` subprocess runs on this machine; p50/p99 +
-      injected-vs-budget_exceeded split recorded in VERIFY-LEDGER.md:16. Row transitions per
-      Decision 3.
+- [x] AC1.1 **MET** (`c784714`): forced-bail seam active → appended line carries `elapsed_ms`
+      whichever bail site wins. Neuter: remove from **both** :792 and :802 → red
+      deterministically. Separate assertion covers the success path (:847).
+      *Independently re-derived by the phase reviewer: neuter RED 3/3 for the right reason
+      (assertion message, not a compile error), source restored byte-identically to
+      `d1f3f30a…`. The success-path assert is load-bearing — neutering site 6 alone reds it
+      by name.*
+      **PLAN CORRECTION (measured, 2026-07-28):** this AC's stated rationale — that the two
+      bail sites "race under the forced-bail seam (either arm wins)" — is **FALSE**. The
+      reviewer instrumented both arms with a discriminator and measured **60/60 in favour of
+      the `recv_timeout` Err arm** (30 clean + 30 under 6-way CPU load); site 3 never fired.
+      Cause: std's `recv_timeout` does an optimistic `try_recv` before `recv_deadline(now+0)`,
+      and the freshly-spawned worker has not sent yet. The AC still holds as written (its
+      neuter removes the field from **both** sites, so it cannot pass on one arm alone), but
+      the consequence is a real residual: **sites 3, 4 and 5 carry `elapsed_ms` with no test
+      asserting it**, and site 3 is precisely the one whose value passes through the
+      `u128 as u64` cast. Not closed this round — the ratchet forbids the reviewer widening
+      an AC, and widening it now would be tightening after the fact. Recorded as a residual.
+- [x] AC1.2 **MET** (`c784714`): fixture with elapsed values 1..=100 + one pre-upgrade line +
+      one torn line → exactly p50=50, p99=99, `1 pre-upgrade lines (no elapsed_ms)`,
+      `1 unparseable lines skipped`. Neuter: merge either bucket into another → red.
+      *Reviewer re-derived the neuter in **both** directions (pre-upgrade→torn and
+      torn→pre-upgrade), each RED for the right reason, restored to `0bdc2c87…`. Percentiles
+      confirmed exactly nearest-rank on the real binary (p50=50 p90=90 p99=99 max=100 — no
+      interpolation, no off-by-one). The load-bearing isolation constraint was verified
+      empirically, not just read: a corrupt `memory.jsonl` alongside a healthy
+      `memory-stats.jsonl` still reports, while plain `memories` on the same store returns
+      nothing.*
+      *Note: the **count** asserts carry the neuter; the percentile asserts do not
+      discriminate a pre-upgrade→measurable merge (n=101 over [0,1..100] still yields p50=50,
+      p99=99) — they exist to pin the exact-value demand, which is what the AC asked for.*
+- [x] AC1.3 **MET → ledger row CLOSED** (2026-07-28, release build at `051a9a4`): 10k-record
+      `memory.jsonl` (schema per `seed_capped_stale_heavy_corpus`, integration.rs:6196),
+      **360** real `agentrec hook` subprocess runs in a throwaway root, 0 nonzero exits.
+      Three legs of 120: (A) stale-heavy/capped **p99=16 ms**, (B) fresh-first/injecting
+      **p99=13 ms** with 120/120 injected, (C) leg B under 8-way CPU load **p99=22 ms**.
+      **Zero `budget_exceeded` across all 360 runs** — the envelope holds on the merits, not
+      via the fail-open suppression the criterion would also have accepted. Row transitions
+      to CLOSED per Decision 3 (criterion is p99 < 50 ms; worst leg is 22 ms, ~2.3× margin).
+      Leg C was added beyond the AC because an unloaded sequential run is the "reasoned safe,
+      unobserved" class this repo has repeatedly been burned by; it carries a positive control
+      (the load shifted p50 10→16, p99 13→22, so it was not a no-op). Full figure, honest
+      bounds, and verbatim reproduction commands in VERIFY-LEDGER.md.
 **Expected test outputs:** **430 / 0 / 1** (+2:
 `hook_stats_lines_carry_elapsed_ms_on_either_bail_site`,
 `memories_stats_three_bucket_summary`).
