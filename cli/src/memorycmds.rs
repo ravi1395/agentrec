@@ -704,9 +704,14 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
 ///   measurable count: injected / budget_exceeded / failure / `capped_empty`
 ///   (a capped walk that surfaced zero fresh hits — the one case with no
 ///   other outcome to bucket under).
-/// - **parseable-pre-upgrade** — parses as a JSON object but has no
-///   `elapsed_ms` (a line written before this phase). Counted, never
-///   silently dropped or folded into "torn".
+/// - **parseable-pre-upgrade** — parses as a JSON object but yields no
+///   *u64* `elapsed_ms` (a line written before this phase). Precisely: the
+///   key is absent, OR present with a non-u64 type, since both fail
+///   `as_u64()` identically. No producer emits the wrong-typed shape today
+///   — every append site writes `elapsed_ms` as a u64 — so in practice this
+///   bucket is exactly the pre-phase lines; the wider wording is here so a
+///   future reader is not surprised by a hand-edited or foreign line landing
+///   here rather than in "torn". Counted, never silently dropped.
 /// - **torn** — fails to parse as a JSON object at all. Counted, never
 ///   silently dropped or folded into "pre-upgrade" — conflating the two
 ///   would hide real corruption behind an honest-looking version skew.

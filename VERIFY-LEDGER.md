@@ -63,9 +63,66 @@ done
 for c in $(seq 1 8); do (while :; do :; done) & done
 ```
 
-Both seeders are ~40 lines of stdlib Python emitting the JSON schema above; pin hashes are
-`"sha256:" + sha256(file_bytes).hexdigest()`, matching `memory::hash_pin` →
-`store::hash_bytes`. Reproduce them from that one line rather than trusting a copy.
+The seeder, verbatim (one script; `--fresh-first` selects leg B's ordering). Pin hashes are
+`"sha256:" + sha256(file_bytes).hexdigest()`, matching `memory::hash_pin` → `store::hash_bytes`.
+
+```python
+#!/usr/bin/env python3
+import hashlib, json, os, sys
+root = sys.argv[1]
+fresh_first = "--fresh-first" in sys.argv
+CAP, ORPH, FRESH, TOTAL = 128, 128 + 12, 60, 10_000
+FILLER = TOTAL - ORPH - FRESH
+FACT = "kraken telemetry batching"
+
+def rec(i, kind, fact, path, h, ts):
+    return json.dumps({"v": 1, "type": "memory", "id": f"{kind}{i}", "op": "assert",
+                       "fact": fact, "pins": [{"path": path, "hash": h}],
+                       "source_turns": [], "origin": "agent", "ts": ts})
+
+def fresh_block(base):                      # real files, real hashes
+    out = []
+    for i in range(FRESH):
+        rel, body = f"fresh{i}.rs", b"fn fresh() {}\n"
+        open(os.path.join(root, rel), "wb").write(body)
+        out.append(rec(i, "fresh", FACT, rel,
+                       "sha256:" + hashlib.sha256(body).hexdigest(), base + i))
+    return out
+
+def orph_block(base):                       # pins point at paths that do not exist
+    return [rec(i, "orph", FACT, f"missing{i}.rs", "sha256:" + f"{i:064}", base + i)
+            for i in range(ORPH)]
+
+lines = (fresh_block(1000) + orph_block(2000)) if fresh_first \
+        else (orph_block(1000) + fresh_block(2000))
+
+fb = b"fn filler() {}\n"                    # padding so idf does not collapse
+open(os.path.join(root, "filler.rs"), "wb").write(fb)
+fh = "sha256:" + hashlib.sha256(fb).hexdigest()
+lines += [rec(i, "filler", f"unrelated subsystem note {i} about parsing and layout",
+              "filler.rs", fh, 3000 + i) for i in range(FILLER)]
+
+open(os.path.join(root, ".agentrec", "memory.jsonl"), "w").write("\n".join(lines) + "\n")
+print(f"seeded {len(lines)} (fresh_first={fresh_first}) orph={ORPH} fresh={FRESH} filler={FILLER}")
+```
+
+### P2b ride-along — eviction-pass cost on the live dogfood store (2026-07-28)
+
+Required by the plan's Phase 2b: the 10 ms/2006-turn read-verb figure in the rejected list was
+measured for a different purpose and is not evidence about a store where eviction actually fires.
+Measured here on the **real production store** (`~/Projects/agentrec`, **2064 turns**, **76 MB**
+objects, 256 fanout dirs) using the release binary at this round's HEAD. `status`'s text path is
+exactly `load_log → extra_protected_refs → plan_eviction` after P2b — the same sequence the daemon
+tick runs — so timing the whole `status` process is a strict **upper bound** on the tick's cost
+(it additionally pays process spawn, the orphan scan, and rendering).
+
+**30 runs, all exit 0: p50 = 12.9 ms, p90 = 13.1 ms, max = 14.2 ms.** Object count unchanged at
+256 across all 40 invocations taken that session — the zero-write property (AC2b.1) confirmed on
+the real store, not only on a fixture. At ~14 ms worst case against a 10-minute `EVICT_INTERVAL`,
+the pass occupies ~2×10⁻⁵ of the daemon's single-threaded loop; it is not a turn-closure risk at
+this store size. **Bound:** one store, one machine, macOS/APFS; the walk is over `log.jsonl` turns
+plus the object tree, so this figure grows with both and should be re-measured before assuming it
+stays negligible on a materially larger store.
 
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 

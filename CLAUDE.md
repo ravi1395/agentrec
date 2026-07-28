@@ -14,8 +14,30 @@ cut from `main` @ `1ece033`, `c784714..aa9fec4`, 19 commits, not pushed, no PR).
 carries no `AGENTREC_TEST`. Sonnet implementer per phase, a fresh-context **Opus review pass
 per phase**, and the orchestrator re-ran the full suite after every phase independent of every
 implementer — **every count agreed twice**. Merge order P1 → P3 → P2a → P2b as the plan
-required (P2b depends on P2a's API). **Final binding fable skeptic gate: see the line at the
-end of this entry — nothing here is a "done" claim until that verdict is recorded.**
+required (P2b depends on P2a's API). **Binding fable skeptical-reviewer done-gate: GATE PASS
+on the first pass, 0 blocking findings, all 14 ACs MET** — and it did not take the round's
+word for anything load-bearing: it re-derived the neuters itself, independently **replicated
+the AC1.3 headline measurement** (its own 40-run leg on a fresh 10k store measured p99=12 ms
+against leg B's 13 ms), and reproduced firsthand the one claim the round most depended on —
+that under a neuter deleting *only* the periodic tick, the new tick test fails while the
+pre-existing `daemon_eviction_keeps_protected_refs` still passes. Its ruling on AC2b.2 is
+worth preserving verbatim in substance: **`98bd074` alone did NOT satisfy AC2b.2** under the
+strict reading of the AC's own neuter; the criterion is MET only *with* the `009ecd0`
+addition. Both plan-reserved legs settled affirmatively: the call site is one unbroken
+sequence (`daemon.rs:92-112`, with the tick invocation at `:275-278` sitting **before**
+`drain_watch_events` in the single-threaded loop), and the timing leg ran **10/10 and 10/10**
+solo. Two NON-BLOCKING findings, **both closed at `9d0a1af` rather than recorded**: the
+plan-mandated P2b ledger ride-along had been silently dropped (now measured — see below), and
+AC1.3's "verbatim reproduction" block named seeder scripts that existed nowhere (the seeder is
+now embedded in the ledger row itself).
+**The dropped-then-closed ride-along, because it is real evidence:** eviction-pass cost on the
+**live production store** (2064 turns, 76 MB objects) — `status`'s text path is exactly the
+sequence the daemon tick runs, so timing the whole process is a strict upper bound. **30 runs,
+all exit 0: p50 = 12.9 ms, p90 = 13.1 ms, max = 14.2 ms**, object count unchanged at 256
+across all 40 invocations — AC2b.1's zero-write property confirmed on the *real* store, not
+only a fixture. Against a 10-minute `EVICT_INTERVAL` that is ~2×10⁻⁵ of the daemon loop; not
+a turn-closure risk at this store size, and the figure grows with both turn count and object
+count, so re-measure before assuming it stays negligible.
 **The +15 test delta is the story: 9 came from the plan's own ACs, 6 from defects that review
 found and no acceptance criterion would have caught.**
 **(P1) `c784714`** persists `elapsed_ms` on **all six** hook-recall outcome sites (the early-bail

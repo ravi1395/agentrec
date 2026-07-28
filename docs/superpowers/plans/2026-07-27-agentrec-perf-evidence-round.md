@@ -1,4 +1,4 @@
-# Plan: Perf-evidence round — measure the three evidenced hot-path gaps (4 phases, branch/worktree: `fix/perf-evidence-round`, cut from `main` @ `834f477`)
+# Plan: Perf-evidence round — measure the three evidenced hot-path gaps (4 phases, branch/worktree: `fix/perf-evidence-round`, cut from `main` @ `1ece033`)
 
 **Revision 6 — plan-level skeptic gate: PASS (2026-07-28).** Gate history: v1 FAIL (B1–B7:
 wrong enum-change shape, unnamed test landmines, unobservable counters, ambiguous neuters,
@@ -199,19 +199,19 @@ map lines + extend `status_json_carries_degraded_fields` at cmds.rs:1602).
 - `state.rs`: two fields, per-field parse, default 0; pre-instrumentation `state.json`
   renders 0, never resets siblings.
 **Acceptance criteria:**
-- [ ] AC3.1 (unit, daemon.rs tests module, driving `Recorder::stage` directly — no live
+- [x] AC3.1 (unit, daemon.rs tests module, driving `Recorder::stage` directly — no live
       daemon, no hook, so persist-path callers cannot inflate): same content staged twice →
       `dedup_hits == 1`, `dedup_reread_bytes == <len>`; content change → no increment;
       over-cap file → no increment. Neuter: hardcode `deduped: false` at store.rs:94 → red.
-- [ ] AC3.2: `status --json` exposes both counters (extension inside
+- [x] AC3.2: `status --json` exposes both counters (extension inside
       `status_json_carries_degraded_fields`); missing-field `state.json` renders 0 for both,
       siblings preserved (extend the existing forward-compat test; cite the extension in
       the claim).
-- [ ] AC3.3: heal (store.rs:591) and mtime-bump (store.rs:609) assert the same *behavior*;
+- [x] AC3.3: heal (store.rs:591) and mtime-bump (store.rs:609) assert the same *behavior*;
       the heal test's `assert_eq!` names the Decision 6 concrete values
       (`deduped: false, reread_bytes: 0`) — an executor inventing different values is a
       plan violation, not a judgment call.
-- [ ] AC3.4: `Recorder::stage` alone never touches `state.json` (assert the file is absent/
+- [x] AC3.4: `Recorder::stage` alone never touches `state.json` (assert the file is absent/
       byte-identical after staging a batch containing dedup hits); it changes only after
       `drain_recorder_stats` runs. Neuter: move the counter persistence into `stage`'s
       per-file loop → red. *(Retargeted per gate NB7 — v3 probed the drain fn itself, which
@@ -256,13 +256,13 @@ retention.rs's own tests module alongside the existing ones (retention.rs:247+).
   Existing retention tests (retention.rs:247-520) pass **unmodified** — this is the
   refactor's whole discriminator.
 **Acceptance criteria:**
-- [ ] AC2a.1: every existing retention test passes with zero edits — pure regression
+- [x] AC2a.1: every existing retention test passes with zero edits — pure regression
       criterion. *(B12 correction: `enforce_budget_skips_a_candidate_touched_after_pass_
       start` (retention.rs:444-480) pins the guard **pair** via the delete outcome only —
       under the both-halves design, execute's re-check masks a deleted plan-side guard from
       every deletion-observable assertion, so this test canNOT red a plan-only neuter. The
       plan-side guard's own discriminator lives in AC2a.2.)*
-- [ ] AC2a.2 (new unit — carries the plan-side guard's discriminator, per B12): fixture
+- [x] AC2a.2 (new unit — carries the plan-side guard's discriminator, per B12): fixture
       where `enforce_budget` would evict V and protect P, **plus** a boundary candidate F
       whose mtime is future-dated past `pass_start` (future-dating is correct on THIS leg —
       the plan *report* is under test, not the delete-time re-check), **plus** one candidate
@@ -278,7 +278,7 @@ retention.rs's own tests module alongside the existing ones (retention.rs:247+).
       plan-side freshness guard → F appears in victims; (ii) reorder the guard ahead of
       protect-retain → `protected_bytes` shrinks; (iii) make `plan_eviction` delete →
       byte-identical assert reds.
-- [ ] AC2a.3 (new unit — the deterministic replacement for v3's vacuous AC2b.4): an old,
+- [x] AC2a.3 (new unit — the deterministic replacement for v3's vacuous AC2b.4): an old,
       boundary-evictable turn references blob X (plus a newer turn, so A5 newest-turn
       protection cannot mask the result); `plan_eviction` lists X as victim; the test then
       bumps X's mtime via a **real-now dedup-put of identical bytes** (store.rs:83-84 sets
@@ -365,19 +365,19 @@ needs (NB3)). README.md (docs).
   staleness is covered by execute's mtime re-check (AC2a.3). The honesty-round's
   "narrowed not closed" `undo`-race residual carries over unchanged.
 **Acceptance criteria (Q1 = (a)):**
-- [ ] AC2b.1: text `status` on an over-budget store leaves `.agentrec/objects/` byte-,
+- [x] AC2b.1: text `status` on an over-budget store leaves `.agentrec/objects/` byte-,
       mtime-, count-identical, while still printing the over-budget notice AND the
       protected-bytes clause. (Objects-tree scope only — the store-mutation claim, not
       "status writes nothing anywhere".) Neuter: swap `plan_eviction` back to
       `enforce_budget` in `status_report` → red.
-- [ ] AC2b.2: live daemon (seam interval ~2s, seam budget) on an over-budget store evicts
+- [x] AC2b.2: live daemon (seam interval ~2s, seam budget) on an over-budget store evicts
       within 2× interval: oldest unprotected blob gone + one stderr eviction line (captured
       via the new stderr-file spawn variant); torn-line ref and pin blob survive. Neuter:
       delete the tick call → red.
-- [ ] AC2b.3: daemon-down + over-budget → `status` prints `nothing is evicting`, deletes
+- [x] AC2b.3: daemon-down + over-budget → `status` prints `nothing is evicting`, deletes
       nothing. (Accepted residual, stated in-product: CLI-only writers — `undo` — can grow
       a store no daemon shrinks.)
-- [ ] AC2b.4: full suite green with exactly the three dispositions above; no other test
+- [x] AC2b.4: full suite green with exactly the three dispositions above; no other test
       deleted or weakened; unit-level `open.json` harvest test present. *(v3's AC2b.4 —
       "freshly-staged blob survives the tick" — is deleted as vacuous per gate B10: a
       staged blob is not in `log.jsonl` until the turn closes, so it is never a candidate
