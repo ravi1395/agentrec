@@ -9085,102 +9085,213 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
     );
 }
 
-// Phase 1 (honesty-fixes round) — call-site wiring: proves `status`
-// actually threads its harvested protect-set into `enforce_budget`, not
-// just that the core mechanism honors one when handed one directly (that's
-// already unit-tested in `cli/src/cmds.rs`'s `eviction_keeps_*` tests). A
-// real ~2 GiB store is infeasible here, so this drives the real binary with
-// the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` override (compiled out
-// of release — see `cmds::effective_store_budget`), seeding an old,
-// otherwise-evictable turn whose blob is ALSO the in-flight open turn's
-// `before` — exactly the live-daemon scenario this phase's defect
-// describes (open.json's before is typically the previous committed
-// turn's after for the same file).
+/// Like [`SingleDaemonGuard`] but redirects the daemon's stderr to a file
+/// instead of discarding it (perf-evidence round, Phase 2b): today's
+/// `spawn_record` nulls stderr (integration.rs:28-35) and no existing test
+/// asserts on daemon stderr at all — this phase's eviction pass needs to,
+/// since its only steady-state observable besides the store itself is one
+/// stderr line per pass that evicted something. `extra_env` lets a caller
+/// drive the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` /
+/// `AGENTREC_TEST_EVICT_INTERVAL_MS` seams (both compiled out of release).
+struct StderrCapturingDaemonGuard(Option<Child>);
+
+impl StderrCapturingDaemonGuard {
+    fn spawn(root: &Path, stderr_path: &Path, extra_env: &[(&str, &str)]) -> Self {
+        let stderr_file = std::fs::File::create(stderr_path).expect("create stderr capture file");
+        let mut cmd = Command::new(bin());
+        cmd.args(["record", "--root", root.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file));
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn record with captured stderr");
+        // Bounded-poll for the daemon to actually be up, same discipline as
+        // `SingleDaemonGuard::spawn`.
+        wait_for_live_daemon(root);
+        StderrCapturingDaemonGuard(Some(child))
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            sigkill(&c);
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for StderrCapturingDaemonGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn backdate_blob(objects_dir: &Path, hash: &str, secs_ago: u64) {
+    let hex = hash.strip_prefix("sha256:").unwrap();
+    let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
+    let past = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+}
+
+// Phase 2b (perf-evidence round, Decision 7 Q1=(a)) — retargets the old
+// `status_eviction_keeps_open_turn_blob` (which proved `status` threaded
+// its harvested protect-set into `enforce_budget`) at the daemon's own
+// eviction tick instead, since eviction itself moved off the `status` read
+// verb entirely. `open.json` can no longer be a protect-channel fixture
+// here — gate-proven infeasible (B9): the daemon's own `sync_journal` idle
+// arm deletes `open.json` within ~250ms of there being no open turn
+// (daemon.rs), long before any eviction seam could observe it protecting
+// anything. This test uses channels the daemon only ever APPENDS to
+// instead: an unparseable-but-newline-terminated `log.jsonl` line, and a
+// `memory.jsonl` pin. `open.json`'s own protection keeps its coverage at
+// the unit level —
+// `cmds::tests::harvest_protects_open_json_refs_at_plan_level`.
 #[test]
-fn status_eviction_keeps_open_turn_blob() {
+fn daemon_eviction_keeps_protected_refs() {
     use agentrec_core::record::FileEntry;
     use agentrec_core::store::BlobStore;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     init(root);
-    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
 
-    let old = store.put(&[0xAAu8; 500]).unwrap();
-    // Backdate well before `enforce_budget`'s internal `pass_start` so the
-    // pre-existing A3(c) freshness guard can't rescue it vacuously.
-    {
-        let hex = old.strip_prefix("sha256:").unwrap();
-        let path = root
-            .join(".agentrec/objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
-        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-    }
+    // The genuine victim: an old, UNprotected candidate the daemon must
+    // actually evict — otherwise a run that protects everything would
+    // trivially pass with zero evictions and prove nothing.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    // Protected via an unparseable-but-newline-terminated log.jsonl line.
+    let torn = store.put(&[0x22u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &torn, 3600);
+    // Protected via a memory.jsonl pin.
+    let pinned = store.put(&[0x33u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &pinned, 3600);
+    // Newest — kept by the budget itself, no protection needed.
     let new = store.put(&[0xCCu8; 5]).unwrap();
 
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }
+    }
+
+    // Oldest -> newest, matching load_log order. Each protected blob is
+    // ALSO a normal, structurally-visible eviction candidate via a valid
+    // committed turn — proving survival is due to the protect-channel, not
+    // ordinary A5/A2 protection.
     seed_turn(
         root,
         &base_turn(
-            "t_OPENWIRE0000000000000001",
-            vec![FileEntry {
-                path: "old.bin".into(),
-                before: None,
-                after: Some(old.clone()),
-                op: "create".into(),
-                skipped: false,
-                withheld: false,
-                baseline_unknown: false,
-                skipped_reason: None,
-            }],
+            "t_DAEMONEVICTVICTIM00001",
+            vec![file_entry("victim.bin", &victim)],
         ),
     );
     seed_turn(
         root,
         &base_turn(
-            "t_OPENWIRENEW000000000001",
-            vec![FileEntry {
-                path: "new.bin".into(),
-                before: None,
-                after: Some(new.clone()),
-                op: "create".into(),
-                skipped: false,
-                withheld: false,
-                baseline_unknown: false,
-                skipped_reason: None,
-            }],
+            "t_DAEMONEVICTTORN000001",
+            vec![file_entry("torn.bin", &torn)],
         ),
     );
-
-    // Simulates the daemon's crash journal: the in-flight open turn's
-    // `before` cites the same blob as the old committed turn's `after`.
-    std::fs::write(
-        root.join(".agentrec/open.json"),
-        format!(r#"{{"before":"{old}"}}"#),
-    )
-    .unwrap();
-
-    let out = Command::new(bin())
-        .args(["status", "--root", root.to_str().unwrap()])
-        .env("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")
-        .output()
-        .expect("run agentrec status");
-    assert!(out.status.success(), "status failed: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("over"),
-        "expected over-budget notice: {stdout}"
+    seed_turn(
+        root,
+        &base_turn(
+            "t_DAEMONEVICTPINNED0001",
+            vec![file_entry("pinned.bin", &pinned)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_DAEMONEVICTNEW0000001", vec![file_entry("new.bin", &new)]),
     );
 
-    assert!(
-        store.contains(&old),
-        "the in-flight turn's blob must survive a real `status` eviction pass: {stdout}"
+    // Unparseable but `\n`-terminated — so the daemon's own epoch-start
+    // append lands on a fresh line instead of concatenating onto this one
+    // (`open_append` is O_APPEND with no leading newline; `harvest_refs` is
+    // a raw byte scan and survives either way, but the fixture must exist
+    // in the shape this test's own doc comment claims).
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".agentrec/log.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_DAEMONEVICTTORNLINE","files":[{{"before":"{torn}"#
+        )
+        .unwrap();
+    }
+
+    // A memory.jsonl pin citing the same hash — the daemon only ever
+    // appends to this file, never rewrites it, so it's a safe live-daemon
+    // protect-channel fixture (unlike open.json).
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: "daemon eviction protect-channel fixture".to_string(),
+        pins: vec![Pin {
+            path: "pinned.bin".to_string(),
+            hash: pinned.clone(),
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
     );
-    assert!(store.contains(&new));
+
+    // Within 2x the seam interval, the daemon's tick must have evicted the
+    // sole unprotected victim.
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob was not evicted by the live daemon within the timeout"
+    );
+
+    daemon.kill();
+
+    assert!(
+        store.contains(&torn),
+        "torn-log-line-cited blob must survive a real daemon eviction pass"
+    );
+    assert!(
+        store.contains(&pinned),
+        "memory-pin-cited blob must survive a real daemon eviction pass"
+    );
+    assert!(store.contains(&new), "newest blob must survive");
+
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        stderr_text.contains("evicted") && stderr_text.contains("blob"),
+        "expected one stderr eviction line from the daemon: {stderr_text}"
+    );
 }

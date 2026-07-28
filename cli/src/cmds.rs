@@ -415,24 +415,23 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         state.memory_rejects
     ));
 
-    // AC I+: the store is checked (and, if over, evicted) here rather than
-    // from the daemon's turn-close path — see DEVIATIONS in the delivery
-    // receipt for why. Prompt blobs are exempt; only snapshot blobs evict.
+    // AC I+ (perf-evidence round, Phase 2b, Decision 7 Q1=(a)): eviction
+    // itself now runs from a daemon tick (`daemon::run_eviction_pass`), NOT
+    // from this read verb — `status` renders `plan_eviction`'s read-only
+    // dry-run report, matching what the daemon would do on its next pass,
+    // and deletes nothing. This is what makes AC2b.1 ("status performs zero
+    // store writes") true by construction rather than by discipline.
     if size > budget {
         let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
-        // SAFETY (Phase 1 honesty fix): harvest the protect-set as late as
-        // possible, immediately before calling `enforce_budget`, to narrow
-        // the window a live daemon (running continuously under launchd —
-        // Decisions log #2, no liveness refusal here) could append a new
-        // in-flight blob after we've read log.jsonl/open.json but before the
-        // remove loop runs.
+        // SAFETY (Phase 1 honesty fix, still load-bearing for the dry-run
+        // report): harvest the protect-set as late as possible, immediately
+        // before planning, to narrow the window a live daemon (running
+        // continuously under launchd — Decisions log #2, no liveness
+        // refusal here) could append a new in-flight blob after we've read
+        // log.jsonl/open.json but before the plan is built.
         let extra_protected = extra_protected_refs(root);
-        let evicted = agentrec_core::retention::enforce_budget(
-            &store,
-            &owned_turns,
-            budget,
-            &extra_protected,
-        );
+        let plan =
+            agentrec_core::retention::plan_eviction(&store, &owned_turns, budget, &extra_protected);
         // Honesty (B): budget enforcement here only evicts turn-referenced
         // snapshot blobs. Most store bloat is usually ORPHANED blobs —
         // superseded intermediate snapshots the daemon `put` for crash
@@ -442,19 +441,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         // freed figure is ~0.
         let orphans = crate::purgecmd::orphan_bytes(root, &store);
         out.push_str(&format!(
-            "store {} over {} budget — snapshot eviction freed {}",
+            "store {} over {} budget — would free {}",
             human_bytes(size),
             human_bytes(budget),
-            human_bytes(evicted.bytes)
+            human_bytes(plan.freed_bytes_projected)
         ));
         // Honesty (Phase 1): protecting pinned/in-flight refs shrinks
-        // `evicted.bytes` — sometimes to 0 even while genuinely over
+        // `freed_bytes_projected` — sometimes to 0 even while genuinely over
         // budget — and an unexplained "0 freed" is exactly the dishonest
         // status class the orphan-bloat attribution above already fixed.
-        if evicted.protected_bytes > 0 {
+        if plan.protected_bytes > 0 {
             out.push_str(&format!(
                 "; {} protected (pinned or in-flight — never evicted)",
-                human_bytes(evicted.protected_bytes)
+                human_bytes(plan.protected_bytes)
             ));
         }
         if orphans > 0 {
@@ -462,6 +461,13 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
                 "; {} is unreferenced (superseded snapshots) — run `agentrec purge --orphans` to reclaim",
                 human_bytes(orphans)
             ));
+        }
+        // AC2b.3: the daemon-down + `undo`-growth residual (Decisions log
+        // #7) is accepted as rare/bounded, but must be self-announcing — a
+        // human reading `status` on a stopped daemon must not be left
+        // thinking eviction is happening when nothing is evicting anything.
+        if !crate::daemon::daemon_is_running(root) {
+            out.push_str("; daemon not running — nothing is evicting");
         }
         out.push('\n');
     }
@@ -554,7 +560,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
 /// parse success or not), so the two would disagree on that hash. No
 /// producer emits such a field today; a future additive protocol field
 /// carrying a hash needs revisiting this function, not just PROTOCOL.md.
-fn extra_protected_refs(root: &Path) -> HashSet<String> {
+pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     // open.json + memory.jsonl are never themselves a `TurnRecord`, so
     // every ref in them is "extra" by construction — no validity filter
@@ -647,13 +653,11 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Test-only override (Phase 1, `cli/tests/integration.rs`,
-/// `status_eviction_keeps_open_turn_blob`) that lets an integration test
-/// exercise the real `status` verb's over-budget/eviction path — the AC
-/// this test proves is call-site wiring (does `status` actually pass the
-/// harvested protect-set into `enforce_budget`?), not the eviction
-/// mechanism itself (already core-unit-tested), and a genuine ~2 GiB store
-/// is infeasible to build in a test. Same `#[cfg(debug_assertions)]`
+/// Test-only override (Phase 1, `cli/tests/integration.rs`; Phase 2b of the
+/// perf-evidence round reuses the SAME seam for the daemon's own eviction
+/// tick — deliberately not a second env var, per the plan's infeasible
+/// list) that lets an integration test exercise a real over-budget/eviction
+/// path without building a genuine ~2 GiB store. Same `#[cfg(debug_assertions)]`
 /// fail-safe class as [`TEST_FORCE_BUDGET_EXCEEDED_VAR`] below — compiled
 /// out of release builds, so it can never override a real user's budget.
 #[cfg(debug_assertions)]
@@ -662,7 +666,7 @@ const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 /// [`agentrec_core::MAX_STORE_BYTES`] unless [`TEST_STORE_BUDGET_BYTES_VAR`]
 /// is set to a valid `u64`, in which case that value is used instead. The
 /// override is a no-op — the env is never read — in release builds.
-fn effective_store_budget() -> u64 {
+pub(crate) fn effective_store_budget() -> u64 {
     #[cfg(debug_assertions)]
     if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
         if let Ok(n) = v.parse::<u64>() {
@@ -1068,12 +1072,15 @@ mod tests {
         let out = status_report(root, 1_000).unwrap();
         assert!(out.contains("over"), "expected over-budget notice: {out}");
         assert!(
-            out.contains("snapshot eviction freed"),
-            "expected eviction mention: {out}"
+            out.contains("would free"),
+            "expected the dry-run eviction mention: {out}"
         );
+        // Phase 2b (perf-evidence round, Decision 7 Q1=(a)): INVERTED from
+        // this test's pre-round form — `status` no longer evicts anything;
+        // that moved to the daemon tick (`daemon::run_eviction_pass`).
         assert!(
-            !store.contains(&hash),
-            "the only snapshot blob should have been evicted"
+            store.contains(&hash),
+            "status must never delete a blob — it only reports what a daemon tick would do"
         );
     }
 
@@ -1996,12 +2003,173 @@ mod tests {
         let out = status_report(root, 5).unwrap();
         assert!(out.contains("over"), "expected over-budget notice: {out}");
         assert!(
-            out.contains("snapshot eviction freed 0 B"),
-            "expected 0 freed: {out}"
+            out.contains("would free 0 B"),
+            "expected 0 freed (dry-run wording): {out}"
         );
         assert!(
             out.contains("protected") && (out.contains("pinned") || out.contains("in-flight")),
             "expected a protected-bytes attribution naming pinned/in-flight: {out}"
+        );
+    }
+
+    /// Recursive snapshot of every regular file under `dir`: (path relative
+    /// to `dir`, mtime, byte length). Used by AC2b.1 to prove `status`
+    /// mutates nothing under `.agentrec/objects/` — a plain byte-count
+    /// comparison wouldn't catch a delete-then-recreate-identical-content
+    /// sequence, and a plain existence check wouldn't catch a touched mtime.
+    fn snapshot_objects_dir(
+        dir: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
+        fn walk(
+            dir: &std::path::Path,
+            base: &std::path::Path,
+            out: &mut Vec<(std::path::PathBuf, std::time::SystemTime, u64)>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    let rel = path.strip_prefix(base).unwrap().to_path_buf();
+                    out.push((rel, meta.modified().unwrap(), meta.len()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    // AC2b.1 (perf-evidence round, Phase 2b): `status` on an over-budget
+    // store must leave `.agentrec/objects/` byte-, mtime-, and
+    // count-identical while STILL printing the over-budget notice AND the
+    // protected-bytes clause — eviction moved to the daemon tick; this read
+    // verb only reports what a tick would do. Neuter: swap `plan_eviction`
+    // back to `enforce_budget` in `status_report` -> this test reds (the
+    // snapshot comparison catches the delete; the two content asserts still
+    // pass either way, which is why the store-snapshot assert is the one
+    // that carries the AC, not the text asserts alone).
+    #[test]
+    fn status_performs_zero_store_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 800]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let turn = turn_with_snapshot("t_ZEROWRITE0000000000000001", "old.bin", &old);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+        let newer = turn_with_snapshot("t_ZEROWRITENEW000000000001", "new.bin", &new);
+        append_log(&log_path(root), &LogRecord::Turn(newer)).unwrap();
+
+        let before = snapshot_objects_dir(&objects_dir(root));
+
+        // Budget fits only `new` — `old` is a genuine, structurally-visible
+        // eviction candidate that a real eviction pass WOULD delete.
+        let out = status_report(root, 5).unwrap();
+        assert!(out.contains("over"), "expected over-budget notice: {out}");
+        assert!(
+            out.contains("would free"),
+            "expected the dry-run eviction report: {out}"
+        );
+
+        let after = snapshot_objects_dir(&objects_dir(root));
+        assert_eq!(
+            before, after,
+            "status must not mutate .agentrec/objects/ at all — a real \
+             eviction pass would have deleted `old`, changing this snapshot"
+        );
+        assert!(store.contains(&old), "old must survive a `status` call");
+    }
+
+    // AC2b.3: with no daemon running (the common `hold_daemon_lock` probe
+    // this repo already uses to fake liveness — never held here), an
+    // over-budget `status` must say so explicitly rather than leaving a
+    // human to assume eviction is happening. Discriminated against the
+    // opposite case (lock held) so this isn't just "the line always
+    // prints" — it must NOT print once a daemon is live.
+    #[test]
+    fn status_reports_no_evictor_when_daemon_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let hash = store.put(&[0u8; 5_000]).unwrap();
+        let turn = turn_with_snapshot("t_NOEVICTOR0000000000000001", "big.bin", &hash);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        let out_down = status_report(root, 1_000).unwrap();
+        assert!(
+            out_down.contains("nothing is evicting"),
+            "expected the daemon-down evictor notice: {out_down}"
+        );
+        assert!(
+            store.contains(&hash),
+            "status must delete nothing either way"
+        );
+
+        let _lock = hold_daemon_lock(root);
+        let out_live = status_report(root, 1_000).unwrap();
+        assert!(
+            !out_live.contains("nothing is evicting"),
+            "a live daemon must not get the down-evictor notice: {out_live}"
+        );
+    }
+
+    // AC2b.4: `extra_protected_refs` is a side-effect-free reader (three
+    // `fs::read_to_string` calls, cmds.rs:558-568) — it cannot be fed
+    // in-memory inputs, so this unit test seeds a REAL `open.json` on disk
+    // with NO daemon running and drives the harvested set straight into
+    // `plan_eviction`, proving the harvest -> plan wiring at the level
+    // `open.json`'s protection now lives at. `open.json` specifically
+    // cannot be proven at the live-daemon level (B9: the daemon's own
+    // `sync_journal` idle arm deletes it within ~250ms of there being no
+    // open turn) — `daemon_eviction_keeps_protected_refs`
+    // (`cli/tests/integration.rs`) covers the torn-log-line and
+    // memory.jsonl-pin channels there instead.
+    #[test]
+    fn harvest_protects_open_json_refs_at_plan_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let old = store.put(&[0xAAu8; 500]).unwrap();
+        backdate(&objects_dir(root), &old, 3600);
+        let new = store.put(&[0xCCu8; 5]).unwrap();
+
+        // Entries handed directly to `plan_eviction` — only `open.json`
+        // needs to be a real on-disk file for this test's claim.
+        let entries = vec![
+            turn_with_snapshot("t_OPENPLAN0000000000000001", "old.bin", &old),
+            turn_with_snapshot("t_OPENPLANNEW00000000000001", "new.bin", &new),
+        ];
+
+        std::fs::write(crate::open_path(root), format!(r#"{{"before":"{old}"}}"#)).unwrap();
+
+        let extra_protected = extra_protected_refs(root);
+        assert!(
+            extra_protected.contains(&old),
+            "extra_protected_refs must harvest open.json's hash"
+        );
+
+        let plan = agentrec_core::retention::plan_eviction(&store, &entries, 5, &extra_protected);
+        assert!(
+            !plan.victims.iter().any(|(h, _)| h == &old),
+            "plan_eviction must not list the open.json-protected blob as a victim: {:?}",
+            plan.victims
+        );
+        assert_eq!(
+            plan.protected_bytes, 500,
+            "protected_bytes must attribute the open.json-protected blob's size"
         );
     }
 }

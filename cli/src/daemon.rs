@@ -44,6 +44,72 @@ const DEBOUNCE: Duration = Duration::from_millis(1_500);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(10);
 /// Loop poll granularity — also the max latency of quiet-window/tick closure.
 const POLL: Duration = Duration::from_millis(250);
+/// Budget-eviction tick interval (perf-evidence round, Phase 2b, Decision 7
+/// Q1=(a)): eviction moved off the `status` read verb onto this recurring
+/// daemon-tick check, alongside `maybe_rebuild`'s ignore-set reload. 10
+/// minutes in production — a store rarely crosses budget between checks,
+/// and eviction is not latency-sensitive the way turn-closure is.
+const EVICT_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Test-only override for [`EVICT_INTERVAL`] (AC2b.2's live-daemon timing
+/// leg — a real 10-minute interval is infeasible to wait out in a test).
+/// Same `#[cfg(debug_assertions)]` fail-safe class as
+/// `cmds::TEST_STORE_BUDGET_BYTES_VAR` (reused unmodified by this phase, per
+/// the plan's "no second seam" instruction) — compiled out of release
+/// builds, so it can never shrink a real deployment's interval.
+#[cfg(debug_assertions)]
+const TEST_EVICT_INTERVAL_MS_VAR: &str = "AGENTREC_TEST_EVICT_INTERVAL_MS";
+
+/// [`EVICT_INTERVAL`] unless [`TEST_EVICT_INTERVAL_MS_VAR`] is set to a
+/// valid `u64` of milliseconds, in which case that value is used instead.
+/// The override is a no-op — the env is never read — in release builds.
+fn effective_evict_interval() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var(TEST_EVICT_INTERVAL_MS_VAR) {
+        if let Ok(ms) = v.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    EVICT_INTERVAL
+}
+
+/// One budget-eviction pass: harvest -> plan -> execute, in that exact
+/// unbroken sequence with no event drain or other work interleaved (perf-
+/// evidence round, Phase 2b — the plan-level skeptic gate's parting scope
+/// note names this call site as one of the two things only a code-level
+/// reviewer can verify). This is load-bearing, not stylistic: `execute`'s
+/// freshness re-check (`agentrec_core::retention::execute`) re-checks each
+/// victim's mtime only, not `keep`/`protected_prompts` — behavior-identical
+/// to the old unsplit `enforce_budget` ONLY when `execute` runs immediately
+/// adjacent to its own `plan_eviction`. A dispatch, an event drain, or any
+/// other work between harvest and execute would let a newly-landed turn
+/// referencing an old blob (without touching its mtime) go unprotected.
+///
+/// Prints one stderr line when anything is actually evicted; silent
+/// otherwise — mirrors `log_ignore_rebuild`'s read-mutate-log shape, minus
+/// the `state.json` write (no persistent eviction-history counter this
+/// phase — stderr plus `status`'s dry-run report are the observables).
+fn run_eviction_pass(root: &Path) {
+    let store = BlobStore::new(objects_dir(root));
+    let owned_turns: Vec<TurnRecord> = agentrec_core::record::load_log(&log_path(root))
+        .into_iter()
+        .filter_map(|r| match r {
+            LogRecord::Turn(t) => Some(t),
+            LogRecord::Epoch(_) => None,
+        })
+        .collect();
+    let extra_protected = crate::cmds::extra_protected_refs(root);
+    let budget = crate::cmds::effective_store_budget();
+    let plan =
+        agentrec_core::retention::plan_eviction(&store, &owned_turns, budget, &extra_protected);
+    let evicted = agentrec_core::retention::execute(&store, plan);
+    if evicted.count > 0 {
+        eprintln!(
+            "agentrec: evicted {} snapshot blob(s), {} byte(s) freed ({} byte(s) protected)",
+            evicted.count, evicted.bytes, evicted.protected_bytes
+        );
+    }
+}
 
 pub fn run(root: &Path) -> Result<(), String> {
     let root = root
@@ -61,6 +127,13 @@ pub fn run(root: &Path) -> Result<(), String> {
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
     recover_orphan(&root)?;
+
+    // Perf-evidence round, Phase 2b: one eviction pass at startup, AFTER
+    // recovery — so a turn `recover_orphan` just closed is already a real
+    // `log.jsonl` reference before any eviction walk runs, rather than a
+    // startup race where the walk could see the pre-recovery log.
+    run_eviction_pass(&root);
+    let mut last_eviction = Instant::now();
 
     let mut clock = Clock::start();
     let store = BlobStore::new(objects_dir(&root));
@@ -193,6 +266,15 @@ pub fn run(root: &Path) -> Result<(), String> {
         if let Some(fresh) = maybe_rebuild(&mut gitignore_dirty, &root) {
             log_ignore_rebuild(&root, fresh.matchers.len(), clock.wall_ms(clock.now_ms()));
             ignore_set = fresh;
+        }
+
+        // Perf-evidence round, Phase 2b: recurring budget-eviction tick,
+        // alongside the ignore-rebuild check above. `run_eviction_pass` is
+        // the whole harvest -> plan -> execute sequence in one call — see
+        // its own doc comment for why that adjacency is load-bearing.
+        if last_eviction.elapsed() >= effective_evict_interval() {
+            run_eviction_pass(&root);
+            last_eviction = Instant::now();
         }
 
         // D9: block for the first message, then drain everything already
