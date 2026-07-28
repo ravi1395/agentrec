@@ -9295,3 +9295,165 @@ fn daemon_eviction_keeps_protected_refs() {
         "expected one stderr eviction line from the daemon: {stderr_text}"
     );
 }
+
+// Coverage gap disclosed by the Phase 2b implementer:
+// `daemon_eviction_keeps_protected_refs` above seeds its over-budget store
+// BEFORE spawning the daemon, so the eviction it observes is necessarily
+// the STARTUP pass (`run_eviction_pass` at daemon.rs, which runs strictly
+// before the watcher arms — daemon.rs:131-136). The RECURRING tick
+// (`if last_eviction.elapsed() >= effective_evict_interval()` inside
+// `run`'s main loop) is never exercised by that test and could be broken
+// entirely — never fires, wrong comparison, `last_eviction` never reset —
+// without it going red. This test spawns the daemon on a store that is
+// genuinely under budget (empty), waits for it to be confirmed live, and
+// only THEN pushes the store over budget by appending directly to the CAS
+// and `log.jsonl` (both append-only; never rewritten). The victim blob did
+// not exist at startup, so only the recurring tick can be what evicts it.
+#[test]
+fn daemon_periodic_tick_evicts_after_startup_pass() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }
+    }
+
+    let stderr_path = root.join("daemon-stderr.log");
+    // 2s eviction interval — the same value `daemon_eviction_keeps_
+    // protected_refs` already proved stable. Long enough that the handful
+    // of small file writes done immediately below (a few `store.put`s and
+    // `seed_turn` appends, sub-millisecond to low-tens-of-ms) cannot itself
+    // straddle a tick boundary; short enough that a 6s (3x) poll timeout
+    // stays fast. POLL is 250ms, so 2s gives an 8x margin against ordinary
+    // daemon-loop jitter — tight enough to keep the test fast, not so
+    // tight it races the daemon's own tick granularity.
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
+    );
+
+    // `StderrCapturingDaemonGuard::spawn` already blocked on
+    // `wait_for_live_daemon`, which only returns once
+    // `watcher_armed_nonce == epoch_nonce` in state.json — and daemon.rs's
+    // `run` calls the startup eviction pass strictly BEFORE arming the
+    // watcher. So the startup pass has unconditionally already run, on an
+    // empty (trivially under-budget) store, by the time control reaches
+    // here. Nothing below existed for it to see or evict — that ordering
+    // is the entire point of this test.
+
+    // NOW push the store over budget, entirely after the startup pass.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    // Protected via an unparseable-but-newline-terminated log.jsonl line.
+    let torn = store.put(&[0x22u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &torn, 3600);
+    // Protected via a memory.jsonl pin.
+    let pinned = store.put(&[0x33u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &pinned, 3600);
+    // Newest — kept by the budget itself, no protection needed.
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+
+    // Oldest -> newest, matching load_log order, same shape as
+    // `daemon_eviction_keeps_protected_refs` — just written post-spawn.
+    seed_turn(
+        root,
+        &base_turn(
+            "t_PERIODICVICTIM0000001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_PERIODICTORN0000001", vec![file_entry("torn.bin", &torn)]),
+    );
+    seed_turn(
+        root,
+        &base_turn(
+            "t_PERIODICPINNED000001",
+            vec![file_entry("pinned.bin", &pinned)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_PERIODICNEW00000001", vec![file_entry("new.bin", &new)]),
+    );
+
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".agentrec/log.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_PERIODICTORNLINE","files":[{{"before":"{torn}"#
+        )
+        .unwrap();
+    }
+
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: "periodic-tick protect-channel fixture".to_string(),
+        pins: vec![Pin {
+            path: "pinned.bin".to_string(),
+            hash: pinned.clone(),
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    // Only the RECURRING tick can be responsible for evicting this —
+    // none of it existed when the startup pass ran.
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob (created strictly AFTER the confirmed-live startup \
+         pass) was not evicted within the timeout — the recurring \
+         eviction tick appears not to be running"
+    );
+
+    daemon.kill();
+
+    assert!(
+        store.contains(&torn),
+        "torn-log-line-cited blob must survive the periodic eviction pass"
+    );
+    assert!(
+        store.contains(&pinned),
+        "memory-pin-cited blob must survive the periodic eviction pass"
+    );
+    assert!(store.contains(&new), "newest blob must survive");
+
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        stderr_text.contains("evicted") && stderr_text.contains("blob"),
+        "expected one stderr eviction line from the daemon: {stderr_text}"
+    );
+}
