@@ -6828,13 +6828,146 @@ fn memories_stats_three_bucket_summary() {
         stdout.contains("p99=99"),
         "expected nearest-rank p99=99 over 1..=100: {stdout}"
     );
+    // Whole-line match, not `contains` (finding 8, review round): a bare
+    // substring check on "1 pre-upgrade lines ..." / "1 unparseable lines
+    // skipped" would also be satisfied by "11 pre-upgrade lines ..." /
+    // "11 unparseable lines skipped", so a future off-by-one in either count
+    // could pass silently. Not reachable with this fixture today (both
+    // neuters land on 2, which already reds a substring check), but a prefix
+    // match is the wrong invariant to assert regardless.
     assert!(
-        stdout.contains("1 pre-upgrade lines (no elapsed_ms)"),
+        stdout
+            .lines()
+            .any(|l| l == "1 pre-upgrade lines (no elapsed_ms)"),
         "expected exactly one pre-upgrade line reported: {stdout}"
     );
     assert!(
-        stdout.contains("1 unparseable lines skipped"),
+        stdout.lines().any(|l| l == "1 unparseable lines skipped"),
         "expected exactly one torn line reported: {stdout}"
+    );
+}
+
+/// Review-round finding 3: a capped injection (`cmds::inject_memory` site 6 —
+/// `n` present AND `capped:true`, the hook found fresh hits but hit
+/// `RECALL_VERIFY_CAP` on the way there) must be visible to the readout that
+/// exists to answer "how many recalls hit the verify cap" — not swallowed
+/// into `injected` with no trace. Fixture: 2 capped-and-injected lines, 1
+/// zero-hit-capped line (the only case the four mutually-exclusive buckets
+/// can name directly), 1 plain injection with no cap at all. Named neuter:
+/// restore the pre-fix bucketing (an `else if capped` arm reachable only
+/// after `n.is_some()` has already been tested and failed, with no
+/// cross-cutting total at all) — this test's `capped_total=3` assertion reds
+/// because the field no longer exists in the pre-fix line shape, and
+/// `capped_empty=1`'s renamed label reds too.
+#[test]
+fn memories_stats_capped_injection_counted_in_capped_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let lines = [
+        serde_json::json!({ "ts": 1, "n": 2, "elapsed_ms": 10, "capped": true }),
+        serde_json::json!({ "ts": 2, "n": 1, "elapsed_ms": 20, "capped": true }),
+        serde_json::json!({ "ts": 3, "elapsed_ms": 30, "capped": true }),
+        serde_json::json!({ "ts": 4, "n": 3, "elapsed_ms": 40 }),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    std::fs::write(root.join(".agentrec/memory-stats.jsonl"), lines).unwrap();
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert!(out.status.success(), "memories --stats failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim() == "injected=3 budget_exceeded=0 failure=0 capped_empty=1"),
+        "expected the mutually-exclusive buckets (2 capped-injections + 1 plain\
+         injection = injected=3, 1 zero-hit-capped = capped_empty=1): {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim().starts_with("capped_total=3")),
+        "expected capped_total=3 (both capped-injections plus the \
+         zero-hit-capped line, regardless of which bucket each fell into): {stdout}"
+    );
+}
+
+/// Review-round finding 4: `--stats` combined with `--json`/`--stale`/`--all`
+/// must be rejected by clap, not silently accepted with the other flags
+/// ignored — same precedent as `status --ack-degraded --json`
+/// (`ack_degraded_json_is_not_prose` above). Named neuter: drop
+/// `conflicts_with_all` from the `stats` field — this test's non-success
+/// assertions red because clap then accepts every combination and the
+/// (ignored) `--json`/`--stale`/`--all` branch never fires.
+#[test]
+fn memories_stats_conflicts_with_json_stale_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    for flag in ["--json", "--stale", "--all"] {
+        let out = agentrec(root, &["memories", "--stats", flag]);
+        assert!(
+            !out.status.success(),
+            "the --stats/{flag} combination must be rejected, not silently accepted: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "expected a clap conflict message on stderr for {flag}: {stderr:?}"
+        );
+    }
+}
+
+/// Review-round finding 5: `--stats` on an uninitialized repo must return the
+/// same honest "not initialized" refusal + exit 1 as plain `memories`
+/// (PD1-class), not a measured-looking "no hook invocations recorded" at
+/// exit 0 — those are different facts (never set up vs set up but quiet).
+/// Asserts the contrast directly: the same command in an *initialized* repo
+/// with no stats file yet must still print the honest empty-store message at
+/// exit 0. Named neuter: restore `unwrap_or_default()` with no init-gate —
+/// the uninitialized-repo assertions red (exit 0, no "not initialized" text)
+/// while the initialized-empty-repo assertions keep passing, which is
+/// exactly the two-different-facts distinction this test exists to pin.
+#[test]
+fn memories_stats_requires_init() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Deliberately no `agentrec init`.
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "an uninitialized repo must never print a measured-looking stats readout: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not initialized — run"),
+        "expected the init remedy on stderr: {stderr:?}"
+    );
+
+    // Contrast: an *initialized* repo with no stats file yet is a different
+    // fact and must render differently — exit 0, honest empty-store message.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    init(root2);
+    let out2 = agentrec(root2, &["memories", "--stats"]);
+    assert!(
+        out2.status.success(),
+        "an initialized repo with no stats yet must exit 0: {out2:?}"
+    );
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("no hook invocations recorded"),
+        "expected the honest empty-store message: {stdout2:?}"
     );
 }
 

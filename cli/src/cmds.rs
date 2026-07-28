@@ -720,11 +720,19 @@ fn recall_deadline(started: Instant) -> Instant {
 /// this fix exists for, so it gets its own
 /// `{"ts","capped":true,"elapsed_ms":N}` line rather than returning with no
 /// stat at all. `elapsed_ms` (Phase 1, perf-evidence round) is
-/// `started.elapsed().as_millis()` — wall time from the top of this
-/// function to the append, monotonic-clock-derived — and is now carried on
-/// **every** append site in this function, including the two early-bail
-/// sites above (thread-spawn failure, `recv_timeout` timeout/disconnect),
-/// which previously never computed it at all. Never `state.json`, which
+/// `started.elapsed().as_millis()`, monotonic-clock-derived, and is now
+/// carried on **every** append site in this function, including the two
+/// early-bail sites above (thread-spawn failure, `recv_timeout`
+/// timeout/disconnect), which previously never computed it at all. Its
+/// timing is not uniform across sites, though (finding 7, review round):
+/// only the two early-bail sites (spawn failure, `recv_timeout` bail) compute
+/// it fresh at `started.elapsed()` immediately before their own append. The
+/// four later sites (budget-exceeded-after-recv, store-corrupt,
+/// capped-with-no-hits, successful injection) all reuse one shared
+/// `elapsed_ms` binding computed once, right after `recv_timeout` returns —
+/// not recomputed at each site's own append — so it undercounts whatever
+/// those sites do afterward; the successful-injection site in particular
+/// writes the fenced block to stdout in between. Never `state.json`, which
 /// only the daemon writes (the hazard this task is explicitly gated
 /// against).
 /// F8: the recall call runs on a detached worker thread; this function
