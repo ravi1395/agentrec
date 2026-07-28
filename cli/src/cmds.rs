@@ -254,6 +254,8 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         "prompt_put_failures": state.prompt_put_failures,
         "state_parse_failures": state.state_parse_failures,
         "last_bad_field": state.last_bad_field,
+        "dedup_hits": state.dedup_hits,
+        "dedup_reread_bytes": state.dedup_reread_bytes,
     }))
 }
 
@@ -1627,6 +1629,17 @@ mod tests {
             payload["epoch_ignore_rebuilds"], 0,
             "must not resurrect the pre-nonce file's stale epoch count"
         );
+        // AC3.2: this fixture also predates the perf-evidence round's two
+        // dedup fields entirely (neither key is in the literal JSON above) —
+        // per-field `#[serde(default)]` must render 0 for both without
+        // resetting any sibling (proven above: `ignore_rebuilds` survives at
+        // its real value, not 0 — a struct-level reset would have taken
+        // these down together).
+        assert_eq!(
+            payload["dedup_hits"], 0,
+            "a pre-instrumentation state.json must render 0, not resurrect garbage"
+        );
+        assert_eq!(payload["dedup_reread_bytes"], 0);
     }
 
     // Phase 3: `status --json` must carry every field the text DEGRADED
@@ -1645,6 +1658,12 @@ mod tests {
         crate::state::record_prompt_put_failure(&mut state);
         state.state_parse_failures = 3;
         state.last_bad_field = Some("signal_offset".to_string());
+        // Perf-evidence round (AC3.2): the dedup-hit counters must ride
+        // along with every other DEGRADED/operational field this payload
+        // carries — a monitoring script must see them too, not just a
+        // human running `agentrec doctor`.
+        state.dedup_hits = 5;
+        state.dedup_reread_bytes = 4096;
         write_state(root, &state).unwrap();
 
         let payload = status_json(root).unwrap();
@@ -1653,6 +1672,8 @@ mod tests {
             "prompt_put_failures",
             "io_failed",
             "state_parse_failures",
+            "dedup_hits",
+            "dedup_reread_bytes",
         ] {
             assert!(
                 payload.get(field).is_some(),
@@ -1663,6 +1684,8 @@ mod tests {
         assert_eq!(payload["prompt_put_failures"], 1);
         assert_eq!(payload["io_failed"], serde_json::json!(["src/a.rs"]));
         assert_eq!(payload["state_parse_failures"], 3);
+        assert_eq!(payload["dedup_hits"], 5);
+        assert_eq!(payload["dedup_reread_bytes"], 4096);
     }
 
     // Bare `status` output for a healthy store must be unchanged by this

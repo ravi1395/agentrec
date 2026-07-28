@@ -48,7 +48,7 @@ impl BlobStore {
     /// needs to distinguish those two cases (D35).
     pub fn put(&self, bytes: &[u8]) -> Option<String> {
         match self.put_result(bytes) {
-            PutResult::Stored(hash) => Some(hash),
+            PutResult::Stored { hash, .. } => Some(hash),
             PutResult::OverCap | PutResult::IoError(_) => None,
         }
     }
@@ -73,8 +73,13 @@ impl BlobStore {
             // A4: dedup normally trusts the existing object verbatim — but
             // if it's silently corrupt, discarding the good bytes we were
             // just handed (by returning early) would be worse than
-            // rewriting. Verify before trusting.
-            let intact = fs::read(&path).is_ok_and(|existing| hash_bytes(&existing) == hash);
+            // rewriting. Verify before trusting. Perf-evidence round: this
+            // read's length is the `reread_bytes` cost a clean dedup hit
+            // pays — captured here rather than dropped on the floor.
+            let existing_bytes = fs::read(&path).ok();
+            let intact = existing_bytes
+                .as_ref()
+                .is_some_and(|existing| hash_bytes(existing) == hash);
             if intact {
                 // A3: best-effort mtime touch — narrows the TOCTOU window
                 // where a retention pass snapshots its keep-set from
@@ -91,10 +96,20 @@ impl BlobStore {
                         let _ = dir.sync_all();
                     }
                 }
-                return PutResult::Stored(hash);
+                // Decision 6: a clean dedup hit is the only case that
+                // reports its verification-read cost — `existing_bytes` is
+                // `Some` here (that's what made `intact` true).
+                let reread_bytes = existing_bytes.map(|b| b.len() as u64).unwrap_or(0);
+                return PutResult::Stored {
+                    hash,
+                    deduped: true,
+                    reread_bytes,
+                };
             }
             // Corrupt — fall through and rewrite via the normal tmp+rename
-            // path below instead of trusting it.
+            // path below instead of trusting it. Decision 6: this re-read
+            // was a heal, not steady-state dedup cost, so `finish_stored`
+            // below reports `deduped: false, reread_bytes: 0` for it.
         }
         let Some(parent) = path.parent() else {
             return PutResult::IoError("object path has no parent directory".to_string());
@@ -304,15 +319,33 @@ fn finish_stored(hash: String, parent: &std::path::Path) -> PutResult {
             eprintln!("agentrec: snapshot {hash} stored but parent-dir fsync failed: {e}");
         }
     }
-    PutResult::Stored(hash)
+    // Fresh writes (including the corrupt-fallthrough rewrite, Decision 6)
+    // are never a clean dedup hit.
+    PutResult::Stored {
+        hash,
+        deduped: false,
+        reread_bytes: 0,
+    }
 }
 
 /// Typed outcome of a write (D35) — replaces the lossy `Option<String>`
 /// where callers need to tell "too big" apart from "disk/permission error".
 #[derive(Debug, PartialEq)]
 pub enum PutResult {
-    /// Written (or already present) under this `sha256:` ref.
-    Stored(String),
+    /// Written (or already present) under this `sha256:` ref. `deduped` is
+    /// true only for a clean dedup-hit verification read (the object
+    /// already existed and its bytes matched) — the corrupt-fallthrough
+    /// heal path (A4) rewrites and always reports `deduped: false,
+    /// reread_bytes: 0` (Decision 6, perf-evidence round): that re-read's
+    /// cost is a heal event, not steady-state dedup cost, and mixing the
+    /// two would blur the number this instrumentation exists to produce.
+    /// `reread_bytes` is the length of the existing object re-read to
+    /// verify a clean dedup hit; 0 for any non-dedup-hit `Stored`.
+    Stored {
+        hash: String,
+        deduped: bool,
+        reread_bytes: u64,
+    },
     /// Rejected: exceeds `MAX_SNAPSHOT_BYTES`.
     OverCap,
     /// Write failed; message is `io::Error`'s `Display` output.
@@ -383,12 +416,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = BlobStore::new(tmp.path());
         let h = match store.put_result(b"payload") {
-            PutResult::Stored(h) => h,
+            PutResult::Stored { hash, .. } => hash,
             other => panic!("expected Stored, got {other:?}"),
         };
         assert_eq!(store.get(&h).unwrap(), b"payload");
         // second put dedups to the same hash, no rewrite
-        assert_eq!(store.put_result(b"payload"), PutResult::Stored(h.clone()));
+        assert_eq!(
+            store.put_result(b"payload"),
+            PutResult::Stored {
+                hash: h.clone(),
+                deduped: true,
+                reread_bytes: b"payload".len() as u64,
+            }
+        );
 
         let hex = h.strip_prefix("sha256:").unwrap();
         let fan_dir = tmp.path().join(&hex[..2]);
@@ -415,7 +455,7 @@ mod tests {
         let hashes: Vec<String> = results
             .into_iter()
             .map(|r| match r {
-                PutResult::Stored(h) => h,
+                PutResult::Stored { hash, .. } => hash,
                 other => panic!("expected Stored, got {other:?}"),
             })
             .collect();
@@ -475,7 +515,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = BlobStore::new(tmp.path());
         let h = match store.put_result(b"secret-bytes") {
-            PutResult::Stored(h) => h,
+            PutResult::Stored { hash, .. } => hash,
             other => panic!("expected Stored, got {other:?}"),
         };
         let hex = h.strip_prefix("sha256:").unwrap();
@@ -587,7 +627,20 @@ mod tests {
         // to `Stored(hash)` without checking the bytes on disk, leaving the
         // corruption in place forever.
         let result = store.put_result(b"good content");
-        assert_eq!(result, PutResult::Stored(h.clone()));
+        // Decision 6 (perf-evidence round): the corrupt-fallthrough re-read
+        // is a heal event, not steady-state dedup cost — it must report
+        // `deduped: false, reread_bytes: 0` even though it DID re-read the
+        // existing (corrupt) bytes to discover the mismatch. Mixing this
+        // into the dedup-hit counter would blur the number that
+        // instrumentation exists to produce.
+        assert_eq!(
+            result,
+            PutResult::Stored {
+                hash: h.clone(),
+                deduped: false,
+                reread_bytes: 0,
+            }
+        );
         assert_eq!(store.get(&h).unwrap(), b"good content", "corruption healed");
     }
 
@@ -634,7 +687,14 @@ mod tests {
     fn finish_stored_never_downgrades_a_landed_blob() {
         let bogus_parent = std::path::Path::new("/nonexistent/agentrec-a7-probe-dir");
         let result = finish_stored("sha256:deadbeef".to_string(), bogus_parent);
-        assert_eq!(result, PutResult::Stored("sha256:deadbeef".to_string()));
+        assert_eq!(
+            result,
+            PutResult::Stored {
+                hash: "sha256:deadbeef".to_string(),
+                deduped: false,
+                reread_bytes: 0,
+            }
+        );
     }
 
     // list_hashes enumerates real blobs and NEVER returns a stray tmp write or

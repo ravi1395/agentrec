@@ -248,7 +248,7 @@ pub fn run(root: &Path) -> Result<(), String> {
             }
             let changes = recorder.stage(&pending);
             engine.observe_changes(now, &changes);
-            drain_io_failures(&root, &mut recorder);
+            drain_recorder_stats(&root, &mut recorder);
             pending.clear();
             last_event = None;
             first_event = None;
@@ -323,7 +323,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     if !pending.is_empty() {
         let changes = recorder.stage(&pending);
         engine.observe_changes(now, &changes);
-        drain_io_failures(&root, &mut recorder);
+        drain_recorder_stats(&root, &mut recorder);
     }
     let closed = engine.force_close(now);
     persist(&root, &recorder, &clock, closed)?;
@@ -836,7 +836,7 @@ fn maybe_rebuild(dirty: &mut bool, root: &Path) -> Option<IgnoreSet> {
 /// rebuild-gate fix — this class shipped twice partly because nothing
 /// reported whether a reload ever happened). Bumps `state.json`'s
 /// `ignore_rebuilds`/`last_ignore_rebuild_ms` and prints one stderr line
-/// naming the matcher count, mirroring `drain_io_failures`'s
+/// naming the matcher count, mirroring `drain_recorder_stats`'s
 /// read-mutate-log-write shape. Called only from the `Some(fresh)` arm of
 /// `maybe_rebuild`'s caller, so the increment tracks REBUILDS, never events.
 fn log_ignore_rebuild(root: &Path, matcher_count: usize, wall_ms: u64) {
@@ -889,6 +889,23 @@ struct Recorder {
     /// (there is no valid `String` form to store), drained into
     /// `state.json`'s `non_utf8_path_skips` the same way `io_failures` is.
     non_utf8_skips: u64,
+    /// Perf-evidence round: lifetime-for-this-Recorder count of clean
+    /// dedup-hit verification reads on the snapshot path (`stage`'s
+    /// `put_result` calls only — scope deliberately excludes the
+    /// prompt/symlink `put_result` calls in `persist`). Never reset —
+    /// `drain_recorder_stats` mirrors the current value into `state.json`
+    /// rather than incrementally accumulating onto it.
+    dedup_hits: u64,
+    /// Total bytes re-read across all clean dedup-hit verifications
+    /// counted by `dedup_hits` (Decision 6: the corrupt-fallthrough heal
+    /// path never contributes here — see `PutResult::Stored`'s doc).
+    dedup_reread_bytes: u64,
+    /// Set whenever `dedup_hits`/`dedup_reread_bytes` change in `stage`;
+    /// cleared by `drain_recorder_stats` once it has mirrored them into
+    /// `state.json`. This is what lets the drain guard detect "the dedup
+    /// counters advanced since the last drain" without a per-event write —
+    /// `stage` itself never touches `state.json` (AC3.4).
+    dedup_stats_dirty: bool,
 }
 
 impl Recorder {
@@ -918,6 +935,9 @@ impl Recorder {
             models: HashMap::new(),
             io_failures: Vec::new(),
             non_utf8_skips: 0,
+            dedup_hits: 0,
+            dedup_reread_bytes: 0,
+            dedup_stats_dirty: false,
         }
     }
 
@@ -986,7 +1006,19 @@ impl Recorder {
                 match std::fs::read(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
                         match self.store.put_result(&bytes) {
-                            PutResult::Stored(h) => (Some(h), true, false, None),
+                            PutResult::Stored {
+                                hash: h,
+                                deduped,
+                                reread_bytes,
+                            } => {
+                                if deduped {
+                                    self.dedup_hits = self.dedup_hits.saturating_add(1);
+                                    self.dedup_reread_bytes =
+                                        self.dedup_reread_bytes.saturating_add(reread_bytes);
+                                    self.dedup_stats_dirty = true;
+                                }
+                                (Some(h), true, false, None)
+                            }
                             // Unreachable given the `<= MAX_SNAPSHOT_BYTES` guard
                             // above (store.put_result's own over-cap check can
                             // never trip here) — handled anyway, symmetrically
@@ -1130,13 +1162,20 @@ fn symlink_change(
 }
 
 /// Drain `recorder`'s pending snapshot failures (D35 I/O failures, item 2
-/// non-UTF8 path skips) into `state.json`: bump the counters, track I/O
-/// failure paths, and warn loudly on stderr. One read-mutate-write cycle for
-/// both (mirrors the SignalTailer offset pattern) rather than two, so a
-/// batch that hits both kinds doesn't race itself across two separate
-/// state.json writes.
-fn drain_io_failures(root: &Path, recorder: &mut Recorder) {
-    if recorder.io_failures.is_empty() && recorder.non_utf8_skips == 0 {
+/// non-UTF8 path skips) AND its dedup-hit counters (perf-evidence round)
+/// into `state.json`: bump the counters, track I/O failure paths, and warn
+/// loudly on stderr. One read-mutate-write cycle for all of it (mirrors the
+/// SignalTailer offset pattern) rather than several, so a batch that hits
+/// more than one kind doesn't race itself across separate state.json
+/// writes. Called unconditionally post-flush and on shutdown flush — its
+/// own early-return guard below is what keeps this to AT MOST one
+/// `state.json` write per flush, never one per event: `stage` only
+/// accumulates onto `Recorder`'s in-memory counters and never calls this.
+fn drain_recorder_stats(root: &Path, recorder: &mut Recorder) {
+    if recorder.io_failures.is_empty()
+        && recorder.non_utf8_skips == 0
+        && !recorder.dedup_stats_dirty
+    {
         return;
     }
     let mut state = read_state(root);
@@ -1153,6 +1192,11 @@ fn drain_io_failures(root: &Path, recorder: &mut Recorder) {
             recorder.non_utf8_skips
         );
         recorder.non_utf8_skips = 0;
+    }
+    if recorder.dedup_stats_dirty {
+        state.dedup_hits = recorder.dedup_hits;
+        state.dedup_reread_bytes = recorder.dedup_reread_bytes;
+        recorder.dedup_stats_dirty = false;
     }
     if let Err(e) = write_state(root, &state) {
         eprintln!("agentrec: warning: failed to persist snapshot-failure state: {e}");
@@ -1581,7 +1625,7 @@ fn persist(
                 // same as `BlobStore::put`) so it can be counted separately
                 // from file-snapshot failures — see `prompt_put_failures`.
                 let prompt_ref = match recorder.store.put_result(full.as_bytes()) {
-                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::Stored { hash, .. } => Some(hash),
                     PutResult::OverCap => None,
                     PutResult::IoError(cause) => {
                         let mut state = read_state(root);
@@ -1756,7 +1800,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
             Some(text) => {
                 let scrubbed = scrub::scrub(text);
                 let prompt_ref = match store.put_result(scrubbed.as_bytes()) {
-                    PutResult::Stored(hash) => Some(hash),
+                    PutResult::Stored { hash, .. } => Some(hash),
                     PutResult::OverCap => None,
                     PutResult::IoError(cause) => {
                         let mut state = read_state(root);
@@ -2202,6 +2246,9 @@ mod tests {
             models: HashMap::new(),
             io_failures: Vec::new(),
             non_utf8_skips: 0,
+            dedup_hits: 0,
+            dedup_reread_bytes: 0,
+            dedup_stats_dirty: false,
         }
     }
 
@@ -2542,6 +2589,134 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "café.rs");
         assert_eq!(recorder.non_utf8_skips, 0);
+    }
+
+    // ---- Perf-evidence round: dedup-hit instrumentation on the snapshot path --
+
+    // AC3.1: `Recorder::stage`'s own counters, driven directly (no live
+    // daemon, no hook — so nothing on the persist path can inflate this).
+    // Neuter: hardcode `deduped: false` at store.rs's dedup-hit return site
+    // → `dedup_hits`/`dedup_reread_bytes` never advance → RED.
+    #[test]
+    fn dedup_hit_counters_accumulate_in_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let path = root.join("a.rs");
+        let content = b"hello dedup world";
+        std::fs::write(&path, content).unwrap();
+
+        // First stage: fresh write, not a dedup hit.
+        let mut paths = HashSet::new();
+        paths.insert(path.clone());
+        recorder.stage(&paths);
+        assert_eq!(recorder.dedup_hits, 0, "a fresh write is never a dedup hit");
+        assert_eq!(recorder.dedup_reread_bytes, 0);
+
+        // Second stage of the SAME bytes at the SAME path: the content
+        // hash is unchanged, so `put_result` hits the dedup path and
+        // re-reads the existing object to verify it.
+        recorder.stage(&paths);
+        assert_eq!(
+            recorder.dedup_hits, 1,
+            "identical re-stage must count as one dedup hit"
+        );
+        assert_eq!(
+            recorder.dedup_reread_bytes,
+            content.len() as u64,
+            "must count the length of the re-read existing object"
+        );
+
+        // A content CHANGE must never increment — it's a fresh write, not
+        // a dedup hit.
+        std::fs::write(&path, b"different content now").unwrap();
+        recorder.stage(&paths);
+        assert_eq!(
+            recorder.dedup_hits, 1,
+            "a content change must not increment"
+        );
+        assert_eq!(recorder.dedup_reread_bytes, content.len() as u64);
+
+        // An over-cap file must never increment either — `put_result`
+        // rejects it via `PutResult::OverCap` before any dedup check runs.
+        let big_path = root.join("huge.bin");
+        let big_content = vec![b'x'; MAX_SNAPSHOT_BYTES + 1];
+        std::fs::write(&big_path, &big_content).unwrap();
+        let mut big_paths = HashSet::new();
+        big_paths.insert(big_path.clone());
+        recorder.stage(&big_paths);
+        recorder.stage(&big_paths); // "re-stage" too — still over cap, still no dedup path
+        assert_eq!(
+            recorder.dedup_hits, 1,
+            "an over-cap file must never increment"
+        );
+        assert_eq!(recorder.dedup_reread_bytes, content.len() as u64);
+    }
+
+    // AC3.4: `stage` alone must never touch `state.json` — only
+    // `drain_recorder_stats` does, and at most once per flush. Neuter: move
+    // the counter persistence into `stage`'s per-file loop (e.g. call
+    // `write_state` right after the `dedup_stats_dirty` set) → RED, because
+    // `state.json` would then exist/change immediately after `stage` alone.
+    #[test]
+    fn stage_never_writes_state_json_drain_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        let path = root.join("a.rs");
+        std::fs::write(&path, b"stable content").unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(path);
+
+        let state_path = crate::state_path(root);
+        assert!(
+            !state_path.exists(),
+            "state.json must not exist before any staging"
+        );
+
+        // First stage: fresh write.
+        recorder.stage(&paths);
+        assert!(
+            !state_path.exists(),
+            "stage() alone must never create state.json (fresh write case)"
+        );
+
+        // Second stage of identical content: a dedup hit, so the counters
+        // advance in memory — but `stage` itself still must not write.
+        recorder.stage(&paths);
+        assert_eq!(recorder.dedup_hits, 1);
+        assert!(
+            !state_path.exists(),
+            "stage() alone must never create state.json, even with a dedup hit pending"
+        );
+
+        // Only `drain_recorder_stats` writes — and it must actually persist
+        // the counters it mirrored from `recorder`.
+        drain_recorder_stats(root, &mut recorder);
+        assert!(
+            state_path.exists(),
+            "drain_recorder_stats must create state.json once it has stats to persist"
+        );
+        let persisted = read_state(root);
+        assert_eq!(persisted.dedup_hits, 1);
+        assert_eq!(persisted.dedup_reread_bytes, "stable content".len() as u64);
+
+        // A byte-identical re-run of drain with nothing new to report must
+        // not touch the file again (mtime unchanged) — the guard's other
+        // half.
+        let mtime_before = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drain_recorder_stats(root, &mut recorder);
+        let mtime_after = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "a drain with no new stats and no new io_failures/non_utf8_skips must not rewrite state.json"
+        );
     }
 
     // ---- D2: flock-based lock -----------------------------------------------
