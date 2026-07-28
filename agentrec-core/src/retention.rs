@@ -22,51 +22,51 @@ pub struct Evicted {
     pub protected_bytes: u64,
 }
 
-/// Evict snapshot blobs (each turn's `FileEntry.before`/`after`) belonging to
-/// the oldest turns once their accumulated size would exceed `budget`.
-///
-/// `entries` must be in append (oldest-first) log order — the same order
-/// `record::load_log` returns turns in. Walks newest → oldest, accumulating
-/// each turn's *unique* (not already counted) snapshot-blob bytes. The first
-/// turn whose inclusion would push the running total over `budget` — and
-/// every turn older than it — becomes an eviction candidate for any of its
-/// blobs not already kept by a newer, already-accepted turn (content-addressed
-/// sharing means the same blob can belong to both an old and a new turn).
-///
-/// Two blobs are never evicted regardless of budget: (A2) any blob that's
-/// also referenced as *any* turn's `prompt_ref` — prompt retention is a
-/// disjoint TTL-based policy (`purge`), not budget-based, so a blob shared
-/// between the two must survive here even if its snapshot side is old; and
-/// (A5) the newest turn's own blobs, *as long as an older turn exists to
-/// evict instead* — a single oversized newest turn must never be evicted
-/// wholesale just because it's also the boundary turn (that would delete
-/// the most recent snapshot, the one most likely to be needed for
-/// `diff`/`undo`) while cheaper, older data still exists to sacrifice
-/// first. When the newest turn is the *only* turn, this protection does not
-/// apply — there is nothing else to sacrifice, so budget enforcement falls
-/// back to evicting it (see `cmds::tests::status_prints_over_budget_notice`,
-/// which asserts exactly this single-turn case).
-///
-/// `extra_protected` (Phase 1 honesty fix): a caller-supplied set of hashes
-/// that must never be evicted regardless of the above, subtracted from
-/// `candidates` immediately before the remove loop. This module only knows
-/// about *parsed* `TurnRecord`s, so it cannot on its own see a blob cited
-/// only by the in-flight turn's crash journal (`open.json`), a memory pin
-/// (`memory.jsonl`), or a torn/unparseable `log.jsonl` line — exactly the
-/// classes `cli/src/purgecmd.rs::referenced_hashes` (this repo's own stated
-/// safety standard for CAS deletion) protects via a raw, non-parsing
-/// `sha256:` byte-scan. `agentrec-core` stays dependency-free of that CLI
-/// module, so the caller harvests the set and passes it in.
-pub fn enforce_budget(
+/// Read-only report from `plan_eviction`: which blobs a budget-enforcement
+/// pass would evict, and why the rest survive. Nothing in `plan_eviction`
+/// touches disk — this is what lets a read verb (`status`) render the same
+/// honesty figures `enforce_budget` used to only produce as a side effect of
+/// deleting (perf-evidence round, closes B8).
+#[derive(Debug)]
+pub struct EvictionPlan {
+    /// `(hash, size)` pairs that would be evicted if this plan is executed.
+    pub victims: Vec<(String, u64)>,
+    /// Bytes saved by `extra_protected` — same accumulation semantics as
+    /// `Evicted::protected_bytes` (B12: computed here, before the freshness
+    /// guard runs, so a candidate that is both externally protected and
+    /// fresh is counted exactly once).
+    pub protected_bytes: u64,
+    /// Sum of `victims`' sizes — projected, not actual: `execute` may still
+    /// spare a victim whose mtime moved past `pass_start` between plan and
+    /// execute (B11), so this is an upper bound on what `execute` frees.
+    pub freed_bytes_projected: u64,
+    /// Captured once, at the start of the plan pass. `execute` re-checks
+    /// each victim's freshness against THIS value, never a fresh
+    /// `SystemTime::now()` — a fresh-now recheck would let a blob touched
+    /// between plan and execute-start be deleted, i.e. strictly *less*
+    /// protection than the unsplit code offered in a hard-delete path
+    /// (B11, non-negotiable).
+    pub pass_start: std::time::SystemTime,
+}
+
+/// Pure planning half of budget eviction (perf-evidence round, closes B8):
+/// walks the turn log and partitions candidates exactly like the old
+/// unsplit `enforce_budget` did, but deletes nothing. `execute` turns the
+/// result into real deletions; `enforce_budget` composes the two so its
+/// external behavior stays byte-identical to before the split. See
+/// `enforce_budget`'s doc comment below for the full walk/candidate/A2/A5
+/// semantics — they are unchanged, just relocated to this pure half.
+pub fn plan_eviction(
     store: &BlobStore,
     entries: &[TurnRecord],
     budget: u64,
     extra_protected: &HashSet<String>,
-) -> Evicted {
+) -> EvictionPlan {
     // A3(c): a candidate touched *during this pass* — e.g. a concurrent
     // daemon's dedup-hit landing between the caller's log.jsonl read and
-    // this call — must never be evicted even though the keep-set computed
-    // from that (now slightly stale) log doesn't yet mention it.
+    // this call — must never be reported as a victim even though the
+    // keep-set computed from that (now slightly stale) log doesn't yet
+    // mention it.
     let pass_start = std::time::SystemTime::now();
 
     // A2: prompt blobs share the same CAS as snapshot blobs; protect any
@@ -121,11 +121,11 @@ pub fn enforce_budget(
         }
     }
 
-    // Phase 1: subtract the caller's protect-set from `candidates`
-    // immediately before the remove loop — as late as possible, so a
-    // narrower window exists between harvesting refs and this pass
-    // deleting anything. Tally the bytes saved so the caller can attribute
-    // a low/zero `evicted.bytes` instead of reporting it unexplained.
+    // Phase 1: subtract the caller's protect-set from `candidates` first —
+    // this ordering (protect-retain BEFORE the freshness guard below) must
+    // never change: a candidate that is both externally protected and
+    // fresh must be counted in `protected_bytes` exactly once (AC2a.2);
+    // reordering silently shrinks the figure `status` renders.
     let mut protected_bytes = 0u64;
     candidates.retain(|hash| {
         if extra_protected.contains(hash) {
@@ -136,26 +136,111 @@ pub fn enforce_budget(
         }
     });
 
-    let mut evicted = Evicted {
-        protected_bytes,
-        ..Evicted::default()
-    };
+    let mut victims: Vec<(String, u64)> = Vec::new();
+    let mut freed_bytes_projected = 0u64;
     for hash in candidates {
         if keep.contains(&hash) {
-            continue; // referenced by a kept (newer) turn — never evict
+            continue; // referenced by a kept (newer) turn — never a victim
         }
         if protected_prompts.contains(hash.as_str()) {
-            continue; // A2: shared with a prompt blob — never evict here
+            continue; // A2: shared with a prompt blob — never a victim
         }
         if store.mtime(&hash).is_some_and(|mtime| mtime > pass_start) {
-            continue; // A3(c): touched after this pass started — too fresh
+            continue; // A3(c) plan-side: too fresh to report as a victim —
+                      // a dry-run that lists a fresh blob as a victim
+                      // would be a wrong report.
+        }
+        let size = store.size(&hash).unwrap_or(0);
+        freed_bytes_projected += size;
+        victims.push((hash, size));
+    }
+
+    EvictionPlan {
+        victims,
+        protected_bytes,
+        freed_bytes_projected,
+        pass_start,
+    }
+}
+
+/// Executes an `EvictionPlan`: deletes each victim, re-checking freshness
+/// against the plan's *carried* `pass_start` immediately before each
+/// `store.remove` (never a fresh `SystemTime::now()` — B11). This preserves
+/// today's delete-time semantics exactly: the freshness guard used to be
+/// evaluated once, at delete time, inside the same pass that built the
+/// keep-set; splitting into plan+execute must not widen that window by
+/// letting a blob touched between plan and execute-start survive undetected.
+pub fn execute(store: &BlobStore, plan: EvictionPlan) -> Evicted {
+    let mut evicted = Evicted {
+        protected_bytes: plan.protected_bytes,
+        ..Evicted::default()
+    };
+    for (hash, _projected_size) in plan.victims {
+        if store
+            .mtime(&hash)
+            .is_some_and(|mtime| mtime > plan.pass_start)
+        {
+            continue; // touched after the plan was taken — too fresh
         }
         if let Some(size) = store.remove(&hash) {
             evicted.count += 1;
+            // From `remove`'s return, never the plan's projected size — a
+            // blob already gone (raced away between plan and execute)
+            // contributes nothing, matching the old unsplit behavior.
             evicted.bytes += size;
         }
     }
     evicted
+}
+
+/// Evict snapshot blobs (each turn's `FileEntry.before`/`after`) belonging to
+/// the oldest turns once their accumulated size would exceed `budget`.
+///
+/// `entries` must be in append (oldest-first) log order — the same order
+/// `record::load_log` returns turns in. Walks newest → oldest, accumulating
+/// each turn's *unique* (not already counted) snapshot-blob bytes. The first
+/// turn whose inclusion would push the running total over `budget` — and
+/// every turn older than it — becomes an eviction candidate for any of its
+/// blobs not already kept by a newer, already-accepted turn (content-addressed
+/// sharing means the same blob can belong to both an old and a new turn).
+///
+/// Two blobs are never evicted regardless of budget: (A2) any blob that's
+/// also referenced as *any* turn's `prompt_ref` — prompt retention is a
+/// disjoint TTL-based policy (`purge`), not budget-based, so a blob shared
+/// between the two must survive here even if its snapshot side is old; and
+/// (A5) the newest turn's own blobs, *as long as an older turn exists to
+/// evict instead* — a single oversized newest turn must never be evicted
+/// wholesale just because it's also the boundary turn (that would delete
+/// the most recent snapshot, the one most likely to be needed for
+/// `diff`/`undo`) while cheaper, older data still exists to sacrifice
+/// first. When the newest turn is the *only* turn, this protection does not
+/// apply — there is nothing else to sacrifice, so budget enforcement falls
+/// back to evicting it (see `cmds::tests::status_prints_over_budget_notice`,
+/// which asserts exactly this single-turn case).
+///
+/// `extra_protected` (Phase 1 honesty fix): a caller-supplied set of hashes
+/// that must never be evicted regardless of the above, subtracted from
+/// `candidates` immediately before the remove loop. This module only knows
+/// about *parsed* `TurnRecord`s, so it cannot on its own see a blob cited
+/// only by the in-flight turn's crash journal (`open.json`), a memory pin
+/// (`memory.jsonl`), or a torn/unparseable `log.jsonl` line — exactly the
+/// classes `cli/src/purgecmd.rs::referenced_hashes` (this repo's own stated
+/// safety standard for CAS deletion) protects via a raw, non-parsing
+/// `sha256:` byte-scan. `agentrec-core` stays dependency-free of that CLI
+/// module, so the caller harvests the set and passes it in.
+///
+/// Thin wrapper over `plan_eviction` + `execute` (perf-evidence round) —
+/// externally byte-identical to the prior single-pass implementation.
+pub fn enforce_budget(
+    store: &BlobStore,
+    entries: &[TurnRecord],
+    budget: u64,
+    extra_protected: &HashSet<String>,
+) -> Evicted {
+    execute(
+        store,
+        plan_eviction(store, entries, budget, extra_protected),
+    )
 }
 
 /// Unique snapshot-blob hashes (`before` + `after`) referenced by one turn.
@@ -530,5 +615,210 @@ mod tests {
         );
         assert!(store.contains(&old), "extra_protected blob must survive");
         assert!(store.contains(&new));
+    }
+
+    // AC2a.2 (perf-evidence round): carries the plan-side freshness guard's
+    // ONLY discriminator (B12) — `enforce_budget_skips_a_candidate_touched_
+    // after_pass_start` above pins the guard *pair* via the delete outcome
+    // only, so under the both-halves design `execute`'s re-check masks a
+    // deleted plan-side guard from every deletion-observable assertion.
+    // Five turns, oldest → newest: V (backdated, genuinely evicted), P
+    // (extra_protected only), F (a boundary candidate future-dated past
+    // `pass_start` — must survive planning via the freshness guard, and
+    // must NOT contribute to `protected_bytes`, matching today's semantics
+    // where the freshness guard is a silent `continue`, not a protect-set
+    // entry), D (BOTH extra_protected AND future-dated — the case that
+    // proves protect-retain runs before the freshness guard: reordering
+    // would remove D via freshness first, so the later protect-retain step
+    // never sees it and `protected_bytes` silently loses its contribution),
+    // and NEW (newest, tiny, budget fits it exactly so it alone is kept).
+    #[test]
+    fn plan_reports_without_deleting_then_execute_deletes_exactly_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+
+        let v = store.put(&[0xAAu8; 50]).unwrap(); // victim
+        let p = store.put(&[0xBBu8; 20]).unwrap(); // extra_protected only
+        let f = store.put(&[0xCCu8; 15]).unwrap(); // future-dated only
+        let d = store.put(&[0xDDu8; 10]).unwrap(); // extra_protected AND future-dated
+        let new = store.put(&[0xEEu8; 5]).unwrap(); // newest, kept by budget
+
+        let entries = vec![
+            turn(
+                "t_PLANV00000000000000001",
+                "2026-01-01T00:00:00.000Z",
+                vec![entry("v", None, Some(&v), "create")],
+            ),
+            turn(
+                "t_PLANP00000000000000001",
+                "2026-01-02T00:00:00.000Z",
+                vec![entry("p", None, Some(&p), "create")],
+            ),
+            turn(
+                "t_PLANF00000000000000001",
+                "2026-01-03T00:00:00.000Z",
+                vec![entry("f", None, Some(&f), "create")],
+            ),
+            turn(
+                "t_PLAND00000000000000001",
+                "2026-01-04T00:00:00.000Z",
+                vec![entry("d", None, Some(&d), "create")],
+            ),
+            turn(
+                "t_PLANNEW0000000000000001",
+                "2026-01-05T00:00:00.000Z",
+                vec![entry("n", None, Some(&new), "create")],
+            ),
+        ];
+
+        // V: backdated well before pass_start — no timestamp coincidence
+        // can rescue it from the freshness guard.
+        let hex_v = v.strip_prefix("sha256:").unwrap();
+        let path_v = tmp.path().join(&hex_v[..2]).join(&hex_v[2..]);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path_v)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        // F and D: future-dated past any plausible pass_start (mirrors
+        // `enforce_budget_skips_a_candidate_touched_after_pass_start`).
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        for h in [&f, &d] {
+            let hex = h.strip_prefix("sha256:").unwrap();
+            let path = tmp.path().join(&hex[..2]).join(&hex[2..]);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+        }
+
+        // P is left at its natural (pre-plan) creation mtime — well before
+        // `pass_start`, which is captured only once `plan_eviction` runs.
+        let extra_protected: HashSet<String> = [p.clone(), d.clone()].into_iter().collect();
+
+        // Budget fits only NEW's 5 bytes — V, P, F, D all become candidates.
+        let plan = plan_eviction(&store, &entries, 5, &extra_protected);
+
+        assert_eq!(
+            plan.victims,
+            vec![(v.clone(), 50)],
+            "only V is a genuine victim — F excluded by freshness, P/D by extra_protected"
+        );
+        assert_eq!(
+            plan.protected_bytes,
+            20 + 10,
+            "P (20) + D (10) — D counted exactly once despite being both \
+             extra_protected and fresh"
+        );
+        assert_eq!(
+            plan.freed_bytes_projected, 50,
+            "excludes F's 15 bytes — F is not a victim"
+        );
+
+        // Planning must not touch disk.
+        for h in [&v, &p, &f, &d, &new] {
+            assert!(store.contains(h), "plan_eviction must delete nothing");
+        }
+
+        let evicted = execute(&store, plan);
+        assert_eq!(
+            evicted,
+            Evicted {
+                count: 1,
+                bytes: 50,
+                protected_bytes: 30,
+            }
+        );
+        assert!(!store.contains(&v), "V is the only thing execute deletes");
+        assert!(store.contains(&p));
+        assert!(store.contains(&f));
+        assert!(store.contains(&d));
+        assert!(store.contains(&new));
+    }
+
+    // AC2a.3 (perf-evidence round): the deterministic replacement for the
+    // plan's rejected vacuous future-dated-bump design (B11). A blob that
+    // `plan_eviction` genuinely lists as a victim gets its mtime bumped by a
+    // REAL-NOW dedup-put (store.rs:83-84's `set_modified(SystemTime::now())`
+    // path) AFTER the plan is taken — never a future-dated filetime, which
+    // would satisfy `mtime > t` for any plausible `t` and so cannot tell
+    // apart "execute re-checks against the plan's carried pass_start" from
+    // "execute re-checks against a fresh now()" (the two designs B11 exists
+    // to distinguish). `execute` must then spare it.
+    #[test]
+    fn execute_recheck_spares_blob_touched_after_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+        let x_bytes = [0xAAu8; 50];
+        let x = store.put(&x_bytes).unwrap();
+        let y = store.put(&[0xCCu8; 5]).unwrap();
+
+        let entries = vec![
+            turn(
+                "t_RECHECKOLD000000000001",
+                "2026-01-01T00:00:00.000Z",
+                vec![entry("x", None, Some(&x), "create")],
+            ),
+            turn(
+                "t_RECHECKNEW000000000001",
+                "2026-01-02T00:00:00.000Z",
+                vec![entry("y", None, Some(&y), "create")],
+            ),
+        ];
+
+        // Budget fits only the newest turn (Y) — X is the sole (non-newest)
+        // boundary victim, so A5's newest-turn protection cannot mask this.
+        let plan = plan_eviction(&store, &entries, 5, &HashSet::new());
+        assert_eq!(
+            plan.victims,
+            vec![(x.clone(), 50)],
+            "X is the plan's sole victim before any mtime bump"
+        );
+
+        // Granularity guard (NB14): give the filesystem's mtime clock room
+        // to move forward, mirroring `dedup_hit_touches_mtime`'s own 20ms
+        // gap for the same strict `>` comparison.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Real-now dedup-put: identical bytes, so this is a genuine dedup
+        // hit (not a fresh write), and `put_result` bumps the existing
+        // object's mtime to `SystemTime::now()` as part of that path.
+        assert_eq!(store.put(&x_bytes).unwrap(), x, "dedup hit on X");
+
+        // Self-guarding precondition: if the filesystem's mtime granularity
+        // didn't actually move X's mtime past `plan.pass_start`, fail here
+        // with a clear precondition message rather than silently passing
+        // (or silently failing) the real assertions below for the wrong
+        // reason — this is the exact false-RED class the NB14 guard exists
+        // to surface, not paper over.
+        let x_mtime = store
+            .mtime(&x)
+            .expect("X must still exist before the precondition check");
+        assert!(
+            x_mtime > plan.pass_start,
+            "PRECONDITION FAILED: filesystem mtime granularity did not move \
+             X's mtime past plan.pass_start ({x_mtime:?} vs {:?}) — this is \
+             the false-RED the NB14 sleep+precondition guard exists to \
+             surface; the 20ms gap was insufficient on this filesystem",
+            plan.pass_start
+        );
+
+        let evicted = execute(&store, plan);
+        assert_eq!(
+            evicted,
+            Evicted {
+                count: 0,
+                bytes: 0,
+                protected_bytes: 0,
+            },
+            "X was touched after the plan was taken — execute must spare it"
+        );
+        assert!(store.contains(&x), "X survives execute");
+        assert!(store.contains(&y));
     }
 }
