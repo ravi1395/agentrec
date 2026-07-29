@@ -58,6 +58,37 @@
 //! `show`/`status`) walk the tree themselves, `agentrec init` behaves
 //! differently outside a git repo, so this harness matches the same `init()`
 //! shape `integration.rs` uses for every other end-to-end test.
+//!
+//! # Documented residual coverage gaps (D5, review round)
+//!
+//! P4 is a `RepositoryView` extraction over the read verbs; the review
+//! round asked for goldens covering the arms inside that extraction's
+//! plausible blast radius (`print_entry`'s binary/baseline-unknown/
+//! missing/corrupt branches, the noise-fold line) and explicitly
+//! deprioritized the rest as a stated residual rather than silently
+//! skipped. The following production-reachable renderer arms are NOT
+//! pinned by any golden in this file:
+//!
+//! - `blame_file`'s deleted-file suffix (`" · deleted this file"`) and its
+//!   gap-stale suffix (`" · attribution stale — recording gap"` appended to
+//!   an otherwise-touched-file line, as opposed to the whole-line untouched
+//!   forms both `blame_untouched_file*` goldens already pin).
+//! - `blame_line`'s "attribution unavailable — snapshot unavailable" arm
+//!   and its "before recording began" / gap-poisoned "attribution stale"
+//!   arms.
+//! - The git-turn glossary entry, the "human-edited since" glossary term,
+//!   and the "noise files" glossary term under `log --explain` (only
+//!   "rich"/"bare"/"truncated" are exercised — see `golden_log_explain`).
+//! - `log --utc` (absolute-timestamp rendering instead of the relative
+//!   default).
+//! - `show --all-files` (the noise-fold-suppression flag on `show`, as
+//!   opposed to `log --all-files`, which IS covered —
+//!   `golden_log_noise_all_files`).
+//!
+//! If a future round needs these, they follow the same pattern already
+//! established here: derive the exact shape from the renderer, add the
+//! minimal fixture data to reach it, capture, review the bytes once before
+//! committing.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -79,6 +110,7 @@ const GIT_TURN_ID: &str = "t_GITT000000000000000000TUR3";
 const UNDO_TURN_ID: &str = "t_UNDO000000000000000000TUR4";
 const IMPORTED_TURN_ID: &str = "t_IMPT000000000000000000TUR7";
 const DUP_TURN_ID: &str = "t_DUPA000000000000000000TUR8";
+const EDGE_TURN_ID: &str = "t_EDGE000000000000000000TUR9";
 
 const EPOCH_GAP_START1: &str = "2020-01-01T00:00:00.000Z";
 const EPOCH_GAP_START2: &str = "2020-01-01T00:01:00.000Z"; // no stop between -> 1 gap
@@ -97,6 +129,8 @@ const IMPORTED_ENDED: &str = "2020-01-01T08:00:01.000Z";
 const DUP_STARTED: &str = "2020-01-02T14:00:00.000Z";
 const DUP_ENDED_A: &str = "2020-01-02T14:00:01.000Z";
 const DUP_ENDED_B: &str = "2020-01-02T14:00:02.000Z"; // recovery-recomputed `ended` drift
+const EDGE_STARTED: &str = "2020-01-02T15:00:00.000Z";
+const EDGE_ENDED: &str = "2020-01-02T15:00:01.000Z";
 
 // app.rs content: line2 changes, used for both diff-hunk and blame-line
 // coverage (added_or_changed_lines(before, after) == ["LINE2"]).
@@ -115,6 +149,12 @@ const DUP_AFTER: &[u8] = b"dup after\n";
 const IMPORTED_CONTENT: &[u8] = b"imported by backfill\n";
 const PROMPT_TEXT: &[u8] =
     b"Please add rate limiting to the API and handle burst traffic gracefully.";
+const BINARY_BEFORE: &[u8] = &[0u8, 1, 2, 3];
+const BINARY_AFTER: &[u8] = &[0u8, 1, 2, 3, 4, 5, 6];
+const BASELINE_UNKNOWN_AFTER: &[u8] = b"first seen mid-session\n";
+const MISSING_BLOB_GHOST: &[u8] = b"never actually stored\n";
+const CORRUPT_BLOB_REAL: &[u8] = b"real content at write time\n";
+const CORRUPT_BLOB_TAMPERED: &[u8] = b"tampered after the fact\n";
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -126,21 +166,40 @@ fn bin() -> &'static str {
 
 /// Run the real `agentrec` binary; never spawns `record` (AC5 — this whole
 /// harness runs with the daemon stopped and starts none itself).
+///
+/// D10 (review fix): scrubs every `AGENTREC_*` variable from the child's
+/// environment before running. Without this, a developer's shell exporting
+/// e.g. `AGENTREC_TEST_STORE_BUDGET_BYTES` (read by `cmds.rs` under
+/// `#[cfg(debug_assertions)]` and folded into `status_report`'s eviction
+/// path) would get different `status` bytes than CI — a golden mismatch
+/// that has nothing to do with the code under test.
 fn agentrec(root: &Path, args: &[&str]) -> Output {
-    Command::new(bin())
-        .args(args)
+    let mut cmd = Command::new(bin());
+    for (key, _) in std::env::vars_os() {
+        if let Some(k) = key.to_str() {
+            if k.starts_with("AGENTREC_") {
+                cmd.env_remove(k);
+            }
+        }
+    }
+    cmd.args(args)
         .args(["--root", root.to_str().unwrap()])
         .output()
         .expect("run agentrec")
 }
 
+/// D8 (review fix): `.status()` alone only catches spawn failure, not a
+/// non-zero exit — a `git` that runs and fails would leave the fixture in a
+/// non-git tempdir, silently disabling every ignore rule (the exact trap
+/// this module's doc comment and `P3.md` both call out). Assert success.
 fn git_init(root: &Path) {
-    Command::new("git")
+    let status = Command::new("git")
         .arg("init")
         .arg("-q")
         .arg(root)
         .status()
-        .expect("git init");
+        .expect("spawn git init");
+    assert!(status.success(), "git init failed for {root:?}: {status:?}");
 }
 
 fn init(root: &Path) {
@@ -176,6 +235,19 @@ fn write_file(root: &Path, rel: &str, content: &[u8]) {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(p, content).unwrap();
+}
+
+/// Overwrites an already-`put` blob's on-disk bytes directly (bypassing
+/// `BlobStore`'s own API, which has no "corrupt an object" method by
+/// design) so `store.get` later sees a hash mismatch — `StoreError::Corrupt`
+/// — instead of `Missing`. Mirrors `BlobStore`'s private two-char fan-out
+/// layout (`objects/<hash[..2]>/<hash[2..]>`) rather than reaching into the
+/// crate; that layout is PROTOCOL §6, stable, and this is a test-only
+/// tamper, not a load-bearing dependency on store internals.
+fn corrupt_blob(objects_dir: &Path, hash: &str, tampered: &[u8]) {
+    let hex = hash.strip_prefix("sha256:").expect("well-formed hash ref");
+    let (fan, rest) = hex.split_at(2);
+    std::fs::write(objects_dir.join(fan).join(rest), tampered).expect("tamper blob");
 }
 
 fn seed_turn(root: &Path, turn: &TurnRecord) {
@@ -375,17 +447,31 @@ fn build_fixture(root: &Path) {
     // matches P2's frozen struct declaration order exactly:
     // v, id, grade, truncated?, started, ended, tool, model, session, root,
     // prompt_ref?, prompt_excerpt?, merges?, imported, files_complete, files.
+    //
+    // `grade: "rich"`, `tool: "claude"` — NOT `"bare"`/`"claude-code"` (fixed
+    // in the review round; the first cut of this fixture got this wrong).
+    // `daemon.rs`'s `grade == "bare"` arm categorically forces
+    // `(tool, session, prompt_ref, prompt_excerpt)` to `None` — a bare turn
+    // carrying a tool is a shape the real system can never produce, and
+    // rendering one would fabricate agent attribution onto an unattributed
+    // window, directly contradicting the "bare turns never fabricate
+    // attribution" invariant (CLAUDE.md; P2.md decision 6). P2.md:53's own
+    // AC is explicit: imported turns land as `grade: "rich"`, `tool:
+    // "claude"`. This is the shape a bare fixture-and-implementation
+    // agreement would have hidden — exactly the P1 failure mode.
+    //
     // Until P2 lands, `load_log` parses this via serde's tolerant-unknown-
     // field default and silently drops `imported`/`files_complete` — this
-    // turn renders today as an ordinary bare turn with no visible marker.
-    // The day P2 merges those fields onto `TurnRecord`, `log --json`'s
-    // re-serialization of this exact line will start including
-    // `"imported":true,"files_complete":false` — the ONE golden this
-    // legitimately changes at that merge, not a regression.
+    // turn renders today as an ordinary rich `claude` turn with no visible
+    // "imported" marker. The day P2 merges those fields onto `TurnRecord`
+    // AND adds its own AC7 "partial file list (imported)" `log` marker,
+    // `log_default`/`log_all`/`log_explain`/`log_json` will all change
+    // again at that merge — expected, not a regression; do not pre-empt
+    // that marker by hand-writing it here.
     let imported_line = format!(
         concat!(
-            r#"{{"type":"turn","v":1,"id":"{id}","grade":"bare","#,
-            r#""started":"{started}","ended":"{ended}","tool":"claude-code","#,
+            r#"{{"type":"turn","v":1,"id":"{id}","grade":"rich","#,
+            r#""started":"{started}","ended":"{ended}","tool":"claude","#,
             r#""root":"/repo","imported":true,"files_complete":false,"#,
             r#""files":[{{"path":"src/imported.rs","before":null,"after":"{after}","#,
             r#""op":"create"}}]}}"#
@@ -427,6 +513,60 @@ fn build_fixture(root: &Path) {
     };
     seed_turn(root, &dup_a);
     seed_turn(root, &dup_b);
+
+    // ---- edge turn (D5, review fix): pins `print_entry`'s remaining
+    // branches that a plausible P4 `RepositoryView` extraction could change
+    // without any golden noticing — binary, baseline-unknown, missing-blob,
+    // and corrupt-blob, all captured by one `diff` invocation
+    // (`golden_diff_edge_cases`).
+    let binary_before = store.put(BINARY_BEFORE).unwrap();
+    let binary_after = store.put(BINARY_AFTER).unwrap();
+    let baseline_unknown_after = store.put(BASELINE_UNKNOWN_AFTER).unwrap();
+    // Never `store.put` — a well-formed hash ref pointing at an object that
+    // was never written, so `store.get` returns `StoreError::Missing`.
+    let missing_hash = agentrec_core::store::hash_bytes(MISSING_BLOB_GHOST);
+    let corrupt_hash = store.put(CORRUPT_BLOB_REAL).unwrap();
+    corrupt_blob(
+        &root.join(".agentrec/objects"),
+        &corrupt_hash,
+        CORRUPT_BLOB_TAMPERED,
+    );
+
+    let edge = TurnRecord {
+        v: 1,
+        id: EDGE_TURN_ID.to_string(),
+        grade: "rich".to_string(),
+        truncated: false,
+        started: EDGE_STARTED.to_string(),
+        ended: EDGE_ENDED.to_string(),
+        tool: Some("claude".to_string()),
+        model: None,
+        session: None,
+        root: "/repo".to_string(),
+        prompt_ref: None,
+        prompt_excerpt: Some("edge cases".to_string()),
+        merges: vec![],
+        files: vec![
+            fe(
+                "assets/img.bin",
+                Some(binary_before),
+                Some(binary_after),
+                "modify",
+            ),
+            FileEntry {
+                baseline_unknown: true,
+                ..fe(
+                    "src/baseline_unknown.rs",
+                    None,
+                    Some(baseline_unknown_after),
+                    "modify",
+                )
+            },
+            fe("src/missing.rs", None, Some(missing_hash), "modify"),
+            fe("src/corrupt.rs", None, Some(corrupt_hash.clone()), "modify"),
+        ],
+    };
+    seed_turn(root, &edge);
 }
 
 /// `t_<ULID>` -> `t_<first4>…<last4>`, mirroring `cli/src/fmt.rs::short_id`
@@ -469,10 +609,21 @@ fn golden_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden")
 }
 
-/// Captures `stdout\0stderr\0exit=<code>\n` (NUL-separated so a golden diff
-/// distinguishes an empty-stderr-different-stdout case from the reverse) for
-/// `out`, normalizes it, and compares against (or — under `UPDATE_GOLDEN=1`
-/// — writes) `tests/fixtures/golden/<name>.golden`.
+/// Captures `out` as `stdout:\n<stdout>\n--stderr--\n<stderr>\n--exit--\n<code>\n`
+/// (text delimiters, not NUL-separated — see caveat below), normalizes it,
+/// and compares against (or — under `UPDATE_GOLDEN=1` — writes)
+/// `tests/fixtures/golden/<name>.golden`.
+///
+/// Caveat (review fix — this doc previously claimed a NUL-separated format
+/// that the code below never implemented): if a captured `stdout` payload
+/// ever contained the literal line `--stderr--` or `--exit--`, this format
+/// would misparse on a manual read (though `assert_golden`'s own comparison
+/// is a whole-string equality check, so a golden MISMATCH is still caught
+/// correctly either way — the ambiguity only affects a human eyeballing the
+/// `.golden` file, not correctness of the pass/fail). None of this
+/// harness's captured commands can ever emit those literal lines (no
+/// renderer in `cmds.rs`/`readcmds.rs` prints either string), so this is a
+/// documented risk, not a live bug.
 fn assert_golden(name: &str, out: &Output) {
     let captured = format!(
         "stdout:\n{}\n--stderr--\n{}\n--exit--\n{}\n",
@@ -701,6 +852,39 @@ fn golden_diff_unknown_id_fails() {
     assert_golden("diff_unknown_id", &out);
 }
 
+/// D4 (review fix): nothing previously invoked any verb against
+/// `DUP_TURN_ID`, so `resolve_turn`'s same-revert collapse arm
+/// (`readcmds.rs:152`) was unpinned — the fixture's "duplicate-id pair
+/// collapsible by `same_revert`" existed in `log.jsonl` but its actual
+/// purpose (that querying it by id succeeds instead of erroring
+/// "ambiguous") was never exercised. `diff` on the (single, collapsed)
+/// duplicate id proves the collapse.
+#[test]
+fn golden_diff_dup_turn_collapses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture(root);
+    let out = agentrec(root, &["diff", DUP_TURN_ID]);
+    assert!(
+        out.status.success(),
+        "expected same_revert to collapse the duplicate pair, not error ambiguous: {out:?}"
+    );
+    assert_golden("diff_dup_turn_collapses", &out);
+}
+
+/// D5 (review fix, narrow slice): pins `print_entry`'s binary,
+/// baseline-unknown, missing-blob (`StoreError::Missing`), and
+/// corrupt-blob (`StoreError::Corrupt`) branches — all reachable in
+/// production, all inside a plausible P4 `RepositoryView` extraction's
+/// blast radius, none previously covered by any golden.
+#[test]
+fn golden_diff_edge_cases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture(root);
+    assert_golden("diff_edge_cases", &agentrec(root, &["diff", EDGE_TURN_ID]));
+}
+
 #[test]
 fn golden_blame_untouched_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -763,6 +947,65 @@ fn golden_blame_untouched_file_no_gap() {
     assert_golden(
         "blame_untouched_file_no_gap",
         &agentrec(root, &["blame", "src/untouched.rs"]),
+    );
+}
+
+/// D5 (review fix, narrow slice): pins `log`'s `noise_globs` fold
+/// (`cmds.rs:124` / NF-A/NF-B) — a third, minimal fixture, since
+/// `noise_globs` is config-driven and adding a `config.toml` to the main
+/// fixture would perturb every other golden's `status`/`log` byte count for
+/// no reason. One turn with one noise-matching entry and one ordinary
+/// entry, so the fold line's count (`+1 noise files`) and the surviving
+/// visible entry are both pinned in a single capture.
+fn build_fixture_noise(root: &Path) {
+    init(root);
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "noise_globs = [\"*.log\"]\n",
+    )
+    .unwrap();
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let log_after = store.put(b"noisy\n").unwrap();
+    let src_after = store.put(b"real change\n").unwrap();
+
+    let turn = TurnRecord {
+        v: 1,
+        id: "t_NOISE00000000000000000TUR1".to_string(),
+        grade: "rich".to_string(),
+        truncated: false,
+        started: "2020-01-02T00:00:00.000Z".to_string(),
+        ended: "2020-01-02T00:00:01.000Z".to_string(),
+        tool: Some("claude".to_string()),
+        model: None,
+        session: None,
+        root: "/repo".to_string(),
+        prompt_ref: None,
+        prompt_excerpt: Some("touch a log and a source file".to_string()),
+        merges: vec![],
+        files: vec![
+            fe("debug.log", None, Some(log_after), "create"),
+            fe("src/real.rs", None, Some(src_after), "create"),
+        ],
+    };
+    seed_turn(root, &turn);
+}
+
+#[test]
+fn golden_log_noise_fold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture_noise(root);
+    assert_golden("log_noise_fold", &agentrec(root, &["log"]));
+}
+
+#[test]
+fn golden_log_noise_all_files_reveals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture_noise(root);
+    assert_golden(
+        "log_noise_all_files",
+        &agentrec(root, &["log", "--all-files"]),
     );
 }
 
@@ -877,6 +1120,12 @@ fn golden_show_unknown_id_fails() {
 
 #[test]
 fn three_fresh_builds_are_byte_identical() {
+    // D6 (review fix): the original list covered only `log`/`status`, but
+    // those never touch the worktree or the blob store by absolute path.
+    // `blame` reads `root.join(&file)` directly (`readcmds.rs:361`) and
+    // `diff`/`show --prompt` resolve blobs from `objects_dir(root)` — those
+    // are the three verbs that could actually leak a tempdir path, and
+    // they were outside this loop.
     const COMMANDS: &[&[&str]] = &[
         &["log"],
         &["log", "--all"],
@@ -884,6 +1133,10 @@ fn three_fresh_builds_are_byte_identical() {
         &["log", "--explain"],
         &["status"],
         &["status", "--json"],
+        &["diff", RICH_TURN_ID],
+        &["blame", "src/app.rs"],
+        &["blame", "src/app.rs:2"],
+        &["show", RICH_TURN_ID, "--prompt"],
     ];
     let mut runs: Vec<Vec<String>> = Vec::new();
     for _ in 0..3 {

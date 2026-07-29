@@ -1,0 +1,15 @@
+stdout:
+turn t_EDGE…TUR9 · claude · 4 files
+  assets/img.bin: binary file changed (4 → 7 bytes)
+  src/baseline_unknown.rs: (baseline unknown — first seen mid-session; showing new content)
+--- a/src/baseline_unknown.rs
++++ b/src/baseline_unknown.rs
+@@ -0,0 +1 @@
++first seen mid-session
+  src/missing.rs: (snapshot unavailable)
+  src/corrupt.rs: (snapshot corrupt — hash mismatch)
+
+--stderr--
+
+--exit--
+0

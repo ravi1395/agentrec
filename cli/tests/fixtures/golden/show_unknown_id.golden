@@ -1,7 +1,7 @@
 stdout:
 
 --stderr--
-agentrec: unknown turn id 't_DOESNOTEXIST0000000000001' — recorded turns: t_RICH…TUR1..t_DUPA…TUR8 (7 turns)
+agentrec: unknown turn id 't_DOESNOTEXIST0000000000001' — recorded turns: t_RICH…TUR1..t_EDGE…TUR9 (8 turns)
 
 --exit--
 1

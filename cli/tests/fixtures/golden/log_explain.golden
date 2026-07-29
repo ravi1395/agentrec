@@ -1,7 +1,8 @@
 stdout:
+t_EDGE…TUR9 · rich · claude · 2020-01-02 · 4 files · "edge cases"
 t_DUPA…TUR8 · rich · claude · 2020-01-02 · 1 file · "dup pass" · (truncated)
 t_DUPA…TUR8 · rich · claude · 2020-01-02 · 1 file · "dup pass"
-t_IMPT…TUR7 · bare · claude-code · 2020-01-01 · 1 file
+t_IMPT…TUR7 · rich · claude · 2020-01-01 · 1 file
 t_UNDO…TUR4 · rich · agentrec · 2020-01-02 · 1 file · "undo of t_RICH…TUR1"
 t_BARE…TUR2 · bare · — · 2020-01-02 · 1 file
 t_RICH…TUR1 · rich · claude · 2020-01-02 · 5 files · "add rate limiting"
