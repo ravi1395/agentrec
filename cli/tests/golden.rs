@@ -666,6 +666,23 @@ fn golden_status_json() {
     assert_golden("status_json", &agentrec(root, &["status", "--json"]));
 }
 
+/// `status`'s own failing invocation (AC2's "one failing invocation per
+/// command"): `--ack-degraded` and `--json` are `conflicts_with` in clap
+/// (`main.rs`'s `Status` variant) — clap itself rejects this before
+/// `cmds::status` ever runs, exit code 2, clap's own usage text on stderr.
+/// Pinned because that text is exactly the kind of byte that silently
+/// drifts on a clap version bump, with nothing else in this suite watching
+/// it.
+#[test]
+fn golden_status_ack_degraded_json_conflict_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture(root);
+    let out = agentrec(root, &["status", "--ack-degraded", "--json"]);
+    assert!(!out.status.success(), "expected clap to reject: {out:?}");
+    assert_golden("status_ack_degraded_json_conflict", &out);
+}
+
 #[test]
 fn golden_diff_rich_turn() {
     let tmp = tempfile::tempdir().unwrap();
@@ -691,8 +708,60 @@ fn golden_blame_untouched_file() {
     build_fixture(root);
     // Poisoned by the fixture's global epoch gap (see build_fixture's doc) —
     // "attribution stale — recording gap", not "no recorded turn touches".
+    // The genuinely-untouched, no-gap branch is a SEPARATE golden below
+    // (`golden_blame_untouched_file_no_gap`) against a second, minimal
+    // fixture — without it, `blame_file`'s `no recorded turn touches <file>`
+    // arm would be unreachable by any golden in this suite and could be
+    // deleted with the whole suite still green (exactly the failure shape
+    // the governing lesson warns about).
     assert_golden(
         "blame_untouched_file",
+        &agentrec(root, &["blame", "src/untouched.rs"]),
+    );
+}
+
+/// Minimal second fixture: balanced epochs (start/stop, no gap), one rich
+/// turn that does NOT touch `src/untouched.rs`. Exists solely to reach
+/// `blame_file`'s `no recorded turn touches {file}` arm — the main
+/// `build_fixture` fixture can never reach it because its epoch gap
+/// unconditionally poisons that branch via `has_recording_gap` (positional,
+/// not time-scoped — see `build_fixture`'s doc comment).
+fn build_fixture_no_gap(root: &Path) {
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let before = store.put(b"a\n").unwrap();
+    let after = store.put(b"b\n").unwrap();
+    write_file(root, "src/touched.rs", b"b\n");
+
+    seed_epoch(root, "start", "2020-01-01T00:00:00.000Z");
+    seed_epoch(root, "stop", "2020-01-01T00:01:00.000Z");
+
+    let turn = TurnRecord {
+        v: 1,
+        id: "t_NOGAP00000000000000000TUR1".to_string(),
+        grade: "rich".to_string(),
+        truncated: false,
+        started: "2020-01-02T00:00:00.000Z".to_string(),
+        ended: "2020-01-02T00:00:01.000Z".to_string(),
+        tool: Some("claude".to_string()),
+        model: None,
+        session: None,
+        root: "/repo".to_string(),
+        prompt_ref: None,
+        prompt_excerpt: Some("touch a file".to_string()),
+        merges: vec![],
+        files: vec![fe("src/touched.rs", Some(before), Some(after), "modify")],
+    };
+    seed_turn(root, &turn);
+}
+
+#[test]
+fn golden_blame_untouched_file_no_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_fixture_no_gap(root);
+    assert_golden(
+        "blame_untouched_file_no_gap",
         &agentrec(root, &["blame", "src/untouched.rs"]),
     );
 }
