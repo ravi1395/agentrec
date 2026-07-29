@@ -150,6 +150,9 @@ file, so both must be proven for AC5 to hold.
 **Proves:** AC6 — a file whose every line is malformed JSON reports one skip per line, exits
 0, and does not abort the run or other files.
 
+*Amended after review to add a sibling valid file, proving the broken file doesn't abort
+processing of others.*
+
 - File: `projects/proj-a/broken.jsonl`, 5 lines, **every single line is syntactically invalid
   JSON** (verified with `json.loads` in Python — all 5 raise `JSONDecodeError`):
   1. Unbalanced brace (opening `{` never closed).
@@ -159,6 +162,10 @@ file, so both must be proven for AC5 to hold.
      line.
   5. Bare `{{{{` garbage.
 - No valid JSON appears anywhere in this file.
+- File: `projects/proj-a/valid-sibling.jsonl`, 1 line, hand-authored, unremarkable T1 `Edit`
+  entry (`originalFile` set, `cwd: "/fake/repo9"`) — same shape as the other scenarios' valid
+  lines. Its only purpose is proving `broken.jsonl`'s malformed content doesn't abort the scan
+  of other files in the same project directory: this session must still count importable.
 
 ---
 
@@ -214,7 +221,7 @@ that predicate to each scenario here (each scenario is its own `--source` root):
 | `t2_t3_candidate/` | 1 | 1 | All lines parse; no AC8 field missing (T2 detection doesn't gate importability). |
 | `opaque/` | 1 | 1 | Zero file-entries, but the one line is a legitimate opaque `Bash` call — importable per decision 3(b)'s explicit carve-out. |
 | `sidechain/` | **1** | 1 (but 0 turns) | `subagents/agent-x1.jsonl` is **two levels** below `projects/proj-a/` (under `<sessionId>/subagents/`), so it is **outside the denominator entirely** — it is not "a session that fails", it's not counted at all. Only the top-level `d4444444-...jsonl` counts, and it counts as importable (it completes cleanly) even though it produces **zero turns** (its one file-producing line is sidechain-excluded). Importability and turn-count are different axes — this fixture is the one that makes that distinction visible. |
-| `malformed/` | 1 | **0** | Every line fails to parse (AC6), so **zero** lines parse — decision 3(b)'s "at least one line parses" carve-out does not apply here. This is the one a test author is most likely to get wrong, since AC6 only promises exit 0 + no abort and says nothing about importability. |
+| `malformed/` | **2** | **1** | `broken.jsonl`: every line fails to parse (AC6), so **zero** lines parse — decision 3(b)'s "at least one line parses" carve-out does not apply, so it is not importable. `valid-sibling.jsonl` (added after review): all lines parse, no AC8 field missing, so it counts importable — proving `broken.jsonl` doesn't abort the scan of its sibling. |
 | `missing_cwd/` | 1 | **0** | Hits the AC8 loud-failure path (missing required field `cwd`) — decision 3(b) explicitly excludes this from importable. |
 | `missing_touluseresult/` | 1 | **0** | Hits the AC8 loud-failure path (missing required field `toolUseResult` on a line that structurally needs it). |
 
@@ -237,7 +244,9 @@ cli/tests/fixtures/import/claude/
 │       ├── d4444444-4444-4444-8444-444444444444.jsonl
 │       └── d4444444-4444-4444-8444-444444444444/subagents/agent-x1.jsonl
 ├── malformed/
-│   └── projects/proj-a/broken.jsonl
+│   └── projects/proj-a/
+│       ├── broken.jsonl
+│       └── valid-sibling.jsonl                    (added after review, see scenario 5)
 ├── missing_cwd/
 │   └── projects/proj-a/no-cwd.jsonl
 └── missing_touluseresult/
