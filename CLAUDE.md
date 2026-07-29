@@ -40,8 +40,9 @@ carries only current state, what's next, and standing debts.
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
 - **P1 EXECUTED + GATE PASS (2026-07-29) — merged into `feat/phase-2-0-substrate` at `cc026c9`;
   nothing pushed, no PR.**
-  `agentrec import claude --dry-run` built; **447 / 0 / 1** (baseline 428, +19: 17 integration
-  + 2 unit); clippy+fmt clean debug & release; debug seam absent from release `strings`.
+  `agentrec import claude --dry-run` built; **460 / 0 / 1** on `fix/p1-t15-path-normalization`
+  (pre-P1 baseline 428; the 8/8 gate ran at 447, before the two T1.5 defect fixes added
+  coverage); clippy+fmt clean debug & release; debug seam absent from release `strings`.
   Final Fable skeptic in an isolated worktree: **8/8 ACs PASS**, every figure independently
   reproduced (against figures since proven wrong twice over — see below). Real-corpus gate
   run, corrected 2026-07-29 evening (`docs/verify/p1-gate-run-t15fix2.txt`): **1631 sessions,
