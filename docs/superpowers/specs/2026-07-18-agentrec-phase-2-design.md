@@ -390,36 +390,65 @@ load-bearing:
    pre-edit file content on Edit/Write results, but **unreliably** (~30% of edit
    results in the audited corpus, varying 4–70% per session with no version
    correlation). Opportunistic, never assumed. Measured share (P1's real-corpus
-   importer run, 2026-07-29, 2151 file entries): 39.9% of file entries (incl.
-   create ops) — supersedes the 2026-07-24 audit's 42.5% prediction.
+   importer run, corrected 2026-07-29 evening, 2159 file entries): **856 entries
+   — 39.6%** (of which 595 — 27.6% — carry inline `originalFile` and yield real
+   pre-edit bytes; 261 — 12.1% — are `create` ops, which correctly have no
+   pre-edit bytes) — supersedes the 2026-07-24 audit's 42.5% prediction.
 2. **T1.5** — `~/.claude/file-history/<sessionId>/<hash>@<vN>`, resolved via
-   `snapshot.trackedFileBackups[path].backupFileName`: verbatim pre-edit bytes.
-   The 2026-07-24 audit predicted 25.3% of entries, but that figure counted
-   files with *any* same-session backup reference, not entries the ladder's
-   first-hit-wins logic actually resolves via T1.5 — most referenced files were
-   already covered by T1 first. P1's real-corpus run measured T1.5's true
-   marginal contribution at **0.5%** (11 of 2151 entries; 11 of 12 candidate
-   blobs still on disk, one reaped by ~30-day retention). Retention-limited
-   (~30 days) so coverage degrades with age — opportunistic, same class as T1.
+   `snapshot.trackedFileBackups[path].backupFileName`: verbatim pre-edit bytes,
+   admitted only when a **structural** check passes — no edit to the same path
+   intervened between the snapshot that recorded the backup and the edit being
+   classified. (File-history blobs are written at snapshot time, not per edit,
+   so for a 2nd-or-later edit the naive blob is a pre-*snapshot*, not pre-edit,
+   state.) The 2026-07-24 audit predicted 25.3% of entries, but that figure
+   counted files with *any* same-session backup reference, not entries the
+   ladder's first-hit-wins logic actually resolves via T1.5. **T1.5 was wrong
+   twice, in opposite directions, before this figure — it was never "genuinely
+   near-empty."** First it was *under-detected* to 0.5% (11 entries) by a bug
+   comparing an absolute `filePath` against `trackedFileBackups` keys that are
+   relative to the session `cwd` in most of the corpus. Fixing that path
+   compare raised the count to 210 — which was then found to be *over-counted*:
+   a ground-truth subsample put the fabrication rate at ~30% (115 of that
+   sample provably stale), because the textual `oldString`-containment guard
+   let stale blobs (pre-snapshot, not pre-edit) through. Gating on the
+   structural check above rejects **170 entries corpus-wide** as stale;
+   P1's corrected, twice-re-measured marginal contribution is **90 entries —
+   4.2%** (1 structurally-inferred). Ground-truth
+   check (entries that also carry an inline `originalFile`, so the true bytes
+   are known): **101 correct / 1 fabricated — 1.0% residual**, down from ~30%
+   fabricated before the structural fix. Retention-limited (~30 days) so
+   coverage degrades with age — opportunistic, same class as T1.
 3. **T2** — git history blob (commit-time reconstruction) when the repo's git log
    covers the file at the turn's timestamp. **Upper bound by construction**: git
    holds committed states only, so a mid-session intermediate edit was never in
    git — a T2 candidate whose exact bytes were never committed falls through to
    T3, never to a nearby commit's bytes. 2026-07-24 predicted candidate share
-   24.5%; P1's real-corpus run measured T2-candidate share at 44.8% (bytes still
-   not resolved — see "Do not quote 92.3%" below).
+   24.5%; P1's real-corpus run measured T2-candidate share at **41.5%** (897 of
+   2159 entries; bytes still not resolved — see "Do not quote 92.3%" below).
 4. **T3** — none of the above → `before: null` + provenance-only; refused by undo
    with an explicit imported-history reason. Import never fabricates a revertible
-   snapshot. 2026-07-24 predicted 7.7%; P1's real-corpus run measured 15.0%.
+   snapshot. 2026-07-24 predicted 7.7%; P1's real-corpus run measured **14.6%**
+   (316 of 2159).
 
-Honest reconstructible figure: **40.4% without git** (T1 39.9% + T1.5 0.5%,
-measured 2026-07-29 by the built importer's real-corpus run — task P1; see
-`VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and `docs/verify/p1-gate-run.txt`).
-This supersedes the 2026-07-24 audit's predicted 67.9%: that prediction's T1.5
-term counted same-session backup *references*, not entries the first-hit-wins
-ladder would actually resolve via T1.5 after T1 already claimed most of them.
-Do not quote 92.3% — T2-candidate measured 44.8% (P1), still an unresolved
-upper bound, now more clearly so than the 24.5% prediction implied.
+**Honest reconstructible figure — two numbers, read separately, never collapsed
+to one** (measured 2026-07-29 evening by the built importer's real-corpus run —
+task P1; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and
+`docs/verify/p1-gate-run-t15fix2.txt`):
+- **43.8%** (T1 856 + T1.5 90 = 946 of 2159) counting `create` ops as
+  reconstructible, since a new file's correct `before` genuinely is "nothing".
+- **31.7%** (595 + 90 = 685 of 2159) counting only entries that yield **actual
+  pre-edit bytes**.
+
+This figure has been wrong twice: the 2026-07-24 prediction (67.9%), then a
+first real-corpus reading (40.4%) that undercounted T1.5 via the path-compare
+bug and — had it not been caught — would next have overcounted it via stale
+blobs. Neither superseded number should be quoted again.
+Do not quote 92.3% — T2-candidate measured 41.5% (P1), still an unresolved
+upper bound. **The same ban applies to the ~85% ceiling** (43.8 + 41.5
+T2-candidate): it is an upper bound by the identical argument (git holds
+committed states only, so a mid-session intermediate edit was never in git at
+all), and P2 will not resolve every T2 candidate. Do not quote ~85% as a
+recovery rate.
 
 **File lists are structurally incomplete** — the deeper honesty problem. In the
 audited corpus, Bash tool calls outnumber Edit+Write ~2:1, and Bash and subagent

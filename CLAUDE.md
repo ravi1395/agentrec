@@ -33,8 +33,9 @@ carries only current state, what's next, and standing debts.
   setup, Codex). Corpus decay measured: import is a **≤30-day rolling backfill**
   (`cleanupPeriodDays` default 30); "durable archive" claim embargoed until a re-import
   mechanism ships; 4-tier before-ladder predicted this day (T1 42.5 / T1.5 25.3 / T2-cand 24.5
-  / T3 7.7 → 67.9% honest, 92.3% banned) — **superseded same-day by P1's real-corpus run, see
-  below: honest figure is 40.4%.**
+  / T3 7.7 → 67.9% honest, 92.3% banned) — **superseded, twice, by P1's real-corpus runs, see
+  below: honest figures are 43.8% (counting `create` ops as reconstructible) / 31.7% (actual
+  pre-edit bytes only); an intermediate 40.4% reading was also wrong and is retired.**
 - **Phase 2.0 plan chunked:** `docs/superpowers/plans/tasks/P1..P5.md` (standalone,
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
 - **P1 EXECUTED + GATE PASS (2026-07-29) — merged into `feat/phase-2-0-substrate` at `cc026c9`;
@@ -42,20 +43,30 @@ carries only current state, what's next, and standing debts.
   `agentrec import claude --dry-run` built; **447 / 0 / 1** (baseline 428, +19: 17 integration
   + 2 unit); clippy+fmt clean debug & release; debug seam absent from release `strings`.
   Final Fable skeptic in an isolated worktree: **8/8 ACs PASS**, every figure independently
-  reproduced. Real-corpus gate run (`docs/verify/p1-gate-run.txt`): **1617 sessions, 99.6%
-  importable** (bar ≥90%), peak RSS **16.7 MB** (bar <500 MB). Fidelity row + anti-overclaim
-  rider in `VERIFY-LEDGER.md`. **The Phase 2.0 hard stop is retired with a fidelity row, not a
-  parse-only pass** (spec decision 8 satisfied).
-  - **The plan's before-ladder prediction did NOT hold.** Measured T1 39.9 / **T1.5 0.5** /
-    T2-cand 44.8 / T3 15.0 vs predicted 42.5 / 25.3 / 24.5 / 7.7. T1.5 is ~50× below
-    prediction — verified genuine (only 12 entries corpus-wide qualify; 11 have blobs on
-    disk; the importer resolves all 11). **Honest reconstructible is 40.4%, not 67.9%** —
-    propagated across spec/plan/task/measurement docs at `34d858c`; 92.3% stays banned. Root
-    cause of the miss: the 25.3% T1.5 prediction counted backup *references* (files a session
-    watches, e.g. `CLAUDE.md`), not entries the first-hit-wins ladder resolves via T1.5 after
-    T1 already claimed them.
-  - **99.6% is an ingestion rate, never a recovery rate** — only 184/1617 sessions carry any
-    file mutation at all. Never quote it bare; the rider in VERIFY-LEDGER.md travels with it.
+  reproduced (against figures since proven wrong twice over — see below). Real-corpus gate
+  run, corrected 2026-07-29 evening (`docs/verify/p1-gate-run-t15fix2.txt`): **1631 sessions,
+  1625 importable — 99.6%** (bar ≥90%), peak RSS **16.7 MB** (bar <500 MB). Fidelity row +
+  anti-overclaim rider in `VERIFY-LEDGER.md`. **The Phase 2.0 hard stop is retired with a
+  fidelity row, not a parse-only pass** (spec decision 8 satisfied).
+  - **The plan's before-ladder prediction did NOT hold, and the correction itself was wrong
+    once before landing.** Predicted T1 42.5 / T1.5 25.3 / T2-cand 24.5 / T3 7.7. A first
+    real-corpus reading (`34d858c`) measured T1 39.9 / **T1.5 0.5** / T2-cand 44.8 / T3 15.0
+    and claimed T1.5 was "genuinely near-empty, not under-detected" — **that claim was false.**
+    T1.5 was under-detected by a bug (lookup compared an absolute `filePath` against
+    `trackedFileBackups` keys that are relative to session `cwd`, so the raw compare almost
+    never matched); fixing it raised the count, but then over-counted via stale file-history
+    blobs (written at snapshot time, not per edit — ~30% of the fixed reading's resolved bytes
+    were fabricated pre-*snapshot* states). Corrected figures, now measured over **2159**
+    entries: T1 856 (39.6%, of which 595/27.6% inline `originalFile` + 261/12.1% `create` ops)
+    / T1.5 90 (4.2%, ground-truth 101 correct / 1 fabricated) / T2-cand 897 (41.5%) / T3 316
+    (14.6%). **Honest reconstructible is 43.8% (T1+T1.5 counting `create` ops) or 31.7%
+    (actual-bytes only) — not 67.9%, and not the intermediate 40.4% either** — propagated
+    across spec/plan/task/measurement docs/VERIFY-LEDGER. 92.3% stays banned, and the same ban
+    now covers the **~85% ceiling** (43.8 + 41.5 T2-cand) — both are upper bounds by the
+    identical argument (git holds committed states only).
+  - **99.6% is an ingestion rate, never a recovery rate** — only ~184/1631 sessions (11%) carry
+    any file mutation at all. Never quote it bare; the rider in VERIFY-LEDGER.md travels with
+    it.
   - Defect worth remembering: first gate run reported `t1_5 = 0` because the classifier
     matched a `type: "snapshot"` literal the *synthetic fixture had invented*; the real corpus
     uses `file-history-snapshot`. Every test passed while nothing real resolved. Fixed to
@@ -71,8 +82,8 @@ carries only current state, what's next, and standing debts.
    exact next steps, gotchas, and founder-pending items; ingest it and delete it.
    **Founder-directed method: sonnet implementers → opus reviewers → one final Fable skeptic as
    the binding done-gate (isolated worktree). Done means the skeptic says the ACs are met.**
-   P2 resolves T2 git blobs — the work that converts the 963 T2-candidates into a real recovery
-   rate (expect well below 44.8%; git holds committed states only, and that is the honest
+   P2 resolves T2 git blobs — the work that converts the 897 T2-candidates into a real recovery
+   rate (expect well below 41.5%; git holds committed states only, and that is the honest
    outcome, not a failure). P3's fixture needs an imported turn: if P2 hasn't landed, seed the
    line into `log.jsonl` directly rather than blocking.
 2. Then P4 (`RepositoryView` — needs P2 **and** P3's goldens) → P5 (`--json`) → plan-exit
