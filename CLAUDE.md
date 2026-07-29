@@ -37,7 +37,8 @@ carries only current state, what's next, and standing debts.
   below: honest figure is 40.4%.**
 - **Phase 2.0 plan chunked:** `docs/superpowers/plans/tasks/P1..P5.md` (standalone,
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
-- **P1 EXECUTED + GATE PASS (2026-07-29) — `feat/p1-import-classifier`, not merged, no PR.**
+- **P1 EXECUTED + GATE PASS (2026-07-29) — merged into `feat/phase-2-0-substrate` at `cc026c9`;
+  nothing pushed, no PR.**
   `agentrec import claude --dry-run` built; **447 / 0 / 1** (baseline 428, +19: 17 integration
   + 2 unit); clippy+fmt clean debug & release; debug seam absent from release `strings`.
   Final Fable skeptic in an isolated worktree: **8/8 ACs PASS**, every figure independently
@@ -49,7 +50,10 @@ carries only current state, what's next, and standing debts.
     T2-cand 44.8 / T3 15.0 vs predicted 42.5 / 25.3 / 24.5 / 7.7. T1.5 is ~50× below
     prediction — verified genuine (only 12 entries corpus-wide qualify; 11 have blobs on
     disk; the importer resolves all 11). **Honest reconstructible is 40.4%, not 67.9%** —
-    correct the 67.9% figure wherever it is quoted; 92.3% stays banned.
+    propagated across spec/plan/task/measurement docs at `34d858c`; 92.3% stays banned. Root
+    cause of the miss: the 25.3% T1.5 prediction counted backup *references* (files a session
+    watches, e.g. `CLAUDE.md`), not entries the first-hit-wins ladder resolves via T1.5 after
+    T1 already claimed them.
   - **99.6% is an ingestion rate, never a recovery rate** — only 184/1617 sessions carry any
     file mutation at all. Never quote it bare; the rider in VERIFY-LEDGER.md travels with it.
   - Defect worth remembering: first gate run reported `t1_5 = 0` because the classifier
@@ -62,11 +66,17 @@ carries only current state, what's next, and standing debts.
 
 ### Now / next (in order)
 
-1. **P1 done — merge decision is the founder's** (`feat/p1-import-classifier`, 6 commits off
-   `feat/phase-2-0-substrate`; no PR opened, per standing practice of not publishing unasked).
-2. P2 (persist + undo refusal — consumes P1's classifier; resolves T2 git blobs, which is what
-   converts the 963 T2-candidates into a real recovery rate) → P4 (`RepositoryView`) → P5
-   (`--json`), then the plan-exit checklist. P3 (golden harness) may run in parallel now.
+1. **Execute P2 and P3 in parallel worktrees** (`docs/superpowers/plans/tasks/P2.md`, `P3.md`) —
+   they touch disjoint files. `HANDOFF.md` at the root of `feat/phase-2-0-substrate` carries the
+   exact next steps, gotchas, and founder-pending items; ingest it and delete it.
+   **Founder-directed method: sonnet implementers → opus reviewers → one final Fable skeptic as
+   the binding done-gate (isolated worktree). Done means the skeptic says the ACs are met.**
+   P2 resolves T2 git blobs — the work that converts the 963 T2-candidates into a real recovery
+   rate (expect well below 44.8%; git holds committed states only, and that is the honest
+   outcome, not a failure). P3's fixture needs an imported turn: if P2 hasn't landed, seed the
+   line into `log.jsonl` directly rather than blocking.
+2. Then P4 (`RepositoryView` — needs P2 **and** P3's goldens) → P5 (`--json`) → plan-exit
+   checklist.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
