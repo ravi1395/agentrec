@@ -333,6 +333,9 @@ fn json_flag_round_trips_through_serde_json() {
     assert!(report["sessions_in_root"].is_u64());
     assert!(report["tier_counts"]["t1"].is_u64());
     assert!(report["tier_counts"]["t1_5"].is_u64());
+    assert!(report["tier_counts"]["t15_unverified"].is_u64());
+    assert!(report["tier_counts"]["t15_rejected_unverifiable"].is_u64());
+    assert!(report["tier_counts"]["t15_blob_missing"].is_u64());
     assert!(report["tier_counts"]["t2_candidate"].is_u64());
     assert!(report["tier_counts"]["t3"].is_u64());
     assert!(report["opaque_calls"].is_u64());
@@ -491,6 +494,9 @@ fn text_report_contains_every_json_field_in_prose() {
         "tier_counts",
         "t1=",
         "t1_5=",
+        "t15_unverified=",
+        "t15_rejected_unverifiable=",
+        "t15_blob_missing=",
         "t2_candidate=",
         "t3=",
         "opaque_calls",
@@ -692,4 +698,287 @@ fn empty_projects_dir_is_a_legitimate_zero_session_corpus() {
         report["sessions_total"], 0,
         "an existing but empty projects/ dir is a legitimate empty corpus"
     );
+}
+
+// ---- 18. T1.5 path-normalization fix: a `trackedFileBackups` key that is
+// RELATIVE to the session's `cwd` (measured on the real corpus: 1606 of 1883
+// keys) must still resolve — this is the RED->GREEN test for the reported
+// defect (fixture `t15_relative_key/`; see FIXTURES.md scenario 8). ---------
+
+#[test]
+fn t15_relative_backup_key_resolves_against_session_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_relative_key"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "a relative trackedFileBackups key (\"src/notes.txt\") joined against \
+         the session's cwd must resolve to T1.5, not fall through to T2/T3; \
+         full report: {report}"
+    );
+    assert_eq!(report["tier_counts"]["t1"], 0);
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t3"], 0);
+    assert_eq!(
+        report["tier_counts"]["t15_unverified"], 0,
+        "oldString is present and matches the blob — this must be content-proven"
+    );
+    assert_eq!(report["tier_counts"]["t15_rejected_unverifiable"], 0);
+
+    let entries = debug_entries(&report);
+    let notes = entry_for(&entries, "notes.txt");
+    assert_eq!(notes["tier"], "t1_5");
+    assert_eq!(
+        notes["sha256"], "678cd3ef69c16e338a717c91a0ecdec9c394b4992360d2680539fbaf028b8396",
+        "resolved bytes must match the independently-computed shasum of the \
+         file-history blob (see FIXTURES.md scenario 8)"
+    );
+}
+
+// ---- 19. T1.5 "never fabricate" guard: a backup blob resolves and is
+// readable, but its content does NOT contain the edit's `oldString` — the
+// blob is not this edit's pre-state, so the entry must be refused as T1.5
+// and fall through to T2/T3, counted in `t15_rejected_unverifiable`
+// (fixture `t15_stale_blob/`; see FIXTURES.md scenario 9). ------------------
+
+#[test]
+fn stale_backup_blob_is_rejected_not_classified_t15() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_stale_blob"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 0,
+        "the resolved blob does not contain the edit's oldString — must NOT \
+         classify T1.5 (would fabricate a plausible-but-wrong pre-state); \
+         full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_unverifiable"], 1,
+        "the rejection must be counted so the loss stays visible"
+    );
+    // No git repo backs `/fake/repo16` in this fixture, so the fallthrough
+    // lands in T3, not T2-candidate.
+    assert_eq!(report["tier_counts"]["t3"], 1);
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t1"], 0);
+
+    let entries = debug_entries(&report);
+    let stale = entry_for(&entries, "stale.txt");
+    assert_eq!(stale["tier"], "t3");
+    assert!(
+        stale["sha256"].is_null(),
+        "a rejected/unverifiable entry must never report resolved bytes"
+    );
+}
+
+// ---- 20. T1.5 ordering trap: the `snapshot` line carrying
+// `trackedFileBackups` appears BEFORE any line in the session carries `cwd`.
+// The relative key harvested on that first line must still resolve once
+// `cwd` becomes known on a later line (fixture `t15_cwd_after_snapshot/`;
+// see FIXTURES.md scenario 10). ---------------------------------------------
+
+#[test]
+fn relative_key_harvested_before_cwd_is_known_still_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_cwd_after_snapshot"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "a trackedFileBackups key harvested on a line BEFORE cwd is \
+         established must still resolve once a later line sets cwd; \
+         full report: {report}"
+    );
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t3"], 0);
+
+    let entries = debug_entries(&report);
+    let readme = entry_for(&entries, "readme.txt");
+    assert_eq!(readme["tier"], "t1_5");
+    assert_eq!(
+        readme["sha256"], "59c14830f5913e2fb18b82eb129dfb6189bf39b80a7a858c0b9b86758e1ae963",
+        "resolved bytes must match the independently-computed shasum of the \
+         file-history blob (see FIXTURES.md scenario 10)"
+    );
+}
+
+// ---- 21. T1.5 unverified branch: `oldString` is absent from the entry
+// entirely (some ops don't carry one), so the containment check cannot run.
+// The blob reference is still trusted (best evidence available), but the
+// entry must be counted as `t15_unverified`, not silently folded into a
+// content-proven T1.5 (fixture `t15_unverified_no_oldstring/`; see
+// FIXTURES.md scenario 11). This is the corpus-untested defensive branch: a
+// full real-corpus gate run (2026-07-29) found `oldString` present on every
+// single T1.5 candidate (243/243), so `t15_unverified` measures 0 there —
+// this fixture is the only coverage this branch has. --------------------
+
+#[test]
+fn missing_old_string_classifies_t15_unverified_not_content_proven() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_unverified_no_oldstring"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "no oldString to verify against — the blob reference is still the \
+         best evidence available, so this must classify T1.5; full report: \
+         {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_unverified"], 1,
+        "must be counted as unverified/assumed, not content-proven"
+    );
+    assert_eq!(report["tier_counts"]["t15_rejected_unverifiable"], 0);
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t3"], 0);
+
+    let entries = debug_entries(&report);
+    let data = entry_for(&entries, "data.bin");
+    assert_eq!(data["tier"], "t1_5");
+    assert_eq!(
+        data["sha256"], "03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824",
+        "resolved bytes must match the independently-computed shasum of the \
+         file-history blob (see FIXTURES.md scenario 11)"
+    );
+}
+
+// ---- 22. T1.5 fabrication round, Fix 1: a snapshot followed by TWO edits to
+// the same path with no intervening snapshot. The blob is edit #1's true
+// pre-state (must classify T1.5, content-proven) but is stale for edit #2 —
+// and edit #2's `oldString` ("shared line\n") happens to still be present in
+// the untouched region of the stale blob, so the pre-fix `oldString`-only
+// guard would have incorrectly accepted it. The intervening-edit check must
+// reject edit #2 regardless (fixture `t15_intervening_edit/`; see
+// FIXTURES.md scenario 12). This is the fixture shape (snapshot -> edit ->
+// edit against the same path) that every prior T1.5 fixture lacked, which is
+// why this exact defect class survived three review rounds. --------------
+
+#[test]
+fn intervening_edit_between_snapshot_and_second_edit_is_rejected_as_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_intervening_edit"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "exactly one of the two edits (#1) has a true pre-state blob; \
+         full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_stale"], 1,
+        "edit #2's backup is stale by one intervening edit (#1) and must be \
+         rejected BEFORE any oldString check, even though edit #2's \
+         oldString (\"shared line\\n\") is still coincidentally present in \
+         the stale blob's untouched region — full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_unverifiable"], 0,
+        "this must be caught by the staleness check, not the content check"
+    );
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(
+        report["tier_counts"]["t3"], 1,
+        "edit #2 falls through to T3 (no git repo backs /fake/repo19 here)"
+    );
+
+    let entries = debug_entries(&report);
+    let multi_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.ends_with("multi.txt"))
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        multi_entries.len(),
+        2,
+        "expected one debug_entries row per edit; full report: {report}"
+    );
+    assert_eq!(multi_entries[0]["tier"], "t1_5");
+    assert_eq!(
+        multi_entries[0]["sha256"],
+        "99931c6269c8f9e306b7ce0ac5fe986ab1121e83df93153eb3f66cf298384c56",
+        "resolved bytes for edit #1 must match the independently-computed \
+         shasum of the file-history blob (see FIXTURES.md scenario 12)"
+    );
+    assert_eq!(
+        multi_entries[1]["tier"], "t3",
+        "edit #2 must NOT resolve T1.5 despite the coincidental oldString match"
+    );
+    assert!(
+        multi_entries[1]["sha256"].is_null(),
+        "a stale-rejected entry must never report resolved bytes"
+    );
+}
+
+// ---- 23. T1.5 fabrication round, ground-truth-discovered refinement: a
+// `trackedFileBackups` snapshot line re-announcing the SAME `backupFileName`
+// (a manifest-style re-list; confirmed on the real corpus — identical
+// backupFileName AND identical backupTime repeated across consecutive
+// snapshot lines) must NOT reset the intervening-edit staleness counter.
+// Only a genuinely NEW backup identity (a different `backupFileName`) may
+// reset it. Real-corpus ground-truth validation of the Fix-1 predicate
+// (comparing resolved T1.5 blobs against known-true `originalFile` bytes on
+// entries that also happen to carry one) surfaced this as the dominant
+// remaining source of fabricated T1.5 classifications after Fix 1 alone: a
+// redundant re-announcement of an already-stale backup was wrongly treated
+// as evidence of a fresh backup, clearing staleness that should have stayed
+// set (fixture `t15_redundant_backup_announcement/`). ------------------------
+
+#[test]
+fn redundant_reannouncement_of_same_backup_name_does_not_clear_staleness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_redundant_backup_announcement"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "edit #1 has a true pre-state blob and must still resolve T1.5; \
+         full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_stale"], 1,
+        "edit #2's backup is stale by edit #1, and the SAME backupFileName \
+         being re-announced between them (a manifest re-list, not a fresh \
+         backup) must NOT clear that staleness — even though edit #2's \
+         oldString (\"line B\\n\") is still present in the stale blob's \
+         untouched region; full report: {report}"
+    );
+    assert_eq!(report["tier_counts"]["t15_rejected_unverifiable"], 0);
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t3"], 1);
+
+    let entries = debug_entries(&report);
+    let redundant_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.ends_with("redundant.txt"))
+        })
+        .copied()
+        .collect();
+    assert_eq!(redundant_entries.len(), 2);
+    assert_eq!(redundant_entries[0]["tier"], "t1_5");
+    assert_eq!(
+        redundant_entries[1]["tier"], "t3",
+        "must NOT resolve T1.5 despite the redundant same-name re-announcement"
+    );
+    assert!(redundant_entries[1]["sha256"].is_null());
 }

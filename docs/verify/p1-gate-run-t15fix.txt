@@ -1,0 +1,15 @@
+agentrec: import claude: 6 line(s) missing required field 'cwd' (schema drift) — affected session(s) not counted importable
+agentrec import claude --dry-run report
+  sessions_total: 1626
+  sessions_importable: 1620 (99.6%)
+  sessions_in_root: 0
+  tier_counts: t1=856 t1_5=210 (of which t15_unverified=0) t2_candidate=788 t3=305
+  t1_5 fallthroughs (NOT part of t1_5, counted toward t2_candidate/t3): t15_rejected_unverifiable=33 t15_blob_missing=0
+  opaque_calls: 8667
+  mean_opaque_share_pct: 13.17
+  skipped_sidechain: 1255
+  skipped_malformed_line: 0
+  skipped_non_utf8_line: 0
+  skipped_io_error: 0
+  skipped_missing_field: cwd=6 tool_use_result=0
+  peak_rss_mb: 16.23

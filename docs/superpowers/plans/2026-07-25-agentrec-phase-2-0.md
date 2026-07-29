@@ -42,7 +42,7 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 
 ## Infeasible / rejected (killed against real code or measured evidence)
 
-- **Quoting 92.3% as the reconstructible rate.** T2 (git-tracked) is an upper bound: git holds committed states only, so mid-session intermediate edits were never in git. Honest figure is **40.4%** (T1 39.9% + T1.5 0.5%, measured 2026-07-29 by P1's real-corpus importer run — supersedes this entry's earlier 67.9%, whose T1.5 term counted same-session backup references rather than entries the first-hit-wins ladder actually resolves via T1.5; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section) + "git recovers some unknown share of the remaining 44.8% T2-candidate" (measurement §2; P1 measured T2-candidate share at 44.8%, still unresolved).
+- **Quoting 92.3% as the reconstructible rate.** T2 (git-tracked) is an upper bound: git holds committed states only, so mid-session intermediate edits were never in git. Honest figure is two numbers, not one — **43.8%** (T1 856 + T1.5 90 = 946 of 2159, counting `create` ops as reconstructible) or **31.7%** (595 + 90 = 685 of 2159, counting only entries yielding actual pre-edit bytes) — measured 2026-07-29 by P1's real-corpus importer run, corrected twice: first from the 2026-07-24 prediction (67.9%) to an initial reading (40.4%) that undercounted T1.5 via a path-comparison bug, then to this figure once a stale-blob over-count in the fixed T1.5 path was also caught (see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section). The same ban applies to the **~85% ceiling** (43.8 + 41.5 T2-candidate) — it is an upper bound only if every T2 candidate resolved, which P2 will not achieve, since git holds committed states only. "git recovers some unknown share of the remaining 41.5% T2-candidate" (measurement §2; P1 measured T2-candidate share at 41.5%, still unresolved).
 - **Excluding sidechains by `isSidechain` field alone.** 583 of 1860 corpus files are now separate `subagents/agent-*.jsonl` files carrying no `cwd`. Must exclude by **path** as well (measurement §1 note).
 - **Treating imported file lists as exhaustive.** Opaque:naming tool-call ratio measured 2.49:1 — 71% of tool calls can mutate files while naming none. `files_complete: false` is mandatory.
 - **Reusing CLI stdout as the machine contract.** Unstable text, no typed errors, duplicate parsing (spec §Rejected).
@@ -251,15 +251,28 @@ holding verbatim pre-edit bytes. It is retention-limited (~30 days, 102 of 1277 
 it is treated as **opportunistic** — exactly the class the spec already accepts for T1 (which
 itself hits only ~30%, varying 4–70%). Including an opportunistic source that reads real
 bytes off disk cannot weaken the honesty model, whose rule is "never fabricate" — that
-reasoning holds. **Falsified by P1's real-corpus run (2026-07-29):** the 25.3% figure counted
-backup *references*, not entries the ladder's first-hit-wins logic would actually resolve via
-T1.5 — T1 already covers nearly everything a same-session backup could have covered, so T1.5
-only fires when T1 misses AND a backup exists for that exact path. P1 measured T1.5's true
-marginal contribution at 0.5% (11 of 2151 entries), raising honest reconstructible coverage
-39.9% → 40.4%, not 42.5% → 67.9% as predicted here. T1.5 was still correctly adopted into the
-ladder — it resolves real bytes with no downside — it is simply near-empty in practice. Spec
-§Phase 2.0 ladder carries the amendment; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and
-`docs/verify/p1-gate-run.txt` for the measurement.
+reasoning holds. **Falsified by P1's real-corpus run (2026-07-29), twice, in opposite
+directions — T1.5 was under-detected, then over-counted; it was never "genuinely near-empty."**
+The 25.3% figure counted backup *references*, not entries the ladder's first-hit-wins logic
+would actually resolve via T1.5. The first real-corpus reading measured a marginal contribution
+of 0.5% (11 of 2151 entries) — but that reading itself carried a bug: the T1.5 lookup compared
+an absolute `filePath` against `trackedFileBackups` keys that are relative to the session `cwd`
+in most of the corpus, so the raw string compare almost never matched. Fixing that path compare
+raised the count to 210 — which was in turn found to be *fabricating* bytes: file-history
+blobs are written at snapshot time, not per edit, so for a file's 2nd-or-later edit the blob is
+a pre-*snapshot*, not pre-edit, state, and the textual `oldString`-containment guard let those
+through (a ground-truth subsample put the fabrication rate at ~30%, 115 of that sample provably
+stale). Gating on a structural check instead (no edit to the same path intervened between the
+snapshot and the edit being classified) rejects **170 entries corpus-wide** as stale, and lands
+T1.5's honest, twice-corrected marginal contribution at **4.2%** (90 of 2159 entries;
+ground-truth check against entries that also carry `originalFile`: 101 correct / 1 fabricated,
+1.0% residual). Honest reconstructible coverage moved 39.9%/0.5%(wrong) → **43.8%** (or **31.7%**
+counting only entries yielding actual bytes) — not 42.5% → 67.9% as predicted here, and not the
+intermediate 40.4% either. T1.5 was still correctly adopted into the ladder — it resolves real
+bytes with no downside — but "near-empty" was never an honest description of it; it was
+mismeasured twice before this figure. Spec §Phase 2.0 ladder carries the amendment; see
+`VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and `docs/verify/p1-gate-run-t15fix2.txt` for the
+measurement.
 
 ## Open questions (answer before implementation)
 
