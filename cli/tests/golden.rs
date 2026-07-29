@@ -226,6 +226,7 @@ fn fe(path: &str, before: Option<String>, after: Option<String>, op: &str) -> Fi
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }
 }
 
@@ -336,6 +337,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: Some(prompt_ref),
         prompt_excerpt: Some("add rate limiting".to_string()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![
             fe(
                 "src/app.rs",
@@ -379,6 +382,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![fe(
             "src/bare.rs",
             Some(bare_before),
@@ -403,6 +408,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![fe(
             ".gitattributes",
             Some(git_before),
@@ -432,6 +439,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: Some(format!("undo of {}", short_id_of(RICH_TURN_ID))),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![fe(
             "src/app.rs",
             Some(app_after),
@@ -503,6 +512,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: Some("dup pass".to_string()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![dup_entry.clone()],
     };
     let dup_b = TurnRecord {
@@ -546,6 +557,8 @@ fn build_fixture(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: Some("edge cases".to_string()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![
             fe(
                 "assets/img.bin",
@@ -934,6 +947,8 @@ fn build_fixture_no_gap(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: Some("touch a file".to_string()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![fe("src/touched.rs", Some(before), Some(after), "modify")],
     };
     seed_turn(root, &turn);
@@ -982,6 +997,8 @@ fn build_fixture_noise(root: &Path) {
         prompt_ref: None,
         prompt_excerpt: Some("touch a log and a source file".to_string()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![
             fe("debug.log", None, Some(log_after), "create"),
             fe("src/real.rs", None, Some(src_after), "create"),
