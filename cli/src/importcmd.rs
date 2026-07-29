@@ -179,10 +179,27 @@ struct TierCounts {
     /// content did not contain the edit's `oldString`, so it was refused as
     /// T1.5 (would-be-fabricated pre-state) and fell through to T2/T3.
     t15_rejected_unverifiable: usize,
+    /// NOT part of `t1_5`: at least one OTHER edit to the same absolute path
+    /// occurred between the snapshot that recorded this backup and the edit
+    /// being classified, so the blob is a pre-*snapshot* state, not this
+    /// edit's pre-*edit* state (Fix 1, T1.5 fabrication round). Distinct from
+    /// `t15_rejected_unverifiable` — that one has content proof the blob is
+    /// wrong; this one is refused purely on ordering, before any content
+    /// check runs, because content correctness by itself is not sufficient
+    /// (a stale blob's unrelated regions can still happen to contain a later
+    /// edit's `oldString`, which is exactly how the fabrication defect
+    /// survived the `oldString`-only guard). Falls through to T2/T3.
+    t15_rejected_stale: usize,
     /// NOT part of `t1_5`: a `trackedFileBackups` key resolved to `file_path`
     /// but the referenced blob file could not be read (e.g. reaped by
     /// retention) — no content to even check. Falls through to T2/T3.
     t15_blob_missing: usize,
+    /// NOT part of `t1_5`: the resolved `sessionId`/`backupFileName` pair
+    /// failed path-component validation (absolute, empty, or containing a
+    /// separator/`..`) before being joined into a filesystem path (Fix 3,
+    /// latent-traversal hardening) — refused rather than read. Falls through
+    /// to T2/T3.
+    t15_rejected_unsafe_path: usize,
     t2_candidate: usize,
     t3: usize,
 }
@@ -261,7 +278,9 @@ fn build_report(
             t1_5: counters.t1_5,
             t15_unverified: counters.t15_unverified,
             t15_rejected_unverifiable: counters.t15_rejected_unverifiable,
+            t15_rejected_stale: counters.t15_rejected_stale,
             t15_blob_missing: counters.t15_blob_missing,
+            t15_rejected_unsafe_path: counters.t15_rejected_unsafe_path,
             t2_candidate: counters.t2_candidate,
             t3: counters.t3,
         },
@@ -300,8 +319,12 @@ fn print_text_report(report: &ImportReport) {
     );
     println!(
         "  t1_5 fallthroughs (NOT part of t1_5, counted toward t2_candidate/t3): \
-         t15_rejected_unverifiable={} t15_blob_missing={}",
-        report.tier_counts.t15_rejected_unverifiable, report.tier_counts.t15_blob_missing
+         t15_rejected_unverifiable={} t15_rejected_stale={} t15_blob_missing={} \
+         t15_rejected_unsafe_path={}",
+        report.tier_counts.t15_rejected_unverifiable,
+        report.tier_counts.t15_rejected_stale,
+        report.tier_counts.t15_blob_missing,
+        report.tier_counts.t15_rejected_unsafe_path
     );
     println!("  opaque_calls: {}", report.opaque_calls);
     println!(
@@ -421,6 +444,16 @@ struct Counters {
     /// forbids, so the entry falls through to T2/T3 instead and is counted
     /// here so the loss stays visible rather than silently folding into T3.
     t15_rejected_unverifiable: usize,
+    /// NOT part of `t1_5`: at least one other edit to this same absolute
+    /// path was classified since the backup currently held for it was
+    /// recorded, so the blob predates that intervening edit and is not this
+    /// edit's true pre-state (Fix 1). Checked — and, if true, short-circuits
+    /// straight to this counter — BEFORE any `oldString` content check runs,
+    /// because a stale blob's untouched regions can still coincidentally
+    /// contain a later edit's `oldString` (the exact shape that let the
+    /// fabrication defect pass the content-only guard). Tracked via
+    /// `edits_since_backup` (per-session state alongside `backups`).
+    t15_rejected_stale: usize,
     /// NOT part of `t1_5`: a `trackedFileBackups` key resolved (matched
     /// `file_path`, verbatim or after `cwd`-normalization), but
     /// `fs::read(blob_path)` failed — e.g. retention already reaped the
@@ -429,6 +462,14 @@ struct Counters {
     /// to even check. Falls through to T2/T3, same as before this counter
     /// existed; added so this loss is visible instead of silently absorbed.
     t15_blob_missing: usize,
+    /// NOT part of `t1_5`: the `sessionId`/`backupFileName` pair that would
+    /// be joined into a filesystem path failed validation (Fix 3) — absolute,
+    /// empty, or containing a path separator / `..` component. Corpus-clean
+    /// today (all real values match a narrow confirmed shape), but a
+    /// transcript-supplied string must never be trusted unvalidated in a
+    /// path join (`Path::join` silently replaces on an absolute component).
+    /// Refused rather than attempted; falls through to T2/T3.
+    t15_rejected_unsafe_path: usize,
     t2_candidate: usize,
     t3: usize,
     opaque_calls: usize,
@@ -613,6 +654,17 @@ fn process_session_file(
     // `backupFileName` stays an opaque string, read verbatim (Pinned
     // decision 1).
     let mut backups: HashMap<String, String> = HashMap::new();
+    // Fix 1 (T1.5 fabrication round): per absolute path, how many OTHER
+    // file-edit entries for that path have been classified since the backup
+    // currently held in `backups` for it was recorded. Reset to 0 at every
+    // point `backups` gains or replaces an entry for a path (a fresh
+    // snapshot is, by definition, zero edits stale); incremented once per
+    // classified file-entry for a path already present here (see
+    // `classify_file_entry`'s `mark_edit`). A nonzero count at
+    // classification time means the blob predates an intervening edit and
+    // must not be trusted as this edit's pre-state, regardless of what the
+    // `oldString` containment check would say.
+    let mut edits_since_backup: HashMap<String, usize> = HashMap::new();
     // Relative keys harvested before `cwd` is known yet (Pinned decision 14:
     // `cwd` is session-level and a snapshot line can legitimately precede
     // the first line that carries `cwd`). Drained into `backups` the moment
@@ -672,7 +724,13 @@ fn process_session_file(
                 // was harvested before we could resolve it — draining in
                 // order preserves "latest recorded before the edit wins".
                 for (key, backup_name) in pending_relative_backups.drain(..) {
-                    backups.insert(normalize_backup_key(&key, &cwd_path), backup_name);
+                    let normalized = normalize_backup_key(&key, &cwd_path);
+                    record_backup(
+                        &mut backups,
+                        &mut edits_since_backup,
+                        normalized,
+                        backup_name,
+                    );
                 }
                 session_cwd = Some(cwd_path);
             }
@@ -700,10 +758,21 @@ fn process_session_file(
                     // if we have it, otherwise defer until the `cwd`-
                     // detection block above drains it.
                     if file_path.starts_with('/') {
-                        backups.insert(file_path.clone(), backup_name.to_string());
+                        let normalized = lexical_normalize(Path::new(file_path))
+                            .to_string_lossy()
+                            .into_owned();
+                        record_backup(
+                            &mut backups,
+                            &mut edits_since_backup,
+                            normalized,
+                            backup_name.to_string(),
+                        );
                     } else if let Some(cwd) = &session_cwd {
-                        backups.insert(
-                            normalize_backup_key(file_path, cwd),
+                        let normalized = normalize_backup_key(file_path, cwd);
+                        record_backup(
+                            &mut backups,
+                            &mut edits_since_backup,
+                            normalized,
                             backup_name.to_string(),
                         );
                     } else {
@@ -774,6 +843,7 @@ fn process_session_file(
             session_id.as_deref(),
             session_cwd.as_deref(),
             &backups,
+            &mut edits_since_backup,
             &session_file_label,
             counters,
             debug,
@@ -814,19 +884,111 @@ fn process_session_file(
 }
 
 /// Resolves a raw `trackedFileBackups` key to the absolute path it names.
-/// An already-absolute key (`/`-prefixed) is returned as-is. A relative key
-/// is joined lexically against `cwd` — deliberately never
-/// `fs::canonicalize`d, since transcript paths frequently name a file that
-/// no longer exists on disk (canonicalize would fail on exactly the paths
-/// this needs to resolve). A leading `./` is stripped before joining so the
-/// resulting string never carries a literal `./` component (`Path::join`
-/// does not collapse one on its own).
+/// An already-absolute key (`/`-prefixed) is lexically normalized as-is. A
+/// relative key is joined lexically against `cwd`, then normalized —
+/// deliberately never `fs::canonicalize`d, since transcript paths frequently
+/// name a file that no longer exists on disk (canonicalize would fail on
+/// exactly the paths this needs to resolve). A leading `./` is stripped
+/// before joining so the resulting string never carries a literal `./`
+/// component (`Path::join` does not collapse one on its own).
+///
+/// Fix 2 (T1.5 fabrication round): a bare `./`-strip does not collapse `..`
+/// — a key like `../sutra-focus/src/composer.ts` joined against `cwd`
+/// produces a path string that can never equal any real (already-absolute,
+/// `..`-free) `filePath`, so every such key silently failed to match,
+/// looking like "no `..` keys ever resolve" when the real cause was that the
+/// join was never lexically collapsed. `lexical_normalize` fixes that.
 fn normalize_backup_key(key: &str, cwd: &Path) -> String {
     if key.starts_with('/') {
-        return key.to_string();
+        return lexical_normalize(Path::new(key))
+            .to_string_lossy()
+            .into_owned();
     }
     let stripped = key.strip_prefix("./").unwrap_or(key);
-    cwd.join(stripped).to_string_lossy().into_owned()
+    lexical_normalize(&cwd.join(stripped))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Lexically normalizes `.` and `..` path components without touching the
+/// filesystem (unlike `fs::canonicalize`, which requires every component to
+/// actually exist — fails on exactly the transcript-referenced paths this
+/// importer needs to resolve, since those files are routinely stale,
+/// renamed, or deleted by the time import runs). Mirrors the walk-and-pop
+/// behavior of Python's `os.path.normpath`: a `..` pops the preceding
+/// `Normal` component; a `..` with nothing poppable (already at the root, or
+/// a leading `..` on a relative path) is preserved rather than allowed to
+/// escape — the degenerate "climb above root" case is the one place this
+/// deliberately does NOT mirror `..`'s filesystem meaning, since there is no
+/// path above `/` to represent.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {
+                    // Guard the degenerate case: `..` above the filesystem
+                    // root has nowhere to go. Drop it rather than escape.
+                }
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Records a resolved backup for `path`, resetting `edits_since_backup` to 0
+/// ONLY when `backup_name` is genuinely different from whatever is already
+/// stored for `path` — never unconditionally on every `trackedFileBackups`
+/// sighting.
+///
+/// Ground-truth corpus validation (T1.5 fabrication round, post-Fix-1) found
+/// real transcripts commonly emit several manifest-style `file-history-
+/// snapshot` lines in a row that all re-list the SAME `backupFileName` for a
+/// path whose backup hasn't actually changed since the last one (confirmed
+/// on-disk: identical `backupFileName` AND identical `backupTime` repeated
+/// across consecutive snapshot lines). Resetting the staleness counter on
+/// every such re-announcement — as an earlier version of this fix did —
+/// wrongly cleared "an edit already happened since this backup" for a
+/// redundant re-announcement of the exact same (already-stale) blob,
+/// re-opening the fabrication window Fix 1 exists to close. A change in
+/// `backup_name` (a real new version) still resets normally.
+fn record_backup(
+    backups: &mut HashMap<String, String>,
+    edits_since_backup: &mut HashMap<String, usize>,
+    path: String,
+    backup_name: String,
+) {
+    let is_new_backup = backups.get(&path) != Some(&backup_name);
+    backups.insert(path.clone(), backup_name);
+    if is_new_backup {
+        edits_since_backup.insert(path, 0);
+    }
+}
+
+/// Fix 3 (T1.5 fabrication round, latent-traversal hardening): rejects a
+/// transcript-supplied `sessionId`/`backupFileName` string before it is
+/// joined into a filesystem path. `Path::join` silently REPLACES the whole
+/// accumulated path when the joined component is itself absolute, and does
+/// not reject a `..` component — so an unvalidated value could otherwise
+/// escape `<source>/file-history/` entirely. The corpus is clean today (see
+/// module-level notes), so this is a hardening guard against a shape that
+/// hasn't been observed live, not a fix for an observed failure — same
+/// posture as `agentrec_core::store`'s
+/// `malformed_hash_rejects_traversal_components`.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !Path::new(s).is_absolute()
 }
 
 /// True iff `needle` occurs as a contiguous byte sequence anywhere in
@@ -846,6 +1008,19 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Before-bytes ladder, first hit wins (P1.md Changes / Pinned decision 1).
+///
+/// Fix 1 (T1.5 fabrication round): `edits_since_backup` tracks, per absolute
+/// path, how many file-edit entries for that path have already been
+/// classified since the backup currently held for it (in `backups`) was
+/// recorded. Every call into this function for a given `file_path` reads
+/// that count BEFORE deciding anything (a nonzero count means the blob
+/// predates an intervening edit and cannot be this edit's true pre-state,
+/// full stop — checked ahead of and independent of the `oldString`
+/// containment check, since a stale blob can still coincidentally contain a
+/// later edit's `oldString` in a region an earlier edit didn't touch), then
+/// increments it exactly once via `mark_edit` right before returning or
+/// falling through — so the NEXT entry for this path sees this edit
+/// reflected. `mark_edit` is a no-op for a path with no tracked backup.
 #[allow(clippy::too_many_arguments)]
 fn classify_file_entry(
     tur: &Value,
@@ -854,12 +1029,19 @@ fn classify_file_entry(
     session_id: Option<&str>,
     session_cwd: Option<&Path>,
     backups: &HashMap<String, String>,
+    edits_since_backup: &mut HashMap<String, usize>,
     session_file_label: &str,
     counters: &mut Counters,
     debug: &mut DebugSink,
     git_cache: &mut GitTrackCache,
     session_entries: &mut usize,
 ) {
+    let mark_edit = |edits_since_backup: &mut HashMap<String, usize>| {
+        if let Some(count) = edits_since_backup.get_mut(file_path) {
+            *count += 1;
+        }
+    };
+
     let original_file = tur.get("originalFile").and_then(|v| v.as_str());
     // Item 9 (real-corpus-confirmed shape, not a guess): a create op has
     // `toolUseResult.type == "create"` AND `originalFile` explicitly JSON
@@ -882,29 +1064,79 @@ fn classify_file_entry(
             "t1",
             Some(strip_hash_prefix(&hash)),
         );
+        mark_edit(edits_since_backup);
         return;
     }
     if op_is_create {
         counters.t1 += 1;
         *session_entries += 1;
         debug.push(session_file_label, file_path, "t1", None);
+        mark_edit(edits_since_backup);
         return;
     }
     if let Some(backup_name) = backups.get(file_path) {
         if let Some(sid) = session_id {
-            let blob_path = source.join("file-history").join(sid).join(backup_name);
-            if let Ok(bytes) = fs::read(&blob_path) {
-                // "Never fabricate" invariant (PROTOCOL.md / IMPLEMENTATION.md):
-                // resolving `before` bytes from a blob that is NOT actually
-                // this edit's pre-state would fabricate a plausible-but-wrong
-                // pre-state. When `oldString` is present and non-empty, the
-                // blob must be verified to contain it before it can be
-                // trusted as T1.5.
-                let old_string = tur.get("oldString").and_then(|v| v.as_str());
-                match old_string {
-                    Some(old) if !old.is_empty() => {
-                        if bytes_contain(&bytes, old.as_bytes()) {
+            let stale_by_intervening_edit =
+                edits_since_backup.get(file_path).copied().unwrap_or(0) > 0;
+            if stale_by_intervening_edit {
+                // At least one other edit to this same path was classified
+                // since this backup was recorded — the blob is a
+                // pre-*snapshot* state, not this edit's pre-*edit* state.
+                // Refused before any content check runs; falls through to
+                // T2/T3 exactly as if no backup existed.
+                counters.t15_rejected_stale += 1;
+            } else if !is_safe_path_component(sid) || !is_safe_path_component(backup_name) {
+                // Fix 3: refuse to join an unvalidated transcript-supplied
+                // component into a filesystem path. Corpus-clean today, but
+                // latent — never errors the run, just counted and treated
+                // as if the blob could not be resolved.
+                counters.t15_rejected_unsafe_path += 1;
+            } else {
+                let blob_path = source.join("file-history").join(sid).join(backup_name);
+                if let Ok(bytes) = fs::read(&blob_path) {
+                    // "Never fabricate" invariant (PROTOCOL.md /
+                    // IMPLEMENTATION.md): resolving `before` bytes from a
+                    // blob that is NOT actually this edit's pre-state would
+                    // fabricate a plausible-but-wrong pre-state. When
+                    // `oldString` is present and non-empty, the blob must
+                    // also be verified to contain it before it can be
+                    // trusted as T1.5 — this check runs in addition to (not
+                    // instead of) the staleness check above; both must hold.
+                    let old_string = tur.get("oldString").and_then(|v| v.as_str());
+                    match old_string {
+                        Some(old) if !old.is_empty() => {
+                            if bytes_contain(&bytes, old.as_bytes()) {
+                                counters.t1_5 += 1;
+                                *session_entries += 1;
+                                let hash = hash_bytes(&bytes);
+                                debug.push(
+                                    session_file_label,
+                                    file_path,
+                                    "t1_5",
+                                    Some(strip_hash_prefix(&hash)),
+                                );
+                                mark_edit(edits_since_backup);
+                                return;
+                            }
+                            // The blob does not contain the edit's
+                            // `oldString` — it is not this edit's pre-state.
+                            // Fall through to T2/T3 exactly as if no backup
+                            // existed, and count the rejection so the loss
+                            // stays visible rather than silently folding
+                            // into T3.
+                            counters.t15_rejected_unverifiable += 1;
+                        }
+                        _ => {
+                            // No `oldString` on this entry (some ops don't
+                            // carry one), so the containment check can't
+                            // run. The staleness check above already holds
+                            // (no intervening edit), which is the
+                            // structural argument that this blob IS the
+                            // pre-edit state even without content proof —
+                            // classify T1.5, but count it as
+                            // unverified/assumed rather than content-proven.
                             counters.t1_5 += 1;
+                            counters.t15_unverified += 1;
                             *session_entries += 1;
                             let hash = hash_bytes(&bytes);
                             debug.push(
@@ -913,43 +1145,21 @@ fn classify_file_entry(
                                 "t1_5",
                                 Some(strip_hash_prefix(&hash)),
                             );
+                            mark_edit(edits_since_backup);
                             return;
                         }
-                        // The blob does not contain the edit's `oldString` —
-                        // it is not this edit's pre-state. Fall through to
-                        // T2/T3 exactly as if no backup existed, and count
-                        // the rejection so the loss stays visible rather
-                        // than silently folding into T3.
-                        counters.t15_rejected_unverifiable += 1;
                     }
-                    _ => {
-                        // No `oldString` on this entry (some ops don't carry
-                        // one), so the containment check can't run. The blob
-                        // reference is still the best evidence available —
-                        // classify T1.5, but count it as unverified/assumed
-                        // rather than content-proven.
-                        counters.t1_5 += 1;
-                        counters.t15_unverified += 1;
-                        *session_entries += 1;
-                        let hash = hash_bytes(&bytes);
-                        debug.push(
-                            session_file_label,
-                            file_path,
-                            "t1_5",
-                            Some(strip_hash_prefix(&hash)),
-                        );
-                        return;
-                    }
+                } else {
+                    // Backup referenced but missing (e.g. retention already
+                    // reaped it, ~30-day window) — falls through to T2/T3,
+                    // never errors, but the loss is counted so it stays
+                    // visible.
+                    counters.t15_blob_missing += 1;
                 }
-            } else {
-                // Backup referenced but missing (e.g. retention already
-                // reaped it, ~30-day window) — falls through to T2/T3,
-                // never errors, but the loss is counted so it stays
-                // visible.
-                counters.t15_blob_missing += 1;
             }
         }
     }
+    mark_edit(edits_since_backup);
     classify_t2_or_t3(
         file_path,
         session_cwd,
@@ -1104,6 +1314,122 @@ mod tests {
             default_source_for_home("/Users/x"),
             PathBuf::from("/Users/x/.claude")
         );
+    }
+
+    #[test]
+    fn lexical_normalize_collapses_parent_dir_components() {
+        assert_eq!(
+            lexical_normalize(Path::new("/Users/x/../y")),
+            PathBuf::from("/Users/y")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../../c")),
+            PathBuf::from("/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new(
+                "/Users/ravichandrasekhar/Projects/sutra-focus/../sutra-focus/src/composer.ts"
+            )),
+            PathBuf::from("/Users/ravichandrasekhar/Projects/sutra-focus/src/composer.ts")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_drops_dot_components() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b/./c")),
+            PathBuf::from("/a/b/c")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_does_not_escape_above_root() {
+        // Guard the degenerate case (Fix 2): more `..`s than there are
+        // components above them must not climb above `/`.
+        assert_eq!(
+            lexical_normalize(Path::new("/a/../../b")),
+            PathBuf::from("/b")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/../../b")),
+            PathBuf::from("/b")
+        );
+    }
+
+    #[test]
+    fn normalize_backup_key_resolves_relative_dotdot_key_against_cwd() {
+        // Reproduces the real-corpus shape from Fix 2's brief: a
+        // `trackedFileBackups` key that climbs one directory above `cwd`.
+        let cwd = Path::new("/Users/ravichandrasekhar/Projects/sutra");
+        assert_eq!(
+            normalize_backup_key("../sutra-focus/src/composer.ts", cwd),
+            "/Users/ravichandrasekhar/Projects/sutra-focus/src/composer.ts"
+        );
+    }
+
+    #[test]
+    fn record_backup_resets_staleness_only_on_a_genuinely_new_backup_name() {
+        let mut backups = HashMap::new();
+        let mut edits_since_backup = HashMap::new();
+        let path = "/fake/redundant.txt".to_string();
+
+        record_backup(
+            &mut backups,
+            &mut edits_since_backup,
+            path.clone(),
+            "v1".to_string(),
+        );
+        assert_eq!(edits_since_backup.get(&path), Some(&0));
+
+        // Simulate one edit having happened since.
+        *edits_since_backup.get_mut(&path).unwrap() += 1;
+        assert_eq!(edits_since_backup.get(&path), Some(&1));
+
+        // A re-announcement of the SAME backup name (the real-corpus
+        // manifest-re-list shape) must NOT reset the staleness count.
+        record_backup(
+            &mut backups,
+            &mut edits_since_backup,
+            path.clone(),
+            "v1".to_string(),
+        );
+        assert_eq!(
+            edits_since_backup.get(&path),
+            Some(&1),
+            "re-announcing the same backup name must not clear staleness"
+        );
+
+        // A genuinely different backup name DOES reset it.
+        record_backup(
+            &mut backups,
+            &mut edits_since_backup,
+            path.clone(),
+            "v2".to_string(),
+        );
+        assert_eq!(
+            edits_since_backup.get(&path),
+            Some(&0),
+            "a real new backup version must reset staleness"
+        );
+    }
+
+    #[test]
+    fn is_safe_path_component_rejects_hostile_values() {
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component("../../etc/passwd"));
+        assert!(!is_safe_path_component("/etc/passwd"));
+        assert!(!is_safe_path_component("a/b"));
+        assert!(!is_safe_path_component("a\\b"));
+    }
+
+    #[test]
+    fn is_safe_path_component_accepts_the_real_confirmed_shape() {
+        assert!(is_safe_path_component("bb6db0439755b9fa@v1"));
+        assert!(is_safe_path_component(
+            "a1111111-1111-4111-8111-111111111111"
+        ));
     }
 
     #[test]

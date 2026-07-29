@@ -312,9 +312,20 @@ $ shasum -a 256 cli/tests/fixtures/import/claude/t15_cwd_after_snapshot/file-his
 ## 11. `t15_unverified_no_oldstring/`
 
 **Proves:** the T1.5 "unverified" branch of Fix 2 — an entry whose `toolUseResult` has **no
-`oldString` field at all** (some ops don't carry one). The containment check can't run, so the
-blob reference is trusted on its own (best evidence available), but the entry must be counted
-`t15_unverified`, distinct from a content-proven match.
+`oldString` field at all** (some ops don't carry one). The containment check can't run, so
+classification instead relies on the structural argument from Fix 1 (T1.5 fabrication round): no
+other edit to this path has been classified since the backup was recorded (`edits_since_backup ==
+0`), which is sufficient on its own to trust the blob as this edit's pre-state — but the entry
+must still be counted `t15_unverified`, distinct from a content-proven match, since no byte-level
+proof ran.
+
+**Amended (T1.5 fabrication round, Fix 4):** the blob content used to be described as "no relation
+to any oldString" — i.e. the fixture asserted a sha256 for bytes its own comment admitted were
+unrelated to anything, which is exactly the shape of bug this round exists to eliminate. The blob
+below is now a plausible pre-edit cell body consistent with the `NotebookEdit`'s `newString`
+(`"print('hi')"`), i.e. what this fixture proves is "structurally-inferred, not content-proven"
+classification of a *genuine* clean snapshot→edit sequence, not classification of admittedly
+unrelated bytes.
 
 **Corpus-untested branch, called out honestly:** a full real-corpus gate run (2026-07-29,
 1626 sessions) found `oldString` present and non-empty on every single one of the 243 T1.5
@@ -328,21 +339,120 @@ exercise this time.
   1. A `file-history-snapshot` line recording `trackedFileBackups["/fake/repo18/data.bin"]`
      (absolute key) `.backupFileName = "ff11aa22bb33cc44@v1"`.
   2. A `NotebookEdit`-shaped result for `/fake/repo18/data.bin` — no `originalFile`, and
-     **no `oldString` key at all** (only `newString`).
+     **no `oldString` key at all** (only `newString: "print('hi')"`) — the only edit to this
+     path in the session, so `edits_since_backup` is 0 at classification time.
 - File-history blob: `file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1`.
 
 ### Known-good content + independently-computed hash
 
 ```
-binary-ish backup content, no relation to any oldString
+print('hello')
 ```
 
 ```
 $ shasum -a 256 cli/tests/fixtures/import/claude/t15_unverified_no_oldstring/file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
-9f79508431a3a504310ce89c4050986efece7012e23258c20b8b6ae4d4e56154  cli/tests/fixtures/import/claude/t15_unverified_no_oldstring/file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
+03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824  cli/tests/fixtures/import/claude/t15_unverified_no_oldstring/file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
 ```
 
-**Expected `sha256(resolved before bytes)`:** `9f79508431a3a504310ce89c4050986efece7012e23258c20b8b6ae4d4e56154`
+**Expected `sha256(resolved before bytes)`:** `03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824`
+
+---
+
+## 12. `t15_intervening_edit/`
+
+**Proves:** Fix 1 (T1.5 fabrication round) — the shape every prior T1.5 fixture lacked: a
+snapshot followed by **two** edits to the same path with no intervening snapshot. The blob is
+edit #1's true pre-state (must classify T1.5, content-proven) but is stale for edit #2. Edit #2's
+`oldString` (`"shared line\n"`) is deliberately chosen to still be present, byte-for-byte, in the
+stale blob's untouched second line — so the pre-fix `oldString`-only containment guard would have
+**incorrectly accepted** it as T1.5. The intervening-edit check (tracked per-path,
+`edits_since_backup`) must reject edit #2 regardless, counted in `t15_rejected_stale`, distinct
+from `t15_rejected_unverifiable` (which is a content-proven rejection — this one is rejected
+before any content check runs).
+
+- Session id: `a1919191-1919-4191-8191-191919191919`
+- File: `projects/proj-a/a1919191-1919-4191-8191-191919191919.jsonl`, 3 lines, `cwd:
+  "/fake/repo19"`:
+  1. A `file-history-snapshot` line recording `trackedFileBackups["/fake/repo19/multi.txt"]`
+     (absolute key) `.backupFileName = "9988776655443322@v1"`.
+  2. Edit #1: `oldString: "alpha original\n"`, `newString: "alpha changed\n"` — matches the
+     blob's first line; must resolve T1.5, content-proven.
+  3. Edit #2 (same path, no intervening snapshot): `oldString: "shared line\n"`, `newString:
+     "shared line updated\n"` — this string IS present in the blob (its second line is
+     unchanged since the blob predates edit #1 too), so a content-only guard would wrongly
+     accept it. Must be rejected as stale instead, falling through to T3 (no git repo backs
+     `/fake/repo19` in this fixture).
+- File-history blob: `file-history/a1919191-1919-4191-8191-191919191919/9988776655443322@v1`.
+
+### Known-good content + independently-computed hash
+
+```
+alpha original
+shared line
+```
+
+```
+$ shasum -a 256 cli/tests/fixtures/import/claude/t15_intervening_edit/file-history/a1919191-1919-4191-8191-191919191919/9988776655443322@v1
+99931c6269c8f9e306b7ce0ac5fe986ab1121e83df93153eb3f66cf298384c56  cli/tests/fixtures/import/claude/t15_intervening_edit/file-history/a1919191-1919-4191-8191-191919191919/9988776655443322@v1
+```
+
+**Expected `sha256(resolved before bytes)` for edit #1:**
+`99931c6269c8f9e306b7ce0ac5fe986ab1121e83df93153eb3f66cf298384c56`
+
+**Edit #2 must not resolve any bytes** (`sha256: null`), classified `t3`, counted in
+`t15_rejected_stale`.
+
+---
+
+## 13. `t15_redundant_backup_announcement/`
+
+**Proves:** a refinement discovered during real-corpus ground-truth validation of Fix 1 (not in
+the original brief) — a `trackedFileBackups` snapshot line that re-announces the exact SAME
+`backupFileName` for a path (confirmed on the real corpus: consecutive snapshot lines with
+identical `backupFileName` AND identical `backupTime` — a manifest-style re-list of
+already-known backups, not evidence of a fresh backup) must NOT reset the intervening-edit
+staleness counter. Only a genuinely different `backupFileName` may reset it
+(`record_backup`'s `is_new_backup` check). Validating the Fix-1-only implementation against
+ground truth (real `~/.claude` corpus entries carrying both an inline `originalFile` and a
+resolvable T1.5 backup) found this exact shape was the dominant remaining source of fabricated
+T1.5 classifications: 4 of 4 initial post-Fix-1 mismatches had a redundant same-name
+re-announcement sitting between the stale backup and the edit that used it.
+
+- Session id: `a2020202-2020-4202-8202-202020202020`
+- File: `projects/proj-a/a2020202-2020-4202-8202-202020202020.jsonl`, 4 lines, `cwd:
+  "/fake/repo20"`:
+  1. A `file-history-snapshot` line recording `trackedFileBackups["/fake/repo20/redundant.txt"]`
+     (absolute key) `.backupFileName = "aabbccdd11223344@v1"`.
+  2. Edit #1: `oldString: "line A\n"`, `newString: "line A changed\n"` — matches the blob's
+     first line; must resolve T1.5, content-proven.
+  3. A SECOND `file-history-snapshot` line re-announcing the identical `backupFileName =
+     "aabbccdd11223344@v1"` for the same path (`isSnapshotUpdate: true`) — simulating the
+     real-corpus manifest re-list shape. Must NOT reset the staleness this path already
+     accrued from edit #1.
+  4. Edit #2 (same path): `oldString: "line B\n"`, `newString: "line B changed\n"` — this
+     string IS present in the blob (its second line is unchanged), so a content-only guard
+     (or a staleness rule that reset on line 3's redundant re-announcement) would wrongly
+     accept it. Must be rejected as stale, falling through to T3 (no git repo backs
+     `/fake/repo20` in this fixture).
+- File-history blob: `file-history/a2020202-2020-4202-8202-202020202020/aabbccdd11223344@v1`.
+
+### Known-good content + independently-computed hash
+
+```
+line A
+line B
+```
+
+```
+$ shasum -a 256 cli/tests/fixtures/import/claude/t15_redundant_backup_announcement/file-history/a2020202-2020-4202-8202-202020202020/aabbccdd11223344@v1
+64c3a782a5345755c8a957545fc2b274fc373b51196864c63cea25409951c4fb  cli/tests/fixtures/import/claude/t15_redundant_backup_announcement/file-history/a2020202-2020-4202-8202-202020202020/aabbccdd11223344@v1
+```
+
+**Expected `sha256(resolved before bytes)` for edit #1:**
+`64c3a782a5345755c8a957545fc2b274fc373b51196864c63cea25409951c4fb`
+
+**Edit #2 must not resolve any bytes** (`sha256: null`), classified `t3`, counted in
+`t15_rejected_stale`.
 
 ---
 
@@ -369,6 +479,8 @@ that predicate to each scenario here (each scenario is its own `--source` root):
 | `t15_stale_blob/` | 1 | 1 | All lines parse; the entry falls through to T3 (rejected as unverifiable T1.5), which does not gate importability. |
 | `t15_cwd_after_snapshot/` | 1 | 1 | All lines parse; `cwd` is established by line 2 (session-level, per decision 14), so the session is importable and the pending relative key resolves. |
 | `t15_unverified_no_oldstring/` | 1 | 1 | All lines parse; no AC8 field missing; the missing-`oldString` entry still classifies T1.5 (unverified), which does not gate importability. |
+| `t15_intervening_edit/` | 1 | 1 | All lines parse; no AC8 field missing; edit #1 resolves T1.5, edit #2 falls through to T3 (rejected as stale) — the fallthrough doesn't gate importability. |
+| `t15_redundant_backup_announcement/` | 1 | 1 | All lines parse; no AC8 field missing; edit #1 resolves T1.5, edit #2 falls through to T3 (rejected as stale despite the redundant same-name re-announcement) — the fallthrough doesn't gate importability. |
 
 ---
 
@@ -405,7 +517,13 @@ cli/tests/fixtures/import/claude/
 ├── t15_cwd_after_snapshot/
 │   ├── projects/proj-a/a1717171-1717-4171-8171-171717171717.jsonl
 │   └── file-history/a1717171-1717-4171-8171-171717171717/ee55ff66aa77bb88@v1
-└── t15_unverified_no_oldstring/
-    ├── projects/proj-a/a1818181-1818-4181-8181-181818181818.jsonl
-    └── file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
+├── t15_unverified_no_oldstring/
+│   ├── projects/proj-a/a1818181-1818-4181-8181-181818181818.jsonl
+│   └── file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
+├── t15_intervening_edit/
+│   ├── projects/proj-a/a1919191-1919-4191-8191-191919191919.jsonl
+│   └── file-history/a1919191-1919-4191-8191-191919191919/9988776655443322@v1
+└── t15_redundant_backup_announcement/
+    ├── projects/proj-a/a2020202-2020-4202-8202-202020202020.jsonl
+    └── file-history/a2020202-2020-4202-8202-202020202020/aabbccdd11223344@v1
 ```

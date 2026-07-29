@@ -846,8 +846,139 @@ fn missing_old_string_classifies_t15_unverified_not_content_proven() {
     let data = entry_for(&entries, "data.bin");
     assert_eq!(data["tier"], "t1_5");
     assert_eq!(
-        data["sha256"], "9f79508431a3a504310ce89c4050986efece7012e23258c20b8b6ae4d4e56154",
+        data["sha256"], "03e693d9f2f687e0f40e36a8df7fcb4d1c22974012b7c2a55c000eb30f305824",
         "resolved bytes must match the independently-computed shasum of the \
          file-history blob (see FIXTURES.md scenario 11)"
     );
+}
+
+// ---- 22. T1.5 fabrication round, Fix 1: a snapshot followed by TWO edits to
+// the same path with no intervening snapshot. The blob is edit #1's true
+// pre-state (must classify T1.5, content-proven) but is stale for edit #2 —
+// and edit #2's `oldString` ("shared line\n") happens to still be present in
+// the untouched region of the stale blob, so the pre-fix `oldString`-only
+// guard would have incorrectly accepted it. The intervening-edit check must
+// reject edit #2 regardless (fixture `t15_intervening_edit/`; see
+// FIXTURES.md scenario 12). This is the fixture shape (snapshot -> edit ->
+// edit against the same path) that every prior T1.5 fixture lacked, which is
+// why this exact defect class survived three review rounds. --------------
+
+#[test]
+fn intervening_edit_between_snapshot_and_second_edit_is_rejected_as_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_intervening_edit"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "exactly one of the two edits (#1) has a true pre-state blob; \
+         full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_stale"], 1,
+        "edit #2's backup is stale by one intervening edit (#1) and must be \
+         rejected BEFORE any oldString check, even though edit #2's \
+         oldString (\"shared line\\n\") is still coincidentally present in \
+         the stale blob's untouched region — full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_unverifiable"], 0,
+        "this must be caught by the staleness check, not the content check"
+    );
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(
+        report["tier_counts"]["t3"], 1,
+        "edit #2 falls through to T3 (no git repo backs /fake/repo19 here)"
+    );
+
+    let entries = debug_entries(&report);
+    let multi_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.ends_with("multi.txt"))
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        multi_entries.len(),
+        2,
+        "expected one debug_entries row per edit; full report: {report}"
+    );
+    assert_eq!(multi_entries[0]["tier"], "t1_5");
+    assert_eq!(
+        multi_entries[0]["sha256"],
+        "99931c6269c8f9e306b7ce0ac5fe986ab1121e83df93153eb3f66cf298384c56",
+        "resolved bytes for edit #1 must match the independently-computed \
+         shasum of the file-history blob (see FIXTURES.md scenario 12)"
+    );
+    assert_eq!(
+        multi_entries[1]["tier"], "t3",
+        "edit #2 must NOT resolve T1.5 despite the coincidental oldString match"
+    );
+    assert!(
+        multi_entries[1]["sha256"].is_null(),
+        "a stale-rejected entry must never report resolved bytes"
+    );
+}
+
+// ---- 23. T1.5 fabrication round, ground-truth-discovered refinement: a
+// `trackedFileBackups` snapshot line re-announcing the SAME `backupFileName`
+// (a manifest-style re-list; confirmed on the real corpus — identical
+// backupFileName AND identical backupTime repeated across consecutive
+// snapshot lines) must NOT reset the intervening-edit staleness counter.
+// Only a genuinely NEW backup identity (a different `backupFileName`) may
+// reset it. Real-corpus ground-truth validation of the Fix-1 predicate
+// (comparing resolved T1.5 blobs against known-true `originalFile` bytes on
+// entries that also happen to carry one) surfaced this as the dominant
+// remaining source of fabricated T1.5 classifications after Fix 1 alone: a
+// redundant re-announcement of an already-stale backup was wrongly treated
+// as evidence of a fresh backup, clearing staleness that should have stayed
+// set (fixture `t15_redundant_backup_announcement/`). ------------------------
+
+#[test]
+fn redundant_reannouncement_of_same_backup_name_does_not_clear_staleness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_import_json(&fixture("t15_redundant_backup_announcement"), tmp.path());
+    let report = report_json(&out);
+
+    assert_eq!(report["sessions_total"], 1);
+    assert_eq!(report["sessions_importable"], 1);
+    assert_eq!(
+        report["tier_counts"]["t1_5"], 1,
+        "edit #1 has a true pre-state blob and must still resolve T1.5; \
+         full report: {report}"
+    );
+    assert_eq!(
+        report["tier_counts"]["t15_rejected_stale"], 1,
+        "edit #2's backup is stale by edit #1, and the SAME backupFileName \
+         being re-announced between them (a manifest re-list, not a fresh \
+         backup) must NOT clear that staleness — even though edit #2's \
+         oldString (\"line B\\n\") is still present in the stale blob's \
+         untouched region; full report: {report}"
+    );
+    assert_eq!(report["tier_counts"]["t15_rejected_unverifiable"], 0);
+    assert_eq!(report["tier_counts"]["t2_candidate"], 0);
+    assert_eq!(report["tier_counts"]["t3"], 1);
+
+    let entries = debug_entries(&report);
+    let redundant_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.ends_with("redundant.txt"))
+        })
+        .copied()
+        .collect();
+    assert_eq!(redundant_entries.len(), 2);
+    assert_eq!(redundant_entries[0]["tier"], "t1_5");
+    assert_eq!(
+        redundant_entries[1]["tier"], "t3",
+        "must NOT resolve T1.5 despite the redundant same-name re-announcement"
+    );
+    assert!(redundant_entries[1]["sha256"].is_null());
 }
