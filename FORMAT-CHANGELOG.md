@@ -33,6 +33,14 @@ pub files_complete: Option<bool>,
   activity outside file-producing tool results are never captured, so the
   turn's `files` list is a known-partial accounting, not a complete one.
   `None` on every live-recorded turn, same as `imported`.
+  **Extended (P2 integration-gate fix round, BLOCKER 1):** also covers
+  file-producing entries dropped because `filePath` is not lexically
+  under the session's `cwd` (`ScopeCounters::skipped_out_of_cwd` in
+  `cli/src/importcmd.rs`, real-corpus measured at 507/2,170 = 23.4% of
+  non-sidechain file-producing entries) — these are refused, not
+  imported, so `files_complete: false` already covered them correctly in
+  spirit, but the loss used to be invisible (no counter, no FileEntry, no
+  stderr line) before this fix.
 
 Consumers:
 - `cli/src/fmt.rs::turn_list_line` (used by `log`) renders a `partial file
@@ -47,6 +55,19 @@ Consumers:
   import-missing-`before` entry — those stay `before: null` with
   `baseline_unknown` absent/`false` (spec decision, P1.md "Pinned
   decisions" #7).
+- `cli/src/cmds.rs::status_report`'s rich-rate window (FOUNDER DECISION,
+  P2 integration-gate fix round, Fix 4): imported turns are excluded from
+  the trailing-20-agent-turn window entirely, the same shape as the
+  pre-existing git-tool exclusion. An imported turn carries `grade:
+  "rich"` without any hook ever having fired — recapturing P3's goldens
+  at integration moved the rich-rate from 67% to 86% purely because
+  imported turns filled the window, which would let a bulk import mask a
+  genuinely broken hook (the rich-rate metric's whole purpose). `turns:`
+  (the total agent-turn count `status` also reports) is UNCHANGED by this
+  — only the rich-rate window's membership narrows; imported turns still
+  count toward the total. This regenerated `status.golden`'s rich-rate
+  line only (`86% over trailing 7` -> `83% over trailing 6`); no other
+  golden file changed.
 
 Judgment call: `agentrec import claude`'s turn segmentation buckets a
 session's transcript into candidate turns at each genuine user-authored

@@ -2,7 +2,7 @@ stdout:
 store:      307 B
 turns:      7 (agent turns; git activity hidden)
 gaps:       1 recording gap(s)
-rich-rate:  86% over trailing 7 agent turn(s)
+rich-rate:  83% over trailing 6 agent turn(s)
   ⚠ rich-rate below 90% — hooks may be broken (check `agentrec doctor`)
 memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures
 

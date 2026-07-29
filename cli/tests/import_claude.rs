@@ -1587,6 +1587,69 @@ mod persist {
         assert!(files[0]["after"].is_null());
     }
 
+    // ---- BLOCKER 1 (P2 integration-gate fix round): a file-producing
+    // entry whose `filePath` is NOT lexically under its session's `cwd`
+    // must be COUNTED (`skipped_out_of_cwd`), not silently vanish. Mirrors
+    // the skeptic's proven failure scenario exactly: `cwd = <root>/sub`,
+    // a fully-recoverable T1 entry (real `originalFile` bytes) sits at
+    // `<root>/outside-cwd-inside-root.txt` — outside cwd, but still inside
+    // root. Recovery is NOT authorized this round: the entry must still be
+    // refused, only now visibly.
+    #[test]
+    fn blocker1_out_of_cwd_entry_is_counted_not_silently_dropped() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+
+        let cwd = root.path().join("sub").to_string_lossy().to_string();
+        let outside_path = root.path().join("outside-cwd-inside-root.txt");
+        let outside_path_str = outside_path.to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-20T09:00:00.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"touch both files"}}}}"#
+            ),
+            // In-cwd entry: must persist normally (proves the fix doesn't
+            // over-refuse — only the genuinely out-of-cwd entry is dropped).
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-20T09:00:05.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/inside.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+            // Out-of-cwd (but in-root) entry: fully recoverable (real
+            // originalFile bytes) yet must be refused-and-counted, not
+            // silently dropped.
+            format!(
+                r#"{{"type":"assistant","uuid":"a2","timestamp":"2026-06-20T09:00:06.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t2","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{outside_path_str}","oldString":"alpha","newString":"beta","originalFile":"alpha\nkeep\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_b1", &lines);
+
+        let out = run_persist_json(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["skipped_out_of_cwd"], 1,
+            "the out-of-cwd entry must be counted: report={report}"
+        );
+
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "only the in-cwd entry persists — the out-of-cwd one is refused, not recovered: {files:?}"
+        );
+        assert_eq!(files[0]["path"], "sub/inside.txt");
+        assert!(
+            !files.iter().any(|f| f["path"]
+                .as_str()
+                .unwrap_or("")
+                .contains("outside-cwd-inside-root")),
+            "the out-of-cwd entry must never appear in files, even though its bytes were \
+             fully recoverable: {files:?}"
+        );
+    }
+
     // ---- AC7 (last P2.md bullet): `log` renders imported turns with a
     // "partial file list (imported)" marker; a bare turn is never relabeled.
 

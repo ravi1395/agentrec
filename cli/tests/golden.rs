@@ -450,10 +450,12 @@ fn build_fixture(root: &Path) {
     };
     seed_turn(root, &undo);
 
-    // ---- imported turn: seeded as a RAW JSON line (P2's `imported`/
-    // `files_complete` fields don't exist on this branch's `TurnRecord` yet
-    // — see the frozen interface contract in the task brief). Field order
-    // matches P2's frozen struct declaration order exactly:
+    // ---- imported turn: seeded as a RAW JSON line (rather than a
+    // `TurnRecord` struct literal) so this fixture pins the exact wire
+    // bytes independent of whatever field order the struct happens to
+    // declare — the byte contract, not the Rust type, is what a golden
+    // test is supposed to nail down. Field order matches P2's frozen
+    // struct declaration order exactly:
     // v, id, grade, truncated?, started, ended, tool, model, session, root,
     // prompt_ref?, prompt_excerpt?, merges?, imported, files_complete, files.
     //
@@ -469,14 +471,13 @@ fn build_fixture(root: &Path) {
     // "claude"`. This is the shape a bare fixture-and-implementation
     // agreement would have hidden — exactly the P1 failure mode.
     //
-    // Until P2 lands, `load_log` parses this via serde's tolerant-unknown-
-    // field default and silently drops `imported`/`files_complete` — this
-    // turn renders today as an ordinary rich `claude` turn with no visible
-    // "imported" marker. The day P2 merges those fields onto `TurnRecord`
-    // AND adds its own AC7 "partial file list (imported)" `log` marker,
-    // `log_default`/`log_all`/`log_explain`/`log_json` will all change
-    // again at that merge — expected, not a regression; do not pre-empt
-    // that marker by hand-writing it here.
+    // On the merged tree (P2 + P3 integrated), `imported`/`files_complete`
+    // are real `TurnRecord` fields and AC7's "partial file list (imported)"
+    // `log` marker is live — both are exercised and pinned by this fixture:
+    // the marker renders in `log_default.golden` (and friends) for this
+    // turn. This RAW-JSON seeding approach still stands (see above), not
+    // because the fields don't exist, but because it is the more precise
+    // golden-testing technique regardless.
     let imported_line = format!(
         concat!(
             r#"{{"type":"turn","v":1,"id":"{id}","grade":"rich","#,

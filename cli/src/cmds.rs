@@ -289,7 +289,23 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
-    let trailing: Vec<&&TurnRecord> = turns.iter().rev().take(20).collect();
+    //
+    // FOUNDER DECISION (P2 integration-gate fix round, Fix 4): imported
+    // turns are excluded from this window, same shape as the git-tool
+    // exclusion above — an imported turn carries `grade: "rich"` without
+    // any hook ever having fired, so a bulk import could otherwise flood
+    // the trailing-20 window and make a genuinely broken hook read as
+    // 100% healthy (the metric exists specifically to warn "your hooks may
+    // be broken", cmds.rs:342-353 below). Deliberately a SEPARATE list
+    // from `turns` (not a further narrowing reused elsewhere): `turns:`
+    // above still reports the total including imported ones — only the
+    // rich-rate window's membership changes.
+    let rich_rate_turns: Vec<&TurnRecord> = turns
+        .iter()
+        .copied()
+        .filter(|t| t.imported != Some(true))
+        .collect();
+    let trailing: Vec<&&TurnRecord> = rich_rate_turns.iter().rev().take(20).collect();
 
     let mut out = String::new();
     out.push_str(&format!("store:      {}\n", human_bytes(size)));
@@ -1212,6 +1228,70 @@ mod tests {
         assert!(
             !out.contains("check `agentrec init`"),
             "remedy must no longer point at `agentrec init`: {out}"
+        );
+    }
+
+    // FOUNDER DECISION (P2 integration-gate fix round, Fix 4): an imported
+    // turn (`grade: "rich"`, but no hook ever fired) must not count toward
+    // the rich-rate window at all — not just "not count as rich", but not
+    // even occupy a window SLOT, since the whole failure mode is a bulk
+    // import diluting a genuinely broken hook's signal. All 10 turns here
+    // are imported; the window must have nothing to compute a rate over.
+    #[test]
+    fn status_rich_rate_excludes_imported_turns_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        for i in 0..10 {
+            let mut turn = turn_with_grade(&format!("t_imp_{i:021}"), "rich");
+            turn.imported = Some(true);
+            turn.files_complete = Some(false);
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("rich-rate:  n/a (no agent turns yet)"),
+            "an all-imported log must report n/a — nothing live to rate: {out}"
+        );
+    }
+
+    // The property actually worth protecting: a genuinely broken hook
+    // (bare turns) must still drive the rate down and trip the warning,
+    // even when imported turns are ALSO present in the same log — a bulk
+    // import must never mask a real regression by diluting the window with
+    // turns no hook ever produced.
+    #[test]
+    fn status_rich_rate_still_reflects_broken_hooks_alongside_imported_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // 20 imported turns first (would fill the entire trailing-20
+        // window under the old, unfixed behavior).
+        for i in 0..20 {
+            let mut turn = turn_with_grade(&format!("t_imp_{i:021}"), "rich");
+            turn.imported = Some(true);
+            turn.files_complete = Some(false);
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+        // Then 10 bare (live, hook-not-firing) turns — the real signal.
+        for i in 0..10 {
+            let turn = turn_with_grade(&format!("t_BARE{i:021}"), "bare");
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("rich-rate:  0% over trailing 10 agent turn(s)"),
+            "the window must be the 10 live bare turns only, not diluted by \
+             the 20 imported ones ahead of them: {out}"
+        );
+        assert!(
+            out.contains("hooks may be broken"),
+            "a genuinely broken-hook signal must still trip the warning \
+             even with imported turns present in the log: {out}"
         );
     }
 

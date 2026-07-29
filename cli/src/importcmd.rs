@@ -1412,6 +1412,7 @@ mod persist {
         let mut git_cache = GitTrackCache::default();
         let mut t2 = T2Counters::default();
         let mut t15 = T15Counters::default();
+        let mut scope = ScopeCounters::default();
         let mut oracle = OracleCounters::default();
         let oracle_on = t2_oracle_enabled();
 
@@ -1464,6 +1465,7 @@ mod persist {
                     &mut git_cache,
                     &mut t2,
                     &mut t15,
+                    &mut scope,
                     oracle_on.then_some(&mut oracle),
                 );
                 for record in records {
@@ -1498,6 +1500,10 @@ mod persist {
                     "blob_missing": t15.blob_missing,
                     "rejected_unverifiable": t15.rejected_unverifiable,
                 },
+                // BLOCKER 1: see `ScopeCounters`' doc — a file-producing
+                // entry not lexically under its session's `cwd` used to
+                // silently vanish; now counted (never recovered/imported).
+                "skipped_out_of_cwd": scope.skipped_out_of_cwd,
             });
             if oracle_on {
                 obj["t2_oracle"] = serde_json::json!({
@@ -1537,6 +1543,7 @@ mod persist {
                 t15.blob_missing,
                 t15.rejected_unverifiable
             );
+            println!("skipped_out_of_cwd: {}", scope.skipped_out_of_cwd);
             if oracle_on {
                 println!(
                     "t2_oracle (AC5b, T1 entries only): mismatches={} of {} both-resolved",
@@ -1573,6 +1580,27 @@ mod persist {
         rejected_unsafe_path: usize,
         blob_missing: usize,
         rejected_unverifiable: usize,
+    }
+
+    /// BLOCKER 1 (P2 integration-gate fix round): counts file-producing
+    /// entries whose `filePath` is NOT lexically under their session's
+    /// `session_cwd` (Pinned decision 14: `cwd` is session-level, first-
+    /// line-wins — untouched by this fix). Real-corpus measurement
+    /// (read-only, 1,660 top-level session files): **507 of 2,170 (23.4%)**
+    /// non-sidechain file-producing entries fall here — 24 are mid-session
+    /// `cwd` moves, 196 sit under the first `cwd`'s PARENT (would be
+    /// importable under a repo-root `--root`, but that is a founder-scope
+    /// recall decision not made here), the remainder are genuinely
+    /// out-of-tree. An earlier version of this code's doc comment claimed
+    /// `cwd` "is lexically a prefix of `file_path` in every real
+    /// transcript" — that was never measured and is false; the entry used
+    /// to simply vanish (no `FileEntry`, no counter, no stderr line) when
+    /// it wasn't. This struct exists so that loss is countable, per this
+    /// round's own repeated invariant. Recovery (importing these entries
+    /// under a wider scope) is explicitly NOT authorized this round.
+    #[derive(Default)]
+    struct ScopeCounters {
+        skipped_out_of_cwd: usize,
     }
 
     #[derive(Default)]
@@ -1704,6 +1732,7 @@ mod persist {
         git_cache: &mut GitTrackCache,
         t2: &mut T2Counters,
         t15: &mut T15Counters,
+        scope: &mut ScopeCounters,
         mut oracle: Option<&mut OracleCounters>,
     ) -> Vec<LogRecord> {
         let Ok(file) = File::open(path) else {
@@ -1811,7 +1840,15 @@ mod persist {
                 }
             }
 
-            if is_genuine_user_prompt(&value) {
+            // Fix 2 (P2 integration-gate fix round): sidechain check moved
+            // ahead of the turn-boundary check — an `isSidechain:true`
+            // "user"-role line must never seed a turn boundary or have its
+            // text persisted as a prompt. Real-corpus measurement: 0 such
+            // lines across all 1,660 top-level session files (latent, not
+            // yet observed), but a top-level file COULD carry one and the
+            // prior ordering would have silently promoted sidechain text
+            // into a persisted prompt blob.
+            if !is_sidechain_field && is_genuine_user_prompt(&value) {
                 if let Some(text) = extract_user_text(&value) {
                     if cur.prompt_raw.is_some() || !cur.files.is_empty() {
                         turn_index += 1;
@@ -1868,6 +1905,7 @@ mod persist {
                 git_cache,
                 t2,
                 t15,
+                scope,
                 oracle.as_deref_mut(),
             ) {
                 cur.files.push(entry);
@@ -1961,6 +1999,7 @@ mod persist {
         git_cache: &mut GitTrackCache,
         t2: &mut T2Counters,
         t15: &mut T15Counters,
+        scope: &mut ScopeCounters,
         oracle: Option<&mut OracleCounters>,
     ) -> Option<FileEntry> {
         // `file_path` (from the transcript) and `root` (from `--root`) are
@@ -1969,12 +2008,30 @@ mod persist {
         // a raw `file_path` against a canonicalized root directly fails
         // whenever the root sits behind a symlinked path segment, even
         // though the two names the SAME directory. Route `file_path` through
-        // `session_cwd` (itself lexically a prefix of `file_path` in every
-        // real transcript, since the tool always reports an absolute path
-        // under the session's own cwd) and canonicalize THAT, so both sides
-        // of the final `strip_prefix` went through the same resolution.
+        // `session_cwd` and canonicalize THAT, so both sides of the final
+        // `strip_prefix` went through the same resolution.
+        //
+        // BLOCKER 1 (P2 integration-gate fix round): this used to assume
+        // `session_cwd` is lexically a prefix of `file_path` "in every real
+        // transcript" — that was never measured and is false. Real-corpus
+        // measurement (read-only, 1,660 top-level session files): 507 of
+        // 2,170 (23.4%) non-sidechain file-producing entries are NOT under
+        // their session's first `cwd` (24 mid-session `cwd` moves, 196
+        // under the first `cwd`'s PARENT — would be importable under a
+        // repo-root `--root`, a founder-scope recall decision not made
+        // here — the remainder genuinely out-of-tree). Previously this
+        // entry simply vanished: no `FileEntry`, no counter, no stderr
+        // line. Now it is counted (`ScopeCounters::skipped_out_of_cwd`)
+        // and still refused — countability, not recovery; recovering these
+        // by widening scope is explicitly NOT authorized this round.
         let cwd = session_cwd?;
-        let rel_to_cwd = Path::new(file_path).strip_prefix(cwd).ok()?;
+        let rel_to_cwd = match Path::new(file_path).strip_prefix(cwd) {
+            Ok(rel) => rel,
+            Err(_) => {
+                scope.skipped_out_of_cwd += 1;
+                return None;
+            }
+        };
         let cwd_canon = fs::canonicalize(cwd).ok()?;
         let abs = lexical_normalize(&cwd_canon.join(rel_to_cwd));
 
