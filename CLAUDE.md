@@ -36,17 +36,37 @@ carries only current state, what's next, and standing debts.
   honest, 92.3% banned).
 - **Phase 2.0 plan chunked:** `docs/superpowers/plans/tasks/P1..P5.md` (standalone,
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
-  **`HANDOFF.md` at repo root points the next session at P1** — ingest it, execute, delete it.
+- **P1 EXECUTED + GATE PASS (2026-07-29) — `feat/p1-import-classifier`, not merged, no PR.**
+  `agentrec import claude --dry-run` built; **447 / 0 / 1** (baseline 428, +19: 17 integration
+  + 2 unit); clippy+fmt clean debug & release; debug seam absent from release `strings`.
+  Final Fable skeptic in an isolated worktree: **8/8 ACs PASS**, every figure independently
+  reproduced. Real-corpus gate run (`docs/verify/p1-gate-run.txt`): **1617 sessions, 99.6%
+  importable** (bar ≥90%), peak RSS **16.7 MB** (bar <500 MB). Fidelity row + anti-overclaim
+  rider in `VERIFY-LEDGER.md`. **The Phase 2.0 hard stop is retired with a fidelity row, not a
+  parse-only pass** (spec decision 8 satisfied).
+  - **The plan's before-ladder prediction did NOT hold.** Measured T1 39.9 / **T1.5 0.5** /
+    T2-cand 44.8 / T3 15.0 vs predicted 42.5 / 25.3 / 24.5 / 7.7. T1.5 is ~50× below
+    prediction — verified genuine (only 12 entries corpus-wide qualify; 11 have blobs on
+    disk; the importer resolves all 11). **Honest reconstructible is 40.4%, not 67.9%** —
+    correct the 67.9% figure wherever it is quoted; 92.3% stays banned.
+  - **99.6% is an ingestion rate, never a recovery rate** — only 184/1617 sessions carry any
+    file mutation at all. Never quote it bare; the rider in VERIFY-LEDGER.md travels with it.
+  - Defect worth remembering: first gate run reported `t1_5 = 0` because the classifier
+    matched a `type: "snapshot"` literal the *synthetic fixture had invented*; the real corpus
+    uses `file-history-snapshot`. Every test passed while nothing real resolved. Fixed to
+    presence-based harvesting. **Fixture-only evidence cannot close a corpus-shape claim.**
+  - 2 claimd claims REFUTED on malformed replay commands (multi-filter `cargo test`, which
+    takes one TESTNAME) — the underlying tests pass under a corrected invocation, but REFUTED
+    is not amendable and re-declaring an equivalent is forbidden as dodging. Founder call.
 
 ### Now / next (in order)
 
-1. **Execute P1** — `docs/superpowers/plans/tasks/P1.md`: `import claude --dry-run`
-   classifier + 4-tier ladder + fidelity report over the real corpus; retires (or honestly
-   fails) the Phase 2.0 hard gate. Branch `feat/phase-2-0-substrate` (create it), claimd
-   declare-first, skeptic gate in isolated worktree. P3 (golden harness) may run in parallel.
-2. P2 (persist + undo refusal) → P4 (`RepositoryView`) → P5 (`--json`), then the plan-exit
-   checklist. Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open
-   question 1.
+1. **P1 done — merge decision is the founder's** (`feat/p1-import-classifier`, 6 commits off
+   `feat/phase-2-0-substrate`; no PR opened, per standing practice of not publishing unasked).
+2. P2 (persist + undo refusal — consumes P1's classifier; resolves T2 git blobs, which is what
+   converts the 963 T2-candidates into a real recovery rate) → P4 (`RepositoryView`) → P5
+   (`--json`), then the plan-exit checklist. P3 (golden harness) may run in parallel now.
+   Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
