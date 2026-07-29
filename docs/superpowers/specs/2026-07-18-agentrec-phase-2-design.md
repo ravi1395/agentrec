@@ -389,27 +389,37 @@ load-bearing:
 1. **T1** — transcript `toolUseResult.originalFile`: Claude Code embeds the full
    pre-edit file content on Edit/Write results, but **unreliably** (~30% of edit
    results in the audited corpus, varying 4–70% per session with no version
-   correlation). Opportunistic, never assumed. Measured share: 42.5% of file
-   entries (incl. create ops).
+   correlation). Opportunistic, never assumed. Measured share (P1's real-corpus
+   importer run, 2026-07-29, 2151 file entries): 39.9% of file entries (incl.
+   create ops) — supersedes the 2026-07-24 audit's 42.5% prediction.
 2. **T1.5** — `~/.claude/file-history/<sessionId>/<hash>@<vN>`, resolved via
    `snapshot.trackedFileBackups[path].backupFileName`: verbatim pre-edit bytes.
-   Measured 25.3% of entries (518 of 2044); separately, 508/508 backups
-   *referenced by the audit sample* resolved on disk — a resolve-rate check
-   with its own denominator, not the tier count. Retention-limited (~30 days)
-   so coverage degrades with age — opportunistic, same class as T1.
+   The 2026-07-24 audit predicted 25.3% of entries, but that figure counted
+   files with *any* same-session backup reference, not entries the ladder's
+   first-hit-wins logic actually resolves via T1.5 — most referenced files were
+   already covered by T1 first. P1's real-corpus run measured T1.5's true
+   marginal contribution at **0.5%** (11 of 2151 entries; 11 of 12 candidate
+   blobs still on disk, one reaped by ~30-day retention). Retention-limited
+   (~30 days) so coverage degrades with age — opportunistic, same class as T1.
 3. **T2** — git history blob (commit-time reconstruction) when the repo's git log
    covers the file at the turn's timestamp. **Upper bound by construction**: git
    holds committed states only, so a mid-session intermediate edit was never in
    git — a T2 candidate whose exact bytes were never committed falls through to
-   T3, never to a nearby commit's bytes. Measured candidate share: 24.5%.
+   T3, never to a nearby commit's bytes. 2026-07-24 predicted candidate share
+   24.5%; P1's real-corpus run measured T2-candidate share at 44.8% (bytes still
+   not resolved — see "Do not quote 92.3%" below).
 4. **T3** — none of the above → `before: null` + provenance-only; refused by undo
    with an explicit imported-history reason. Import never fabricates a revertible
-   snapshot. Measured share: 7.7%.
+   snapshot. 2026-07-24 predicted 7.7%; P1's real-corpus run measured 15.0%.
 
-Honest reconstructible figure: **67.9% without git** (T1 + T1.5, as measured on
-unrounded entry counts; the rounded tier shares above sum to 67.8 — quote 67.9,
-the direct measurement), plus an unknown resolved share of the 24.5% T2
-candidates. Do not quote 92.3%.
+Honest reconstructible figure: **40.4% without git** (T1 39.9% + T1.5 0.5%,
+measured 2026-07-29 by the built importer's real-corpus run — task P1; see
+`VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and `docs/verify/p1-gate-run.txt`).
+This supersedes the 2026-07-24 audit's predicted 67.9%: that prediction's T1.5
+term counted same-session backup *references*, not entries the first-hit-wins
+ladder would actually resolve via T1.5 after T1 already claimed most of them.
+Do not quote 92.3% — T2-candidate measured 44.8% (P1), still an unresolved
+upper bound, now more clearly so than the 24.5% prediction implied.
 
 **File lists are structurally incomplete** — the deeper honesty problem. In the
 audited corpus, Bash tool calls outnumber Edit+Write ~2:1, and Bash and subagent

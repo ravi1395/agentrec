@@ -32,8 +32,9 @@ carries only current state, what's next, and standing debts.
   parked** — Phase 2 re-centered on accessibility (import, trailers, `--json`, distribution,
   setup, Codex). Corpus decay measured: import is a **≤30-day rolling backfill**
   (`cleanupPeriodDays` default 30); "durable archive" claim embargoed until a re-import
-  mechanism ships; 4-tier before-ladder (T1 42.5 / T1.5 25.3 / T2-cand 24.5 / T3 7.7 → 67.9%
-  honest, 92.3% banned).
+  mechanism ships; 4-tier before-ladder predicted this day (T1 42.5 / T1.5 25.3 / T2-cand 24.5
+  / T3 7.7 → 67.9% honest, 92.3% banned) — **superseded same-day by P1's real-corpus run, see
+  below: honest figure is 40.4%.**
 - **Phase 2.0 plan chunked:** `docs/superpowers/plans/tasks/P1..P5.md` (standalone,
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
 - **P1 EXECUTED + GATE PASS (2026-07-29) — `feat/p1-import-classifier`, not merged, no PR.**

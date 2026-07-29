@@ -27,6 +27,15 @@ Parse robustness: **0 unparseable lines out of 106,311.** 37 MB peak RSS over th
 
 ## 2. Before-bytes ladder — the spec's 3 tiers are missing a source
 
+> **Superseded 2026-07-29.** This section's T1.5 figure (25.3%) counted files with a
+> *same-session backup reference available*, not file entries the ladder's first-hit-wins
+> logic would actually resolve via T1.5 — most of those referenced files were already
+> covered by T1 and never reached the T1.5 check. The built importer's real-corpus run
+> (task P1) measured T1.5's actual marginal contribution at **0.5%**, making the honest
+> T1+T1.5 reconstructible figure **40.4%**, not 67.9%. See `VERIFY-LEDGER.md`'s "Phase 2.0
+> P1" section and `docs/verify/p1-gate-run.txt` for the measurement. The table and
+> narrative below are left unchanged as a record of what was predicted on this date.
+
 | tier | source | entries | share |
 |---|---|---|---|
 | T1 | transcript `originalFile` or `create` op | 869 | 42.5% |
@@ -35,6 +44,10 @@ Parse robustness: **0 unparseable lines out of 106,311.** 37 MB peak RSS over th
 | T3 | provenance-only, honest `null` | 157 | 7.7% |
 
 **Reconstructible without touching git: 67.9%.** With the git upper bound: 92.3%.
+
+> **Superseded 2026-07-29 — see callout above.** Honest measured figure is **40.4%**
+> (T1 39.9% + T1.5 0.5%). The "do not quote 92.3%" rule below is unaffected and stronger:
+> T2-candidate measured 44.8%, still an unresolved upper bound.
 
 ### T1.5 is a real, undocumented source
 `~/.claude/file-history/<sessionId>/<hash>@<version>` holds **verbatim pre-edit

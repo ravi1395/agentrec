@@ -42,7 +42,7 @@ consume seams that don't exist yet or sit behind the un-retired gate.
 
 ## Infeasible / rejected (killed against real code or measured evidence)
 
-- **Quoting 92.3% as the reconstructible rate.** T2 (git-tracked) is an upper bound: git holds committed states only, so mid-session intermediate edits were never in git. Honest figure is 67.9% + "git recovers some unknown share of the remaining 24.5%" (measurement §2).
+- **Quoting 92.3% as the reconstructible rate.** T2 (git-tracked) is an upper bound: git holds committed states only, so mid-session intermediate edits were never in git. Honest figure is **40.4%** (T1 39.9% + T1.5 0.5%, measured 2026-07-29 by P1's real-corpus importer run — supersedes this entry's earlier 67.9%, whose T1.5 term counted same-session backup references rather than entries the first-hit-wins ladder actually resolves via T1.5; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section) + "git recovers some unknown share of the remaining 44.8% T2-candidate" (measurement §2; P1 measured T2-candidate share at 44.8%, still unresolved).
 - **Excluding sidechains by `isSidechain` field alone.** 583 of 1860 corpus files are now separate `subagents/agent-*.jsonl` files carrying no `cwd`. Must exclude by **path** as well (measurement §1 note).
 - **Treating imported file lists as exhaustive.** Opaque:naming tool-call ratio measured 2.49:1 — 71% of tool calls can mutate files while naming none. `files_complete: false` is mandatory.
 - **Reusing CLI stdout as the machine contract.** Unstable text, no typed errors, duplicate parsing (spec §Rejected).
@@ -245,13 +245,21 @@ evidence gate to open.)*
 **T1.5 (`~/.claude/file-history/`) is IN, and the spec's 3-tier ladder is amended to four.**
 *(Update 2026-07-28: the spec amendment landed in the hardening round — the spec now carries
 the four-tier ladder with measured shares; P1's commit no longer owes it.)*
-The corpus audit found this undocumented source covering 25.3% of entries at a 100% on-disk
-resolve rate (508/508 referenced backups), holding verbatim pre-edit bytes. It is
-retention-limited (~30 days, 102 of 1277 sessions), so it is treated as **opportunistic** —
-exactly the class the spec already accepts for T1 (which itself hits only ~30%, varying
-4–70%). Including an opportunistic source that reads real bytes off disk cannot weaken the
-honesty model, whose rule is "never fabricate"; it raises honest reconstructible coverage
-42.5% → 67.9%. Spec §Phase 2.0 ladder gets the amendment in P1's commit.
+The corpus audit found this undocumented source covering 25.3% of *entries with a
+same-session backup reference*, at a 100% on-disk resolve rate (508/508 referenced backups),
+holding verbatim pre-edit bytes. It is retention-limited (~30 days, 102 of 1277 sessions), so
+it is treated as **opportunistic** — exactly the class the spec already accepts for T1 (which
+itself hits only ~30%, varying 4–70%). Including an opportunistic source that reads real
+bytes off disk cannot weaken the honesty model, whose rule is "never fabricate" — that
+reasoning holds. **Falsified by P1's real-corpus run (2026-07-29):** the 25.3% figure counted
+backup *references*, not entries the ladder's first-hit-wins logic would actually resolve via
+T1.5 — T1 already covers nearly everything a same-session backup could have covered, so T1.5
+only fires when T1 misses AND a backup exists for that exact path. P1 measured T1.5's true
+marginal contribution at 0.5% (11 of 2151 entries), raising honest reconstructible coverage
+39.9% → 40.4%, not 42.5% → 67.9% as predicted here. T1.5 was still correctly adopted into the
+ladder — it resolves real bytes with no downside — it is simply near-empty in practice. Spec
+§Phase 2.0 ladder carries the amendment; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and
+`docs/verify/p1-gate-run.txt` for the measurement.
 
 ## Open questions (answer before implementation)
 
