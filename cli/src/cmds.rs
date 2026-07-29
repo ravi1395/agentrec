@@ -1000,6 +1000,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![FileEntry {
                 path: path.into(),
                 before: None,
@@ -1180,6 +1182,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![],
         }
     }

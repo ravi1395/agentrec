@@ -260,9 +260,11 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Import history from another agent tool's transcript store (P1: Claude
-    /// Code only, read-only classification — never writes; persistence
-    /// lands in a later phase).
+    /// Import history from another agent tool's transcript store (Claude
+    /// Code only). `--dry-run` classifies and reports without writing
+    /// (P1); omitting it persists imported turns into this repo's
+    /// `log.jsonl`, scoped to sessions whose `cwd` resolves under `--root`
+    /// (P2).
     Import {
         #[command(subcommand)]
         source: ImportSource,
@@ -271,12 +273,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ImportSource {
-    /// Classify Claude Code's ~/.claude/projects transcript corpus for
-    /// import safety: per-tier before-bytes reconstructability, fidelity
-    /// figures, peak RSS. Read-only; requires --dry-run (P1 never persists).
+    /// Classify (and, without `--dry-run`, persist) Claude Code's
+    /// ~/.claude/projects transcript corpus: per-tier before-bytes
+    /// reconstructability, fidelity figures, peak RSS. `--dry-run` is
+    /// read-only classification only (P1); omitting it persists imported
+    /// turns into `log.jsonl` for sessions in scope of `--root` (P2) —
+    /// idempotent (re-running appends nothing new) and safe to interrupt.
     Claude {
-        /// Required (P1 never persists) — passing it is the only supported
-        /// mode; omitting it is a loud, nonzero-exit refusal.
+        /// Read-only classify-and-report mode (P1) — no writes. Omit to
+        /// persist (P2).
         #[arg(long)]
         dry_run: bool,
         /// Corpus root containing sibling `projects/` and `file-history/`

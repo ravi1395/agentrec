@@ -49,6 +49,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -75,6 +77,8 @@ fn make_turn(
         prompt_ref: None,
         prompt_excerpt: prompt_excerpt.map(str::to_string),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -128,6 +132,98 @@ fn wall_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+// ---- P2 AC3 (clm_2GCNB5WPT0FKHH4NFBYB9Q2JJT): undo of an imported turn
+// with a provenance-only (`before: null`) entry refuses the WHOLE turn,
+// before any working-tree write — even when another entry in the same turn
+// has real, revertible content. ---------------------------------------------
+
+#[test]
+fn ac3_imported_turn_with_provenance_only_entry_refuses_before_any_write() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"BEFORE\n").unwrap();
+    let after = store.put(b"AFTER\n").unwrap();
+    // The on-disk file matches the turn's recorded `after` exactly, so this
+    // entry is NOT modified-since — if the AC3 preflight were absent, this
+    // entry alone would be perfectly revertible.
+    std::fs::write(root.join("known.rs"), b"AFTER\n").unwrap();
+
+    let mut turn = base_turn(
+        "t_imp_AC3TEST00000000000000001",
+        vec![
+            FileEntry {
+                path: "known.rs".into(),
+                before: Some(before),
+                after: Some(after),
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+            },
+            FileEntry {
+                path: "unknown.rs".into(),
+                before: None, // provenance-only: import could not reconstruct this
+                after: None,
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false, // AC4: import-missing-before is NOT baseline_unknown
+                skipped_reason: None,
+            },
+        ],
+    );
+    turn.imported = Some(true);
+    turn.files_complete = Some(false);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+
+    assert!(
+        !out.status.success(),
+        "AC3: undo of an imported turn with a provenance-only entry must exit nonzero: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("imported"),
+        "AC3: refusal must name imported history, got: {stderr}"
+    );
+    // Textually distinct from the other three refusal classes.
+    assert!(!stderr.contains("secret-pattern"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("content not snapshotted"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("later agent turn")
+            && !stderr.contains("recording gap")
+            && !stderr.contains("human or external edit"),
+        "stderr: {stderr}"
+    );
+
+    // The load-bearing assertion: `known.rs` — which WOULD have been
+    // revertible on its own — must be byte-unchanged. The refusal must land
+    // before build_plan/execute_revert ever runs, not just before the
+    // *other* file.
+    assert_eq!(
+        std::fs::read(root.join("known.rs")).unwrap(),
+        b"AFTER\n",
+        "AC3: refusal must happen before ANY working-tree write, even to an \
+         otherwise-revertible file in the same turn"
+    );
+    // No undo turn was appended either (nothing was reverted, so nothing to record).
+    assert!(
+        agentrec_turns(root).is_empty(),
+        "AC3: a refused undo must not append an agentrec undo turn"
+    );
 }
 
 // ---- E1: pre-flight integrity read + idempotent create-inverse ------------

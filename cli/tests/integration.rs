@@ -1711,6 +1711,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -2577,6 +2579,8 @@ fn make_turn(
         prompt_ref: None,
         prompt_excerpt: prompt_excerpt.map(str::to_string),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }

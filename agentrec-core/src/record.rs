@@ -136,6 +136,18 @@ pub struct TurnRecord {
     /// PROTOCOL §4). Consumers must treat merged turns as superseded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merges: Vec<String>,
+    /// Import provenance (Phase 2.0 P2). Additive + UNFROZEN per spec
+    /// decision 5. `None` on every live-recorded record, so existing lines
+    /// stay byte-identical — neither this nor `files_complete` is emitted
+    /// unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<bool>,
+    /// `Some(false)` on imported turns: their file list is known-partial
+    /// (opaque tool calls and non-file activity are not captured). Never
+    /// `Some(true)` today — reserved for a future importer that can attest
+    /// completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_complete: Option<bool>,
     pub files: Vec<FileEntry>,
 }
 
@@ -287,6 +299,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: Some("add rate limiting".into()),
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![FileEntry {
                 path: "src/a.rs".into(),
                 before: None,
@@ -408,6 +422,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![],
         };
         append_log(&log_path, &LogRecord::Turn(turn)).unwrap();
@@ -480,5 +496,81 @@ mod tests {
             LogRecord::Turn(t) => assert_eq!(t.id, "t_LEGACY"),
             LogRecord::Epoch(_) => panic!("expected turn record"),
         }
+    }
+
+    // AC1 (clm_3V5KN3YSKEEWYVQ03NFRVCQJ6F, P2): a live-recorded turn
+    // (`imported`/`files_complete` both `None`) serializes byte-identically
+    // to its pre-P2 wire form — no new key appears at all. `old_shape` below
+    // is not an invented literal: it is the exact field set/order
+    // `TurnRecord` had at parent commit `5ea946b` (`git show
+    // 5ea946b:agentrec-core/src/record.rs`), confirmed before this field was
+    // added — this diff adds ONLY the two new fields between `merges` and
+    // `files`, reordering nothing else, so `old_shape` is provably what this
+    // exact struct used to emit for these values.
+    #[test]
+    fn imported_fields_absent_on_live_turn_keeps_pre_p2_wire_shape_byte_identical() {
+        let old_shape = concat!(
+            "{\"v\":1,\"id\":\"t_GOLD\",\"grade\":\"rich\",",
+            "\"started\":\"2026-07-05T00:00:00.000Z\",\"ended\":\"2026-07-05T00:00:01.000Z\",",
+            "\"tool\":\"claude-code\",\"session\":\"s1\",\"root\":\"/repo\",",
+            "\"prompt_excerpt\":\"add rate limiting\",",
+            "\"files\":[{\"path\":\"src/a.rs\",\"before\":null,\"after\":\"sha256:aa\",\"op\":\"create\"}]}"
+        );
+
+        // Old-shape JSON deserializes fine (additive-field tolerance).
+        let turn: TurnRecord = serde_json::from_str(old_shape).unwrap();
+        assert_eq!(turn.imported, None, "absent field must default to None");
+        assert_eq!(
+            turn.files_complete, None,
+            "absent field must default to None"
+        );
+
+        // A live-recorded record (both fields None) re-serializes to
+        // EXACTLY `old_shape` — the additive-field promise this whole file
+        // makes for every wire type, now proven for `imported`/
+        // `files_complete` specifically.
+        let json = serde_json::to_string(&turn).unwrap();
+        assert_eq!(
+            json, old_shape,
+            "a live (non-imported) turn must not gain any new wire key"
+        );
+        assert!(!json.contains("imported"));
+        assert!(!json.contains("files_complete"));
+    }
+
+    // AC1's other half: an IMPORTED turn (P2) emits both new keys, and in
+    // the frozen position (immediately after `merges`, before `files`).
+    #[test]
+    fn imported_turn_emits_both_new_keys_between_merges_and_files() {
+        let turn = TurnRecord {
+            v: 1,
+            id: "t_imp_abc".into(),
+            grade: "rich".into(),
+            truncated: false,
+            started: "2026-07-05T00:00:00.000Z".into(),
+            ended: "2026-07-05T00:00:01.000Z".into(),
+            tool: Some("claude".into()),
+            model: None,
+            session: Some("s1".into()),
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: Some(true),
+            files_complete: Some(false),
+            files: vec![],
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        let merges_pos = json.find("\"files\":[]").unwrap() - 1; // just before "files"
+        let imported_pos = json
+            .find("\"imported\":true")
+            .expect("imported key present");
+        let complete_pos = json
+            .find("\"files_complete\":false")
+            .expect("files_complete key present");
+        assert!(
+            imported_pos < complete_pos && complete_pos < merges_pos,
+            "expected order ...merges, imported, files_complete, files...: {json}"
+        );
     }
 }

@@ -672,6 +672,35 @@ pub fn undo(
         }
     }
 
+    // AC3 (P2, clm_2GCNB5WPT0FKHH4NFBYB9Q2JJT): a turn imported from
+    // external history whose selected files include any provenance-only
+    // entry (`before: null` — NOT a `create` op, whose `before: null` is
+    // legitimate rather than a reconstruction failure) refuses the WHOLE
+    // undo BEFORE `build_plan`/`execute_revert` ever run — never a partial
+    // revert of the other, genuinely-revertible entries in the same turn.
+    // Distinct wording from `withheld` ("secret-pattern..."), `skipped`
+    // ("content not snapshotted...") and modified-since ("later agent
+    // turn"/"recording gap"/"human or external edit").
+    if target.imported == Some(true) {
+        let selected: Vec<&FileEntry> = target
+            .files
+            .iter()
+            .filter(|f| files.is_empty() || files.contains(&f.path))
+            .collect();
+        let unreconstructable = selected
+            .iter()
+            .filter(|f| f.op != "create" && f.before.is_none())
+            .count();
+        if unreconstructable > 0 {
+            return Err(format!(
+                "undo refused: turn {} was imported from external history and has no \
+                 recoverable pre-edit content for {unreconstructable} file(s) — \
+                 provenance-only, never fabricated; nothing was written",
+                fmt::short_id(&target.id)
+            ));
+        }
+    }
+
     let store = BlobStore::new(objects_dir(root));
     let plans = build_plan(
         root,
@@ -747,6 +776,8 @@ pub fn undo(
                     "undo of {short_target} (partial — aborted mid-revert)"
                 )),
                 merges: vec![],
+                imported: None,
+                files_complete: None,
                 files: inverse_entries,
             };
             let _ = crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(partial));
@@ -773,6 +804,8 @@ pub fn undo(
         prompt_ref: None,
         prompt_excerpt: Some(format!("undo of {short_target}")),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: inverse_entries,
     };
     let reverted_n = undo_record.files.len();
