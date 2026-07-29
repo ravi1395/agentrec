@@ -46,7 +46,7 @@ carries only current state, what's next, and standing debts.
   Final Fable skeptic in an isolated worktree: **8/8 ACs PASS**, every figure independently
   reproduced (against figures since proven wrong twice over — see below). Real-corpus gate
   run, corrected 2026-07-29 evening (`docs/verify/p1-gate-run-t15fix2.txt`): **1631 sessions,
-  1625 importable — 99.6%** (bar ≥90%), peak RSS **16.7 MB** (bar <500 MB). Fidelity row +
+  1625 importable — 99.6%** (bar ≥90%), peak RSS **17.17 MB** (bar <500 MB). Fidelity row +
   anti-overclaim rider in `VERIFY-LEDGER.md`. **The Phase 2.0 hard stop is retired with a
   fidelity row, not a parse-only pass** (spec decision 8 satisfied).
   - **The plan's before-ladder prediction did NOT hold, and the correction itself was wrong

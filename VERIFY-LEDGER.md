@@ -53,7 +53,7 @@ that history would hide the failure mode that produced it three times running.
 | T1.5 rejected — blob stale by an intervening edit | **170** |
 | T1.5 rejected — `oldString` not found in blob | 3 |
 | T1.5 rejected — unsafe path component / blob missing | 0 / 0 |
-| peak RSS | **16.7 MB** (AC7 bar is <500 MB) |
+| peak RSS | **17.17 MB** (AC7 bar is <500 MB) |
 
 **Honest reconstructible figure — read the two numbers separately.**
 - **43.8%** (T1 856 + T1.5 90 = 946 of 2159) counting `create` ops as reconstructible, since a
