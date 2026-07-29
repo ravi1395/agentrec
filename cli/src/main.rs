@@ -5,6 +5,7 @@ mod cmds;
 mod daemon;
 mod doctorcmd;
 mod fmt;
+mod importcmd;
 mod initcmd;
 mod loglock;
 mod memlock;
@@ -259,6 +260,33 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Import history from another agent tool's transcript store (P1: Claude
+    /// Code only, read-only classification — never writes; persistence
+    /// lands in a later phase).
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Classify Claude Code's ~/.claude/projects transcript corpus for
+    /// import safety: per-tier before-bytes reconstructability, fidelity
+    /// figures, peak RSS. Read-only; requires --dry-run (P1 never persists).
+    Claude {
+        /// Required (P1 never persists) — passing it is the only supported
+        /// mode; omitting it is a loud, nonzero-exit refusal.
+        #[arg(long)]
+        dry_run: bool,
+        /// Corpus root containing sibling `projects/` and `file-history/`
+        /// dirs (mirrors the real `~/.claude` layout). Defaults to `~/.claude`.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Emit the machine-readable report instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -338,6 +366,7 @@ fn main() {
             replace_pin,
         } => memorycmds::verify(&root, &id, confirm, &drop_pin, &replace_pin),
         Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
+        Command::Import { source } => importcmd::run(&root, source),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
