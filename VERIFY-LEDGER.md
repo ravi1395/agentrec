@@ -43,7 +43,7 @@ so the figure's definition cannot float):
 | tier: T1.5 (`file-history` blob) | **11 — 0.5%** |
 | tier: T2-candidate (git-tracked, bytes NOT resolved in P1) | 963 — 44.8% |
 | tier: T3 (no recoverable before) | 322 — 15.0% |
-| opaque calls (Bash/Task — name no files) | 8618 |
+| opaque calls (tool results naming no file) | 8618 |
 | mean per-session opaque share | 13.25% |
 | skipped_sidechain | 1255 |
 | skipped_missing_field: `cwd` | 6 (schema drift, reported loudly) |
@@ -76,6 +76,33 @@ corpus-shape claim; the real-corpus run is the gate.**
 **Still open after this row:** T2-candidate bytes are detected, never resolved (P1 scope — the
 963 candidates are a ceiling, not a proven recovery rate; P2 resolves git blobs and will
 convert some fraction of them to real recoveries and the rest to T3).
+
+### Anti-overclaim rider (added at the final skeptic gate — read before quoting any figure)
+
+The gate PASSed 8/8 ACs, and the skeptic independently reproduced every figure above. It also
+named four ways these numbers will be misread. Recorded here so they travel WITH the numbers:
+
+1. **"99.6% importable" is an ingestion-without-loud-failure rate, not a recovery rate.** It
+   must never be quoted bare. Context this table omitted: only **184 of 1617 sessions (11.4%)**
+   contain any file-mutation entry at all — all 2151 tier-laddered entries live in those 184 —
+   and **27 of those 184** have zero T1/T1.5-recoverable entries today. A session whose every
+   entry is T3 still counts importable (correctly: it imports as provenance-only turns with
+   `before: null`, which is the pinned semantics — import never fabricates a snapshot). The
+   honest recoverable figure is **40.4% of entries**, ceiling ~85% only if P2 converts every
+   T2 candidate. Quoted bare, "99.6% importable" will be heard as "99.6% recoverable."
+2. **The opaque bucket is not "Bash/Task."** An earlier revision of this row labeled it so; the
+   8618 actually include ~1434 `Read` results, ~430 string-form `toolUseResult`s (mostly
+   errors), plus Grep/TodoWrite/AskUserQuestion. The count is honest; the old parenthetical was
+   not, and `mean_opaque_share_pct` is therefore **not** an "unattributable-mutation share."
+   Corrected above. Anyone setting a fidelity threshold off 13.25% must know this.
+3. **AC7's Linux leg is arithmetic-tested, not platform-proven.** The `ru_maxrss` divisor
+   selection is `#[cfg]`-gated; the unit test covers both divisors' math from one machine, but
+   which constant Linux actually selects closes only on the CI Linux run — still blocked on the
+   unopened `fix/perf-evidence-round` PR. Same for the release-only debug-seam guard test,
+   which never runs in the default suite (the `strings` check is the real evidence there).
+4. **This is one machine's 30-day window.** 1617 sessions of one user's Claude Code habits. The
+   4-tier shares — especially T1.5 at 0.5% — are a property of this corpus and this Claude Code
+   version's snapshot behavior. Not a population claim.
 
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
