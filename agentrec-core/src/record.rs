@@ -82,6 +82,18 @@ pub struct FileEntry {
     /// and aggregate, driving the DEGRADED banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,
+    /// Additive, UNFROZEN (Phase 2.0 P2 fix round, founder decision 2):
+    /// `Some(true)` when `after` was DERIVED (e.g. applying an imported
+    /// turn's `oldString`→`newString` substitution to a resolved-or-
+    /// unresolved `before`) rather than observed directly from the source
+    /// (a live daemon snapshot, or a transcript's own recorded `content`
+    /// field). `None` on every entry where `after` is real observed bytes,
+    /// including every live-recorded entry — so this stays byte-identical
+    /// to the pre-this-field wire shape for every existing record.
+    /// Consumers MUST NOT attribute a mismatch against a synthesized
+    /// `after` to "human or external edit" — see `readcmds::modified_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_synthesized: Option<bool>,
 }
 
 /// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
@@ -310,6 +322,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         };
         append_log(&path, &LogRecord::Turn(turn)).unwrap();
@@ -348,6 +361,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("skipped"));
@@ -381,6 +395,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         };
         let json = serde_json::to_string(&entry_none).unwrap();
         assert_eq!(
@@ -555,13 +570,21 @@ mod tests {
             root: "/repo".into(),
             prompt_ref: None,
             prompt_excerpt: None,
-            merges: vec![],
+            // Test nit (P2 fix round): `merges: vec![]` is
+            // `skip_serializing_if`'d away, so its own wire position could
+            // never be observed by this test — a non-empty `merges` is
+            // required to actually prove `imported`/`files_complete` land
+            // AFTER it, not merely before `files`.
+            merges: vec!["t_MERGED".into()],
             imported: Some(true),
             files_complete: Some(false),
             files: vec![],
         };
         let json = serde_json::to_string(&turn).unwrap();
-        let merges_pos = json.find("\"files\":[]").unwrap() - 1; // just before "files"
+        let merges_pos = json
+            .find("\"merges\":[\"t_MERGED\"]")
+            .expect("merges key present");
+        let files_pos = json.find("\"files\":[]").unwrap();
         let imported_pos = json
             .find("\"imported\":true")
             .expect("imported key present");
@@ -569,7 +592,7 @@ mod tests {
             .find("\"files_complete\":false")
             .expect("files_complete key present");
         assert!(
-            imported_pos < complete_pos && complete_pos < merges_pos,
+            merges_pos < imported_pos && imported_pos < complete_pos && complete_pos < files_pos,
             "expected order ...merges, imported, files_complete, files...: {json}"
         );
     }

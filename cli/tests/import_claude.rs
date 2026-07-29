@@ -511,6 +511,7 @@ fn text_report_contains_every_json_field_in_prose() {
         "t3=",
         "opaque_calls",
         "mean_opaque_share_pct",
+        "skipped_secret_path",
         "skipped_sidechain",
         "skipped_malformed_line",
         "skipped_non_utf8_line",
@@ -1465,10 +1466,25 @@ mod persist {
         init_repo(root.path());
 
         let cwd = root.path().to_string_lossy().to_string();
-        let secret = "sk-abcdefghijklmnopqrstuvwxyz012345"; // sk-... shape
+        // D5 (P2 fix round): AC6 names THREE distinct secret classes, not
+        // one — an earlier version of this test planted only the `sk-...`
+        // shape. All three literals below are the exact ones
+        // `agentrec-core/src/scrub.rs`'s own test suite already proves
+        // redact (`known_secret_shapes_redacted`,
+        // `entropy_catches_hex_and_decimal_tokens`,
+        // `quoted_multiword_secret_fully_redacted`) — reused here rather
+        // than invented, so this test can't silently drift from what scrub
+        // actually catches.
+        let sk_secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let hex64_secret = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let quoted_secret = r#"password = "correct horse battery staple""#;
+        let prompt_text = format!(
+            "use this key {sk_secret} and blob {hex64_secret} and {quoted_secret} to fix a.txt"
+        );
         let lines = vec![
             format!(
-                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-17T09:00:00.000Z","sessionId":"s_ac6","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"use this key {secret} to fix a.txt"}}}}"#
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-17T09:00:00.000Z","sessionId":"s_ac6","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":{prompt_json}}}}}"#,
+                prompt_json = serde_json::to_string(&prompt_text).unwrap()
             ),
             format!(
                 r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T09:00:05.000Z","sessionId":"s_ac6","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/a.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
@@ -1482,10 +1498,6 @@ mod persist {
         let turns = turn_lines(root.path());
         assert_eq!(turns.len(), 1);
         let excerpt = turns[0]["prompt_excerpt"].as_str().unwrap_or("");
-        assert!(
-            !excerpt.contains(secret),
-            "excerpt leaked the secret: {excerpt}"
-        );
 
         let prompt_ref = turns[0]["prompt_ref"]
             .as_str()
@@ -1495,13 +1507,84 @@ mod persist {
         let blob_path = root.path().join(".agentrec/objects").join(fan).join(rest);
         let blob = std::fs::read_to_string(&blob_path).unwrap();
         assert!(
-            !blob.contains(secret),
-            "prompt blob leaked the secret: {blob}"
-        );
-        assert!(
             blob.contains("[redacted:"),
             "blob must show a redaction marker: {blob}"
         );
+
+        for (label, secret) in [
+            ("sk-...", sk_secret),
+            ("64-hex", hex64_secret),
+            ("quoted multi-word credential", quoted_secret),
+        ] {
+            assert!(
+                !excerpt.contains(secret),
+                "AC6: {label} secret leaked into prompt_excerpt: {excerpt}"
+            );
+            assert!(
+                !blob.contains(secret),
+                "AC6: {label} secret leaked into the CAS prompt blob: {blob}"
+            );
+        }
+        // The quoted credential's individual words must not leak either
+        // (mirrors scrub.rs's own `quoted_multiword_secret_fully_redacted`
+        // assertion) — containment-of-the-whole-string alone could miss a
+        // partial leak if scrub redacted only part of the quoted value.
+        for word in ["correct", "horse", "battery", "staple"] {
+            assert!(
+                !blob.contains(word),
+                "AC6: quoted secret word leaked: {word} in {blob}"
+            );
+        }
+    }
+
+    // ---- D7 (P2 fix round): dry-run and persist must agree on a secret
+    // file — dry-run counts it under `skipped_secret_path` (never
+    // tier-classified as if it were reconstructible), persist withholds it
+    // (never snapshotted). Same transcript, both modes, one shared fixture
+    // — exactly the cross-check the P1 fabrication defects show is needed
+    // whenever two paths measure "the same" thing independently.
+    #[test]
+    fn d7_secret_path_parity_between_dry_run_and_persist() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-19T09:00:00.000Z","sessionId":"s_d7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit .env"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-19T09:00:05.000Z","sessionId":"s_d7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/.env","oldString":"KEY=old","newString":"KEY=new","originalFile":"KEY=old\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_d7", &lines);
+
+        // Dry-run leg: the secret file must be counted under
+        // `skipped_secret_path`, NOT tier-classified.
+        let dry_out = Command::new(bin())
+            .args(["import", "claude", "--dry-run", "--json", "--source"])
+            .arg(source.path())
+            .arg("--root")
+            .arg(root.path())
+            .output()
+            .unwrap();
+        assert!(dry_out.status.success(), "{dry_out:?}");
+        let dry_report: Value = serde_json::from_slice(&dry_out.stdout).unwrap();
+        assert_eq!(dry_report["skipped_secret_path"], 1, "report: {dry_report}");
+        assert_eq!(dry_report["tier_counts"]["t1"], 0, "report: {dry_report}");
+
+        // Persist leg: withheld, never snapshotted, never stored as an
+        // over-cap/regular blob.
+        let persist_out = run_persist(source.path(), root.path());
+        assert!(persist_out.status.success(), "{persist_out:?}");
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["withheld"], true, "entry: {:?}", files[0]);
+        assert!(files[0]["before"].is_null());
+        assert!(files[0]["after"].is_null());
     }
 
     // ---- AC7 (last P2.md bullet): `log` renders imported turns with a
@@ -1557,6 +1640,7 @@ mod persist {
                     withheld: false,
                     baseline_unknown: true,
                     skipped_reason: None,
+                    after_synthesized: None,
                 }],
             }),
         )
@@ -1621,6 +1705,40 @@ mod persist {
         let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() - start;
         assert!(out.status.success(), "{out:?}");
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        eprintln!("AC5b real-corpus report ({elapsed:?}): {report}");
+
+        let denominator = report["t2_oracle"]["denominator"].as_u64().unwrap_or(0);
+        let mismatches = report["t2_oracle"]["mismatches"].as_u64().unwrap_or(0);
+
+        // D2 (P2 fix round, founder-corrected bar): "PASSES <=1%" is not a
+        // claim this oracle can ever establish — the whole guard-admitted
+        // channel on this corpus is on the order of a few hundred cases at
+        // best, nowhere near the ~299 clean samples a genuine <=1% claim
+        // needs. The defensible claim is a one-sided Clopper-Pearson 95%
+        // upper bound on the observed rate, computed exactly (for 0
+        // observed mismatches the closed form is `1 - 0.05^(1/n)`).
+        let upper_bound_pct = if denominator > 0 && mismatches == 0 {
+            (1.0 - 0.05f64.powf(1.0 / denominator as f64)) * 100.0
+        } else {
+            f64::NAN
+        };
+        eprintln!(
+            "AC5b real-corpus report ({elapsed:?}): {report}\n\
+             {mismatches} fabrications in {denominator} guard-admitted real-corpus samples \
+             (95% upper bound {upper_bound_pct:.1}%). The <=1% bar is not establishable on \
+             this corpus by this oracle; the whole verifiable channel is on this order of \
+             magnitude, not thousands."
+        );
+
+        // The actual ratchet: mismatches must stay at 0 on whatever the
+        // guard admits. A regression to the pre-hardening ~37% fabrication
+        // rate (or any nonzero rate) must fail this test — an eprintln!
+        // with no assertion, which is what this test used to be, passes on
+        // a silent regression.
+        assert_eq!(
+            mismatches, 0,
+            "AC5b ratchet: 0 fabrications required on the guard-admitted channel \
+             (denominator={denominator}); a regression here is a correctness defect, \
+             not a recall trade-off"
+        );
     }
 }

@@ -54,3 +54,73 @@ prompt boundary (never a live-recording boundary signal, since none
 exists for imported history) — an approximation, not a protocol
 guarantee; `files_complete: false` is the honest marker that covers any
 imprecision here.
+
+Known limitation (not fixed this round, tracked here per D9): `import
+claude`'s deterministic turn id is a function of `(session_id,
+turn_index)` only. If a session CONTINUES after being imported (the
+transcript file grows with new turns past the last `turn_index` already
+persisted), a later import run reuses the same set of ids for the
+already-seen prefix and never revisits it — new turns appended past the
+previously-seen `turn_index` boundary in an already-imported session are
+picked up correctly (new `turn_index` values), but if the underlying
+transcript file's EARLIER turns are ever re-segmented differently by a
+future importer change (e.g. a `turn_index` boundary shifts), old and new
+ids diverge silently. Relevant to the already-embargoed "durable archive"
+claim (see Status doc): re-imports are not a stable substitute for one.
+
+## Phase 2.0 P2 fix round — `FileEntry.after_synthesized` (2026-07-29)
+
+Added to `FileEntry`, as the last field (after `skipped_reason`):
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub after_synthesized: Option<bool>,
+```
+
+Founder decision 2 (P2 fix round): `agentrec import claude` sometimes has
+no `content` field on a transcript's tool-result entry (Edit-tool shape
+carries `oldString`/`newString`, not the resulting file), so `after` is
+DERIVED by applying that substitution to `before` (itself possibly a T2
+git-blob approximation, or entirely absent). This is not observed data,
+and comparing it against the real on-disk file and reporting a mismatch
+as "human or external edit" — `cli/src/readcmds.rs::modified_cause`'s
+prior behavior — fabricates attribution.
+
+- `Some(true)` only when `after` was actually derived this way AND a
+  real ref made it onto the wire (never set when `skipped` nulled the
+  ref out, since there's nothing on the wire to misread at that point).
+  `None` everywhere else, including every live-recorded entry — no key
+  appears on the wire for those, so this is additive/no-op for existing
+  consumers and existing `log.jsonl` lines.
+- `cli/src/readcmds.rs::modified_cause` returns a distinct, honest cause
+  ("imported turn's after-state was derived (not observed) — cannot
+  attribute this difference") for a synthesized entry, checked before
+  the later-agent-turn/recording-gap signals — an unobserved comparison
+  point isn't made trustworthy by either of those being present.
+- `cli/src/readcmds.rs::print_entry` (used by `diff`) prints an explicit
+  "(after-state DERIVED ..., not observed)" notice before the unified
+  diff for a synthesized entry, instead of presenting it as recorded
+  fact.
+- Mitigating factor, not a reason to skip this: synthesized bytes are
+  never used as an undo *source* — `undo` re-snapshots real on-disk
+  content before reverting, so this defect was false attribution, never
+  data loss.
+
+## Phase 2.0 P2 fix round — documented, not fixed, limitations
+
+Recorded here per the reviewer's D8/D9/D10/D11 findings — none of these are
+wire-format changes, but all bear on the durability/re-import claims this
+file otherwise documents:
+
+- **D8**: `load_log`'s tolerant parsing (a bad line is skipped, never
+  fatal) means a torn LAST line in `log.jsonl` — reachable only via power
+  loss, NOT a `kill -9` (see `importcmd.rs::persist::run`'s comment) —
+  makes `import claude`'s idempotency check miss that turn's id and
+  re-append a duplicate on the next run.
+- **D9**: `import claude`'s deterministic id is `(session_id,
+  turn_index)`-only; see the "Known limitation" note above this section.
+- **D10/D11**: CAS writes happen before the idempotency check (an
+  `appended: 0` re-run still touches the object store and re-shells every
+  T2 git command), and each turn takes `log.lock` individually rather than
+  once for the whole batch. Both are performance/posture items — the
+  append-only invariant holds either way.

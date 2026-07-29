@@ -1011,6 +1011,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         }
     }

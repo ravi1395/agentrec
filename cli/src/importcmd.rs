@@ -221,6 +221,8 @@ struct ImportReport {
     /// fraction, expressed as a 0-100 percentage (same scale as
     /// `importable_pct`).
     mean_opaque_share_pct: f64,
+    /// D7 (P2 fix round): see `Counters::skipped_secret_path`.
+    skipped_secret_path: usize,
     skipped_sidechain: usize,
     skipped_malformed_line: usize,
     /// Pinned decision 15: a line that read but was not valid UTF-8.
@@ -284,6 +286,7 @@ fn build_report(
         },
         opaque_calls: counters.opaque_calls,
         mean_opaque_share_pct,
+        skipped_secret_path: counters.skipped_secret_path,
         skipped_sidechain: counters.skipped_sidechain,
         skipped_malformed_line: counters.skipped_malformed_line,
         skipped_non_utf8_line: counters.skipped_non_utf8_line,
@@ -329,6 +332,7 @@ fn print_text_report(report: &ImportReport) {
         "  mean_opaque_share_pct: {:.2}",
         report.mean_opaque_share_pct
     );
+    println!("  skipped_secret_path: {}", report.skipped_secret_path);
     println!("  skipped_sidechain: {}", report.skipped_sidechain);
     println!(
         "  skipped_malformed_line: {}",
@@ -482,6 +486,18 @@ struct Counters {
     /// fraction (Pinned decision 13). Divided by `sessions_total` and
     /// scaled to a percentage in `build_report`.
     opaque_share_sum: f64,
+    /// D7 (P2 fix round): a file-producing entry whose path matches
+    /// `scrub::is_secret_path` — never snapshotted by the live daemon, and
+    /// (as of this fix round) never persisted by `import claude` either
+    /// (`withheld: true`). Checked FIRST, before any tier ladder, and
+    /// excluded from T1/T1.5/T2/T3 entirely: prior to this fix, dry-run
+    /// tier-counted secret files as if they were ordinary reconstructible
+    /// content (and hashed their bytes into `debug_entries`), while
+    /// persist withheld them — the two paths were measuring different
+    /// things for the same input. Still counted toward `session_entries`
+    /// (a real file-touching entry, just not tier-classified), same as
+    /// every T1-T3 entry.
+    skipped_secret_path: usize,
 }
 
 // ---- line reading, tolerant of invalid UTF-8 (Pinned decision 15) --------
@@ -1040,6 +1056,21 @@ fn classify_file_entry(
         }
     };
 
+    // D7 (P2 fix round): checked FIRST, before any tier ladder — a secret
+    // file is never tier-counted (previously it was silently classified
+    // T1/T1.5/T2/T3 like any other file, and its bytes hashed into
+    // `debug_entries`) or persisted (`classify_and_resolve` withholds it).
+    // This is real corpus-shape measurement drift between the two paths,
+    // fixed here so the fidelity report actually describes what
+    // persistence does.
+    if agentrec_core::scrub::is_secret_path(file_path) {
+        counters.skipped_secret_path += 1;
+        *session_entries += 1;
+        debug.push(session_file_label, file_path, "secret_path", None);
+        mark_edit(edits_since_backup);
+        return;
+    }
+
     let original_file = tur.get("originalFile").and_then(|v| v.as_str());
     // Item 9 (real-corpus-confirmed shape, not a guess): a create op has
     // `toolUseResult.type == "create"` AND `originalFile` explicitly JSON
@@ -1356,6 +1387,19 @@ mod persist {
 
         let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let log_path = crate::log_path(root);
+        // D8 (P2 fix round, documented not fixed): `load_log` silently
+        // skips any line it can't parse — including a torn LAST line, its
+        // documented tolerant-parsing contract (`record.rs::load_log`'s own
+        // doc comment: "a bad line must not wipe history"). If that torn
+        // line was this importer's own most-recently-appended turn (only
+        // reachable via power loss mid-write, NOT a `kill -9`: `append_log`
+        // fsyncs after a single `write_all` of the whole line, so a
+        // `kill -9` can only ever land before or after that atomic write,
+        // never mid-line), `existing_ids` would miss it and a resume would
+        // re-append a duplicate turn for that one id. Accepted risk, not
+        // fixed this round — `load_log`'s tolerance is shared, load-bearing
+        // infrastructure (every consumer of `log.jsonl` depends on it) and
+        // changing its contract is out of scope here.
         let existing_ids: HashSet<String> = agentrec_core::record::load_log(&log_path)
             .into_iter()
             .filter_map(|r| match r {
@@ -1367,6 +1411,7 @@ mod persist {
         let store = BlobStore::new(crate::objects_dir(root));
         let mut git_cache = GitTrackCache::default();
         let mut t2 = T2Counters::default();
+        let mut t15 = T15Counters::default();
         let mut oracle = OracleCounters::default();
         let oracle_on = t2_oracle_enabled();
 
@@ -1394,6 +1439,21 @@ mod persist {
                 .collect();
             session_files.sort();
 
+            // D10/D11 (P2 fix round, documented not fixed — perf/posture
+            // only, correctness is intact): `persist_session_file` calls
+            // `store.put_result` for every resolved before/after blob
+            // BEFORE the `existing_ids` idempotency check below runs, so an
+            // `appended: 0` re-run still rewrites the CAS object set
+            // (dedup-safe, same hash, wasted work) and re-spawns every
+            // `git log`/`git show` for T2 candidates. And each turn is
+            // appended through its own separate `append_log_locked` call
+            // (lock acquired and released per record, not held across the
+            // whole batch), so `purge --log-duplicates` could in principle
+            // interleave a rewrite between two of this run's appends. The
+            // append-only invariant itself is never at risk either way —
+            // `log.lock` IS taken for every append, and this path only ever
+            // appends — so this is a performance/posture item, not a
+            // correctness one; not fixed this round.
             for file in session_files {
                 let records = persist_session_file(
                     &file,
@@ -1403,6 +1463,7 @@ mod persist {
                     &store,
                     &mut git_cache,
                     &mut t2,
+                    &mut t15,
                     oracle_on.then_some(&mut oracle),
                 );
                 for record in records {
@@ -1427,6 +1488,15 @@ mod persist {
                     "rejected_unverifiable": t2.rejected_unverifiable,
                     "no_oldstring": t2.no_oldstring,
                     "rejected_prior_edit_in_session": t2.rejected_prior_edit_in_session,
+                },
+                // D7: parity with dry-run's `t15_rejected_stale`/
+                // `t15_rejected_unsafe_path`/`t15_blob_missing`/
+                // `t15_rejected_unverifiable` — see `T15Counters`' doc.
+                "t15_diagnostics": {
+                    "rejected_stale": t15.rejected_stale,
+                    "rejected_unsafe_path": t15.rejected_unsafe_path,
+                    "blob_missing": t15.blob_missing,
+                    "rejected_unverifiable": t15.rejected_unverifiable,
                 },
             });
             if oracle_on {
@@ -1459,6 +1529,14 @@ mod persist {
                 t2.no_oldstring,
                 t2.rejected_prior_edit_in_session
             );
+            println!(
+                "t15_diagnostics: rejected_stale={} rejected_unsafe_path={} blob_missing={} \
+                 rejected_unverifiable={}",
+                t15.rejected_stale,
+                t15.rejected_unsafe_path,
+                t15.blob_missing,
+                t15.rejected_unverifiable
+            );
             if oracle_on {
                 println!(
                     "t2_oracle (AC5b, T1 entries only): mismatches={} of {} both-resolved",
@@ -1479,6 +1557,22 @@ mod persist {
         /// AC5b gate 1: this session already edited the same path earlier —
         /// refused before any git process even runs.
         rejected_prior_edit_in_session: usize,
+    }
+
+    /// D7 (P2 fix round): the persist-time T1.5 branch used to fall
+    /// through to T2/T3 on `stale`/unsafe-path/blob-missing without
+    /// counting WHY — the dry-run classifier's equivalent
+    /// `t15_rejected_stale`/`t15_rejected_unsafe_path`/`t15_blob_missing`/
+    /// `t15_rejected_unverifiable` counters had no persist-side
+    /// counterpart, so the two paths' fidelity reports were not directly
+    /// comparable. Restored here, named identically to the dry-run report
+    /// contract (Pinned decision 12's amendment).
+    #[derive(Default)]
+    struct T15Counters {
+        rejected_stale: usize,
+        rejected_unsafe_path: usize,
+        blob_missing: usize,
+        rejected_unverifiable: usize,
     }
 
     #[derive(Default)]
@@ -1609,6 +1703,7 @@ mod persist {
         store: &BlobStore,
         git_cache: &mut GitTrackCache,
         t2: &mut T2Counters,
+        t15: &mut T15Counters,
         mut oracle: Option<&mut OracleCounters>,
     ) -> Vec<LogRecord> {
         let Ok(file) = File::open(path) else {
@@ -1772,6 +1867,7 @@ mod persist {
                 store,
                 git_cache,
                 t2,
+                t15,
                 oracle.as_deref_mut(),
             ) {
                 cur.files.push(entry);
@@ -1864,6 +1960,7 @@ mod persist {
         store: &BlobStore,
         git_cache: &mut GitTrackCache,
         t2: &mut T2Counters,
+        t15: &mut T15Counters,
         oracle: Option<&mut OracleCounters>,
     ) -> Option<FileEntry> {
         // `file_path` (from the transcript) and `root` (from `--root`) are
@@ -1950,6 +2047,7 @@ mod persist {
                 withheld: true,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             });
         }
 
@@ -1967,20 +2065,32 @@ mod persist {
         } else if let Some(backup_name) = backups.get(file_path) {
             let stale = edits_since_backup.get(file_path).copied().unwrap_or(0) > 0;
             let mut resolved: Option<Vec<u8>> = None;
-            if !stale {
-                if let Some(sid) = session_id {
-                    if is_safe_path_component(sid) && is_safe_path_component(backup_name) {
-                        let blob_path = source.join("file-history").join(sid).join(backup_name);
-                        if let Ok(bytes) = fs::read(&blob_path) {
-                            match old_string {
-                                Some(old) if !old.is_empty() => {
-                                    if bytes_contain(&bytes, old.as_bytes()) {
-                                        resolved = Some(bytes);
-                                    }
+            // D7 (P2 fix round): these three counters restore parity with
+            // the dry-run classifier's `t15_rejected_stale`/
+            // `t15_rejected_unsafe_path`/`t15_blob_missing` — the persist
+            // path used to fall through to T2/T3 on each of these without
+            // recording why, so the two fidelity reports weren't directly
+            // comparable (the exact measurement-drift shape this repo's
+            // governing lesson warns about).
+            if stale {
+                t15.rejected_stale += 1;
+            } else if let Some(sid) = session_id {
+                if !is_safe_path_component(sid) || !is_safe_path_component(backup_name) {
+                    t15.rejected_unsafe_path += 1;
+                } else {
+                    let blob_path = source.join("file-history").join(sid).join(backup_name);
+                    match fs::read(&blob_path) {
+                        Ok(bytes) => match old_string {
+                            Some(old) if !old.is_empty() => {
+                                if bytes_contain(&bytes, old.as_bytes()) {
+                                    resolved = Some(bytes);
+                                } else {
+                                    t15.rejected_unverifiable += 1;
                                 }
-                                _ => resolved = Some(bytes),
                             }
-                        }
+                            _ => resolved = Some(bytes),
+                        },
+                        Err(_) => t15.blob_missing += 1,
                     }
                 }
             }
@@ -2011,6 +2121,17 @@ mod persist {
             );
             op = "modify".to_string();
         }
+
+        // D1 (P2 fix round, founder decision 2): `content` is the tool's
+        // OWN recorded post-edit bytes — real observed data. When it's
+        // absent, `after` below is DERIVED by applying `oldString`→
+        // `newString` to a `before` that may itself be approximate (a T2
+        // git blob, or nothing at all) — this can disagree with the real
+        // on-disk file for reasons that have nothing to do with a human or
+        // external edit. Recorded so `undo`'s modified-since predicate and
+        // `diff` can say so honestly instead of fabricating "human or
+        // external edit" attribution.
+        let after_will_be_synthesized = content_field.is_none();
 
         let after_bytes: Option<Vec<u8>> = if let Some(c) = content_field {
             Some(c.as_bytes().to_vec())
@@ -2073,6 +2194,11 @@ mod persist {
             before_ref = None;
             after_ref = None;
         }
+        // Only meaningful when there's an `after` ref actually on the wire
+        // to be misread as observed fact — moot (and left `None`, matching
+        // the additive-field discipline) if `skipped` nulled it out, or if
+        // no `after` bytes resolved at all.
+        let after_synthesized = (after_will_be_synthesized && after_ref.is_some()).then_some(true);
 
         Some(FileEntry {
             path: rel,
@@ -2083,6 +2209,7 @@ mod persist {
             withheld: false,
             baseline_unknown: false,
             skipped_reason,
+            after_synthesized,
         })
     }
 
@@ -2096,10 +2223,22 @@ mod persist {
     }
 
     /// Non-overlapping occurrence count of `needle` in `haystack`. AC5b gate
-    /// 2 requires exactly 1 — "at least one" (`bytes_contain`, the T1.5
-    /// primitive) is not strong enough for T2: T1.5 also has the staleness
-    /// counter as an independent signal, T2 does not, so uniqueness is
-    /// load-bearing here in a way it isn't there.
+    /// 2 requires exactly 1.
+    ///
+    /// MEASURED REALITY (P2 fix round, real-corpus reproduction, n=228
+    /// guard-admitted candidates): this uniqueness check is a **no-op** on
+    /// this corpus — `uniq_pass = 228/228`, it never rejects anything,
+    /// because Claude's Edit tool already requires `oldString` to be
+    /// unique within the target file before it will apply the edit at all.
+    /// An earlier version of this comment claimed uniqueness was
+    /// "load-bearing... in a way it isn't" for T1.5 — that claim was never
+    /// measured and was false. The `expected_old_start_line` check below
+    /// (a coarse whole-prefix-equality proxy for "blob == originalFile",
+    /// NOT a fabrication test by itself) is what actually does the work:
+    /// on the same 228, it fails 204 of them. Kept anyway (uniqueness is
+    /// cheap, and a corpus without the tool's own uniqueness guarantee —
+    /// a different tool, a future Claude Code version — could still need
+    /// it), but do not describe it as load-bearing without re-measuring.
     fn bytes_count(haystack: &[u8], needle: &[u8]) -> usize {
         if needle.is_empty() {
             return 0;
@@ -2192,14 +2331,37 @@ mod persist {
         // correct by construction — but it can still be a pre-*commit*
         // state that predates THIS edit within an uncommitted working tree
         // (the T1.5 fabrication shape). Bare `oldString` containment ALONE
-        // was measured (real-corpus AC5b oracle) to fabricate ~37% of the
-        // time — a needle check proves the needle is present, not that the
-        // rest of the haystack didn't drift. Gate 2 tightens it to: exactly
-        // ONE occurrence (not merely "at least one" — a repeated common
-        // substring elsewhere in the file no longer passes), AND, when the
-        // transcript's `structuredPatch` names the hunk's starting line,
-        // that occurrence must land on that exact line — checking a
-        // position derived from the whole prefix, not just the needle.
+        // was measured (real-corpus AC5b oracle, before gate 1 existed) to
+        // fabricate ~37% of the time (84/226) — a needle check proves the
+        // needle is present, not that the rest of the haystack didn't
+        // drift.
+        //
+        // FOUNDER DECISION 1 (P2 fix round, measured trade-off, real
+        // corpus, n=1133 population this guard actually serves —
+        // `originalFile` absent, not a `create`): gate 1 (the
+        // prior-edit-in-session refusal above) ALONE gives 137 resolved /
+        // 5.1% fabricated (7 wrong) / 130 correct. Adding gate 2 (below)
+        // gives 17 resolved / 0% fabricated / 17 correct — it costs 113
+        // correct resolutions (7.6x recall) to remove the last 7
+        // fabrications. The founder ruled: keep both gates. Zero observed
+        // fabrication is the only claim that survives a skeptic, and there
+        // is no per-entry "unverified" marker (unlike T1.5's
+        // `t15_unverified`) that would make shipping a small known-wrong
+        // fraction acceptable here. **Do not re-tune this trade-off** and
+        // do not attempt to recover the 113 — that decision is closed.
+        //
+        // What gate 2 actually rejects (measured, NOT "the fabrication-
+        // prone cases" as an earlier version of this comment claimed): of
+        // 144 resolutions that gate 1 alone got RIGHT, gate 2 refuses 127
+        // of them (only 17 survive) — i.e. 60% of what gate 2 discards was
+        // already correct. Gate 2 buys the last 7-fabrication reduction at
+        // a steep recall cost; see `bytes_count`'s doc comment for exactly
+        // which half of gate 2 (uniqueness vs. line-position) does that
+        // work. Checked: exactly ONE occurrence of `oldString` in the
+        // blob, AND, when the transcript's `structuredPatch` names the
+        // hunk's starting line, that occurrence must land on that exact
+        // line — a coarse whole-prefix-equality proxy, not a fabrication
+        // test by itself (see `bytes_count`).
         match old_string {
             Some(old) if !old.is_empty() => {
                 if bytes_count(&bytes, old.as_bytes()) != 1 {

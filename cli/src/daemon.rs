@@ -1094,6 +1094,7 @@ impl Recorder {
             withheld: obs.withheld,
             baseline_unknown: obs.baseline_unknown,
             skipped_reason: obs.skip_reason.clone(),
+            after_synthesized: None,
         }
     }
 }
@@ -3810,6 +3811,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }];
 
         let existing = TurnRecord {
@@ -3890,6 +3892,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }];
 
         let id = turn_id();
@@ -3975,6 +3978,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
             id: turn_id(),
         };

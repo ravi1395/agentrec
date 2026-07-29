@@ -168,6 +168,7 @@ fn ac3_imported_turn_with_provenance_only_entry_refuses_before_any_write() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "unknown.rs".into(),
@@ -178,6 +179,7 @@ fn ac3_imported_turn_with_provenance_only_entry_refuses_before_any_write() {
                 withheld: false,
                 baseline_unknown: false, // AC4: import-missing-before is NOT baseline_unknown
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -226,6 +228,70 @@ fn ac3_imported_turn_with_provenance_only_entry_refuses_before_any_write() {
     );
 }
 
+// ---- D1 (P2 fix round, founder decision 2): a synthesized `after` must
+// never be reported as "human or external edit" when it disagrees with the
+// real on-disk file — the disagreement is the synthesis being approximate,
+// not a human touching the file. -----------------------------------------
+
+#[test]
+fn d1_synthesized_after_mismatch_is_never_attributed_to_a_human_edit() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // `before` is real (e.g. a T2 git blob); `after` is a DERIVED
+    // oldString->newString substitution that was never independently
+    // observed. The file on disk is genuinely untouched since import —
+    // still exactly the `before` content — so it disagrees with the
+    // synthesized `after`, but NOT because anyone edited it.
+    let before = store.put(b"alpha\nkeep\n").unwrap();
+    let after = store.put(b"beta\nkeep\n").unwrap(); // synthesized, never real
+    std::fs::write(root.join("tracked.txt"), b"alpha\nkeep\n").unwrap(); // untouched
+
+    let mut turn = base_turn(
+        "t_imp_D1TEST0000000000000000001",
+        vec![FileEntry {
+            path: "tracked.txt".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: Some(true),
+        }],
+    );
+    turn.imported = Some(true);
+    turn.files_complete = Some(false);
+    seed_turn(root, &turn);
+
+    // Preview only (no --confirm) is enough to exercise build_plan's
+    // modified-since cause without mutating anything.
+    let out = agentrec(root, &["undo", &turn.id]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !stdout.contains("human or external edit"),
+        "D1: a synthesized-after mismatch must never be blamed on a human edit, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("derived") || stdout.contains("not observed"),
+        "D1: the cause must name the bytes as derived/not-observed, got: {stdout}"
+    );
+
+    // File genuinely untouched — belt-and-braces given this was preview-only.
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).unwrap(),
+        b"alpha\nkeep\n"
+    );
+}
+
 // ---- E1: pre-flight integrity read + idempotent create-inverse ------------
 
 #[test]
@@ -257,6 +323,7 @@ fn e1_corrupt_before_blob_refuses_and_mutates_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -311,6 +378,7 @@ fn e1_create_inverse_with_already_deleted_file_succeeds() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -354,6 +422,7 @@ fn e2_clean_stop_start_gap_after_turn_marks_blame_stale() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -405,6 +474,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -434,6 +504,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_c);
@@ -481,6 +552,7 @@ fn e6_undo_files_unmatched_path_refuses_and_mutates_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -526,6 +598,7 @@ fn e7_prompt_escape_sequence_never_reaches_stdout_raw() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -597,6 +670,7 @@ fn e8_live_guard_refuses_concurrent_undo() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -642,6 +716,7 @@ fn e8_expired_guard_does_not_block_undo() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1382,6 +1457,7 @@ fn undo_collapses_orphan_recovery_duplicate_same_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     // The steady `persist` close of a bracket turn carries an attributed model
@@ -1446,6 +1522,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     let b = base_turn(
@@ -1461,6 +1538,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &a);
@@ -1527,6 +1605,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let mut turn1 = base_turn(dup_id, dup_files);
     turn1.model = Some("claude-opus-4".into());
@@ -1555,6 +1634,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     let turn_c2 = base_turn(
@@ -1570,6 +1650,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_c1);
@@ -1694,6 +1775,7 @@ fn purge_log_duplicates_refuses_while_daemon_running() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let turn = base_turn(dup_id, files);
     // Exact identical dup — WOULD be removed if the daemon-liveness guard
@@ -1777,6 +1859,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let turn = base_turn(dup_id, files);
     seed_turn(root, &turn);
@@ -1819,6 +1902,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &extra_turn);
@@ -1890,6 +1974,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &dup);
@@ -1911,6 +1996,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &target);
@@ -1994,6 +2080,7 @@ fn purge_orphans_archives_unreferenced_and_keeps_referenced() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
