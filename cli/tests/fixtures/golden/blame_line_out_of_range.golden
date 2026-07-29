@@ -1,0 +1,7 @@
+stdout:
+
+--stderr--
+agentrec: src/app.rs has only 3 line(s)
+
+--exit--
+1

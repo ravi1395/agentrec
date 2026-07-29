@@ -1,0 +1,25 @@
+stdout:
+turn t_RICH…TUR1 · claude · 5 files
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1,3 +1,3 @@
+ line1
+-line2
++LINE2
+ line3
+--- a/src/new.rs
++++ b/src/new.rs
+@@ -0,0 +1 @@
++brand new content
+  src/big.bin: (content not snapshotted — over size cap)
+  .env: (withheld — secret-pattern file, not snapshotted)
+--- a/src/human.rs
++++ b/src/human.rs
+@@ -1 +1 @@
+-orig content
++clean content
+
+--stderr--
+
+--exit--
+0
