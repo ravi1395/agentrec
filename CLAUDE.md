@@ -95,7 +95,20 @@ carries only current state, what's next, and standing debts.
 
 ### Founder-pending (agent cannot or may not do these)
 
+- **Pinned decision 14 conflicts with the corpus — needs a ruling.** P1.md pins `cwd` as
+  session-level (first line carrying one wins) and marks it non-re-litigable, but **67 sessions
+  carry more than one distinct `cwd`** (usually a subdirectory move). Resolving each backup key
+  against the `cwd` in effect at its own snapshot line finds ~271 T1.5 candidates vs the current
+  rule's 210-before-staleness-gating, at marginally *better* precision. Deliberately NOT changed —
+  a pinned decision is not an executor's to overturn. Founder decides whether to amend it.
+- 2 claimd claims REFUTED on malformed replay commands (`clm_2DDM03JPR1N9JT4QHYHBTZC1SM`,
+  `clm_07FVVKJGHZS8ZFSR2998HE7QRP`) — multi-filter `cargo test`. Underlying tests pass under a
+  corrected invocation, but REFUTED is not amendable and re-declaring an equivalent is forbidden
+  as dodging.
 - Open the PR for `fix/perf-evidence-round` (Linux CI evidence + merge of the 443-test round).
+  Still the only thing unlocking the **Linux CI leg**, which closes P1's AC7 residual (the
+  `ru_maxrss` divisor is `#[cfg]`-selected; its arithmetic is unit-tested from one machine but
+  Linux's constant selection is unproven).
 - `rm` retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498`
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
