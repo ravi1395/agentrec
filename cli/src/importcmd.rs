@@ -1,9 +1,12 @@
-//! `agentrec import claude --dry-run` (P1, read-only phase): streams Claude
-//! Code's `~/.claude/projects/**/*.jsonl` transcript corpus and reports
-//! per-tier before-bytes reconstructability without writing anything. This
-//! phase never persists — `--dry-run` is the only supported mode; passing
-//! `--dry-run=false` (i.e. omitting the flag) is a loud, nonzero-exit error
-//! rather than a silent no-op, since real persistence lands in P2.
+//! `agentrec import claude` streams Claude Code's
+//! `~/.claude/projects/**/*.jsonl` transcript corpus. `--dry-run` (P1,
+//! read-only) reports per-tier before-bytes reconstructability without
+//! writing anything. Omitting `--dry-run` (P2, `mod persist` below) persists
+//! classified turns into this repo's `log.jsonl`, scoped to sessions whose
+//! `cwd` resolves under `--root` — idempotently (a deterministic id per
+//! `(session_id, turn_index)` means re-running, or resuming after an
+//! interruption, appends only what's missing) and with T2 candidates
+//! actually resolved against a git blob (P1 only detected candidacy).
 //!
 //! Classification ladder (first hit wins), see P1.md "Changes" + Pinned
 //! decisions 1-4 (binding, ground-truthed against real `~/.claude` data):
@@ -56,18 +59,13 @@ fn run_claude(
     source: Option<PathBuf>,
     json: bool,
 ) -> Result<(), String> {
-    // Judgment call (P1.md's CLI-shape section leaves this open): a plain
-    // `#[arg(long)]` bool flag can't distinguish "explicitly passed false"
-    // from "omitted" — clap flags are presence-only. Both collapse to the
-    // same `dry_run == false` case here, and both get the same loud refusal:
-    // P2 hasn't landed persistence yet, so a bare `agentrec import claude`
-    // must never silently do nothing.
+    // P2: `--dry-run` selects the P1 read-only classify-and-report path
+    // (unchanged below, still what the P1 gate measures). Its absence now
+    // means real persistence (P2), not the P1-era refusal — a bare
+    // `agentrec import claude` classifies AND writes turns into this repo's
+    // `log.jsonl`, scoped to sessions whose `cwd` resolves under `root`.
     if !dry_run {
-        return Err(
-            "import claude requires --dry-run — persistence is not implemented \
-             until P2; this command only ever classifies and reports, never writes"
-                .to_string(),
-        );
+        return persist::run(root, source, json);
     }
 
     let src = match source {
@@ -223,6 +221,8 @@ struct ImportReport {
     /// fraction, expressed as a 0-100 percentage (same scale as
     /// `importable_pct`).
     mean_opaque_share_pct: f64,
+    /// D7 (P2 fix round): see `Counters::skipped_secret_path`.
+    skipped_secret_path: usize,
     skipped_sidechain: usize,
     skipped_malformed_line: usize,
     /// Pinned decision 15: a line that read but was not valid UTF-8.
@@ -286,6 +286,7 @@ fn build_report(
         },
         opaque_calls: counters.opaque_calls,
         mean_opaque_share_pct,
+        skipped_secret_path: counters.skipped_secret_path,
         skipped_sidechain: counters.skipped_sidechain,
         skipped_malformed_line: counters.skipped_malformed_line,
         skipped_non_utf8_line: counters.skipped_non_utf8_line,
@@ -331,6 +332,7 @@ fn print_text_report(report: &ImportReport) {
         "  mean_opaque_share_pct: {:.2}",
         report.mean_opaque_share_pct
     );
+    println!("  skipped_secret_path: {}", report.skipped_secret_path);
     println!("  skipped_sidechain: {}", report.skipped_sidechain);
     println!(
         "  skipped_malformed_line: {}",
@@ -484,6 +486,18 @@ struct Counters {
     /// fraction (Pinned decision 13). Divided by `sessions_total` and
     /// scaled to a percentage in `build_report`.
     opaque_share_sum: f64,
+    /// D7 (P2 fix round): a file-producing entry whose path matches
+    /// `scrub::is_secret_path` — never snapshotted by the live daemon, and
+    /// (as of this fix round) never persisted by `import claude` either
+    /// (`withheld: true`). Checked FIRST, before any tier ladder, and
+    /// excluded from T1/T1.5/T2/T3 entirely: prior to this fix, dry-run
+    /// tier-counted secret files as if they were ordinary reconstructible
+    /// content (and hashed their bytes into `debug_entries`), while
+    /// persist withheld them — the two paths were measuring different
+    /// things for the same input. Still counted toward `session_entries`
+    /// (a real file-touching entry, just not tier-classified), same as
+    /// every T1-T3 entry.
+    skipped_secret_path: usize,
 }
 
 // ---- line reading, tolerant of invalid UTF-8 (Pinned decision 15) --------
@@ -1042,6 +1056,21 @@ fn classify_file_entry(
         }
     };
 
+    // D7 (P2 fix round): checked FIRST, before any tier ladder — a secret
+    // file is never tier-counted (previously it was silently classified
+    // T1/T1.5/T2/T3 like any other file, and its bytes hashed into
+    // `debug_entries`) or persisted (`classify_and_resolve` withholds it).
+    // This is real corpus-shape measurement drift between the two paths,
+    // fixed here so the fidelity report actually describes what
+    // persistence does.
+    if agentrec_core::scrub::is_secret_path(file_path) {
+        counters.skipped_secret_path += 1;
+        *session_entries += 1;
+        debug.push(session_file_label, file_path, "secret_path", None);
+        mark_edit(edits_since_backup);
+        return;
+    }
+
     let original_file = tur.get("originalFile").and_then(|v| v.as_str());
     // Item 9 (real-corpus-confirmed shape, not a guess): a create op has
     // `toolUseResult.type == "create"` AND `originalFile` explicitly JSON
@@ -1207,6 +1236,19 @@ struct GitTrackCache {
 }
 
 impl GitTrackCache {
+    /// Repo root for `cwd` (P2's T2 git-blob resolution needs only this,
+    /// not the tracked-file set `is_tracked` also loads) — shares the same
+    /// cache and `load` so a `cwd` already resolved by one caller is never
+    /// re-shelled-out-to-git by the other.
+    fn repo_root(&mut self, cwd: &Path) -> Option<PathBuf> {
+        let key = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let entry = self
+            .by_cwd
+            .entry(key.clone())
+            .or_insert_with(|| Self::load(&key));
+        entry.as_ref().map(|(root, _)| root.clone())
+    }
+
     fn is_tracked(&mut self, cwd: &Path, file_path: &str) -> bool {
         let key = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let entry = self
@@ -1302,6 +1344,1068 @@ fn peak_rss_mb() -> f64 {
 /// arithmetic regardless of which OS actually compiles it (item 7).
 fn rss_raw_to_mb(raw: u64, divisor: f64) -> f64 {
     raw as f64 / divisor
+}
+
+// ---- P2: persistence (`agentrec import claude`, no `--dry-run`) -----------
+//
+// Reuses the P1 ladder's low-level, previously-hardened primitives
+// (`bytes_contain`, `is_safe_path_component`, `record_backup`,
+// `normalize_backup_key`, `lexical_normalize`, `GitTrackCache`) verbatim —
+// those are exactly where the T1.5 fabrication bugs lived, so this
+// deliberately does NOT re-derive them. The tier *decision* ladder itself is
+// intentionally re-expressed here (not shared with `classify_file_entry`)
+// because P1's dry-run path must stay byte-for-byte unchanged (its gate
+// already passed and its RSS/perf figures are cited elsewhere) — dry-run
+// never reads a T2 git blob at all (module doc: "Detected only in this
+// phase"), while persistence must.
+mod persist {
+    use super::*;
+    use agentrec_core::record::{skip_reason, FileEntry, LogRecord, TurnRecord};
+    use agentrec_core::store::{BlobStore, PutResult};
+    use std::process::Command;
+
+    pub fn run(root: &Path, source: Option<PathBuf>, json: bool) -> Result<(), String> {
+        let src = match source {
+            Some(s) => s,
+            None => default_claude_source()?,
+        };
+        if !src.is_dir() {
+            return Err(format!(
+                "import claude: --source '{}' is not a directory (does it exist?)",
+                src.display()
+            ));
+        }
+        let projects_dir = src.join("projects");
+        if !projects_dir.is_dir() {
+            return Err(format!(
+                "import claude: --source '{}' has no 'projects' subdirectory — expected \
+                 Claude Code's transcript layout (<source>/projects/<project>/*.jsonl, \
+                 Pinned decision 1)",
+                src.display()
+            ));
+        }
+
+        let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let log_path = crate::log_path(root);
+        // D8 (P2 fix round, documented not fixed): `load_log` silently
+        // skips any line it can't parse — including a torn LAST line, its
+        // documented tolerant-parsing contract (`record.rs::load_log`'s own
+        // doc comment: "a bad line must not wipe history"). If that torn
+        // line was this importer's own most-recently-appended turn (only
+        // reachable via power loss mid-write, NOT a `kill -9`: `append_log`
+        // fsyncs after a single `write_all` of the whole line, so a
+        // `kill -9` can only ever land before or after that atomic write,
+        // never mid-line), `existing_ids` would miss it and a resume would
+        // re-append a duplicate turn for that one id. Accepted risk, not
+        // fixed this round — `load_log`'s tolerance is shared, load-bearing
+        // infrastructure (every consumer of `log.jsonl` depends on it) and
+        // changing its contract is out of scope here.
+        let existing_ids: HashSet<String> = agentrec_core::record::load_log(&log_path)
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t.id),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+
+        let store = BlobStore::new(crate::objects_dir(root));
+        let mut git_cache = GitTrackCache::default();
+        let mut t2 = T2Counters::default();
+        let mut t15 = T15Counters::default();
+        let mut oracle = OracleCounters::default();
+        let oracle_on = t2_oracle_enabled();
+
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&projects_dir)
+            .map_err(|e| {
+                format!(
+                    "import claude: failed to read '{}': {e}",
+                    projects_dir.display()
+                )
+            })?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+
+        let mut appended = 0usize;
+        for project_dir in dirs {
+            let mut session_files: Vec<PathBuf> = fs::read_dir(&project_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "jsonl"))
+                .collect();
+            session_files.sort();
+
+            // D10/D11 (P2 fix round, documented not fixed — perf/posture
+            // only, correctness is intact): `persist_session_file` calls
+            // `store.put_result` for every resolved before/after blob
+            // BEFORE the `existing_ids` idempotency check below runs, so an
+            // `appended: 0` re-run still rewrites the CAS object set
+            // (dedup-safe, same hash, wasted work) and re-spawns every
+            // `git log`/`git show` for T2 candidates. And each turn is
+            // appended through its own separate `append_log_locked` call
+            // (lock acquired and released per record, not held across the
+            // whole batch), so `purge --log-duplicates` could in principle
+            // interleave a rewrite between two of this run's appends. The
+            // append-only invariant itself is never at risk either way —
+            // `log.lock` IS taken for every append, and this path only ever
+            // appends — so this is a performance/posture item, not a
+            // correctness one; not fixed this round.
+            for file in session_files {
+                let records = persist_session_file(
+                    &file,
+                    &src,
+                    root,
+                    &root_canon,
+                    &store,
+                    &mut git_cache,
+                    &mut t2,
+                    &mut t15,
+                    oracle_on.then_some(&mut oracle),
+                );
+                for record in records {
+                    if let LogRecord::Turn(t) = &record {
+                        if existing_ids.contains(&t.id) {
+                            continue; // idempotent resume/re-run
+                        }
+                    }
+                    crate::loglock::append_log_locked(&log_path, &record)?;
+                    appended += 1;
+                }
+            }
+        }
+
+        if json {
+            let mut obj = serde_json::json!({
+                "appended": appended,
+                "t2_resolution": {
+                    "resolved": t2.resolved,
+                    "no_commit": t2.no_commit,
+                    "blob_missing": t2.blob_missing,
+                    "rejected_unverifiable": t2.rejected_unverifiable,
+                    "no_oldstring": t2.no_oldstring,
+                    "rejected_prior_edit_in_session": t2.rejected_prior_edit_in_session,
+                },
+                // D7: parity with dry-run's `t15_rejected_stale`/
+                // `t15_rejected_unsafe_path`/`t15_blob_missing`/
+                // `t15_rejected_unverifiable` — see `T15Counters`' doc.
+                "t15_diagnostics": {
+                    "rejected_stale": t15.rejected_stale,
+                    "rejected_unsafe_path": t15.rejected_unsafe_path,
+                    "blob_missing": t15.blob_missing,
+                    "rejected_unverifiable": t15.rejected_unverifiable,
+                },
+            });
+            if oracle_on {
+                obj["t2_oracle"] = serde_json::json!({
+                    "denominator": oracle.denominator,
+                    "mismatches": oracle.mismatches,
+                });
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?
+            );
+        } else {
+            println!("appended: {appended}");
+            let candidates = t2.resolved
+                + t2.no_commit
+                + t2.blob_missing
+                + t2.rejected_unverifiable
+                + t2.no_oldstring
+                + t2.rejected_prior_edit_in_session;
+            println!(
+                "t2_resolution: resolved={} of {} candidate(s) attempted \
+                 (no_commit={} blob_missing={} rejected_unverifiable={} no_oldstring={} \
+                 rejected_prior_edit_in_session={})",
+                t2.resolved,
+                candidates,
+                t2.no_commit,
+                t2.blob_missing,
+                t2.rejected_unverifiable,
+                t2.no_oldstring,
+                t2.rejected_prior_edit_in_session
+            );
+            println!(
+                "t15_diagnostics: rejected_stale={} rejected_unsafe_path={} blob_missing={} \
+                 rejected_unverifiable={}",
+                t15.rejected_stale,
+                t15.rejected_unsafe_path,
+                t15.blob_missing,
+                t15.rejected_unverifiable
+            );
+            if oracle_on {
+                println!(
+                    "t2_oracle (AC5b, T1 entries only): mismatches={} of {} both-resolved",
+                    oracle.mismatches, oracle.denominator
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct T2Counters {
+        resolved: usize,
+        no_commit: usize,
+        blob_missing: usize,
+        rejected_unverifiable: usize,
+        no_oldstring: usize,
+        /// AC5b gate 1: this session already edited the same path earlier —
+        /// refused before any git process even runs.
+        rejected_prior_edit_in_session: usize,
+    }
+
+    /// D7 (P2 fix round): the persist-time T1.5 branch used to fall
+    /// through to T2/T3 on `stale`/unsafe-path/blob-missing without
+    /// counting WHY — the dry-run classifier's equivalent
+    /// `t15_rejected_stale`/`t15_rejected_unsafe_path`/`t15_blob_missing`/
+    /// `t15_rejected_unverifiable` counters had no persist-side
+    /// counterpart, so the two paths' fidelity reports were not directly
+    /// comparable. Restored here, named identically to the dry-run report
+    /// contract (Pinned decision 12's amendment).
+    #[derive(Default)]
+    struct T15Counters {
+        rejected_stale: usize,
+        rejected_unsafe_path: usize,
+        blob_missing: usize,
+        rejected_unverifiable: usize,
+    }
+
+    #[derive(Default)]
+    struct OracleCounters {
+        denominator: usize,
+        mismatches: usize,
+    }
+
+    /// AC5b's fabrication oracle (governing-lesson channel): when enabled
+    /// (debug builds only), every T1 entry (true pre-edit bytes known via
+    /// `originalFile`) ALSO attempts git-blob resolution — bypassing T1's
+    /// normal short-circuit — purely to compare, never to change what gets
+    /// persisted. `strings target/release/agentrec | grep
+    /// AGENTREC_IMPORT_T2_ORACLE` must print nothing.
+    fn t2_oracle_enabled() -> bool {
+        #[cfg(debug_assertions)]
+        {
+            std::env::var("AGENTREC_IMPORT_T2_ORACLE").as_deref() == Ok("1")
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
+    struct PendingTurn {
+        turn_index: usize,
+        prompt_raw: Option<String>,
+        started: Option<String>,
+        ended: Option<String>,
+        files: Vec<FileEntry>,
+    }
+
+    impl PendingTurn {
+        fn new(turn_index: usize) -> Self {
+            PendingTurn {
+                turn_index,
+                prompt_raw: None,
+                started: None,
+                ended: None,
+                files: Vec::new(),
+            }
+        }
+
+        // RFC 3339 timestamps compare lexically in time order at this
+        // corpus's fixed-width format (mirrors `readcmds.rs::has_gap_after`,
+        // an existing convention in this codebase).
+        fn touch_ts(&mut self, ts: &str) {
+            if self.started.as_deref().is_none_or(|s| ts < s) {
+                self.started = Some(ts.to_string());
+            }
+            if self.ended.as_deref().is_none_or(|e| ts > e) {
+                self.ended = Some(ts.to_string());
+            }
+        }
+    }
+
+    /// A line is a genuine user-authored turn boundary iff `message.role ==
+    /// "user"` and its content is NOT a `tool_result` block (the same
+    /// structural test the dry-run path uses, Pinned decision 4). Judgment
+    /// call (not specified by P2.md): real transcripts mix true user prompts
+    /// with skill-injected / slash-command-expanded "user"-role lines: this
+    /// over-segments turns in that case, but never mis-resolves file bytes —
+    /// every file entry still resolves `before`/`after` from its own line's
+    /// content and timestamp, never the turn's aggregate. Turn granularity
+    /// is cosmetic; per-entry byte resolution is not.
+    fn is_genuine_user_prompt(value: &Value) -> bool {
+        let Some(msg) = value.get("message").and_then(|m| m.as_object()) else {
+            return false;
+        };
+        if msg.get("role").and_then(|v| v.as_str()) != Some("user") {
+            return false;
+        }
+        let is_tool_result = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            })
+            .unwrap_or(false);
+        !is_tool_result
+    }
+
+    fn extract_user_text(value: &Value) -> Option<String> {
+        let content = value.get("message")?.get("content")?;
+        if let Some(s) = content.as_str() {
+            return (!s.is_empty()).then(|| s.to_string());
+        }
+        let arr = content.as_array()?;
+        let mut out = String::new();
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Deterministic id (idempotency key, Pinned P2.md contract): a function
+    /// of `(session_id, turn_index)` only — never wall-clock, never a
+    /// process-local counter — so a kill-9'd-and-resumed run and an
+    /// uninterrupted run mint byte-identical ids for the same logical turn
+    /// (AC2).
+    fn deterministic_turn_id(session_id: &str, turn_index: usize) -> String {
+        let hash =
+            agentrec_core::store::hash_bytes(format!("{session_id}:{turn_index}").as_bytes());
+        let hex = hash.strip_prefix("sha256:").unwrap_or(&hash);
+        format!("t_imp_{}", &hex[..26.min(hex.len())])
+    }
+
+    /// One session file end to end: segments it into candidate turns, then
+    /// (only for the ones scoped to `root` and not already in
+    /// `existing_ids`, checked by the caller) returns fully-formed
+    /// `LogRecord::Turn`s ready to append, in chronological order.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_session_file(
+        path: &Path,
+        source: &Path,
+        root: &Path,
+        root_canon: &Path,
+        store: &BlobStore,
+        git_cache: &mut GitTrackCache,
+        t2: &mut T2Counters,
+        t15: &mut T15Counters,
+        mut oracle: Option<&mut OracleCounters>,
+    ) -> Vec<LogRecord> {
+        let Ok(file) = File::open(path) else {
+            return vec![];
+        };
+
+        let mut session_cwd: Option<PathBuf> = None;
+        let mut session_id: Option<String> = None;
+        let mut backups: HashMap<String, String> = HashMap::new();
+        let mut edits_since_backup: HashMap<String, usize> = HashMap::new();
+        let mut pending_relative_backups: Vec<(String, String)> = Vec::new();
+        // AC5b hardening (advisor-directed after the real-corpus oracle
+        // measured ~37% fabrication with `oldString` containment alone):
+        // per absolute path, how many EARLIER file-edit entries this
+        // session already classified for it — unlike `edits_since_backup`
+        // (which only has keys for paths that ever had a tracked backup),
+        // this has a key for every path any entry touches, so it also
+        // catches T2 candidates (no backup at all). A nonzero count means
+        // an uncommitted intervening edit exists by construction (this
+        // session already edited the path earlier), so the latest commit
+        // cannot be THIS edit's pre-state regardless of what content
+        // matching says — mirrors Fix 1's staleness argument, generalized
+        // to paths with no tracked backup.
+        let mut session_edit_counts: HashMap<String, usize> = HashMap::new();
+
+        let mut turn_index = 0usize;
+        let mut cur = PendingTurn::new(0);
+        let mut finished: Vec<PendingTurn> = Vec::new();
+
+        each_raw_line(file, |outcome| {
+            let line = match outcome {
+                LineOutcome::Line(s) => s,
+                LineOutcome::NonUtf8 => return,
+            };
+            if line.trim().is_empty() {
+                return;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                return;
+            };
+
+            if session_id.is_none() {
+                session_id = value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            let is_sidechain_field = value
+                .get("isSidechain")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let line_ts = value
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            if session_cwd.is_none() {
+                if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+                    let cwd_path = PathBuf::from(cwd);
+                    for (key, backup_name) in pending_relative_backups.drain(..) {
+                        let normalized = normalize_backup_key(&key, &cwd_path);
+                        record_backup(
+                            &mut backups,
+                            &mut edits_since_backup,
+                            normalized,
+                            backup_name,
+                        );
+                    }
+                    session_cwd = Some(cwd_path);
+                }
+            }
+
+            if let Some(map) = value
+                .pointer("/snapshot/trackedFileBackups")
+                .and_then(|v| v.as_object())
+            {
+                for (file_path, info) in map {
+                    if let Some(backup_name) = info.get("backupFileName").and_then(|v| v.as_str()) {
+                        if file_path.starts_with('/') {
+                            let normalized = lexical_normalize(Path::new(file_path))
+                                .to_string_lossy()
+                                .into_owned();
+                            record_backup(
+                                &mut backups,
+                                &mut edits_since_backup,
+                                normalized,
+                                backup_name.to_string(),
+                            );
+                        } else if let Some(cwd) = &session_cwd {
+                            let normalized = normalize_backup_key(file_path, cwd);
+                            record_backup(
+                                &mut backups,
+                                &mut edits_since_backup,
+                                normalized,
+                                backup_name.to_string(),
+                            );
+                        } else {
+                            pending_relative_backups
+                                .push((file_path.clone(), backup_name.to_string()));
+                        }
+                    }
+                }
+                if value.get("toolUseResult").is_none() {
+                    return;
+                }
+            }
+
+            if is_genuine_user_prompt(&value) {
+                if let Some(text) = extract_user_text(&value) {
+                    if cur.prompt_raw.is_some() || !cur.files.is_empty() {
+                        turn_index += 1;
+                        finished.push(std::mem::replace(&mut cur, PendingTurn::new(turn_index)));
+                    }
+                    cur.prompt_raw = Some(text);
+                    if let Some(ts) = &line_ts {
+                        cur.touch_ts(ts);
+                    }
+                    return;
+                }
+            }
+
+            let is_tool_result_shaped = value
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+                .map(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    })
+                })
+                .unwrap_or(false);
+            let top_level_tur = value.get("toolUseResult");
+            if is_tool_result_shaped && top_level_tur.is_none() {
+                return;
+            }
+            let Some(tur) = top_level_tur else {
+                return;
+            };
+            if is_sidechain_field {
+                return;
+            }
+            let Some(file_path) = tur.get("filePath").and_then(|v| v.as_str()) else {
+                return; // opaque call
+            };
+
+            if let Some(ts) = &line_ts {
+                cur.touch_ts(ts);
+            }
+
+            if let Some(entry) = classify_and_resolve(
+                tur,
+                file_path,
+                source,
+                session_id.as_deref(),
+                session_cwd.as_deref(),
+                &backups,
+                &mut edits_since_backup,
+                &mut session_edit_counts,
+                line_ts.as_deref(),
+                root_canon,
+                store,
+                git_cache,
+                t2,
+                t15,
+                oracle.as_deref_mut(),
+            ) {
+                cur.files.push(entry);
+            }
+        });
+
+        if cur.prompt_raw.is_some() || !cur.files.is_empty() {
+            finished.push(cur);
+        }
+
+        let Some(cwd) = session_cwd else {
+            return vec![];
+        };
+        let Ok(cwd_canon) = fs::canonicalize(&cwd) else {
+            return vec![];
+        };
+        if !cwd_canon.starts_with(root_canon) {
+            return vec![]; // out of scope for this repo (Pinned decision 10)
+        }
+        let Some(sid) = session_id else {
+            return vec![];
+        };
+
+        let mut out = Vec::new();
+        for t in finished {
+            // Judgment call (not specified by P2.md): a turn with zero
+            // touched files carries nothing for agentrec's file-recovery
+            // purpose and is never persisted — only granularity is lost,
+            // never a file-entry's byte resolution.
+            if t.files.is_empty() {
+                continue;
+            }
+            let id = deterministic_turn_id(&sid, t.turn_index);
+            let (prompt_ref, prompt_excerpt) = match &t.prompt_raw {
+                Some(text) => {
+                    let excerpt = agentrec_core::scrub::excerpt(text);
+                    let full = agentrec_core::scrub::scrub(text);
+                    let prompt_ref = match store.put_result(full.as_bytes()) {
+                        PutResult::Stored(hash) => Some(hash),
+                        PutResult::OverCap | PutResult::IoError(_) => None,
+                    };
+                    (prompt_ref, Some(excerpt))
+                }
+                None => (None, None),
+            };
+            let started = t
+                .started
+                .clone()
+                .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+            let ended = t.ended.clone().unwrap_or_else(|| started.clone());
+            out.push(LogRecord::Turn(TurnRecord {
+                v: 1,
+                id,
+                grade: "rich".to_string(),
+                truncated: false,
+                started,
+                ended,
+                tool: Some("claude".to_string()),
+                model: None,
+                session: Some(sid.clone()),
+                root: root.to_string_lossy().to_string(),
+                prompt_ref,
+                prompt_excerpt,
+                merges: vec![],
+                imported: Some(true),
+                files_complete: Some(false),
+                files: t.files,
+            }));
+        }
+        out
+    }
+
+    /// The persist-time before/after ladder. Shares the low-level primitives
+    /// with the dry-run classifier (see module doc above) but is a distinct
+    /// function because it (a) returns real bytes, not just a tier label,
+    /// and (b) is the only place T2 candidates are actually resolved against
+    /// a git blob (P1 only detects candidacy).
+    #[allow(clippy::too_many_arguments)]
+    fn classify_and_resolve(
+        tur: &Value,
+        file_path: &str,
+        source: &Path,
+        session_id: Option<&str>,
+        session_cwd: Option<&Path>,
+        backups: &HashMap<String, String>,
+        edits_since_backup: &mut HashMap<String, usize>,
+        session_edit_counts: &mut HashMap<String, usize>,
+        line_ts: Option<&str>,
+        root_canon: &Path,
+        store: &BlobStore,
+        git_cache: &mut GitTrackCache,
+        t2: &mut T2Counters,
+        t15: &mut T15Counters,
+        oracle: Option<&mut OracleCounters>,
+    ) -> Option<FileEntry> {
+        // `file_path` (from the transcript) and `root` (from `--root`) are
+        // both un-canonicalized strings, but `root_canon` IS canonicalized
+        // (symlink-resolved, e.g. macOS `/tmp` -> `/private/tmp`) — comparing
+        // a raw `file_path` against a canonicalized root directly fails
+        // whenever the root sits behind a symlinked path segment, even
+        // though the two names the SAME directory. Route `file_path` through
+        // `session_cwd` (itself lexically a prefix of `file_path` in every
+        // real transcript, since the tool always reports an absolute path
+        // under the session's own cwd) and canonicalize THAT, so both sides
+        // of the final `strip_prefix` went through the same resolution.
+        let cwd = session_cwd?;
+        let rel_to_cwd = Path::new(file_path).strip_prefix(cwd).ok()?;
+        let cwd_canon = fs::canonicalize(cwd).ok()?;
+        let abs = lexical_normalize(&cwd_canon.join(rel_to_cwd));
+
+        let old_string = tur.get("oldString").and_then(|v| v.as_str());
+        let new_string = tur.get("newString").and_then(|v| v.as_str());
+        let content_field = tur.get("content").and_then(|v| v.as_str());
+        let original_file = tur.get("originalFile").and_then(|v| v.as_str());
+        let op_is_create = tur.get("type").and_then(|v| v.as_str()) == Some("create");
+        let structured_patch = tur.get("structuredPatch");
+
+        // AC5b hardening: count of earlier entries THIS SESSION already
+        // classified for this exact path, read BEFORE this entry is marked
+        // (so entry N sees the count contributed by entries 0..N-1). A
+        // nonzero count means an uncommitted intervening edit exists by
+        // construction, which the real-corpus oracle measurement (~37%
+        // fabrication with `oldString` containment alone) showed content
+        // matching cannot substitute for.
+        let abs_key = abs.to_string_lossy().into_owned();
+        let prior_edits_this_path = session_edit_counts.get(&abs_key).copied().unwrap_or(0);
+        *session_edit_counts.entry(abs_key).or_insert(0) += 1;
+
+        // AC5b oracle: measured independent of `--root` scope (below) — the
+        // fabrication-rate question ("does the guarded T2 path ever still
+        // disagree with a known-true T1 pre-edit state") is corpus-wide by
+        // nature; gating it on root scope would silently zero out the
+        // measurement for a `--root` that happens to match no real session
+        // (which is every synthetic-fixture `--root`, and most single-repo
+        // developer machines run against ONE `--root` per invocation).
+        if let (Some(oracle), Some(orig)) = (oracle, original_file) {
+            let mut scratch = T2Counters::default();
+            if let Some(git_bytes) = resolve_t2_before(
+                &abs,
+                line_ts,
+                old_string,
+                structured_patch,
+                prior_edits_this_path,
+                git_cache,
+                &mut scratch,
+            ) {
+                oracle.denominator += 1;
+                if git_bytes != orig.as_bytes() {
+                    oracle.mismatches += 1;
+                }
+            }
+        }
+
+        let rel = abs
+            .strip_prefix(root_canon)
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        if rel.is_empty() {
+            return None;
+        }
+
+        let mark_edit = |edits_since_backup: &mut HashMap<String, usize>| {
+            if let Some(count) = edits_since_backup.get_mut(file_path) {
+                *count += 1;
+            }
+        };
+
+        if agentrec_core::scrub::is_secret_path(&rel) {
+            mark_edit(edits_since_backup);
+            return Some(FileEntry {
+                path: rel,
+                before: None,
+                after: None,
+                op: if op_is_create { "create" } else { "modify" }.to_string(),
+                skipped: false,
+                withheld: true,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            });
+        }
+
+        let before_bytes: Option<Vec<u8>>;
+        let op: String;
+
+        if let Some(orig) = original_file {
+            before_bytes = Some(orig.as_bytes().to_vec());
+            op = "modify".to_string();
+            mark_edit(edits_since_backup);
+        } else if op_is_create {
+            before_bytes = None;
+            op = "create".to_string();
+            mark_edit(edits_since_backup);
+        } else if let Some(backup_name) = backups.get(file_path) {
+            let stale = edits_since_backup.get(file_path).copied().unwrap_or(0) > 0;
+            let mut resolved: Option<Vec<u8>> = None;
+            // D7 (P2 fix round): these three counters restore parity with
+            // the dry-run classifier's `t15_rejected_stale`/
+            // `t15_rejected_unsafe_path`/`t15_blob_missing` — the persist
+            // path used to fall through to T2/T3 on each of these without
+            // recording why, so the two fidelity reports weren't directly
+            // comparable (the exact measurement-drift shape this repo's
+            // governing lesson warns about).
+            if stale {
+                t15.rejected_stale += 1;
+            } else if let Some(sid) = session_id {
+                if !is_safe_path_component(sid) || !is_safe_path_component(backup_name) {
+                    t15.rejected_unsafe_path += 1;
+                } else {
+                    let blob_path = source.join("file-history").join(sid).join(backup_name);
+                    match fs::read(&blob_path) {
+                        Ok(bytes) => match old_string {
+                            Some(old) if !old.is_empty() => {
+                                if bytes_contain(&bytes, old.as_bytes()) {
+                                    resolved = Some(bytes);
+                                } else {
+                                    t15.rejected_unverifiable += 1;
+                                }
+                            }
+                            _ => resolved = Some(bytes),
+                        },
+                        Err(_) => t15.blob_missing += 1,
+                    }
+                }
+            }
+            mark_edit(edits_since_backup);
+            before_bytes = match resolved {
+                Some(b) => Some(b),
+                None => resolve_t2_before(
+                    &abs,
+                    line_ts,
+                    old_string,
+                    structured_patch,
+                    prior_edits_this_path,
+                    git_cache,
+                    t2,
+                ),
+            };
+            op = "modify".to_string();
+        } else {
+            mark_edit(edits_since_backup);
+            before_bytes = resolve_t2_before(
+                &abs,
+                line_ts,
+                old_string,
+                structured_patch,
+                prior_edits_this_path,
+                git_cache,
+                t2,
+            );
+            op = "modify".to_string();
+        }
+
+        // D1 (P2 fix round, founder decision 2): `content` is the tool's
+        // OWN recorded post-edit bytes — real observed data. When it's
+        // absent, `after` below is DERIVED by applying `oldString`→
+        // `newString` to a `before` that may itself be approximate (a T2
+        // git blob, or nothing at all) — this can disagree with the real
+        // on-disk file for reasons that have nothing to do with a human or
+        // external edit. Recorded so `undo`'s modified-since predicate and
+        // `diff` can say so honestly instead of fabricating "human or
+        // external edit" attribution.
+        let after_will_be_synthesized = content_field.is_none();
+
+        let after_bytes: Option<Vec<u8>> = if let Some(c) = content_field {
+            Some(c.as_bytes().to_vec())
+        } else if let (Some(old), Some(new)) = (old_string, new_string) {
+            let base = original_file.map(str::to_string).or_else(|| {
+                before_bytes
+                    .as_ref()
+                    .and_then(|b| String::from_utf8(b.clone()).ok())
+            });
+            base.map(|base_text| {
+                let replace_all = tur
+                    .get("replaceAll")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if replace_all {
+                    base_text.replace(old, new)
+                } else {
+                    base_text.replacen(old, new, 1)
+                }
+                .into_bytes()
+            })
+        } else {
+            None
+        };
+
+        let mut skipped = false;
+        let mut skipped_reason: Option<String> = None;
+        let mut before_ref: Option<String> = None;
+        let mut after_ref: Option<String> = None;
+
+        if let Some(b) = &before_bytes {
+            match store.put_result(b) {
+                PutResult::Stored(h) => before_ref = Some(h),
+                PutResult::OverCap => {
+                    skipped = true;
+                    skipped_reason = Some(skip_reason::OVER_CAP.to_string());
+                }
+                PutResult::IoError(_) => {
+                    skipped = true;
+                    skipped_reason = Some(skip_reason::IO_FAILED.to_string());
+                }
+            }
+        }
+        if !skipped {
+            if let Some(a) = &after_bytes {
+                match store.put_result(a) {
+                    PutResult::Stored(h) => after_ref = Some(h),
+                    PutResult::OverCap => {
+                        skipped = true;
+                        skipped_reason = Some(skip_reason::OVER_CAP.to_string());
+                    }
+                    PutResult::IoError(_) => {
+                        skipped = true;
+                        skipped_reason = Some(skip_reason::IO_FAILED.to_string());
+                    }
+                }
+            }
+        }
+        if skipped {
+            before_ref = None;
+            after_ref = None;
+        }
+        // Only meaningful when there's an `after` ref actually on the wire
+        // to be misread as observed fact — moot (and left `None`, matching
+        // the additive-field discipline) if `skipped` nulled it out, or if
+        // no `after` bytes resolved at all.
+        let after_synthesized = (after_will_be_synthesized && after_ref.is_some()).then_some(true);
+
+        Some(FileEntry {
+            path: rel,
+            before: before_ref,
+            after: after_ref,
+            op,
+            skipped,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason,
+            after_synthesized,
+        })
+    }
+
+    /// Byte offset of the FIRST occurrence of `needle` in `haystack`, or
+    /// `None` if absent. Companion to `bytes_count` (AC5b gate 2).
+    fn bytes_find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Non-overlapping occurrence count of `needle` in `haystack`. AC5b gate
+    /// 2 requires exactly 1.
+    ///
+    /// MEASURED REALITY (P2 fix round, real-corpus reproduction, n=228
+    /// guard-admitted candidates): this uniqueness check is a **no-op** on
+    /// this corpus — `uniq_pass = 228/228`, it never rejects anything,
+    /// because Claude's Edit tool already requires `oldString` to be
+    /// unique within the target file before it will apply the edit at all.
+    /// An earlier version of this comment claimed uniqueness was
+    /// "load-bearing... in a way it isn't" for T1.5 — that claim was never
+    /// measured and was false. The `expected_old_start_line` check below
+    /// (a coarse whole-prefix-equality proxy for "blob == originalFile",
+    /// NOT a fabrication test by itself) is what actually does the work:
+    /// on the same 228, it fails 204 of them. Kept anyway (uniqueness is
+    /// cheap, and a corpus without the tool's own uniqueness guarantee —
+    /// a different tool, a future Claude Code version — could still need
+    /// it), but do not describe it as load-bearing without re-measuring.
+    fn bytes_count(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let mut count = 0;
+        let mut start = 0;
+        while start + needle.len() <= haystack.len() {
+            if haystack[start..start + needle.len()] == *needle {
+                count += 1;
+                start += needle.len();
+            } else {
+                start += 1;
+            }
+        }
+        count
+    }
+
+    /// T2 resolution (deferred from P1): the latest commit at-or-before the
+    /// entry's OWN line timestamp (never the turn's or session's aggregate
+    /// timestamp — a session can span hours, and resolving against a
+    /// turn-level timestamp would land on a commit that postdates the
+    /// specific edit, exactly the fabrication shape T1.5 already fell into
+    /// once). Accepted only if `oldString` is present AND the resolved blob
+    /// contains it — unlike T1.5, there is no staleness argument available
+    /// here to grant an "unverified" tier, so a missing `oldString` refuses
+    /// outright rather than trusting the blob on structure alone.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_t2_before(
+        abs_file: &Path,
+        line_ts: Option<&str>,
+        old_string: Option<&str>,
+        structured_patch: Option<&Value>,
+        prior_edits_this_path: usize,
+        git_cache: &mut GitTrackCache,
+        t2: &mut T2Counters,
+    ) -> Option<Vec<u8>> {
+        // AC5b hardening, gate 1 (advisor-directed): if THIS session
+        // already classified an earlier edit to this exact path, an
+        // uncommitted intervening edit exists by construction — the latest
+        // commit before this line's timestamp cannot be this edit's
+        // pre-state, full stop, regardless of what content matching below
+        // would say. Checked before any git process is even spawned.
+        if prior_edits_this_path > 0 {
+            t2.rejected_prior_edit_in_session += 1;
+            return None;
+        }
+        let ts = line_ts?;
+        // `abs_file` is already canonicalized (via `cwd_canon` in the
+        // caller), so its parent is a real directory `git rev-parse` can
+        // resolve without hitting the same symlink mismatch `classify_and_
+        // resolve`'s doc comment explains.
+        let dir = abs_file.parent()?;
+        let repo_root = git_cache.repo_root(dir)?;
+        let rel = abs_file.strip_prefix(&repo_root).ok()?;
+
+        let before_arg = format!("--before={ts}");
+        let log_out = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["log", &before_arg, "-1", "--format=%H", "--"])
+            .arg(rel)
+            .output()
+            .ok()?;
+        if !log_out.status.success() {
+            t2.no_commit += 1;
+            return None;
+        }
+        let hash = String::from_utf8_lossy(&log_out.stdout).trim().to_string();
+        if hash.is_empty() {
+            t2.no_commit += 1;
+            return None;
+        }
+
+        let show_out = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("show")
+            .arg(format!("{hash}:{}", rel.display()))
+            .output()
+            .ok()?;
+        if !show_out.status.success() {
+            t2.blob_missing += 1;
+            return None;
+        }
+        let bytes = show_out.stdout;
+
+        // Never accept a near-miss commit blob (P2.md prohibition): the
+        // commit found above is the latest one AT OR BEFORE this edit's own
+        // timestamp that touched this exact path, so it's temporally
+        // correct by construction — but it can still be a pre-*commit*
+        // state that predates THIS edit within an uncommitted working tree
+        // (the T1.5 fabrication shape). Bare `oldString` containment ALONE
+        // was measured (real-corpus AC5b oracle, before gate 1 existed) to
+        // fabricate ~37% of the time (84/226) — a needle check proves the
+        // needle is present, not that the rest of the haystack didn't
+        // drift.
+        //
+        // FOUNDER DECISION 1 (P2 fix round, measured trade-off, real
+        // corpus, n=1133 population this guard actually serves —
+        // `originalFile` absent, not a `create`): gate 1 (the
+        // prior-edit-in-session refusal above) ALONE gives 137 resolved /
+        // 5.1% fabricated (7 wrong) / 130 correct. Adding gate 2 (below)
+        // gives 17 resolved / 0% fabricated / 17 correct — it costs 113
+        // correct resolutions (7.6x recall) to remove the last 7
+        // fabrications. The founder ruled: keep both gates. Zero observed
+        // fabrication is the only claim that survives a skeptic, and there
+        // is no per-entry "unverified" marker (unlike T1.5's
+        // `t15_unverified`) that would make shipping a small known-wrong
+        // fraction acceptable here. **Do not re-tune this trade-off** and
+        // do not attempt to recover the 113 — that decision is closed.
+        //
+        // What gate 2 actually rejects (measured, NOT "the fabrication-
+        // prone cases" as an earlier version of this comment claimed): of
+        // 144 resolutions that gate 1 alone got RIGHT, gate 2 refuses 127
+        // of them (only 17 survive) — i.e. 60% of what gate 2 discards was
+        // already correct. Gate 2 buys the last 7-fabrication reduction at
+        // a steep recall cost; see `bytes_count`'s doc comment for exactly
+        // which half of gate 2 (uniqueness vs. line-position) does that
+        // work. Checked: exactly ONE occurrence of `oldString` in the
+        // blob, AND, when the transcript's `structuredPatch` names the
+        // hunk's starting line, that occurrence must land on that exact
+        // line — a coarse whole-prefix-equality proxy, not a fabrication
+        // test by itself (see `bytes_count`).
+        match old_string {
+            Some(old) if !old.is_empty() => {
+                if bytes_count(&bytes, old.as_bytes()) != 1 {
+                    t2.rejected_unverifiable += 1;
+                    return None;
+                }
+                let offset = bytes_find(&bytes, old.as_bytes()).expect("count==1 implies a match");
+                let line_matches = match expected_old_start_line(structured_patch) {
+                    Some(expected) => {
+                        let line_no = bytes[..offset].iter().filter(|&&b| b == b'\n').count() + 1;
+                        line_no == expected
+                    }
+                    // No hunk-position info in this transcript entry —
+                    // uniqueness above is the only signal available.
+                    None => true,
+                };
+                if line_matches {
+                    t2.resolved += 1;
+                    Some(bytes)
+                } else {
+                    t2.rejected_unverifiable += 1;
+                    None
+                }
+            }
+            _ => {
+                t2.no_oldstring += 1;
+                None
+            }
+        }
+    }
+
+    /// `toolUseResult.structuredPatch[0].oldStart` — the 1-based line
+    /// number the edit's hunk starts at in the PRE-edit file, when the
+    /// transcript provides one. `None` if absent/unparseable (older
+    /// transcript shapes, or a tool that doesn't emit one) — callers must
+    /// treat that as "no positional signal available", never as a match.
+    fn expected_old_start_line(structured_patch: Option<&Value>) -> Option<usize> {
+        structured_patch?
+            .as_array()?
+            .first()?
+            .get("oldStart")?
+            .as_u64()
+            .map(|n| n as usize)
+    }
 }
 
 #[cfg(test)]
