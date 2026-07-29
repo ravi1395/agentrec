@@ -601,19 +601,29 @@ fn process_session_file(
             }
         }
 
-        // `snapshot` lines carry no tool-result, only backup bookkeeping.
-        if value.get("type").and_then(|v| v.as_str()) == Some("snapshot") {
-            if let Some(map) = value
-                .pointer("/snapshot/trackedFileBackups")
-                .and_then(|v| v.as_object())
-            {
-                for (file_path, info) in map {
-                    if let Some(backup_name) = info.get("backupFileName").and_then(|v| v.as_str()) {
-                        backups.insert(file_path.clone(), backup_name.to_string());
-                    }
+        // Backup bookkeeping is harvested on the PRESENCE of
+        // `snapshot.trackedFileBackups`, never gated on the line's `type`.
+        // The real corpus emits these on `type: "file-history-snapshot"`
+        // lines (measured 2026-07-29: 884 such lines, 0 carrying any other
+        // type). Keying off a `type` literal is what silently produced
+        // `t1_5 = 0` over the whole corpus on the first gate run — the
+        // synthetic fixture had invented `type: "snapshot"` and the
+        // classifier matched the fixture, so every test passed while no
+        // real T1.5 entry ever resolved. Presence-based harvesting is
+        // correct for both shapes and cannot drift with a type rename.
+        if let Some(map) = value
+            .pointer("/snapshot/trackedFileBackups")
+            .and_then(|v| v.as_object())
+        {
+            for (file_path, info) in map {
+                if let Some(backup_name) = info.get("backupFileName").and_then(|v| v.as_str()) {
+                    backups.insert(file_path.clone(), backup_name.to_string());
                 }
             }
-            return;
+            // These lines carry bookkeeping only, never a tool result.
+            if value.get("toolUseResult").is_none() {
+                return;
+            }
         }
 
         // Structural check (Pinned decision 4 / FIXTURES.md scenario 7): a
