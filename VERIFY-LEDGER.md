@@ -20,6 +20,90 @@ allowing a "M3 shipped" claim. Each names the exact command/environment that clo
 | D11 (service reload on re-init) | `service.rs`'s `install`/`uninstall`/`load`/`unload` shell out to real `launchctl`/`systemctl` and are, by this file's own long-standing design (see its module doc comment), deliberately never invoked from the automated suite — only `--no-service` paths are. The fix (launchd: `unload` best-effort then `load -w`; systemd: `daemon-reload` before `enable --now`) is implemented and reads correctly, but "re-`init` on an already-loaded service actually restarts it with the new unit content" needs a real macOS box with a previously-loaded `com.agentrec.<slug>` label, and a real Linux box with a previously-loaded `agentrec-<slug>.service`, to prove `launchctl load` no longer silently no-ops and `systemctl` actually re-reads the rewritten unit. | A manual run on both a macOS box and a Linux box: `agentrec init` twice in a row against a real (non-`--no-service`) repo, second run — confirm via `launchctl list \| grep com.agentrec` / `systemctl --user status agentrec-<slug>` that the service is loaded and its `ExecStart` matches the freshly written unit content. |
 | Residuals round P4 — `wait_for_live_daemon` race-closure at the population level | `watcher_arm_stamp_keys_on_current_epoch_nonce` (unit) and `live_daemon_reports_watcher_armed` (integration) prove the MECHANISM: the daemon stamps `watcher_armed_nonce == epoch_nonce` only after `.watch()` succeeds, keyed on the current epoch's nonce so a crashed prior epoch's stale value self-invalidates, and `wait_for_live_daemon` now blocks on that condition instead of a bare `pid != 0`. Neither test — nor any fixture — can directly observe "no live-daemon test loses an event emitted in the ~4.3ms window between `acquire_lock` writing the pid and `.watch()` returning `Ok`" going forward, because that is an absence-of-a-flake claim across the whole suite's history, not a single assertion. | Measured over CI/local-run history: after this fix lands, zero live-daemon integration test failures attributable to "event emitted before the watcher armed" (as opposed to genuine FSEvents/inotify coalescing flake, already documented separately) across N subsequent full-suite runs. Not closeable by a single run; track failures of any live-daemon test (`live_daemon_reports_watcher_armed`, `doctor_healthy_all_pass_exit_0`, `status_suppresses_reload_line_after_daemon_crash`, `daemon_counts_ignore_rebuilds`, etc.) going forward and attribute root cause before counting one against this claim. |
 
+## Phase 2.0 P1 — `import claude` fidelity report (spec decision 8's required row)
+
+Recorded 2026-07-29 from the first real-corpus gate run of the built importer. Command:
+`agentrec import claude --dry-run` (release build, `--source` defaulted to `~/.claude`), full
+output captured at `docs/verify/p1-gate-run.txt`. **No fidelity threshold is asserted** — per
+spec decision 8 the founder sets one from this first measurement.
+
+**Importability predicate used for these numbers** (P1.md Pinned decision 3, recorded verbatim
+so the figure's definition cannot float):
+- *Denominator* = every `*.jsonl` directly under `~/.claude/projects/<project>/` (depth 1;
+  never `subagents/`). Re-measured at run time — the corpus is a rolling ≤30-day window.
+- *Numerator* = a denominator session that is not entirely sidechain-excluded AND completes
+  classification without ever establishing a `cwd` on any line (AC8's loud path). Malformed
+  lines alone do not disqualify a session; a session of only opaque calls still counts.
+
+| Figure | Measured 2026-07-29 |
+|---|---|
+| sessions_total (denominator) | **1617** |
+| sessions_importable | **1611 — 99.6%** (AC1 bar is ≥90%) |
+| tier: T1 (inline `originalFile` / create) | 855 entries — 39.9% of 2151 file entries |
+| tier: T1.5 (`file-history` blob) | **11 — 0.5%** |
+| tier: T2-candidate (git-tracked, bytes NOT resolved in P1) | 963 — 44.8% |
+| tier: T3 (no recoverable before) | 322 — 15.0% |
+| opaque calls (tool results naming no file) | 8618 |
+| mean per-session opaque share | 13.25% |
+| skipped_sidechain | 1255 |
+| skipped_missing_field: `cwd` | 6 (schema drift, reported loudly) |
+| malformed / non-UTF8 / io-error skips | 0 / 0 / 0 |
+| peak RSS | **16.73 MB** (AC7 bar is <500 MB) |
+
+**Honest reading — the plan's predicted 4-tier ladder did NOT hold.** The plan's measurement
+doc predicted T1 42.5 / T1.5 25.3 / T2-cand 24.5 / T3 7.7 (→ 67.9% "honest" reconstructible).
+Measured against the built importer: T1 39.9 / **T1.5 0.5** / T2-cand 44.8 / T3 15.0. T1.5 is
+~50× below prediction. Cross-checked independently (a standalone Python sweep of the corpus,
+written without reference to the importer) — exactly **12** entries corpus-wide lack an inline
+`originalFile` *and* have a same-session `trackedFileBackups` entry for that path, of which
+**11** still have their blob on disk (one reaped by the ~30-day `file-history` retention). The
+importer resolves all 11. **T1.5 is genuinely near-empty in this corpus, not under-detected** —
+the prediction, not the implementation, was wrong. The T1+T1.5 "honest reconstructible" share
+is therefore **40.4%**, not 67.9%. Any downstream claim quoting 67.9% must be corrected.
+
+**Defect this row exists to record (found by the gate run, not by tests):** the first gate run
+reported `t1_5 = 0`. Root cause — the importer gated backup harvesting on `type == "snapshot"`,
+a literal the *synthetic fixture had invented*; the real corpus emits this bookkeeping on
+`type: "file-history-snapshot"` (measured: 884 such lines, zero under any other type). Every
+unit test passed against the fixture while no real T1.5 entry could ever resolve. Fixed by
+harvesting on the **presence** of `snapshot.trackedFileBackups` rather than any `type` literal,
+and the fixture was corrected to carry the real type value. This is the exact failure mode the
+independent-fixture-authoring rule was meant to catch and did not — the fixture author and the
+implementer were independent of each other, but both derived the type literal from the same
+under-specified brief. Recorded as a standing lesson: **fixture-only evidence cannot close a
+corpus-shape claim; the real-corpus run is the gate.**
+
+**Still open after this row:** T2-candidate bytes are detected, never resolved (P1 scope — the
+963 candidates are a ceiling, not a proven recovery rate; P2 resolves git blobs and will
+convert some fraction of them to real recoveries and the rest to T3).
+
+### Anti-overclaim rider (added at the final skeptic gate — read before quoting any figure)
+
+The gate PASSed 8/8 ACs, and the skeptic independently reproduced every figure above. It also
+named four ways these numbers will be misread. Recorded here so they travel WITH the numbers:
+
+1. **"99.6% importable" is an ingestion-without-loud-failure rate, not a recovery rate.** It
+   must never be quoted bare. Context this table omitted: only **184 of 1617 sessions (11.4%)**
+   contain any file-mutation entry at all — all 2151 tier-laddered entries live in those 184 —
+   and **27 of those 184** have zero T1/T1.5-recoverable entries today. A session whose every
+   entry is T3 still counts importable (correctly: it imports as provenance-only turns with
+   `before: null`, which is the pinned semantics — import never fabricates a snapshot). The
+   honest recoverable figure is **40.4% of entries**, ceiling ~85% only if P2 converts every
+   T2 candidate. Quoted bare, "99.6% importable" will be heard as "99.6% recoverable."
+2. **The opaque bucket is not "Bash/Task."** An earlier revision of this row labeled it so; the
+   8618 actually include ~1434 `Read` results, ~430 string-form `toolUseResult`s (mostly
+   errors), plus Grep/TodoWrite/AskUserQuestion. The count is honest; the old parenthetical was
+   not, and `mean_opaque_share_pct` is therefore **not** an "unattributable-mutation share."
+   Corrected above. Anyone setting a fidelity threshold off 13.25% must know this.
+3. **AC7's Linux leg is arithmetic-tested, not platform-proven.** The `ru_maxrss` divisor
+   selection is `#[cfg]`-gated; the unit test covers both divisors' math from one machine, but
+   which constant Linux actually selects closes only on the CI Linux run — still blocked on the
+   unopened `fix/perf-evidence-round` PR. Same for the release-only debug-seam guard test,
+   which never runs in the default suite (the `strings` check is the real evidence there).
+4. **This is one machine's 30-day window.** 1617 sessions of one user's Claude Code habits. The
+   4-tier shares — especially T1.5 at 0.5% — are a property of this corpus and this Claude Code
+   version's snapshot behavior. Not a population claim.
+
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
 Verdict: **GATE PASS** (binding done-gate, opus skeptical-reviewer, round 2 after one loop-back). 269 tests, 0 failed; clippy `-D warnings` + fmt clean. Independent codex (gpt-5.6-terra) cross-review ran alongside and surfaced 2 real bugs the per-task reviews missed (equal-ts fold nondeterminism, crash-window dangling `source_turns`) — both fixed + re-verified before the gate.

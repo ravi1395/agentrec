@@ -1,0 +1,5 @@
+{"type":"assistant","uuid":"e0000050-0000-4000-8000-000000000050","cwd":"/fake/repo5"
+{"type": "user", "message": {"role": "user", "content": [}
+not json at all, just a stray line of text
+{"type":"assistant","toolUseResult":{"filePath":"/fake/repo5/a.txt","originalFile":"abc"}
+{{{{
