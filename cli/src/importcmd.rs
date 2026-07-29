@@ -160,14 +160,29 @@ fn run_claude(
     Ok(())
 }
 
-// ---- report shape (Pinned decision 12, extended by decisions 13/15 and
-// item 6's I/O counter — do not add fields outside `debug_entries`, which
-// serializes away entirely when empty) --------------------------------------
+// ---- report shape (Pinned decision 12, extended by decisions 13/15, item
+// 6's I/O counter, and the T1.5 path-normalization fix's three extra
+// `tier_counts` sub-counters below — the whole point of a fidelity report is
+// that losses stay countable, so these are deliberately visible in the
+// contract rather than folded silently into `debug_entries`) ---------------
 
 #[derive(Serialize)]
 struct TierCounts {
     t1: usize,
     t1_5: usize,
+    /// Subset of `t1_5`: no `oldString` was available to verify the backup
+    /// blob against, so this entry is classified on the blob reference alone
+    /// (assumed, not content-proven). `t1_5 - t15_unverified` is the
+    /// content-proven count.
+    t15_unverified: usize,
+    /// NOT part of `t1_5`: a backup blob resolved and was readable, but its
+    /// content did not contain the edit's `oldString`, so it was refused as
+    /// T1.5 (would-be-fabricated pre-state) and fell through to T2/T3.
+    t15_rejected_unverifiable: usize,
+    /// NOT part of `t1_5`: a `trackedFileBackups` key resolved to `file_path`
+    /// but the referenced blob file could not be read (e.g. reaped by
+    /// retention) — no content to even check. Falls through to T2/T3.
+    t15_blob_missing: usize,
     t2_candidate: usize,
     t3: usize,
 }
@@ -244,6 +259,9 @@ fn build_report(
         tier_counts: TierCounts {
             t1: counters.t1,
             t1_5: counters.t1_5,
+            t15_unverified: counters.t15_unverified,
+            t15_rejected_unverifiable: counters.t15_rejected_unverifiable,
+            t15_blob_missing: counters.t15_blob_missing,
             t2_candidate: counters.t2_candidate,
             t3: counters.t3,
         },
@@ -273,11 +291,17 @@ fn print_text_report(report: &ImportReport) {
     );
     println!("  sessions_in_root: {}", report.sessions_in_root);
     println!(
-        "  tier_counts: t1={} t1_5={} t2_candidate={} t3={}",
+        "  tier_counts: t1={} t1_5={} (of which t15_unverified={}) t2_candidate={} t3={}",
         report.tier_counts.t1,
         report.tier_counts.t1_5,
+        report.tier_counts.t15_unverified,
         report.tier_counts.t2_candidate,
         report.tier_counts.t3
+    );
+    println!(
+        "  t1_5 fallthroughs (NOT part of t1_5, counted toward t2_candidate/t3): \
+         t15_rejected_unverifiable={} t15_blob_missing={}",
+        report.tier_counts.t15_rejected_unverifiable, report.tier_counts.t15_blob_missing
     );
     println!("  opaque_calls: {}", report.opaque_calls);
     println!(
@@ -383,6 +407,28 @@ struct Counters {
     sessions_in_root: usize,
     t1: usize,
     t1_5: usize,
+    /// Subset of `t1_5` (i.e. `t1_5 - t15_unverified` is the content-proven
+    /// count): `oldString` was absent/empty on the entry, so the
+    /// containment check could not run — classified T1.5 on the blob
+    /// reference alone (best evidence available, but NOT content-proven).
+    /// Also double-counted into `t1_5`; kept distinct so the fidelity report
+    /// never lets an assumed match masquerade as a proven one.
+    t15_unverified: usize,
+    /// NOT part of `t1_5`: a backup blob resolved and was readable, but its
+    /// content does not contain the edit's `oldString` — the blob is not
+    /// this edit's pre-state. Resolving it anyway would fabricate a
+    /// plausible-but-wrong `before`, which the "never fabricate" invariant
+    /// forbids, so the entry falls through to T2/T3 instead and is counted
+    /// here so the loss stays visible rather than silently folding into T3.
+    t15_rejected_unverifiable: usize,
+    /// NOT part of `t1_5`: a `trackedFileBackups` key resolved (matched
+    /// `file_path`, verbatim or after `cwd`-normalization), but
+    /// `fs::read(blob_path)` failed — e.g. retention already reaped the
+    /// blob (~30-day window). Distinct from `t15_rejected_unverifiable`
+    /// (blob present but content doesn't match): here there is no content
+    /// to even check. Falls through to T2/T3, same as before this counter
+    /// existed; added so this loss is visible instead of silently absorbed.
+    t15_blob_missing: usize,
     t2_candidate: usize,
     t3: usize,
     opaque_calls: usize,
@@ -545,10 +591,34 @@ fn process_session_file(
     let mut sidechain_flagged_lines = 0usize;
     let mut session_cwd: Option<PathBuf> = None;
     let mut session_id: Option<String> = None;
-    // path -> backupFileName, harvested from `snapshot` lines as we walk;
-    // real transcripts are chronological, so a snapshot always precedes the
-    // edit it backs up (assumption, undisturbed by any fixture here).
+    // Absolute-path key -> backupFileName, harvested from `snapshot` lines
+    // as we walk. `trackedFileBackups` keys are relative to the session's
+    // `cwd` far more often than absolute — corpus is a live, rolling ≤30-day
+    // window so the exact ratio drifts run to run (measured 2026-07-29 on
+    // this machine: 1196 of 1401 keys relative at re-verification time; an
+    // earlier same-day measurement on a larger pre-decay corpus snapshot saw
+    // 1606 of 1883) — every key is normalized to an absolute path before
+    // landing here (`normalize_backup_key`, below) so the T1.5 lookup in
+    // `classify_file_entry` can stay a plain `HashMap::get(file_path)`
+    // (`file_path` there is always absolute).
+    //
+    // Repeated-key `insert` overwriting is deliberate, not accidental: real
+    // transcripts are chronological, so the LAST snapshot recorded before an
+    // edit is the pre-edit version to use for that edit — corpus-validated
+    // (2026-07-29): of every T1.5 candidate, the latest backup recorded
+    // before the edit line was correct in 100% of cases where any recorded
+    // version was correct (zero cases where an earlier version matched but
+    // the latest one didn't). Do not add `@vN`-suffix parsing to pick a
+    // version some other way — record order is the authority, and
+    // `backupFileName` stays an opaque string, read verbatim (Pinned
+    // decision 1).
     let mut backups: HashMap<String, String> = HashMap::new();
+    // Relative keys harvested before `cwd` is known yet (Pinned decision 14:
+    // `cwd` is session-level and a snapshot line can legitimately precede
+    // the first line that carries `cwd`). Drained into `backups` the moment
+    // `cwd` becomes known (see the `cwd`-detection block below), in original
+    // (chronological) order so the latest-wins rule above still holds.
+    let mut pending_relative_backups: Vec<(String, String)> = Vec::new();
     // Pinned decision 13 bookkeeping, this session only.
     let mut session_opaque = 0usize;
     let mut session_entries = 0usize;
@@ -597,7 +667,14 @@ fn process_session_file(
         // only knowable at EOF (checked after this closure returns).
         if session_cwd.is_none() {
             if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
-                session_cwd = Some(PathBuf::from(cwd));
+                let cwd_path = PathBuf::from(cwd);
+                // Now that `cwd` is known, resolve every relative key that
+                // was harvested before we could resolve it — draining in
+                // order preserves "latest recorded before the edit wins".
+                for (key, backup_name) in pending_relative_backups.drain(..) {
+                    backups.insert(normalize_backup_key(&key, &cwd_path), backup_name);
+                }
+                session_cwd = Some(cwd_path);
             }
         }
 
@@ -617,7 +694,21 @@ fn process_session_file(
         {
             for (file_path, info) in map {
                 if let Some(backup_name) = info.get("backupFileName").and_then(|v| v.as_str()) {
-                    backups.insert(file_path.clone(), backup_name.to_string());
+                    // An absolute key needs no `cwd` to resolve — normalize
+                    // and insert immediately regardless of whether `cwd` is
+                    // known yet. A relative key needs `cwd`: normalize now
+                    // if we have it, otherwise defer until the `cwd`-
+                    // detection block above drains it.
+                    if file_path.starts_with('/') {
+                        backups.insert(file_path.clone(), backup_name.to_string());
+                    } else if let Some(cwd) = &session_cwd {
+                        backups.insert(
+                            normalize_backup_key(file_path, cwd),
+                            backup_name.to_string(),
+                        );
+                    } else {
+                        pending_relative_backups.push((file_path.clone(), backup_name.to_string()));
+                    }
                 }
             }
             // These lines carry bookkeeping only, never a tool result.
@@ -722,6 +813,38 @@ fn process_session_file(
     counters.opaque_share_sum += session_fraction;
 }
 
+/// Resolves a raw `trackedFileBackups` key to the absolute path it names.
+/// An already-absolute key (`/`-prefixed) is returned as-is. A relative key
+/// is joined lexically against `cwd` — deliberately never
+/// `fs::canonicalize`d, since transcript paths frequently name a file that
+/// no longer exists on disk (canonicalize would fail on exactly the paths
+/// this needs to resolve). A leading `./` is stripped before joining so the
+/// resulting string never carries a literal `./` component (`Path::join`
+/// does not collapse one on its own).
+fn normalize_backup_key(key: &str, cwd: &Path) -> String {
+    if key.starts_with('/') {
+        return key.to_string();
+    }
+    let stripped = key.strip_prefix("./").unwrap_or(key);
+    cwd.join(stripped).to_string_lossy().into_owned()
+}
+
+/// True iff `needle` occurs as a contiguous byte sequence anywhere in
+/// `haystack`. Used to verify a resolved T1.5 blob actually contains an
+/// edit's `oldString` before trusting it as that edit's pre-state — plain
+/// byte search rather than `str`-based, since a resolved blob is not
+/// guaranteed to be valid UTF-8 (binary files go through the same backup
+/// path).
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Before-bytes ladder, first hit wins (P1.md Changes / Pinned decision 1).
 #[allow(clippy::too_many_arguments)]
 fn classify_file_entry(
@@ -771,19 +894,60 @@ fn classify_file_entry(
         if let Some(sid) = session_id {
             let blob_path = source.join("file-history").join(sid).join(backup_name);
             if let Ok(bytes) = fs::read(&blob_path) {
-                counters.t1_5 += 1;
-                *session_entries += 1;
-                let hash = hash_bytes(&bytes);
-                debug.push(
-                    session_file_label,
-                    file_path,
-                    "t1_5",
-                    Some(strip_hash_prefix(&hash)),
-                );
-                return;
+                // "Never fabricate" invariant (PROTOCOL.md / IMPLEMENTATION.md):
+                // resolving `before` bytes from a blob that is NOT actually
+                // this edit's pre-state would fabricate a plausible-but-wrong
+                // pre-state. When `oldString` is present and non-empty, the
+                // blob must be verified to contain it before it can be
+                // trusted as T1.5.
+                let old_string = tur.get("oldString").and_then(|v| v.as_str());
+                match old_string {
+                    Some(old) if !old.is_empty() => {
+                        if bytes_contain(&bytes, old.as_bytes()) {
+                            counters.t1_5 += 1;
+                            *session_entries += 1;
+                            let hash = hash_bytes(&bytes);
+                            debug.push(
+                                session_file_label,
+                                file_path,
+                                "t1_5",
+                                Some(strip_hash_prefix(&hash)),
+                            );
+                            return;
+                        }
+                        // The blob does not contain the edit's `oldString` —
+                        // it is not this edit's pre-state. Fall through to
+                        // T2/T3 exactly as if no backup existed, and count
+                        // the rejection so the loss stays visible rather
+                        // than silently folding into T3.
+                        counters.t15_rejected_unverifiable += 1;
+                    }
+                    _ => {
+                        // No `oldString` on this entry (some ops don't carry
+                        // one), so the containment check can't run. The blob
+                        // reference is still the best evidence available —
+                        // classify T1.5, but count it as unverified/assumed
+                        // rather than content-proven.
+                        counters.t1_5 += 1;
+                        counters.t15_unverified += 1;
+                        *session_entries += 1;
+                        let hash = hash_bytes(&bytes);
+                        debug.push(
+                            session_file_label,
+                            file_path,
+                            "t1_5",
+                            Some(strip_hash_prefix(&hash)),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // Backup referenced but missing (e.g. retention already
+                // reaped it, ~30-day window) — falls through to T2/T3,
+                // never errors, but the loss is counted so it stays
+                // visible.
+                counters.t15_blob_missing += 1;
             }
-            // Backup referenced but missing (e.g. retention already reaped
-            // it, ~30-day window) — falls through to T2/T3, never errors.
         }
     }
     classify_t2_or_t3(

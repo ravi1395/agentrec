@@ -205,6 +205,147 @@ alone; the nested `message.content[].type == "tool_result"` block is the signal 
 
 ---
 
+## 8. `t15_relative_key/`
+
+**Proves:** the T1.5 path-normalization fix — a `trackedFileBackups` key that is **relative**
+to the session's `cwd` must resolve, not just an already-absolute key. Relative keys vastly
+outnumber absolute ones on the real corpus, though the exact ratio drifts (it's a live, rolling
+≤30-day window): re-verified 2026-07-29 at 1196 of 1401 relative; an earlier same-day
+measurement on a larger pre-decay snapshot saw 1606 of 1883. Also the RED→GREEN regression test
+for the reported defect: fails against the pre-fix raw-string-compare lookup, passes once keys
+are normalized against `cwd` at harvest/lookup time.
+
+- Session id: `a1515151-1515-4151-8151-151515151515`
+- File: `projects/proj-a/a1515151-1515-4151-8151-151515151515.jsonl`, 2 lines, `cwd:
+  "/fake/repo15"`:
+  1. A `file-history-snapshot` line recording `trackedFileBackups["src/notes.txt"]` — **a
+     relative key**, unlike `t1_and_t15/`'s absolute one — `.backupFileName =
+     "dd44ee55ff66aa77@v1"`.
+  2. An `Edit` result for `/fake/repo15/src/notes.txt` (absolute, as `toolUseResult.filePath`
+     always is) — **no `originalFile`** — must resolve via the relative key joined against
+     `cwd`. `oldString: "alpha value"` is present and matches the blob, so this must be
+     content-proven (`t15_unverified` stays 0).
+- File-history blob: `file-history/a1515151-1515-4151-8151-151515151515/dd44ee55ff66aa77@v1`.
+
+### Known-good content + independently-computed hash
+
+```
+alpha value
+beta value
+```
+
+```
+$ shasum -a 256 cli/tests/fixtures/import/claude/t15_relative_key/file-history/a1515151-1515-4151-8151-151515151515/dd44ee55ff66aa77@v1
+678cd3ef69c16e338a717c91a0ecdec9c394b4992360d2680539fbaf028b8396  cli/tests/fixtures/import/claude/t15_relative_key/file-history/a1515151-1515-4151-8151-151515151515/dd44ee55ff66aa77@v1
+```
+
+**Expected `sha256(resolved before bytes)`:** `678cd3ef69c16e338a717c91a0ecdec9c394b4992360d2680539fbaf028b8396`
+
+---
+
+## 9. `t15_stale_blob/`
+
+**Proves:** the T1.5 "never fabricate" verification guard — a backup blob resolves and is
+readable, but its content does **not** contain the edit's `oldString`, so the blob is not
+actually this edit's pre-state. The entry must be refused as T1.5 (never fabricate a
+plausible-but-wrong `before`) and fall through to T2/T3 — here T3, since `/fake/repo16` is not
+backed by any git repo in this fixture. The rejection must be counted in
+`t15_rejected_unverifiable`, distinct from silently folding into T3.
+
+- Session id: `a1616161-1616-4161-8161-161616161616`
+- File: `projects/proj-a/a1616161-1616-4161-8161-161616161616.jsonl`, 2 lines, `cwd:
+  "/fake/repo16"`:
+  1. A `file-history-snapshot` line recording `trackedFileBackups["/fake/repo16/stale.txt"]`
+     (absolute key, to isolate this test to the verification guard rather than path
+     normalization) `.backupFileName = "cc11dd22ee33ff44@v1"`.
+  2. An `Edit` result for `/fake/repo16/stale.txt`, `oldString: "original text"` — **the blob
+     content below does not contain this string**.
+- File-history blob: `file-history/a1616161-1616-4161-8161-161616161616/cc11dd22ee33ff44@v1`
+  — deliberately unrelated content (`totally unrelated content\n`), simulating a stale/mismatched
+  backup recorded for a different edit.
+
+---
+
+## 10. `t15_cwd_after_snapshot/`
+
+**Proves:** the T1.5 ordering trap in Fix 1 — the `file-history-snapshot` line carrying
+`trackedFileBackups` appears **before** any line in the session carries `cwd`. A relative key
+harvested at that point cannot be resolved yet; it must be held pending and resolved once a
+later line establishes `cwd`, not silently dropped.
+
+**This is the dominant real-corpus shape, not a corner case:** a corpus sweep on 2026-07-29
+found `file-history-snapshot` lines **never** carry their own `cwd` field (0 of 468 such lines
+on this machine's `~/.claude` corpus) — `cwd` always comes from a later (or, in `t1_and_t15/`'s
+simpler fixture, coincidentally-same-line) part of the session. This fixture is what makes that
+the tested path rather than an untested assumption; the `t1_and_t15/` and `t15_relative_key/`
+fixtures putting `cwd` on the snapshot line itself are the synthetic simplification, not the
+real shape.
+
+- Session id: `a1717171-1717-4171-8171-171717171717`
+- File: `projects/proj-a/a1717171-1717-4171-8171-171717171717.jsonl`, 3 lines:
+  1. A `file-history-snapshot` line — **no `cwd` field at all** — recording
+     `trackedFileBackups["docs/readme.txt"]` (relative key) `.backupFileName =
+     "ee55ff66aa77bb88@v1"`.
+  2. A plain `user` chat line, `cwd: "/fake/repo17"` — the first line in the session to
+     establish `cwd`, with no `toolUseResult` of its own.
+  3. An `Edit` result for `/fake/repo17/docs/readme.txt`, `oldString: "readme original"` —
+     matches the blob below, so this must resolve T1.5 once `cwd` from line 2 is applied to
+     line 1's pending relative key.
+- File-history blob: `file-history/a1717171-1717-4171-8171-171717171717/ee55ff66aa77bb88@v1`.
+
+### Known-good content + independently-computed hash
+
+```
+readme original
+more text
+```
+
+```
+$ shasum -a 256 cli/tests/fixtures/import/claude/t15_cwd_after_snapshot/file-history/a1717171-1717-4171-8171-171717171717/ee55ff66aa77bb88@v1
+59c14830f5913e2fb18b82eb129dfb6189bf39b80a7a858c0b9b86758e1ae963  cli/tests/fixtures/import/claude/t15_cwd_after_snapshot/file-history/a1717171-1717-4171-8171-171717171717/ee55ff66aa77bb88@v1
+```
+
+**Expected `sha256(resolved before bytes)`:** `59c14830f5913e2fb18b82eb129dfb6189bf39b80a7a858c0b9b86758e1ae963`
+
+---
+
+## 11. `t15_unverified_no_oldstring/`
+
+**Proves:** the T1.5 "unverified" branch of Fix 2 — an entry whose `toolUseResult` has **no
+`oldString` field at all** (some ops don't carry one). The containment check can't run, so the
+blob reference is trusted on its own (best evidence available), but the entry must be counted
+`t15_unverified`, distinct from a content-proven match.
+
+**Corpus-untested branch, called out honestly:** a full real-corpus gate run (2026-07-29,
+1626 sessions) found `oldString` present and non-empty on every single one of the 243 T1.5
+candidates — `t15_unverified` measured `0` there. This fixture is the *only* coverage this
+branch has; it exists purely as a defensive path for a schema shape the corpus didn't happen to
+exercise this time.
+
+- Session id: `a1818181-1818-4181-8181-181818181818`
+- File: `projects/proj-a/a1818181-1818-4181-8181-181818181818.jsonl`, 2 lines, `cwd:
+  "/fake/repo18"`:
+  1. A `file-history-snapshot` line recording `trackedFileBackups["/fake/repo18/data.bin"]`
+     (absolute key) `.backupFileName = "ff11aa22bb33cc44@v1"`.
+  2. A `NotebookEdit`-shaped result for `/fake/repo18/data.bin` — no `originalFile`, and
+     **no `oldString` key at all** (only `newString`).
+- File-history blob: `file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1`.
+
+### Known-good content + independently-computed hash
+
+```
+binary-ish backup content, no relation to any oldString
+```
+
+```
+$ shasum -a 256 cli/tests/fixtures/import/claude/t15_unverified_no_oldstring/file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
+9f79508431a3a504310ce89c4050986efece7012e23258c20b8b6ae4d4e56154  cli/tests/fixtures/import/claude/t15_unverified_no_oldstring/file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
+```
+
+**Expected `sha256(resolved before bytes)`:** `9f79508431a3a504310ce89c4050986efece7012e23258c20b8b6ae4d4e56154`
+
+---
+
 ## Expected session counts per Pinned decision 3's importability predicate
 
 Pinned decision 3 defines the AC1 numerator/denominator: denominator = every `.jsonl` file
@@ -224,6 +365,10 @@ that predicate to each scenario here (each scenario is its own `--source` root):
 | `malformed/` | **2** | **1** | `broken.jsonl`: every line fails to parse (AC6), so **zero** lines parse — decision 3(b)'s "at least one line parses" carve-out does not apply, so it is not importable. `valid-sibling.jsonl` (added after review): all lines parse, no AC8 field missing, so it counts importable — proving `broken.jsonl` doesn't abort the scan of its sibling. |
 | `missing_cwd/` | 1 | **0** | Hits the AC8 loud-failure path (missing required field `cwd`) — decision 3(b) explicitly excludes this from importable. |
 | `missing_touluseresult/` | 1 | **0** | Hits the AC8 loud-failure path (missing required field `toolUseResult` on a line that structurally needs it). |
+| `t15_relative_key/` | 1 | 1 | All lines parse; the relative `trackedFileBackups` key resolves to T1.5 against `cwd`; no AC8 field missing. |
+| `t15_stale_blob/` | 1 | 1 | All lines parse; the entry falls through to T3 (rejected as unverifiable T1.5), which does not gate importability. |
+| `t15_cwd_after_snapshot/` | 1 | 1 | All lines parse; `cwd` is established by line 2 (session-level, per decision 14), so the session is importable and the pending relative key resolves. |
+| `t15_unverified_no_oldstring/` | 1 | 1 | All lines parse; no AC8 field missing; the missing-`oldString` entry still classifies T1.5 (unverified), which does not gate importability. |
 
 ---
 
@@ -249,6 +394,18 @@ cli/tests/fixtures/import/claude/
 │       └── valid-sibling.jsonl                    (added after review, see scenario 5)
 ├── missing_cwd/
 │   └── projects/proj-a/no-cwd.jsonl
-└── missing_touluseresult/
-    └── projects/proj-a/no-tur.jsonl
+├── missing_touluseresult/
+│   └── projects/proj-a/no-tur.jsonl
+├── t15_relative_key/
+│   ├── projects/proj-a/a1515151-1515-4151-8151-151515151515.jsonl
+│   └── file-history/a1515151-1515-4151-8151-151515151515/dd44ee55ff66aa77@v1
+├── t15_stale_blob/
+│   ├── projects/proj-a/a1616161-1616-4161-8161-161616161616.jsonl
+│   └── file-history/a1616161-1616-4161-8161-161616161616/cc11dd22ee33ff44@v1
+├── t15_cwd_after_snapshot/
+│   ├── projects/proj-a/a1717171-1717-4171-8171-171717171717.jsonl
+│   └── file-history/a1717171-1717-4171-8171-171717171717/ee55ff66aa77bb88@v1
+└── t15_unverified_no_oldstring/
+    ├── projects/proj-a/a1818181-1818-4181-8181-181818181818.jsonl
+    └── file-history/a1818181-1818-4181-8181-181818181818/ff11aa22bb33cc44@v1
 ```
