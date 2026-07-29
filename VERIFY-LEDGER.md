@@ -35,31 +35,83 @@ so the figure's definition cannot float):
   classification without ever establishing a `cwd` on any line (AC8's loud path). Malformed
   lines alone do not disqualify a session; a session of only opaque calls still counts.
 
-| Figure | Measured 2026-07-29 |
-|---|---|
-| sessions_total (denominator) | **1617** |
-| sessions_importable | **1611 — 99.6%** (AC1 bar is ≥90%) |
-| tier: T1 (inline `originalFile` / create) | 855 entries — 39.9% of 2151 file entries |
-| tier: T1.5 (`file-history` blob) | **11 — 0.5%** |
-| tier: T2-candidate (git-tracked, bytes NOT resolved in P1) | 963 — 44.8% |
-| tier: T3 (no recoverable before) | 322 — 15.0% |
-| opaque calls (tool results naming no file) | 8618 |
-| mean per-session opaque share | 13.25% |
-| skipped_sidechain | 1255 |
-| skipped_missing_field: `cwd` | 6 (schema drift, reported loudly) |
-| malformed / non-UTF8 / io-error skips | 0 / 0 / 0 |
-| peak RSS | **16.73 MB** (AC7 bar is <500 MB) |
+**THIS ROW WAS WRONG TWICE AND IS NOW ON ITS THIRD SET OF NUMBERS.** The figures below are the
+corrected ones (gate run `docs/verify/p1-gate-run-t15fix2.txt`, 2026-07-29 evening). The two
+superseded readings and exactly why each was wrong are recorded beneath the table — deleting
+that history would hide the failure mode that produced it three times running.
 
-**Honest reading — the plan's predicted 4-tier ladder did NOT hold.** The plan's measurement
-doc predicted T1 42.5 / T1.5 25.3 / T2-cand 24.5 / T3 7.7 (→ 67.9% "honest" reconstructible).
-Measured against the built importer: T1 39.9 / **T1.5 0.5** / T2-cand 44.8 / T3 15.0. T1.5 is
-~50× below prediction. Cross-checked independently (a standalone Python sweep of the corpus,
-written without reference to the importer) — exactly **12** entries corpus-wide lack an inline
-`originalFile` *and* have a same-session `trackedFileBackups` entry for that path, of which
-**11** still have their blob on disk (one reaped by the ~30-day `file-history` retention). The
-importer resolves all 11. **T1.5 is genuinely near-empty in this corpus, not under-detected** —
-the prediction, not the implementation, was wrong. The T1+T1.5 "honest reconstructible" share
-is therefore **40.4%**, not 67.9%. Any downstream claim quoting 67.9% must be corrected.
+| Figure | Measured 2026-07-29 (corrected) |
+|---|---|
+| sessions_total (denominator) | **1631** |
+| sessions_importable | **1625 — 99.6%** (AC1 bar is ≥90%) |
+| tier: T1 total | 856 entries — 39.6% of 2159 file entries |
+| — of which inline `originalFile` (**yields real pre-edit bytes**) | **595 — 27.6%** |
+| — of which `create` ops (no pre-edit bytes exist; correctly none) | 261 — 12.1% |
+| tier: T1.5 (`file-history` blob, staleness-gated) | **90 — 4.2%** (1 structurally-inferred) |
+| tier: T2-candidate (git-tracked, bytes NOT resolved in P1) | 897 — 41.5% |
+| tier: T3 (no recoverable before) | 316 — 14.6% |
+| T1.5 rejected — blob stale by an intervening edit | **170** |
+| T1.5 rejected — `oldString` not found in blob | 3 |
+| T1.5 rejected — unsafe path component / blob missing | 0 / 0 |
+| peak RSS | **16.7 MB** (AC7 bar is <500 MB) |
+
+**Honest reconstructible figure — read the two numbers separately.**
+- **43.8%** (T1 856 + T1.5 90 = 946 of 2159) counting `create` ops as reconstructible, since a
+  new file's correct `before` genuinely is "nothing".
+- **31.7%** (595 + 90 = 685 of 2159) counting only entries that yield **actual pre-edit bytes**.
+
+Quote whichever you mean and say which. Neither is 67.9% (the 2026-07-24 prediction) and
+neither is 40.4% (this row's own superseded second reading).
+
+**Accuracy of the surviving T1.5 entries — measured, not asserted.** Ground-truth channel:
+entries that carry an inline `originalFile` (so the true pre-edit bytes are known) **and** also
+resolve a file-history backup **and** pass the classifier's checks — compare the resolved blob
+against `originalFile`. Result: **101 correct, 1 fabricated (1.0% residual)**, reproduced
+independently by two parties. Before the staleness fix the same channel measured **29.6-30.3%
+fabricated**. The single residual traces to an out-of-order snapshot line in one transcript
+(`memory/MEMORY.md`, a concurrent writer invisible to a linear read) — recorded, not chased.
+
+### Superseded reading #1 (first gate run): "T1.5 = 0"
+
+Cause: the classifier gated backup harvesting on `type == "snapshot"` — a literal the
+*synthetic fixture had invented*. The real corpus emits it on `type: "file-history-snapshot"`
+(884 lines, zero under any other type). Fixed to presence-based harvesting.
+
+### Superseded reading #2: "T1.5 = 11 (0.5%), genuinely near-empty, not under-detected"
+
+That sentence was **false** and this row asserted it. Cause: the T1.5 lookup compared
+`toolUseResult.filePath` (always absolute) against `trackedFileBackups` keys that are
+**relative to the session `cwd`** in 1606 of 1883 cases — so the raw string compare almost
+never matched. The existing fixture happened to use an absolute key, so every test passed and
+an 8/8 skeptic gate cleared it.
+
+Worse, this row cited "a standalone Python sweep of the corpus, written without reference to
+the importer" as independent corroboration. That sweep **re-implemented the importer's own
+raw-path assumption**. It was independent of the *author*, not of the *assumption* — which is
+the only independence that mattered. Two rounds of review and a passing gate all missed it.
+
+### What actually drove T1.5 down, and the correction to the correction
+
+Fixing the path compare raised T1.5 to 210 — and *that* number was also wrong, in the opposite
+and more dangerous direction. Claude Code writes file-history backups **at snapshot time, not
+per edit**, so for the 2nd-and-later edit of a file the blob is the pre-*snapshot* state. The
+`oldString`-containment guard still passed, because a later edit's `oldString` usually sits in
+a region earlier edits didn't touch. 115 of those 210 were provably stale; the ground-truth
+channel put the fabrication rate at ~30%. Import would have handed P2 fabricated pre-states to
+persist as recoverable history — a direct violation of the never-fabricate invariant.
+
+The correct predicate is **structural, not textual**: a blob is a valid pre-edit state only if
+no edit to that same path intervened between the snapshot that recorded the backup and the edit
+being classified. 170 entries fail that test and now fall through instead of resolving. T1.5's
+honest share is **4.2%**, not 25.3% (predicted), not 0.5% (under-detected), not 9.7% (inflated
+by fabrication).
+
+**The standing lesson, now with three instances behind it:** every T1.5 fixture was a
+single-snapshot / single-edit session, so no fixture could ever exercise version alignment —
+and each bug was a case of *the fixture and the code agreeing on a shape the real corpus does
+not have*. Fixture-only evidence cannot close a corpus-shape claim, and a cross-check that
+re-implements the implementation's assumption is not a cross-check. Fixtures for the
+multi-edit and redundant-announcement shapes now exist.
 
 **Defect this row exists to record (found by the gate run, not by tests):** the first gate run
 reported `t1_5 = 0`. Root cause — the importer gated backup harvesting on `type == "snapshot"`,
@@ -79,17 +131,23 @@ convert some fraction of them to real recoveries and the rest to T3).
 
 ### Anti-overclaim rider (added at the final skeptic gate — read before quoting any figure)
 
-The gate PASSed 8/8 ACs, and the skeptic independently reproduced every figure above. It also
-named four ways these numbers will be misread. Recorded here so they travel WITH the numbers:
+The 8/8 AC gate that produced this rider was passed against figures **since proven wrong** (see
+the two superseded readings above) — treat "the skeptic reproduced every figure" as reproducing
+what the code then did, not as validating the numbers. The misreadings it named all still hold:
 
 1. **"99.6% importable" is an ingestion-without-loud-failure rate, not a recovery rate.** It
-   must never be quoted bare. Context this table omitted: only **184 of 1617 sessions (11.4%)**
-   contain any file-mutation entry at all — all 2151 tier-laddered entries live in those 184 —
-   and **27 of those 184** have zero T1/T1.5-recoverable entries today. A session whose every
-   entry is T3 still counts importable (correctly: it imports as provenance-only turns with
-   `before: null`, which is the pinned semantics — import never fabricates a snapshot). The
-   honest recoverable figure is **40.4% of entries**, ceiling ~85% only if P2 converts every
-   T2 candidate. Quoted bare, "99.6% importable" will be heard as "99.6% recoverable."
+   must never be quoted bare. Context this table omitted: only ~**184 of 1631 sessions (11%)**
+   contain any file-mutation entry at all — every tier-laddered entry lives in those — and some
+   have zero T1/T1.5-recoverable entries. A session whose every entry is T3 still counts
+   importable (correctly: it imports as provenance-only turns with `before: null`, the pinned
+   semantics — import never fabricates a snapshot). The honest recoverable figure is **43.8%**
+   of entries (**31.7%** if you count only entries yielding actual bytes), with a ceiling near
+   85% only if P2 converts every T2 candidate — and P2 will not, since git holds committed
+   states only. Quoted bare, "99.6% importable" will be heard as "99.6% recoverable."
+1b. **The 85% ceiling needs the same ban 92.3% has.** 43.8 + 41.5 (T2-candidate) ≈ 85%, and it
+   is an upper bound by exactly the argument that banned 92.3%: a mid-session intermediate edit
+   was never committed, so its bytes are not in git at all. **Do not quote ~85% as a recovery
+   rate.** It is the ceiling if every candidate resolved, which is known to be false.
 2. **The opaque bucket is not "Bash/Task."** An earlier revision of this row labeled it so; the
    8618 actually include ~1434 `Read` results, ~430 string-form `toolUseResult`s (mostly
    errors), plus Grep/TodoWrite/AskUserQuestion. The count is honest; the old parenthetical was
@@ -100,9 +158,21 @@ named four ways these numbers will be misread. Recorded here so they travel WITH
    which constant Linux actually selects closes only on the CI Linux run — still blocked on the
    unopened `fix/perf-evidence-round` PR. Same for the release-only debug-seam guard test,
    which never runs in the default suite (the `strings` check is the real evidence there).
-4. **This is one machine's 30-day window.** 1617 sessions of one user's Claude Code habits. The
-   4-tier shares — especially T1.5 at 0.5% — are a property of this corpus and this Claude Code
-   version's snapshot behavior. Not a population claim.
+4. **This is one machine's 30-day window.** ~1631 sessions of one user's Claude Code habits.
+   The 4-tier shares — especially T1.5 at 4.2% — are a property of this corpus and this Claude
+   Code version's snapshot behavior. Not a population claim.
+5. **Open, unverifiable by any channel available today:** the ~90 surviving T1.5 entries that
+   have no inline `originalFile` cannot be checked against ground truth — by construction there
+   is nothing to compare them to. An edit by another tool or a human between the snapshot and
+   the recorded edit would silently invalidate one, and the transcript cannot see it. The only
+   channel that would close this is P2 comparing a resolved `before` against the git blob at
+   the session timestamp for the T1.5∩T2 overlap. Until then the 1.0% residual error rate is
+   measured over the *checkable* subset only, not over all of T1.5.
+6. **Pinned decision 14 (`cwd` is session-level, first line wins) is contradicted by the
+   corpus** — 67 sessions carry more than one distinct `cwd`, usually a subdirectory move.
+   Resolving each key against the `cwd` in effect at its own snapshot line finds more
+   candidates at slightly better precision. The decision is marked non-re-litigable, so this
+   was deliberately NOT changed and is escalated to the founder as an open question.
 
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
