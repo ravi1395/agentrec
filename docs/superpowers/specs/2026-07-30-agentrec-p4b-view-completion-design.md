@@ -1,10 +1,18 @@
 # P4b — `RepositoryView` completion (diff / blame / recall / wire `list`)
 
-> **Status:** design, awaiting binding skeptic gate. Written 2026-07-30 against
+> **Status:** design, revision 2 — amended after skeptic round 1 returned FAIL with 5 blocking
+> findings (all independently verified, all real). Written 2026-07-30 against
 > `feat/phase-2-0-substrate` @ `638290d`. Parent spec:
 > `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Deep module 1).
 > Parent plan: `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`.
 > Conflict order: PROTOCOL.md > IMPLEMENTATION.md > parent spec > this doc.
+>
+> **Revision 2 changelog** (§Skeptic round 1 records the full findings):
+> R1 dropped decision 6 — it would have reversed the gate-PASSED D-PD4; R2 retargeted G4 from
+> `log` to `status`, whose filter `list()` actually fits; R3 scoped AC1 around `show`/`undo`,
+> which revision 1 failed to inventory; R4 replaced the unmechanizable `rg`-path ACs with
+> positive behavioral gates; R5 added `store_empty` to `RecallPage`; R6 corrected the
+> §Why P4 gate-PASSed thesis, which was literally false as first written.
 
 ## Why this phase exists
 
@@ -19,18 +27,18 @@ deletions its acceptance criteria actually asserted. It did **not** deliver `dif
 `recall`, which appeared only in P4.md's prose "Interface contract" block. `list` was delivered
 but left with **zero callers**.
 
-This is not a retroactive attack on P4's gate. P4's verdict was sound for what its ACs
-asserted; the ACs were the defect. See §Why P4 gate-PASSed, which is a load-bearing part of
-this design, not an aside.
+This is not a retroactive attack on P4's gate. P4's verdict was sound for what its ACs asserted;
+the ACs had a hole. See §Why P4 gate-PASSed.
 
 The immediate consequence is that **P5 cannot be executed as written.** P5.md states
 "DEPENDENCY: P4 must be merged — this phase is adapters over P4's typed values", and its AC1
 requires `serde_json` of "the exact typed value returned by `RepositoryView`". No such value
-exists for `diff` or `blame`. A fresh-context P5 executor would either build the missing
-view.rs plumbing inside P5's commit (scope drift, and the gate would not catch it — same AC
-blind spot as P4) or hand-build JSON off the print logic (direct AC violation).
+exists for `diff` or `blame`, and P5's own file budget (`readcmds.rs`/`cmds.rs`/`main.rs`/
+`README.md`) forbids the `view.rs` edits needed to create them. A fresh-context P5 executor
+would either violate P5's file list or hand-build JSON off the print logic — a direct AC
+violation. *(Skeptic round 1 confirmed this diagnosis as correct and not overstated.)*
 
-## Measured starting state (verified 2026-07-30, not asserted)
+## Measured starting state (verified 2026-07-30; re-verified by skeptic round 1)
 
 | Fact | Evidence |
 |---|---|
@@ -39,13 +47,24 @@ blind spot as P4) or hand-build JSON off the print logic (direct AC violation).
 | `view.rs` public methods | `open`, `ledger`, `health`, `health_of`, `list` — plus free functions `recording_gaps`, `has_crash_gap`, `crash_gap_count`, `has_gap_after`, `resolve_turn`, `same_revert`, `load_ledger` |
 | `DiffQuery` / `BlameQuery` / `RecallQuery` / `FileDiff` / `BlameResult` / `MemoryHit` | `rg` across `agentrec-core/src` + `cli/src` → **0 matches**; none exist |
 | `view::list` callers | `rg '\.list\('` outside `view.rs` → **0 matches**; dead code |
-| `diff` / `blame` shape | `cli/src/readcmds.rs:20` / `:296` — `println!` direct, `Result<(), String>` |
-| `recall` shape | `cli/src/memorycmds.rs:526` — calls `memory::recall_outcome` directly |
-| `log --json` shape | `cli/src/cmds.rs:99` — inline `serde_json::to_string(turn)` |
+| `diff` / `blame` shape | `readcmds::diff` / `readcmds::blame` — `println!` direct, `Result<(), String>` |
+| `recall` shape | `memorycmds::recall_cmd` — calls `memory::recall_outcome` directly |
+| `log --json` shape | `cmds::log` — inline `serde_json::to_string(turn)` |
 | `recall --json` golden | **none** — `cli/tests/fixtures/golden/` has `log_json`, `status_json`, no recall |
+| `readcmds.rs` ledger/blob users | `rg -c 'load_log\|BlobStore' cli/src/readcmds.rs` → **17** — `diff`, **`show`**, `blame`, **`undo`/`execute_revert`**, and shared helpers `print_entry`, `load_blob`, `load_text` |
+| `status_report` duplicates `list()`'s filter | `cmds::status_report` re-derives `merged_ids` + superseded filter + `tool != "git"` — `TurnQuery{include_all:false}` verbatim |
+| `log --json` empty case **is** pinned | `cli/tests/integration.rs::log_json_zero_turns_prints_empty_array` asserts `[]`; **D-PD4**, `HANDOVER-PD-FIXES.md:20` |
 
-The "21 passed" golden figure carried in P3.md / P4.md / P5.md is stale (actual 27); P4b's own
-verification section states measured deltas against 537 / 27, and corrects those three files.
+Revision 1 asserted the `log --json` empty case was unpinned. It is pinned — by an integration
+test, not a golden; revision 1 checked only golden files. Revision 1 also inventoried only
+`diff`/`blame` as `readcmds.rs`'s ledger users, missing `show` and `undo`. Both errors are
+corrected above and both changed the design (R1, R3).
+
+Pointers in this document are `file:symbol`, not line numbers, per the house rule that lines rot
+(revision 1 violated this).
+
+The "21 passed" golden figure carried in P3.md / P4.md / P5.md is stale (actual 27); this phase's
+doc commit corrects those three files.
 
 ## Gap inventory
 
@@ -54,21 +73,29 @@ verification section states measured deltas against 537 / 27, and corrects those
 - **G1 — `RepositoryView::diff` missing.** No `DiffQuery`, no `FileDiff`.
 - **G2 — `RepositoryView::blame` missing.** No `BlameQuery`, no `BlameResult`.
 - **G3 — `RepositoryView::recall` missing.** No `RecallQuery`, no `MemoryHit`.
-- **G4 — `view::list` has zero callers.** `cmds::log` re-implements it: `load_log`
-  (`cmds.rs:57`) plus the merged-turn and git-turn filters (`cmds.rs:66-67`). Wiring this is not
-  scope creep — `TurnQuery::include_all`'s own doc comment ("include turns superseded by a
-  retroactive merge, and git turns") describes those two filters verbatim. `list` was built for
-  that call site. An unwired seam is an unverified seam, which is precisely how P4's drift
-  survived a gate.
+- **G4 — `view::list` has zero callers; `cmds::status_report` re-implements it.**
+  `status_report` derives `merged_ids`, filters superseded ids, and filters `tool != "git"` —
+  which is `TurnQuery{include_all:false}` verbatim, matching `TurnQuery::include_all`'s own doc
+  comment ("include turns superseded by a retroactive merge, and git turns"). Every field
+  `status` then consumes (`imported`, `grade`, `tool`, and a count) is already on `TurnSummary`,
+  so `list()` fits with **no type widening**. An unwired seam is an unverified seam — which is
+  how P4's drift survived a gate.
 - **G5 — `log --json` hand-rolls its serializer.** A fourth one-serializer violation, outside
   P5's scope (P5 covers diff/blame/status only). The parent spec's MCP table requires
-  `agentrec_log` to mirror the `--json` contract exactly, through the same serializer.
+  `agentrec_log` to mirror the `--json` contract through the same serializer.
 
 ### Out of scope, with the reason recorded so a fresh executor cannot resurrect it
 
-- **`UndoCoordinator`** — parent plan's wave-2 table names it explicitly *together with this
-  exact trap*: "Its full contract exists to serve MCP destructive (2.3). Bound it explicitly or
-  a fresh-context executor builds the whole 2.3 ledger early."
+- **`UndoCoordinator` and everything `undo` touches** — parent plan's wave-2 table names it
+  explicitly *together with this exact trap*: "Its full contract exists to serve MCP destructive
+  (2.3). Bound it explicitly or a fresh-context executor builds the whole 2.3 ledger early."
+  `readcmds::undo` and `execute_revert` therefore keep their direct `load_log`/`BlobStore` use;
+  AC1 is scoped accordingly (R3).
+- **`agentrec show`** — `readcmds::show` also reads the ledger and blobs directly, and carries
+  D-PD2 prompt-posture semantics (bare header vs `--prompt` full post-scrub text, `--all-files`
+  noise reveal) that no view method models. Designing a prompt-blob read into the seam is real
+  work with a prompt-posture surface; it is **deferred and named**, not silently omitted. `show`
+  keeps its direct reads this phase.
 - **Report-safe sanitization** — parent spec ties it to `ReportBuilder`, a Phase 3 module that
   "Phase 2 must not pre-build, only avoid foreclosing".
 - **L3 sidecar merge** — no L3 emitter exists. Codex is Phase 2.1 at L2, and the format freeze
@@ -83,28 +110,34 @@ verification section states measured deltas against 537 / 27, and corrects those
   50 ms-budgeted fail-open path through a read seam buys nothing and risks a regression in the
   one place the repo has already had to harden twice.
 - **Line *ranges* in blame** — the parent spec's MCP table says "optional line/range", but
-  `readcmds::parse_target` is single-line only today. `BlameQuery` carries
-  `line: Option<usize>`; range support is deferred to whichever phase needs it, named here so
-  it is a known deferral rather than a silent omission.
+  `readcmds::parse_target` is single-line only today. `BlameQuery` carries `line: Option<usize>`;
+  range support is deferred, named here so it is a known deferral.
+- **The `log --json` array/JSONL asymmetry** — empty prints `[]`, non-empty prints one object
+  per line. Genuinely inconsistent, but **D-PD4 chose the empty-case `[]` deliberately** ("blank
+  stdout is not valid JSON and breaks any consumer that parses it") and that decision is
+  gate-PASSED. Recorded as a known contract wart that MCP 2.2 will mirror; not fixed here
+  (decision 6, R1).
 
 ## Why P4 gate-PASSed without diff/blame/recall
 
-Every P4 acceptance criterion is one of two shapes:
+The precise failure — corrected from revision 1, which overstated it:
 
-1. A **negative-space** assertion — `rg 'fn has_recording_gap|fn has_gap_after|fn count_gaps'
-   cli/src` → 0 matches; `rg 'fn same_revert|fn resolve_turn' cli/src` → 0 matches.
-2. A **golden-byte** or behavioral check — goldens byte-identical, `health()` writes nothing,
-   human `status` still evicts, cursor staleness, parse tolerance.
+P4 **did** have positive, behavior-asserting ACs, and they held. Its AC4 names `health()` and
+asserts it performs zero writes (RED without the split); its cursor AC is exercised by tests
+that call `view.list()`. Revision 1 claimed "not one AC asserted that a method exists" — that is
+literally false.
 
-Not one AC asserted that a method **exists**, or that an adapter **calls** it. The three
-deletions were gated, so the three deletions landed. The three additions were prose, and prose
-carries no gate weight in this repo's AC style.
+The real hole is narrower and more instructive: **`diff`, `blame`, and `recall` had no AC of any
+kind.** They existed only in P4.md's prose "Interface contract" block, and prose carries no gate
+weight in this repo. Everything P4 gated, P4 delivered.
 
-**The design consequence, which is the whole point of recording this:** P4b expresses every
-addition as an adapter-side negative-space AC — "the old path is gone from the adapter" — not as
-an interface-contract block. The interface block below exists for P5's benefit as a consumer
-contract; it carries **zero** AC weight, and this doc says so explicitly so no future executor
-mistakes it for one again.
+**The design consequence:** the load-bearing gates for this phase are **positive behavioral
+ACs** — the shape that actually worked in P4 — not negative-space `rg` assertions. Revision 1
+over-rotated into `rg` ACs, and skeptic round 1 demonstrated two ways to game them (see §Skeptic
+round 1, B1 and B4). `rg` assertions remain in the AC set, but only where they are literally
+runnable and go to zero, and they are supplementary. The interface block below exists as a
+consumer contract for P5; it carries **zero** AC weight, and this sentence exists so no future
+executor mistakes it for one again.
 
 ## Interface contract (consumed by P5 and, later, MCP 2.2)
 
@@ -133,121 +166,164 @@ pub struct DiffQuery   { pub turn: String, pub paths: Option<Vec<String>>,
 pub struct BlameQuery  { pub path: String, pub line: Option<usize> }
 pub struct RecallQuery { pub query: String, pub k: usize, pub after: Option<Cursor> }
 pub struct RecallPage  { pub page: Page<MemoryHit>, pub capped: bool,
-                         pub store_corrupt: bool }
+                         pub store_corrupt: bool, pub store_empty: bool }
 ```
 
-`blame` is deliberately unpaginated: one path (optionally one line) yields one result. This
-matches the parent spec's own signature and its MCP table ("one line/range result").
+`blame` is deliberately unpaginated: one path (optionally one line) yields one result, matching
+the parent spec's signature and its MCP table ("one line/range result").
 
-## Decisions (founder-confirmed 2026-07-30; executors may not re-litigate)
+`store_empty` (R5) is load-bearing: `recall_cmd` today calls `memory::load_effective` directly to
+split "no memories yet" (PD3 zero-state, stderr) from "no fresh memories match" (stdout).
+Without it on `RecallPage`, the adapter must reach around the seam to render its own empty
+states — a half-bypassed seam that revision 1's ACs did not catch.
+
+## Decisions (executors may not re-litigate)
 
 1. **P4b is a distinct phase, sequenced before P5.** Not folded into P5 (P5's file budget is
    `readcmds.rs`/`cmds.rs`/`main.rs`/`README.md`; recall additionally touches `memorycmds.rs`),
    and not deferred to MCP 2.2 (which would leave P5's stated dependency false and let the
    one-serializer invariant stay violated while more code stacks on it).
-2. **Scope is all three missing methods at once**, not diff/blame first and recall later. One
-   re-open, not two.
-3. **`recall --json` output stays byte-identical.** Same discipline P4 applied to diff/blame/
-   status human forms: `RepositoryView::recall` is a seam swap underneath a stable contract, not
-   a contract change. `MemoryHit` therefore carries `EffectiveJson`'s exact serde shape
-   (`id`, `fact`, `pins`, `origin`, `ts`, `retracted`, `freshness`, and `reason` omitted-when-absent).
-4. **The memory hook path is out of scope** (rationale above, under out-of-scope).
-5. **Two typed values for turns, not one.** `TurnSummary` is a lossy projection — it drops `v`,
-   `truncated`, `model`, `session`, `root`, `prompt_ref`, `prompt_excerpt`, `merges`,
-   `files_complete`, and reduces `files[]` to a count. `log --json` emits the **full**
-   `TurnRecord` today (pinned in `log_json.golden`), so routing it through
-   `Page<TurnSummary>` would silently drop ten fields. `list()` keeps `Page<TurnSummary>` and
-   serves the human `log` line plus MCP 2.2's bounded "≤200 turn summaries";
-   `list_records()` returns `Page<TurnRecord>` and serves `log --json`.
-6. **`log --json`'s empty/non-empty inconsistency is fixed, as consistent JSONL.** Today the
-   empty case prints `[]` (a JSON array) while the non-empty case prints one object per line
-   (JSONL) — `cmds.rs:71-76` vs `:99`. `log_json.golden` pins only the non-empty case, so the
-   empty case is unpinned in either direction. The empty case becomes **zero lines of stdout**.
-   `log_json.golden` bytes are unchanged; a new golden pins the empty case. Rejected: making
-   both a JSON array (changes `log_json.golden` bytes, breaks decision 3's discipline and any
-   line-oriented consumer); keeping the wart (MCP 2.2 would mirror it permanently).
-7. **`recall --json` goldens are captured before any refactor.** Decision 3 is unfalsifiable
-   without an instrument — the same failure mode as P4's prose contract. Commit 1 captures them
-   against current code, touching zero production files. This mirrors the P3→P4 pattern that
-   made byte-equivalence a real claim rather than an assertion.
+2. **Scope is all three missing methods at once**, not diff/blame first and recall later.
+3. **`recall --json` output stays byte-identical.** `RepositoryView::recall` is a seam swap
+   underneath a stable contract. `MemoryHit` carries `EffectiveJson`'s exact serde shape
+   (`id`, `fact`, `pins`, `origin`, `ts`, `retracted`, `freshness`, `reason` omitted-when-absent).
+   `capped`/`store_corrupt`/`store_empty` ride on `RecallPage`, **not** in the JSON — today's
+   `--json` deliberately omits the capped notice, and that omission is preserved.
+4. **The memory hook path is out of scope** (rationale under out-of-scope).
+5. **Two typed values for turns, with distinct consumers.** `TurnSummary` is a lossy projection —
+   it drops `v`, `truncated`, `model`, `session`, `root`, `prompt_ref`, `prompt_excerpt`,
+   `merges`, `files_complete`, and reduces `files[]` to a count.
+   - `list() -> Page<TurnSummary>` serves **`status`** (G4) and, later, MCP 2.2's bounded
+     "≤200 turn summaries".
+   - `list_records() -> Page<TurnRecord>` serves **both** `log` forms. The human `log` line needs
+     `prompt_excerpt`, `truncated`, and `files_complete` (`fmt::turn_list_line`) and the noise
+     fold needs per-file paths (`cmds::log`); `log --json` emits the full record, pinned by
+     `log_json.golden`. Revision 1 wrongly claimed `list()` serves human `log` (R2).
+
+   Rejected: widening `TurnSummary` to cover the human `log` line — the parent spec's rule
+   "prompt contents are opt-in data, never included in generic summaries" makes
+   `prompt_excerpt`-in-a-summary-type a direct collision.
+6. **Withdrawn (R1).** Revision 1 proposed changing `log --json`'s empty case from `[]` to zero
+   lines. That reverses **D-PD4** (`HANDOVER-PD-FIXES.md:20`, gate-PASSED, pinned by
+   `integration.rs::log_json_zero_turns_prints_empty_array`, rationale "blank stdout is not
+   valid JSON"), on the false premise that the case was unpinned. `[]` stays; the empty-case
+   test is not weakened, deleted, or inverted. G5 narrows to *routing* `log --json` through the
+   view's serializer without touching the empty-case contract. The asymmetry is a recorded wart
+   (see out-of-scope).
+7. **`recall --json` goldens are captured before any refactor** — decision 3 is unfalsifiable
+   without an instrument, the same failure mode as P4's prose contract. Commit 1 captures them
+   against current code, touching zero production files, mirroring the P3→P4 pattern.
 8. **Signature drift resolves toward the code; the parent spec is amended.**
    `health(budget: u64)` stays: budget comes from config, and the view deliberately holds no
    config (re-coupling it would also disturb P5's `status --json` AC surface).
-   `list -> CursorError` stays: it is strictly more precise than `RepoError`.
-9. **Per-method error enums, not one blanket error type.** `view.rs`'s own module doc states
-   errors are typed "so the human CLI keeps ownership of its prose". `diff` has three genuine
-   failure classes (`LookupError` for unknown/ambiguous turn, `CursorError`, IO); collapsing
-   them forces the adapter to re-guess which prose to print — exactly the coupling this seam
-   exists to remove.
-10. **`recall` returns `RecallPage`, not the parent spec's bare `Page<MemoryHit>`.** `capped`
-    (F3) drives a real stderr notice on the human path and `store_corrupt` (F10) is a distinct
-    recall-failure signal; returning only a `Page` would regress both. Amended in the parent
-    spec alongside decision 8.
+   `list -> CursorError` stays: strictly more precise than `RepoError`. Both amendments *add*
+   precision — they are ratchet-ups, not loosenings.
+9. **Per-method error enums, not one blanket error type.** `view.rs`'s module doc states errors
+   are typed "so the human CLI keeps ownership of its prose". `diff` has three genuine failure
+   classes (`LookupError` unknown/ambiguous turn, `CursorError`, IO); collapsing them forces the
+   adapter to re-guess which prose to print — the coupling this seam exists to remove.
+10. **`recall` returns `RecallPage`, not the parent spec's bare `Page<MemoryHit>`** — `capped`
+    (F3), `store_corrupt` (F10), and `store_empty` (PD3) each drive real adapter behavior that a
+    bare `Page` would drop. Amended in the parent spec alongside decision 8.
+11. **`show` and `undo` keep their direct ledger/blob reads this phase** (R3), with the reasons
+    recorded under out-of-scope. AC1 is scoped to the `diff`/`blame` surface accordingly rather
+    than demanding a file-wide zero it cannot honestly reach.
+12. **The parent spec's `agentrec_log` MCP row is amended in the same doc commit.** It promises
+    "≤200 turn **summaries**" while also promising read tools "mirror the Phase 2.0 `--json`
+    contracts exactly … same typed values, one serializer". Under decision 5 those are
+    irreconcilable for `agentrec_log`: `log --json` is full records, MCP summaries are
+    `TurnSummary`. The amendment states that `agentrec_log` mirrors `list()`'s summary contract,
+    and defers a full-record tool or parameter.
 
 ## Commit sequence
 
-1. **Goldens only — zero production files.** Capture `recall --json` (populated, no-match
-   against a non-empty store, empty store) and the `log --json` empty case, against current
-   code. Makes decisions 3 and 6 falsifiable before anything moves.
-2. **`diff` + `blame` into `view.rs`**, adapters rewritten as render-only. `readcmds.rs` stops
-   loading the log and stops touching `BlobStore`.
-3. **`recall` into `view.rs`** + adapter. `MemoryHit` carries `EffectiveJson`'s serde shape.
-4. **G4 + G5:** `cmds::log` → `list()` (human) and `list_records()` (`--json`); the empty-case
-   JSONL fix from decision 6.
-5. **Docs:** parent spec §Deep module 1 amendment (decisions 8 and 10); `P5.md` dependency line
-   corrected `P4` → `P4b`; the stale "21 passed" golden figure corrected in P3.md/P4.md/P5.md;
-   `README.md` if any documented flag behavior changed; `CLAUDE.md` Status per house rule.
+Five commits, not one. The parent plan's "one phase = one commit" protocol is deviated from
+deliberately and this is the sanctioned exception: commit 1 must contain **zero production
+changes** for its goldens to be a valid pre-refactor instrument, exactly as P3's goldens were
+for P4.
+
+1. **Goldens only — zero production files.** Capture `recall --json` (populated; no-match against
+   a non-empty store; empty store) **and** the two human `recall` empty-state outputs
+   ("no memories yet" on stderr vs "no fresh memories match" on stdout), which are the states
+   `store_empty` exists to preserve. Makes decision 3 and R5 falsifiable before anything moves.
+2. **`diff` + `blame` into `view.rs`**, adapters rewritten as render-only for those two verbs.
+   README rides this commit if any documented behavior of `diff`/`blame` changes.
+3. **`recall` into `view.rs`** + adapter. `MemoryHit` carries `EffectiveJson`'s serde shape;
+   `RecallPage` carries `capped`/`store_corrupt`/`store_empty`.
+4. **G4 + G5:** `cmds::status_report` → `list()`; `cmds::log` (both forms) → `list_records()`.
+   No empty-case contract change (decision 6). README rides this commit if any documented flag
+   behavior changed.
+5. **Docs:** parent spec §Deep module 1 amendment (decisions 8, 10) and the `agentrec_log` MCP
+   row amendment (decision 12); `P5.md` dependency line corrected `P4` → `P4b`; the stale
+   "21 passed" golden figure corrected in P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
 
 ## Acceptance criteria
 
-Negative-space, adapter-side — the only AC shape that held in P4:
+**Load-bearing — positive and behavioral.** These are the gates; they fail if behavior moved at
+all.
 
-- [ ] **AC1** `rg 'load_log|BlobStore' cli/src/readcmds.rs` → **0 matches**. `diff` and `blame`
-      obtain every value from `RepositoryView`; the adapter only renders.
-- [ ] **AC2** `rg 'load_log' cli/src/cmds.rs` → **0 matches on the `log` path**
-      (`cmds::log` reaches the ledger only through `list`/`list_records`).
-- [ ] **AC3** `rg 'memory::recall' cli/src/memorycmds.rs` → matches **only** inside the
-      hook-path functions (`recall_for_hook`, `recall_for_hook_with_deadline`); the
-      `recall_cmd` path routes through `RepositoryView::recall`.
-- [ ] **AC4** `rg 'serde_json::to_string' cli/src` → **0 matches on the `log` and `recall`
-      paths**; both serialize the typed value the view returned.
-
-Positive, byte-pinned:
-
-- [ ] **AC5** All 27 pre-existing goldens byte-identical at the final commit — including
-      `log_json.golden`, which decision 5 exists to protect.
-- [ ] **AC6** The 4 goldens captured in commit 1 are byte-identical after commits 2–4. RED
-      proof required: `recall --json` routed through a `MemoryHit` that omits any
-      `EffectiveJson` field must fail AC6 (demonstrate once in-test, then fix).
-- [ ] **AC7** `log --json` on a zero-turn repo emits **zero bytes** on stdout, exit 0 — pinned
-      by a new golden. The pre-change `[]` behavior is gone and no golden still asserts it.
-- [ ] **AC8** A field added to `TurnRecord` appears in `log --json` with no adapter edit; a
-      field added to `MemoryHit` appears in `recall --json` with no adapter edit (both proven by
-      adding a temp field in-test).
-- [ ] **AC9** `RepositoryView::diff` on an unknown turn ref returns `DiffError::Lookup(Unknown)`
-      and on a duplicated id returns the collapsed turn (not `Ambiguous`) — the P3
+- [ ] **AC1** Every pre-existing golden is byte-identical at the final commit — all 27, including
+      `log_json.golden` (which decision 5 exists to protect) and the blame/gap-honesty goldens.
+- [ ] **AC2** The 5 goldens captured in commit 1 are byte-identical after commits 2–4. RED proof
+      required: a `MemoryHit` omitting any `EffectiveJson` field, or a `RecallPage` without
+      `store_empty`, must fail this AC — demonstrate the failure once in-test, then fix.
+- [ ] **AC3** `cmds::log`'s output equals `serde_json` of exactly what the view returned:
+      a test asserts `log --json` stdout is byte-equal to serializing
+      `view.list_records(&TurnQuery{include_all, ..})`'s items with no adapter-side field
+      construction. Same assertion for `recall --json` against `view.recall(..)`.
+- [ ] **AC4** A field added to `TurnRecord` appears in `log --json` with no adapter edit; a field
+      added to `MemoryHit` appears in `recall --json` with no adapter edit (both proven by adding
+      a temp field in-test).
+- [ ] **AC5** `list()` has at least one production caller, and it is `status`: `rg '\.list\('
+      cli/src` → **≥1 match**, and a test asserts `status`'s turn count, rich-rate, and
+      git-hidden accounting are computed from `list()`'s page rather than a re-derived filter
+      (RED if `status_report` still calls `merged_ids` itself). This AC exists because revision 1
+      would have left `list()` dead a second time.
+- [ ] **AC6** `log --json` on a zero-turn repo still prints `[]`, exit 0 —
+      `integration.rs::log_json_zero_turns_prints_empty_array` passes **unmodified**. D-PD4 is
+      not weakened, deleted, or inverted (decision 6).
+- [ ] **AC7** `RepositoryView::diff` on an unknown turn ref returns `DiffError::Lookup(Unknown)`;
+      on a duplicated id it returns the collapsed turn (not `Ambiguous`) — the P3
       duplicate-collapse golden still passes, and a distinct-turns-sharing-an-id fixture still
       errors ambiguous.
-- [ ] **AC10** `RepositoryView::blame` on an uncovered path returns a `BlameResult` carrying the
-      recording-gap state with **no** attributor — never a guess. The gap-honesty goldens are
-      unchanged.
-- [ ] **AC11** `RecallPage::capped` is set when the verify walk stops at `RECALL_VERIFY_CAP`,
-      and the human adapter still prints the F3 stderr notice; `--json` still omits it
-      (decision 3 — byte-identical).
+- [ ] **AC8** `RepositoryView::diff` on a fileless turn returns an empty `Page<FileDiff>`, not an
+      error (P5 needs `{"files":[]}` over this).
+- [ ] **AC9** `RepositoryView::blame` on an uncovered path returns a `BlameResult` carrying the
+      recording-gap state with **no** attributor — never a guess. Gap-honesty goldens unchanged.
+      `blame_line`'s exact-line-text heuristic is preserved verbatim, proven by the line-level
+      goldens.
+- [ ] **AC10** `RecallPage::capped` is set when the verify walk stops at `RECALL_VERIFY_CAP` and
+      the human adapter still prints the F3 stderr notice; `--json` still omits it (decision 3).
+- [ ] **AC11** `RecallPage::store_empty` distinguishes an empty store from a no-fresh-match
+      result, and both human empty-state outputs are byte-identical to commit 1's goldens. RED
+      without `store_empty`.
 - [ ] **AC12** `RepositoryView::recall` performs **zero writes**: `memory.jsonl` length and
       `memory-stats.jsonl` mtime unchanged across a call.
-- [ ] **AC13** The hook path is untouched: `git diff --stat` over the phase shows no change to
-      `recall_for_hook`, `recall_for_hook_with_deadline`, or `cmds::inject_memory`, and
-      `hook_recall_hard_wall_deadline` passes unmodified.
+- [ ] **AC13** Cursor semantics carry over: a cursor from `list_records` or `diff` replayed after
+      a `purge --log-duplicates` rewrite returns `stale_cursor`, never a silently holed page —
+      the same guarantee already proven for `list`.
+
+**Supplementary — negative-space, scoped to be literally runnable** (revision 1's versions were
+not; see §Skeptic round 1, B1 and B4):
+
+- [ ] **AC14** `rg 'load_log|BlobStore' cli/src/readcmds.rs` no longer matches inside
+      `readcmds::diff` or `readcmds::blame`. The file-wide count drops from **17** to the
+      `show` + `undo` + shared-helper remainder, and the executor states the new count with the
+      surviving matches attributed by function. A file-wide zero is **not** the target
+      (decision 11).
+- [ ] **AC15** `rg 'memory::' cli/src/memorycmds.rs` no longer matches inside `recall_cmd` —
+      including `memory::load_effective`, which revision 1's `memory::recall`-only grep missed.
+      Hook-path functions keep their matches.
 
 ## Verification
 
-Assert **deltas against the measured baseline** (537 / 0 / 2 and 27 goldens), not absolute
+Assert **deltas against the measured baseline** (537 / 0 / 2 and 27 goldens), never absolute
 counts — every prior task file's absolute figure has gone stale:
 
 ```
 cargo test -p agentrec-core view::                        # baseline + new diff/blame/recall tests
-cargo test -p agentrec --test golden                      # 27 + 4 new = 31 passed, 0 changed bytes
+cargo test -p agentrec --test golden                      # 27 + 5 new = 32 passed, 0 changed bytes
+cargo test -p agentrec --test integration                 # includes log_json_zero_turns_prints_empty_array, unmodified
 cargo test --workspace -- --test-threads=3                # 537 + delta passed, 0 failed, 2 ignored
 cargo clippy --workspace --all-targets -- -D warnings     # clean, debug and release
 cargo fmt --check
@@ -255,30 +331,71 @@ cargo fmt --check
 
 Manual, on the dogfood repo: `agentrec log --json | jq -s .` parses; `agentrec recall --json
 <query> | jq .` parses and matches pre-change output byte-for-byte; `agentrec log --json` in a
-zero-turn tempdir emits nothing, exit 0.
+zero-turn tempdir prints `[]`, exit 0; `agentrec status` output unchanged before/after the
+`list()` rewiring.
 
 ## Edge cases
 
-- Zero-turn repo (`log`, `log --json`, `diff`, `blame`).
+- Zero-turn repo (`log`, `log --json` → `[]`, `status`, `diff`, `blame`).
 - Log containing only epoch records.
-- `diff` on a fileless turn (P5 will need `{"files":[]}`; P4b must return an empty
-  `Page<FileDiff>`, not an error).
-- Duplicated turn id (collapse) vs distinct turns sharing an id (ambiguous) — AC9.
-- `recall` against an empty store vs a non-empty store with no fresh match — distinct outputs
-  today; both pinned in commit 1.
+- `diff` on a fileless turn → empty page, not an error (AC8).
+- Duplicated turn id (collapse) vs distinct turns sharing an id (ambiguous) — AC7.
+- `recall` against an empty store vs a non-empty store with no fresh match — **distinct only on
+  the human path**; in `--json` both emit `[]` because the json branch returns before the
+  distinction is drawn. Commit 1 captures the human pair, which is where the difference is
+  observable (revision 1 mis-stated this).
 - Corrupt `memory.jsonl` → `store_corrupt`, fail-open posture preserved on the CLI path.
-- Cursor replayed across a `purge --log-duplicates` rewrite → `stale_cursor` (already proven for
-  `list`; `list_records` and `diff` inherit it and must not silently diverge).
-- `NO_COLOR` / non-TTY — affects human rendering only; JSON paths unaffected.
+- Cursor replayed across a `purge --log-duplicates` rewrite → `stale_cursor` (AC13).
+- Concurrent daemon append during a read — all reads are ledger-fresh per call (`view.rs`'s
+  "holds no open handles" contract); no read path takes `log.lock`.
+- `NO_COLOR` / non-TTY — human rendering only; JSON paths unaffected.
+- `--explain` glossary (`fmt::glossary_for`) scans this invocation's rendered human output; the
+  rewiring must not change what `log` renders, or the glossary AC silently breaks. Covered by
+  AC1's `log_explain.golden`.
 
 ## Risks
 
-- **Highest risk is a repeat of P4's failure mode**: an executor satisfies the negative-space
-  ACs by deleting the old path while the new seam is thin or partially bypassed. AC5–AC8 are the
-  counterweight — they fail if behavior moved at all.
-- `readcmds.rs` is large and blame is the most intricate logic in it (`blame_line`'s exact-line-
-  text heuristic, with a documented v1 limitation). Extraction must preserve that heuristic
-  verbatim; the blame goldens are the instrument.
-- Commit 4 changes user-visible `log --json` behavior in the empty case. It is a deliberate,
-  founder-decided fix (decision 6) and rides with its own golden and a README line if the flag
-  is documented there.
+- **Highest risk is a repeat of P4's failure mode** in a new form: an executor satisfies the
+  supplementary `rg` ACs by deleting or relocating the old path while the new seam is thin or
+  bypassed. AC1–AC5 are the counterweight, and AC5 exists specifically because skeptic round 1
+  showed revision 1's AC set passed with `list()` still dead.
+- `readcmds.rs` is large and shared: `print_entry`, `load_blob`, and `load_text` serve `diff`,
+  `show`, **and** `undo`. Extracting diff/blame must not break `show`/`undo`, which keep their
+  direct reads. Ownership of those three helpers is an explicit design question for the task
+  file, not something to settle by moving code and seeing what compiles.
+- `blame_line`'s exact-line-text heuristic (with its documented v1 duplicate-line limitation) is
+  the most intricate logic in the file. It must move verbatim; the blame goldens are the
+  instrument (AC9).
+- `status` is behaviorally dense (rich-rate window, DEGRADED section, eviction on the human path
+  from P4's split). Rewiring its turn source must not disturb the eviction behavior P4
+  deliberately preserved — `status.golden` and `status_json.golden` are the instrument.
+
+## Skeptic round 1 (2026-07-30) — FAIL, 5 blocking, all verified real
+
+Recorded so revision 2's changes are traceable and so no executor re-introduces a resolved
+defect. Findings verified independently against the tree before amending.
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | `rg 'load_log\|BlobStore' cli/src/readcmds.rs` → **17** matches, spanning `show` and `undo`/`execute_revert` plus shared helpers — revision 1's AC1 ("→ 0 matches") was unsatisfiable without rewiring out-of-scope `undo` or undesigned `show`, leaving file-shuffling as the only way to "pass" | R3: decision 11 + AC14 scope the assertion to `diff`/`blame`; `show`/`undo` named out-of-scope; helper ownership raised as an explicit task-file question |
+| B2 | The `log --json` empty case **is** pinned — `integration.rs::log_json_zero_turns_prints_empty_array`, implementing gate-PASSED **D-PD4**. Revision 1's decision 6 would have deleted a gated test on a false premise, the exact loosening the ratchet rule forbids | R1: decision 6 withdrawn; AC6 pins the test as unmodified; asymmetry recorded as a known wart |
+| B3 | `TurnSummary` cannot render the human `log` line (`fmt::turn_list_line` needs `prompt_excerpt`/`truncated`/`files_complete`; noise fold needs per-file paths). Revision 1's claim that `list()` serves human `log` was false, and the only golden-preserving fix left `list()` **dead again** — G4 recurring, unpinned by any AC | R2: decision 5 rewritten; `list()`'s real consumer is `status`, whose filter it matches verbatim and whose fields `TurnSummary` already carries; AC5 pins it |
+| B4 | Revision 1's AC4 ("`rg 'serde_json::to_string' cli/src` → 0 on the log and recall paths") was unmechanizable — `rg` matches lines, not call paths — and banned the very call the design requires; its AC2 also matched doc comments | R4: replaced by AC3, a byte-equality assertion against the view's serialized return value |
+| B5 | `RecallPage` lacked a store-empty discriminator; `recall_cmd` calls `memory::load_effective` directly for its PD3 empty state, which revision 1's `memory::recall`-only grep did not catch — seam half-bypassed with every AC passing | R5: `store_empty` added; AC11 pins both human empty states; AC15 widens the grep to `memory::` |
+
+Non-blocking findings also folded in: the §Why P4 gate-PASSed thesis corrected (R6 — P4's AC4
+*did* assert `health()`'s behavior; the real hole was diff/blame/recall having no AC at all, and
+revision 1's corrective over-rotated toward the gameable `rg` shape); the `agentrec_log`
+summaries-vs-one-serializer contradiction now amended explicitly (decision 12); the `--json`
+recall empty-state edge case corrected; revision 1's `git diff --stat` hook-path AC dropped as
+theater (`memorycmds.rs` necessarily changes, so `--stat` can never show the intended
+invariant) — the surviving real gate is `hook_recall_hard_wall_deadline` passing unmodified,
+folded into decision 4's scope statement; line-number pointers replaced with `file:symbol`;
+README-in-same-commit moved from commit 5 onto commits 2 and 4; the five-commit deviation from
+"one phase = one commit" stated as a sanctioned exception with its reason.
+
+Skeptic round 1 also **confirmed** the central diagnosis (P5 unexecutable as written) and
+independently re-verified every factual claim in §Measured starting state except the two errors
+corrected above. It flagged that the "founder-confirmed" annotation on revision 1's decisions had
+no artifact in the tree; decisions 1–5 and 7–12 are founder-confirmed in session on 2026-07-30,
+decision 6 was withdrawn by the founder after B2 was surfaced, and this document is the artifact.
