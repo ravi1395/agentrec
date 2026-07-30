@@ -367,3 +367,67 @@ plus the two new keys on `log --json`. Recapture 2 (rich-rate fix): exactly 1 li
   "(unknown id)" form does not exist for it. Ruled inapplicable rather than unmet.
 - Linux legs (the `ru_maxrss` divisor, two release-only `#[cfg(not(debug_assertions))]` tests)
   still close only on the unopened CI PR.
+
+## Phase 2.0 P4 — `RepositoryView` extraction (agent round, pre-skeptic)
+
+Branch `feat/phase-2-0-p4` off `feat/phase-2-0-substrate` @ `f19c17d`. Baseline re-measured on
+clean substrate: **504 / 0 / 2** (P4.md's "410" and its "21 goldens" are both stale — goldens
+are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
+
+| AC | Verdict | Evidence |
+|---|---|---|
+| AC1 gap logic unified, not relocated | MET | `rg 'fn has_recording_gap\|fn has_gap_after\|fn count_gaps' cli/src` → 0. One primitive `view::recording_gaps` returns every uncovered interval tagged `Crash`/`Restart`/`TrailingStop`; the three callers are one-line filters over it. |
+| AC2 lookup choke point moved | MET | `rg 'fn same_revert\|fn resolve_turn' cli/src` → 0. `resolve_turn` returns a typed `LookupError`; the CLI shim renders prose and holds no matching logic. `purgecmd` rewired to the core symbol. |
+| AC3 goldens byte-identical | MET | 27/27 pass; `git diff` over `cli/tests/fixtures/golden` empty at every commit. |
+| AC4 `health()` is a pure read | MET | `health_performs_no_writes_on_an_over_budget_store` asserts store bytes + `log.jsonl` length + `state.json` mtime unchanged. **Falsifiability proven**: re-inserting `enforce_budget` into `health()` fails it on the store-bytes assertion; restored → green. |
+| AC5 human `status` still evicts | MET | `status_prints_over_budget_notice` unmodified (`git diff` on it empty) and passing. |
+| AC6 cursor bound to query + ledger identity | MET | Cursor carries the last item's **id** plus a query fingerprint. Same-length `purge --log-duplicates`-shaped rewrite → `Stale` (the test asserts the rewrite really is same-length, or it proves nothing). Truncation → `Stale`. Different query → `QueryMismatch`. |
+| AC7 unknown fields/types tolerated and counted | MET | `Ledger` carries `unknown_type_lines` + `unparsed_lines`, surfaced through `health()`. Blobs referenced only by an unknown-type record survive a real over-budget eviction. |
+
+### Two defects caught in review, both fixed with the regression test that catches them
+
+- **Cursor went spuriously `Stale` on a pure append.** The cursor resolved its id inside the
+  *post-filter* list, so a retroactive merge (PROTOCOL §4 — append-only, documented engine
+  behavior) absorbing an already-returned turn dropped it from `selected` and read as a rewrite.
+  AC6 names exactly that case. Now resolved against the unfiltered ledger:
+  `a_retroactive_merge_appended_after_a_cursor_is_not_treated_as_a_rewrite`, proven falsifying by
+  reverting the fix.
+- **`unknown_type_lines` counted malformed known records.** A `{"type":"turn"}` line missing
+  required fields incremented the "a newer producer wrote a kind we predate" counter — a counter
+  asserting a false fact about the corpus, the same defect class that blocked P2/P3 round 1.
+  Now gated on the `type` *value* against `record::KNOWN_RECORD_TYPES`.
+
+### Deliberate deviations (recorded, not silent)
+
+- **`health(&self, budget: u64)`, not the contract's no-arg `health()`.** The budget stays
+  injected for the same reason `status_report(root, budget)` already injects it (AC I+: an
+  over-budget store is otherwise untestable without a real multi-GiB store), and it keeps
+  `agentrec-core` free of the CLI's config surface. P5 consumes this signature.
+- **`diff`/`blame`/`recall` are NOT implemented this phase.** No AC constrains them, and shipping
+  an unexercised second interpretation path is how a byte-equivalence claim gets quietly broken.
+  **This is P5's entry condition, not a free pass**: a `--json` serializer that reimplements diff
+  or blame interpretation in `cli/src` reopens the seam P4 exists to close.
+- **AC7 reading, stated so it is evaluated as written**: "counted" attaches to unknown record
+  *types*; unknown *fields* on a known record are tolerated by serde and are correctly counted as
+  neither unknown-type nor unparsed. A test pins that reading.
+- **`RepositoryView::open` deliberately has no "not initialized" error.** An early cut returned
+  one, which silently changed `agentrec status` in an uninitialized directory from a printed
+  report to exit 1 — an unsanctioned behavior change (`log` there still prints "no turns
+  recorded"). Caught by running the binary, not by a test; a test now pins the tolerant reading.
+
+### Measured, not assumed
+
+- **`status` latency is flat.** Routing `status` through the view initially made it parse
+  `log.jsonl` twice: **13.4 ms → 20.6 ms** per invocation on a copy of this project's real
+  2143-line / 2.3 MB dogfood log (50 warm runs, macOS release build). Fixed by giving
+  `load_log` and `load_ledger` one shared per-line classifier (`record::parse_log_line`) and
+  letting `status_report` read the ledger once: **6.4 ms vs 6.6 ms baseline**. The shared
+  classifier is also a correctness win — the records a reader gets and the census of what it
+  skipped can no longer disagree.
+
+### Residuals
+
+- Claims for P4 were declared **mid-phase, after the first commit landed**, not declare-first per
+  AC. Recorded rather than backdated.
+- Test delta is **+29**, not the task file's "+18" — the ladder there is stale, and the ratchet
+  only tightens.
