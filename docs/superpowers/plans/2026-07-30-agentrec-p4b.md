@@ -147,6 +147,21 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
 
    Both are owed tests by whichever task first pages `recall` for real.
 
+8. **(non-blocking, raised during P4b-5 — founder-ratified 2026-07-30)** P4b-5's **AC-5d** is
+   unsatisfiable as literally worded, in the same class as AC13 (open question 5): it demands
+   `rg '21 passed' docs/superpowers/plans/tasks/` → 0 matches, but `P4b-5.md` must quote that
+   string to state the check, so its own AC line and Verification block each match it. The two
+   *descriptive* occurrences were rewritten to break the literal without losing meaning; the two
+   self-quoting ones are irreducible. Ratified substitution: 0 matches in every task file, with
+   `P4b-5.md`'s remaining matches confined to the check quoting itself — recorded in `P4b-5.md`
+   beneath the AC. The AC's intent (no task file asserts a stale golden figure) is met, not
+   weakened. Docs hygiene only; zero functional surface.
+
+9. **(non-blocking, raised by P4b-4's gate — a scope gap, not a regression)** `cli/src/readcmds.rs`
+   (two call sites) and `cli/src/memorycmds.rs` still call `load_log` on **production** paths.
+   AC17's grep was scoped to `cmds.rs`, so these are outside what P4b gated, and P4b-5 is docs-only
+   and cannot fix them. Whoever next widens the seam beyond `cmds.rs` owns retiring them.
+
 ## Manual E2E (after P4b-4, before P4b-5)
 
 Run against the live dogfood repo, observing output — not just exit codes:

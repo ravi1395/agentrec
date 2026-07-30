@@ -14,6 +14,23 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **P4b EXECUTED and GATE-PASSED (2026-07-30) on `feat/phase-2-0-view-completion`.** Closes
+  `RepositoryView` against the parent spec's six-method list (`open`/`list`/`diff`/`blame`/
+  `recall`/`health`) — P4 had left `diff`/`blame`/`recall` unimplemented by design; P4b lands
+  them plus `DiffResult`/`DiffError`/`BlameError`/`RecallPage`/`RecallError` and a shared
+  `select_turns` walk (`list_records`/`list_records_of`, with `list()` surviving as a
+  delegating wrapper). Test baseline **602 / 0 / 2** (was 595/0/2 pre-P4b-4); **33 goldens**
+  (not 32, not 21 — both stale figures corrected across `P3.md`/`P4.md`/`P5.md` in this round).
+  Manual E2E: all 9 steps pass, pre- vs post-P4b binaries byte-identical on both a frozen
+  dogfood clone (steps 1/2/4/5/9) and the live dogfood repo read-only (steps 6/7/8) — **caveat:
+  step 7 (`recall --json`) is weakly discriminating**, the dogfood store has 0 fresh/3 stale
+  memories so both binaries print `[]`. **P5 is now executable** — its dependency (P4b's typed
+  values) is satisfied and its `{"files":[]}` literal is corrected (see P5.md amendment,
+  derived from the merged `DiffResult`, not observed via a live `--json` flag since `diff
+  --json` doesn't exist yet — that's P5's own scope).
+  - **Residual, out of P4b's scope, not fixed here:** `cli/src/readcmds.rs:202`, `:426`, and
+    `cli/src/memorycmds.rs:985` still call `load_log` directly in production paths — AC17's
+    `rg` was scoped to `cmds.rs` only. P5 or a dedicated cleanup task should close this.
 - **P2 + P3 EXECUTED and GATE-PASSED (2026-07-30) — merged into `feat/phase-2-0-substrate` at
   `73d01b9`, ledger + hygiene follow-ups at `6fa0de1`. Nothing pushed, no PR.**
   Method: sonnet implementers in parallel worktrees → opus reviewers → a Fable skeptic in an
@@ -152,12 +169,11 @@ carries only current state, what's next, and standing debts.
 
 ### Now / next (in order)
 
-1. ~~**P4**~~ done (gate-passed, see above) → **P5** (`--json`), whose entry condition is that it
-   consumes `RepositoryView` rather than reimplementing `diff`/`blame` interpretation in
-   `cli/src` — those three methods are deliberately unimplemented, so P5 either adds them to the
-   seam or reopens it → the plan's 9-checkbox "Final acceptance — plan exit"
-   section. **P4 must not weaken or regenerate P3's goldens to make extraction pass** — they are
-   the byte-equivalence instrument for the whole plan, and that is the ratchet.
+1. ~~**P4**~~ done → ~~**P4b**~~ done (gate-passed, see above; `diff`/`blame`/`recall` now
+   implemented in the seam) → **P5** (`--json`), now executable: dependency satisfied, empty-case
+   literal corrected → the plan's 9-checkbox "Final acceptance — plan exit" section. **P4/P4b
+   must not weaken or regenerate P3's goldens to make extraction pass** — they are the
+   byte-equivalence instrument for the whole plan, and that is the ratchet.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.
 2. **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
    `existing_ids` never gains ids appended during the current run, so two session files sharing a

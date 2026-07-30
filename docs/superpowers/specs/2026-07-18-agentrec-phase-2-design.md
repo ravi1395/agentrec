@@ -236,12 +236,43 @@ blame, gap honesty, memory recall, pagination, and report-safe sanitization.
 
 ```rust
 RepositoryView::open(root: &Path) -> Result<RepositoryView, RepoError>
-RepositoryView::list(query: TurnQuery) -> Result<Page<TurnSummary>, RepoError>
-RepositoryView::diff(query: DiffQuery) -> Result<Page<FileDiff>, RepoError>
-RepositoryView::blame(query: BlameQuery) -> Result<BlameResult, RepoError>
-RepositoryView::recall(query: RecallQuery) -> Result<Page<MemoryHit>, RepoError>
-RepositoryView::health() -> Result<RepositoryHealth, RepoError>
+RepositoryView::list(query: TurnQuery) -> Result<Page<TurnSummary>, CursorError>
+RepositoryView::diff(query: DiffQuery) -> Result<DiffResult, DiffError>
+RepositoryView::blame(query: BlameQuery) -> Result<BlameResult, BlameError>
+RepositoryView::recall(query: RecallQuery) -> Result<RecallPage, RecallError>
+RepositoryView::health(budget: u64) -> Result<RepositoryHealth, RepoError>
 ```
+
+> **Amended 2026-07-30 (P4b, decisions 8–10; signature drift resolves toward the code — the
+> parent spec is amended, not the code). Each amendment below is a ratchet-up: it adds
+> precision or information the original signature could not carry, never removes a
+> guarantee.**
+>
+> - `health` takes an explicit `budget: u64`. The view deliberately holds no config; the
+>   budget comes from the caller (config), and re-coupling the view to config would also
+>   disturb P5's `status --json` AC surface. **Ratchet-up:** the pure/impure split this makes
+>   possible is strictly more information than a config-reading `health()` could expose.
+> - `list` returns `Result<.., CursorError>`, not the blanket `RepoError`. **Ratchet-up:**
+>   strictly more precise — a cursor failure (e.g. `stale_cursor`) is no longer indistinguishable
+>   from an I/O failure.
+> - `diff` returns `Result<DiffResult, DiffError>`, not `Result<Page<FileDiff>, RepoError>`.
+>   A bare `Page<FileDiff>` has no slot for the turn-level header
+>   (`turn <id> · <tool> · N files`), so a fileless turn's empty page would make that header
+>   unproducible — `DiffResult` carries `turn_id`/`tool`/`total_files` alongside the page.
+>   `DiffError` separates turn lookup failure from cursor failure from I/O, which a single
+>   `RepoError` cannot. **Ratchet-up:** adds the header carrier and the error-cause distinction;
+>   loses nothing `Page<FileDiff>` had.
+> - `blame` returns `Result<BlameResult, BlameError>`, not `Result<BlameResult, RepoError>`.
+>   `RepoError` is a single `Io(String)`; reproducing prose like
+>   `<path> has only N line(s)` through it would require crafting that prose inside
+>   `agentrec-core`, which violates decision 9 (the human CLI keeps ownership of its prose) and
+>   misfiles a user-input error as I/O. **Ratchet-up:** the per-cause error enum is strictly
+>   more information than one `Io(String)` variant.
+> - `recall` returns `Result<RecallPage, RecallError>`, not `Result<Page<MemoryHit>, RepoError>`.
+>   A bare `Page<MemoryHit>` drops `capped` (F3 — results may be missing from what was
+>   fetched), `store_corrupt` (F10), and `store_empty` (PD3), each of which drives real adapter
+>   behavior today. **Ratchet-up:** `RecallPage` is a strict superset — the underlying `Page`
+>   is still there (`RecallPage.page`), plus the three flags a bare `Page` could not carry.
 
 Rules:
 
@@ -588,8 +619,22 @@ mode requires restart and is reported in `agentrec_status`.
 | `agentrec_recall` | query, k, cursor | fresh hash-verified memory hits only |
 | `agentrec_status` | none | repo/daemon/config/health summary |
 
+> **Amended 2026-07-30 (P4b, decision 12).** This row promised both "≤200 turn **summaries**"
+> and, in the paragraph below, that read tools "mirror the Phase 2.0 `--json` contracts exactly
+> … same typed values, one serializer." Under decision 5 those are irreconcilable for
+> `agentrec_log` specifically: `log --json` serializes full `TurnRecord`s, while the row's own
+> "summaries" promise is `TurnSummary` — a different, smaller typed value with its own
+> serializer (`list()`'s). **`agentrec_log` mirrors `list()`'s summary contract**
+> (`Page<TurnSummary>`), not `log --json`'s full-record contract. A full-record MCP tool or
+> parameter is deferred, not designed here. This is consistent with the spec's own "prompt
+> contents never in generic summaries" rule — `TurnSummary` already excludes prompt fields.
+> The other four rows are unaffected: `agentrec_diff`/`agentrec_blame`/`agentrec_recall`/
+> `agentrec_status` each mirror one `--json` contract with no second typed value competing for
+> the name.
+
 Read tool JSON mirrors the Phase 2.0 `--json` contracts exactly (P2) — same typed
-values, one serializer. Tool descriptions state capability and data shape only;
+values, one serializer, **except `agentrec_log`, which mirrors `list()`'s summary contract per
+the amendment above.** Tool descriptions state capability and data shape only;
 outputs contain data, not instructions to the model (P7). Read tools carry
 read-only MCP annotations.
 
