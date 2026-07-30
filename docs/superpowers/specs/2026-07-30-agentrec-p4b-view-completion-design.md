@@ -1,12 +1,14 @@
 # P4b — `RepositoryView` completion (diff / blame / recall / wire `list`)
 
-> **Status:** design, revision 5 — amended after skeptic rounds 1 (FAIL, 5 blocking), 2 (FAIL, 3),
-> 3 (FAIL, 3), and 4 (FAIL, 1 blocking + 4 non-blocking). Each round found its defects in the
-> *previous revision's own new material*, so each round's fixes were the next round's attack
-> surface. Round 4's explicit convergence judgment: defects are converging, not structural — the
-> core (interface shape, decisions 1–12, commit sequence, golden-first instrument, AC16/AC17
-> mechanisms) has been stable since revision 3, and the remaining fix is mechanical. Every finding
-> independently verified against the tree before amending. Written 2026-07-30 against
+> **Status:** design, revision 6 — amended after skeptic rounds 1 (FAIL, 5 blocking), 2 (FAIL, 3),
+> 3 (FAIL, 3), 4 (FAIL, 1 + 4 non-blocking), and 5 (FAIL, 1 + 2 non-blocking). Each round found its
+> defects in the *previous revision's own new material*, so each round's fixes were the next
+> round's attack surface. Rounds 4 and 5 both assessed the defects as **converging, not
+> structural**: the core (interface shape, decisions 1–12, commit sequence, golden-first
+> instrument, AC16/AC17 mechanisms) has now survived four consecutive rounds untouched, and each
+> round's finding is the same named disease at shrinking scale — round 4 a missing error enum,
+> round 5 a single missing string in one enumeration. Every finding independently verified against
+> the tree before amending. Written 2026-07-30 against
 > `feat/phase-2-0-substrate` @ `638290d`. Parent spec:
 > `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Deep module 1).
 > Parent plan: `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`.
@@ -45,6 +47,14 @@
 > R14 enumerated the sanctioned render opts and closed the closure-capture loophole. R15 gave
 > `recall`'s two-stream output an explicit contract. R16 recorded the `Page<FileDiff>`
 > materialization as an accepted resource-shape change.
+>
+> **Revision 6 changelog** (§Skeptic round 5 records the full findings):
+> R17 re-derived the whole render-opts enumeration **from the code** instead of from memory —
+> revision 5's list omitted `recall`'s `query`, without which the golden-pinned no-match line
+> `no fresh memories match "<query>"` had no compliant implementation (AC17 + AC2 jointly
+> unsatisfiable), and the pass also found `diff`/`blame` need **no** opts at all. R18 stated the
+> adapter-transformation rule for the human `log` form, which is why `limit`/`explain` are not
+> opts. R19 added the decision-9 error-type signatures to commit 5's parent-spec amendment list.
 
 ## Why this phase exists
 
@@ -347,9 +357,12 @@ for P4.
    keeping the `.rev().take(limit)` reordering in the adapter (AC3). Both `log` forms and both
    `recall` forms render through signature-constrained `render_*` functions (AC17). No empty-case
    contract change (decision 6). README rides this commit if any documented flag behavior changed.
-5. **Docs:** parent spec §Deep module 1 amendment (decisions 8, 10) and the `agentrec_log` MCP
-   row amendment (decision 12); `P5.md` dependency line corrected `P4` → `P4b`; the stale
-   "21 passed" golden figure corrected in P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
+5. **Docs:** parent spec §Deep module 1 amendments — decisions 8 and 10, the **error-type
+   signatures per decision 9** (`diff -> DiffError`, `blame -> BlameError`, `list -> CursorError`,
+   where the spec says `RepoError` for all; R19 — revision 5 left these off the list even though
+   they are real spec deltas), and the `agentrec_log` MCP row (decision 12); `P5.md` dependency
+   line corrected `P4` → `P4b`; the stale "21 passed" golden figure corrected in
+   P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
 
 ## Acceptance criteria
 
@@ -460,13 +473,26 @@ all.
       physically cannot render from a direct read while satisfying the contract.
 
       **The opts slot is the residual smuggling channel, so it is enumerated, not open** (R14).
-      Sanctioned opts, per verb, are exactly: `log` — `now_ms`, `utc`, `color`, `all_files`, and a
-      prebuilt `NoiseMatcher` (root-derived at *build* time, pure at render time); `recall` —
-      `now_ms`, `color`; `diff`/`blame` — `color` and whatever the task file enumerates when it
-      reads the renderers. Anything not on that list requires amending this design. A closure or
-      trait object that captures a store, ledger, or root (e.g. `impl Fn(&str) -> Vec<u8>`) **counts
-      as a handle** and is banned by the same rule — the constraint is on reachability, not on the
-      literal type name.
+      The enumeration below was **re-derived by reading each renderer's actual inputs from the
+      code** (R17) — revision 5's version was written from memory and omitted two, one of which was
+      a blocking joint-unsatisfiability:
+
+      | Verb | Sanctioned opts | Derived from |
+      |---|---|---|
+      | `log` (human) | `now_ms`, `utc`, `color`, `all_files`, prebuilt `NoiseMatcher` | `fmt::turn_list_line` + `cmds::log`'s fold branch. **`limit` and `explain` are NOT opts** — see the adapter-transformation rule below |
+      | `recall` (human) | `now_ms`, `color`, **`query: &str`** | `format_memory_line` takes `now_ms`/`color`; the no-match line embeds the query (R17) |
+      | `diff` | **none** | `header_line` takes only the record; `print_entry` needs only the resolved `FileDiff`; `rg 'paint\|should_color' cli/src/readcmds.rs` → 0 — `diff` has never colorized |
+      | `blame` | **none** | `render_turn` → `fmt::turn_detail_header` with `hhmm` derived from the record's own `started`; no color, no clock |
+
+      Anything not in this table requires amending this design. A closure or trait object that
+      captures a store, ledger, or root (e.g. `impl Fn(&str) -> Vec<u8>`) **counts as a handle** and
+      is banned by the same rule — the constraint is on reachability, not on the literal type name.
+
+      **Adapter-transformation rule (R18).** AC3 sanctions `.rev().take(limit)` for `log --json`;
+      the same rule governs the **human** `log` form, which is why `limit` and `explain` are not
+      render opts: the adapter slices `page.items.iter().rev().take(limit)` *before* calling the
+      renderer, and applies `fmt::glossary_for` to the renderer's output *after*. Both stay outside
+      `render_log`, so the enumeration above is complete rather than merely minimal.
 
       **`recall` renders to two streams**, so its contract is stated separately (R15): the F3 capped
       notice and the "no memories yet" zero-state go to **stderr** while hits and "no fresh memories
@@ -476,6 +502,12 @@ all.
       `capped`/`store_empty`/`store_corrupt` flags — which are view-typed data, so either shape
       keeps the constraint intact. This is not a conflict with AC2/AC10/AC11; it is how they are
       jointly satisfied.
+
+      The **stdout** side needs the query text: the no-match line is `no fresh memories match
+      "<query>"` and commit 1 golden-pins it *including the query*, so under either shape the stdout
+      renderer must receive it. `query: &str` is therefore a sanctioned recall opt (R17). The
+      alternative — echoing the query on `RecallPage` — is also acceptable and additionally serves
+      MCP 2.2's request-echo, but is not required.
 
       This replaces revision 3's mechanism, which was gameable three ways (R11): an adapter could
       call `view.diff()` only to map its error, discard the page on `Ok`, and render the happy
@@ -751,3 +783,61 @@ so it creates no new attack surface of the kind rounds 2–4 exploited. A rewrit
    are the ones that make the wrong thing unrepresentable: signature-constrained renderers, typed
    errors carrying their own render data, and a fixture whose RED depends on shared state rather than
    on absence.
+
+## Skeptic round 5 (2026-07-30) — FAIL, 1 blocking + 2 non-blocking; still converging
+
+Round 5 confirmed R13 closes round-4's B1 with an exhaustive sweep of `blame`/`blame_file`/
+`blame_line` for un-inventoried error arms (`blame_file` returns no `Err` at all — every outcome is
+a `BlameResult` state; `blame()` itself has none; `blame_line`'s only two are the arms AC19 names,
+and `line_no == 0` shares the out-of-range arm). It confirmed `BlameQuery.path` carries exactly what
+both prose strings print (`parse_target` splits `file:line` only when the suffix parses as a
+positive integer), that AC19 is consistent with AC1/AC14/AC17, that `Option<TurnRangeSummary>` fixes
+the `NoTurns` unconstructibility, that `all_files` is correctly a render opt rather than a query
+field (it folds file entries in the human count only — putting it in `TurnQuery` would wrongly
+change returned data), and that R16's bound is accurate.
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | **R14's `recall` opts enumeration omitted the query string.** The human no-match line is `no fresh memories match "<query>"` on **stdout**, and commit 1 golden-pins it *including the query text*. R14 said recall's opts are "exactly `now_ms`, `color`" and that anything else requires amending the design — and nothing sanctioned carried the query (not on `RecallPage`, not in the opts, `&RecallQuery` off-list). **No compliant implementation existed**: AC17 + AC2 jointly unsatisfiable for `recall`, the same shape as round 3's B2 and round 4's B1, from the same disease — an enumeration written without reading the renderer's full inputs | R17: `query: &str` added to recall's sanctioned opts (echoing it on `RecallPage` also accepted, and additionally serves MCP 2.2's request-echo). The **whole** enumeration was then re-derived from the code as a table with a "derived from" column per verb |
+
+Non-blocking, folded in: **R18** — `log`'s enumeration omitted `limit` and `explain`, satisfiable
+only under an ownership reading the doc never stated, so the adapter-transformation rule is now
+explicit (slice `.rev().take(limit)` before the renderer, apply `fmt::glossary_for` after), which is
+also why neither is an opt. **R19** — commit 5's parent-spec amendment list omitted the decision-9
+error-type signatures (`diff -> DiffError`, `blame -> BlameError`, `list -> CursorError` against a
+spec that says `RepoError` for all), which are real spec deltas.
+
+The completeness pass R17 demanded produced a **stronger** result than the finding required:
+reading the renderers showed `diff` and `blame` need **no** opts whatsoever — `rg 'paint|should_color'
+cli/src/readcmds.rs` → 0 (diff has never colorized), and `render_turn` derives its timestamp from
+the record's own `started` via `hhmm`. Revision 5 had guessed "`color` and whatever the task file
+enumerates"; the truth is an empty set, which is a tighter constraint than the guess.
+
+**Process finding, recorded for the gate trail.** Round 5's worktree was still at revision 4's
+commit (`f9a1f1d`) — the coordinator's move command used `checkout --detach HEAD`, a no-op when HEAD
+already pointed at the old commit. The reviewer read revision 5 from the object store instead, and
+the two commits are code-identical, so the verdict stands; but a gate verdict must never attach to
+a commit the tree does not show. The worktree was corrected to `b7a5c26` before round 6.
+
+**Convergence, round 5's assessment:** still converging, no new front. Round 4 one blocker (a
+missing error enum), round 5 one blocker (one missing string in one list) plus wording patches —
+both the same disease at shrinking scale, and both *created by* the strictness the design adopted
+deliberately: R14's "exactly this list, anything else amends the design" converts any enumeration
+omission into a formal blocker. That is the ratchet working, not a structural fault.
+
+## What the task file must carry that this design does not
+
+Previewed by round 5 so the next artifact's scope is already fixed. A fresh-context executor reading
+only this spec would still be missing:
+
+- **Field-level definitions** for `FileDiff`, `BlameResult`, and `MemoryHit` — the goldens are the
+  behavioral pin; the field sets are executor-defined within them.
+- **Ownership of `print_entry` / `load_blob` / `load_text`**, shared today by `diff`, `show`, and
+  `undo` — a named open question in §Risks, not a settled decision.
+- **The `RECALL_VERIFY_CAP` transport choice** — `RecallPage` field versus a named `view` re-export
+  (AC15(a) sanctions either).
+- **AC16's concrete arithmetic** — blob sizes, budget value, and which turns sit inside the keep
+  window, so the RED/GREEN discrimination is reproducible rather than described.
+- **Test placement and the claimd declare-first mapping** of AC1–AC19 to specific test names and
+  files, including which existing suites gain assertions versus which files are new.
+- **The `blame` not-found integration assertion's exact location**, since that arm has no golden.
