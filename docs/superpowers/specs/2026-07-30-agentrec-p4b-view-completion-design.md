@@ -950,6 +950,11 @@ only this spec would still be missing:
   mapping" discipline — every id/timestamp/hash reaching a golden must originate from a named
   `const`, never from a generator.
 - **Whether `recall` is infallible or keeps `RecallError::Io`** (R21 sanctions either).
+- **Who writes the concrete amended `P5.md` literal, and when** (R27) — mechanical, not a decision:
+  the exact bytes follow from the final `DiffResult` field set (including how `tool: null` renders
+  for a toolless turn), but someone must write them into `P5.md`'s two sites. Assign it explicitly
+  so it is not dropped in the gap between commit 2 (where the type lands) and commit 5 (where the
+  amendment lands).
 
 ## Skeptic round 6 (2026-07-30) — FAIL, 2 blocking (shared root cause) + 4 non-blocking
 
@@ -1022,3 +1027,58 @@ implementation time. Round 8 is therefore scoped as a **narrow verification of t
 (AC17's signature, the opts-table row, the AC8 parenthetical, and commit 5's two new entries), not
 another adversarial pass. A further full round would have **negative** value: the document's defects
 are now being generated faster by revision churn than by design content.
+
+## Skeptic round 8 (2026-07-30) — PASS
+
+Scoped by the round-7 reviewer to a narrow verification of revision 8's five edits, not another
+adversarial pass. All five verified present and correct: AC17's signature (`render_diff(result:
+&DiffResult) -> String`, no opts parameter — judged "strictly tighter than my suggested fix", since
+an empty opts struct would reopen the R14 smuggling channel at width zero); the opts table's `diff`
+row; AC8's parenthetical; commit 5's parent-spec delta (confirmed absent at `392b544`, present now);
+and commit 5's three `P5.md` amendments against the two real literal sites. Both confirmation sweeps
+passed: no live stale `render_diff`/`*RenderOpts` reference survives outside the historical round
+records where quoting the defect is correct, and the round-7 record retains its damning framing
+("moved, not closed, and revision 7 claimed otherwise") unlaundered, along with the process note
+recording the coordinator's inaccurate summary and "the tree governs".
+
+**What this PASS certifies.** The design at `5dfde88` is internally coherent and, to the limit of
+eight adversarial rounds, contains: no known joint-unsatisfiability across AC1–AC19; no renderer
+input without a sanctioned carrier; no typed error missing the data its pinned prose requires; and
+no false claim about the tree — every factual assertion in §Measured starting state and the round
+records was independently re-derived against the code at least once, most twice. The AC set is
+falsifiable, AC16's fixture genuinely discriminates, and the P5/parent-spec reconciliations are
+enumerated in commit 5 rather than assumed.
+
+**What it explicitly does NOT certify.** No implementation exists, so nothing here certifies
+behavior. Unverified until code lands: that the implemented `FileDiff` reproduces every
+`print_entry` arm byte-for-byte; that AC16's concrete arithmetic (task-file-owned) makes the fixture
+RED/GREEN as designed; that the seam is not bypassed in ways AC17's signature constraint plus
+AC1–AC5 fail to see; that the five commit-1 goldens capture what decision 3 needs; and that commit
+5's amendments to `P5.md` and the parent spec are executed as enumerated. Those close only via the
+tests this design specifies, run against real code, plus the per-commit review the working method
+already mandates.
+
+**The design loop ends here.** Eight rounds produced a clear gradient: rounds 1–3 found structural
+defects, 4–6 found single missing carriers, 7–8 found propagation slips *created by the fixes
+themselves*. The document reached the point of generating its own defects faster than it surfaced
+design content, which is the signal to stop revising and start building. Next artifact: the task
+file, scoped by §What the task file must carry.
+
+### Gate trail
+
+| Round | Reviewer | Verdict | Blocking | Character of findings |
+|---|---|---|---|---|
+| 1 | Fable A | FAIL | 5 | False factual premises; wrong consumers; a reversal of gate-PASSED D-PD4 |
+| 2 | Fable A | FAIL | 3 | Blob-eviction **data-loss path**; unmechanizable ACs; `diff`/`blame` wiring unpinned |
+| 3 | Fable A | FAIL | 3 | AC16 fixture was theater; error prose uncarryable; happy-path bypass survived |
+| 4 | Fable A | FAIL | 1 | `blame`'s error data had no typed carrier |
+| 5 | Fable A | FAIL | 1 | `recall`'s query missing from a closed enumeration |
+| 6 | **Fable B** (fresh, cold read) | FAIL | 2 | `diff`'s turn header had no carrier; P5 still unexecutable |
+| 7 | Fable B | FAIL | 2 | R20 not propagated into AC17; B2 moved, not closed, and claimed closed |
+| 8 | Fable B | **PASS** | 0 | Five edits verified; loop closed |
+
+Seventeen blocking defects, zero lines of implementation. Two would have shipped behind a green test
+suite: eviction deleting blobs still referenced by superseded turns (breaking `undo` of merged
+history), and the silent reversal of a gate-PASSED empty-case contract. The reviewer swap at round 6
+was load-bearing — a fresh cold read found a happy-path defect that five rounds of delta-focused
+review had walked past.
