@@ -85,6 +85,24 @@
 //!   opposed to `log --all-files`, which IS covered —
 //!   `golden_log_noise_all_files`).
 //!
+//! P4b-1 added `recall` goldens and extends the same residual list rather
+//! than implying `recall` is now fully pinned. Still NOT pinned:
+//!
+//! - The human `recall` HITS line (`memorycmds::format_memory_line` — short
+//!   id, relative time, pin rendering, color). Only the two human EMPTY
+//!   states are captured; `recall_json_hits` pins the machine shape.
+//! - The F3 capped notice (`"verification capped at N candidates"`, stderr)
+//!   emitted when the verify walk stops at `memory::RECALL_VERIFY_CAP`.
+//! - `recall --for-hook` (the memory-injection path, INV-M4).
+//! - The `memories` verb in its entirety.
+//!
+//! Within `recall_json_hits` itself, three of `EffectiveJson`'s eight fields
+//! are pinned at a structurally single value, so the golden proves they are
+//! PRESENT but not that they VARY correctly: `origin` (`seed_memory`
+//! hardcodes `"human"`), `freshness` (`recall_cmd` passes a literal
+//! `Freshness::Fresh`), and `retracted` (always false by INV-M2 — not
+//! reachable from this seam at all).
+//!
 //! If a future round needs these, they follow the same pattern already
 //! established here: derive the exact shape from the renderer, add the
 //! minimal fixture data to reach it, capture, review the bytes once before
@@ -168,12 +186,27 @@ const CORRUPT_BLOB_TAMPERED: &[u8] = b"tampered after the fact\n";
 // byte const, mirroring exactly how `build_fixture` above derives blob
 // hashes from `APP_BEFORE` et al. via `store.put`. Never `memory::remember`'s
 // real `id::ulid()` generator, never `SystemTime::now()`.
+//
+// Id SHAPE is faithful to what production can emit, same as the `t_`-prefixed
+// turn consts above: `memorycmds::remember` mints a memory id with bare
+// `id::ulid()` (`cli/src/memorycmds.rs`), so a memory id is 26 Crockford
+// characters with NO prefix — unlike `id::turn_id()`, which does prefix `t_`.
+// The Crockford alphabet (`agentrec-core/src/id.rs`) omits I, L, O and U, so
+// no literal below may contain them.
 // ---------------------------------------------------------------------------
 
-const MEMORY_MATCH_ID: &str = "m_MATCH0000000000000000MEM1";
-const MEMORY_OTHER_ID: &str = "m_OTHR00000000000000000MEM2";
+const MEMORY_MATCH_ID: &str = "MATCH0000000000000000MEM1A";
+const MEMORY_OTHER_ID: &str = "THER0000000000000000MEM2AB";
 const MEMORY_MATCH_TS: u64 = 1_577_923_200_000; // 2020-01-02T00:00:00.000Z
 const MEMORY_OTHER_TS: u64 = 1_577_923_260_000; // 2020-01-02T00:01:00.000Z
+
+// The doubled `throttle` is load-bearing — do NOT reword. `bm25_rank` filters
+// on `SCORE_FLOOR` = 0.8, and with a 2-document corpus the largest reachable
+// idf is ln(2) ≈ 0.693 — below the floor. A single-occurrence match therefore
+// cannot clear it at dl ≈ avg_dl; this fact scores ≈1.05 only because
+// `throttle` occurs three times across `doc_text` (twice here, once in
+// `MEMORY_MATCH_PIN_PATH`). Tidying the sentence silently turns
+// `recall_json_hits` into `[]`.
 const MEMORY_MATCH_FACT: &str =
     "throttle limiter guards the API from bursty traffic via throttle checks";
 const MEMORY_OTHER_FACT: &str = "the release changelog script lives under scripts";
@@ -331,8 +364,9 @@ fn seed_memory(root: &Path, id: &str, fact: &str, pin_path: &str, pin_hash: &str
 /// Builds a minimal, deterministic `recall` fixture: an initialized repo with
 /// exactly two Fresh, non-retracted, pinned memories — `MEMORY_MATCH_*`
 /// (matches `MEMORY_RECALL_QUERY_MATCH` via BM25) and `MEMORY_OTHER_*`
-/// (shares no term with `MEMORY_MATCH_*`, so it never appears in either
-/// query's results — it exists purely to make the store non-empty for
+/// (carries neither query term, so `df(throttle)` stays 1 and it never
+/// appears in either query's results — it exists purely to make the store
+/// non-empty for
 /// `recall_json_no_match`/`recall_human_no_match`, which need "nothing fresh
 /// matched" to be distinguishable from "no memories were ever recorded").
 /// Both pins' real worktree bytes are written first so `memory::hash_pin`
@@ -726,8 +760,9 @@ fn golden_dir() -> std::path::PathBuf {
 /// correctly either way — the ambiguity only affects a human eyeballing the
 /// `.golden` file, not correctness of the pass/fail). None of this
 /// harness's captured commands can ever emit those literal lines (no
-/// renderer in `cmds.rs`/`readcmds.rs` prints either string), so this is a
-/// documented risk, not a live bug.
+/// renderer in `cmds.rs`/`readcmds.rs`/`memorycmds.rs` prints either
+/// string — `memorycmds.rs` joined this list when P4b-1 added the `recall`
+/// goldens), so this is a documented risk, not a live bug.
 fn assert_golden(name: &str, out: &Output) {
     let captured = format!(
         "stdout:\n{}\n--stderr--\n{}\n--exit--\n{}\n",
@@ -1224,7 +1259,7 @@ fn golden_show_unknown_id_fails() {
 // Tests: goldens for `recall` (P4b-1) — pre-refactor byte pins for the three
 // `recall --json` states and the human empty-state pair. Zero production
 // changes accompany these; they exist so P4b-3's `recall` → `view.rs`
-// extraction (design decision 2: `recall --json` output stays byte-
+// extraction (design decision 3: `recall --json` output stays byte-
 // identical) is falsifiable rather than merely asserted, the same
 // instrument role P3's goldens played for P4.
 // ---------------------------------------------------------------------------
@@ -1248,7 +1283,7 @@ fn golden_recall_json_hits() {
 /// `memorycmds::recall_cmd`'s `--json` branch returns the (possibly-empty)
 /// `arr` before the human branch's `hits.is_empty()` check ever runs, so
 /// `--json` mode cannot distinguish "nothing recorded" from "nothing fresh
-/// matched" by construction (design decision 2, P4b-1 plan) — the human pair
+/// matched" by construction (design decision 3, P4b-1 plan) — the human pair
 /// below (`recall_human_no_memories` / `recall_human_no_match`) is the ONLY
 /// place that distinction is actually observable. A future reader should not
 /// deduplicate these two `--json` goldens on the theory that identical bytes

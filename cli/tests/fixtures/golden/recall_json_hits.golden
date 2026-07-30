@@ -1,5 +1,5 @@
 stdout:
-[{"id":"m_MATCH0000000000000000MEM1","fact":"throttle limiter guards the API from bursty traffic via throttle checks","pins":[{"path":"src/throttle.rs","hash":"sha256:2f516e1fb2d0f0a3a4ae1360dd6e6b2aeddf45554d9f34019f1423fd2f555f81"}],"origin":"human","ts":1577923200000,"retracted":false,"freshness":"fresh"}]
+[{"id":"MATCH0000000000000000MEM1A","fact":"throttle limiter guards the API from bursty traffic via throttle checks","pins":[{"path":"src/throttle.rs","hash":"sha256:2f516e1fb2d0f0a3a4ae1360dd6e6b2aeddf45554d9f34019f1423fd2f555f81"}],"origin":"human","ts":1577923200000,"retracted":false,"freshness":"fresh"}]
 
 --stderr--
 
