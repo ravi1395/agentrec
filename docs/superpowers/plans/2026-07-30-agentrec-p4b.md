@@ -92,13 +92,15 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    one and states which; no downstream task depends on the choice.
 2. **(non-blocking)** Whether `list()` survives as a delegating wrapper over `list_of` or is replaced
    by it. Round 6 noted `list()`'s 17 unit tests exercise it either way. P4b-4 decides.
-3. **(BLOCKING for P4b-4; P4b-1..3 unaffected)** `fix/perf-evidence-round` is not in the
-   substrate and collides semantically with P4b-4 — it splits `enforce_budget` into
-   `plan_eviction`/`execute` and moves eviction out of `status` onto the daemon tick, which makes
-   P4b-4's "`status` still evicts" AC false by design there and points AC16's fixture at the wrong
-   function. AC16's substance survives (the unfiltered `owned_turns` slice is still what
-   `plan_eviction` receives). Full analysis and three candidate orderings:
-   `docs/superpowers/plans/2026-07-30-p4b-branch-merge-state.md` §3. **Answer before P4b-4 starts.**
+3. **ANSWERED (founder, 2026-07-30): `fix/perf-evidence-round` merges FIRST, then integrate, then
+   execute P4b.** It splits `enforce_budget` into `plan_eviction`/`execute` and moves eviction out
+   of `status` onto the daemon tick — so **P4b-4 must be authored against `plan_eviction` and
+   against a `status` that no longer evicts**, and its "`status` still evicts" AC is void. AC16's
+   substance is unchanged (the unfiltered `owned_turns` slice is still what `plan_eviction`
+   receives); only the call target and wording move. **P4b-4's task file must be rewritten before
+   an executor reads it** — see `docs/superpowers/plans/2026-07-30-p4b-branch-merge-state.md` §3
+   for the 5-step execution order and the open merge-vs-rebase sub-decision. P4b-1..3 are not
+   gated on any of this.
 4. **(blocking, answered in P4b-2)** `print_entry`/`load_blob`/`load_text` are shared with `show`
    and `undo`. P4b-2 must not break either. The resolution is stated in that task file: the shared
    helpers **stay** in `readcmds.rs` for `show`/`undo`, and `view::diff` gets its own resolution

@@ -77,20 +77,55 @@ P4.md already anticipated this in its Notes ("if that branch has merged by the t
 re-read `cmds.rs`/`retention.rs` … part of the pure-read split may already exist"). It is now
 concrete rather than hypothetical.
 
-### Decision required before P4b-4 starts
+### DECISION TAKEN (founder, 2026-07-30): **(a) — perf-evidence merges first, then integrate.**
 
-Pick one, and record it in the P4b plan's decisions log:
+Rationale as stated: writing AC16's fixture once against the final shape beats writing, gating, and
+then rewriting it; and perf-evidence's PR unlocks the Linux CI timing leg that CLAUDE.md already
+lists as founder-pending.
 
-- **(a) Merge `fix/perf-evidence-round` first** (open its PR, get the Linux CI leg, merge to
-  `main`), then rebase the substrate, then execute P4b **against the post-merge shape**. P4b-4's
-  AC16 and its "status still evicts" AC get rewritten in the task file *before* an executor sees
-  them. Cleanest; costs a rebase of 52 commits.
+**Scope of what this decision fixes — stated precisely, because the founder's note assumed more:**
+it removes the **semantic** collision (P4b-4 will be authored against `plan_eviction` and against a
+`status` that no longer evicts, so no AC has to be rewritten mid-flight). It does **not** remove the
+**mechanical** conflicts: the substrate must still absorb perf-evidence's edits to the same 8 files
+— `cmds.rs` alone is +337 lines there against +208 on the substrate — and that text conflict simply
+moves from "after P4b" to "before P4b".
+
+**Open sub-decision: rebase or merge?** Not settled by the ordering choice.
+
+- **Merge `main` into the substrate** (one merge commit) — resolves each conflicting hunk **once**.
+  Recommended for 52 commits.
+- **Rebase the substrate onto `main`** — replays all 52 commits and can surface the same conflict
+  repeatedly, once per commit that touches `cmds.rs`/`retention.rs`. Buys linear history; costs
+  conflict resolution proportional to commit count, and re-writes commits that already passed a
+  skeptic gate (their SHAs change, which invalidates every `claimd` evidence row and gate record
+  that cites them).
+
+The claimd/gate-record point is the tiebreaker: this repo's gate trail cites commit SHAs
+(`638290d`, `f19c17d`, `e411a45`, …). A rebase orphans those citations. **Recommend merge.**
+
+### Execution order
+
+1. Open the PR for `fix/perf-evidence-round`; get the Linux CI leg green; merge to `main`.
+2. Push `main`'s 8 unpushed docs commits (they can ride before or with step 1).
+3. Integrate `main` into `feat/phase-2-0-substrate` — **merge, not rebase**, per above. Resolve
+   `cmds.rs` / `retention.rs` / `integration.rs` conflicts. Re-run the full suite; record the new
+   baseline (neither 537/0/2 nor 443/0/1 survives).
+4. **Rewrite P4b-4's AC16 and its "`status` still evicts` AC** against the post-merge shape, in the
+   task file, before any executor reads it. Delete the STOP banner in P4b-4's header once done.
+5. Execute P4b-1 … P4b-5.
+
+P4b-1, P4b-2, and P4b-3 do not touch `cmds.rs`'s eviction path and may start at any point — they
+are not gated on steps 1–4.
+
+### Options not taken
+
 - **(b) Execute P4b first**, merge the substrate, then rebase perf-evidence's 24 commits onto it
-  and resolve `retention.rs`/`cmds.rs` by hand. Risks a hand-merge in the exact file that carries
-  the data-loss gate.
-- **(c) Keep perf-evidence parked indefinitely.** Only honest if someone decides its 15 tests and
-  3 real defect fixes are not shipping — CLAUDE.md currently lists opening that PR as
-  founder-pending, so this is the status-quo-by-inaction option, not a decision.
+  and resolve `retention.rs`/`cmds.rs` by hand. **Rejected** — it puts a hand-merge in the exact
+  file that carries the data-loss gate, and P4b-4's AC16 would have been authored, gated, and then
+  invalidated by the later merge.
+- **(c) Keep perf-evidence parked indefinitely.** **Rejected** — only honest if its 15 tests and 3
+  real defect fixes are not shipping. CLAUDE.md lists opening that PR as founder-pending, so this
+  was the status-quo-by-inaction option, not a decision.
 
 **Recommendation: (a).** The AC16 fixture is easier to write once against the final shape than to
 write, gate, and then rewrite. And perf-evidence's PR is what unlocks the Linux CI timing leg that
@@ -133,7 +168,9 @@ founder-pending. The two marked **verify** are the only ones whose deletion coul
 
 ## 6. Pre-merge checklist
 
-- [ ] Answer §3 — the perf-evidence ordering decision. **Blocking for P4b-4**, not for P4b-1..3.
+- [x] ~~Answer §3 — the perf-evidence ordering decision.~~ **Answered 2026-07-30: option (a).**
+- [ ] Settle the §3 sub-decision: **merge** (recommended — preserves the SHAs the gate trail and
+      claimd rows cite) vs **rebase** (linear history, orphans those citations).
 - [ ] Push `main`'s 8 unpushed docs commits to `origin`.
 - [ ] Decide whether the substrate merges as one PR or splits (P1–P4 shipped code vs the P4b
       design/plan docs) — 52 commits is a large review surface.
