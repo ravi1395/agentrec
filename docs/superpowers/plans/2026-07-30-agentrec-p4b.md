@@ -107,6 +107,32 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    logic rather than importing the CLI's. Duplication here is deliberate and bounded — the
    alternative is dragging out-of-scope `undo` into the seam.
 
+   **SUPERSEDED BY THE CODE (P4b-2, delivered):** the premise was factually wrong. In the
+   pre-task tree `print_entry`/`load_blob`/`unresolvable_msg` were reachable only from `diff`,
+   and `load_text` only from `blame_line`; `show` and `undo` call `store.get` directly and never
+   touched any of them. Leaving them in `readcmds.rs` would have been dead code under
+   `-D warnings`, so they moved with the logic. Verified independently twice (advisory review and
+   the binding gate). `show`/`undo` bodies are unchanged; `show_unknown_id.golden` is the pin.
+
+5. **ANSWERED (founder, 2026-07-30): AC13's diff half is unsatisfiable as worded, and the
+   substitution is RATIFIED.** AC13 asks for a `DiffQuery` cursor to return `stale_cursor` after a
+   `purge --log-duplicates` rewrite. That purge drops only `same_revert`-accepted duplicates, and
+   `view::same_revert` requires an identical id **and** set-equal file entries — so the surviving
+   record's entry list is identical and a path-keyed diff cursor always still resolves. The event
+   the AC describes cannot occur. P4b-2 substitutes the same rewrite **class** (a same-length log
+   rewrite that drops the cursor's named entry) with an `assert_eq!(len, before_len, …)` guard so
+   the test cannot drift into proving something easier; the `QueryMismatch` half is satisfied
+   literally and binds both the turn ref and the paths filter. Do not "restore" the literal
+   wording — it names an impossible event.
+
+6. **(non-blocking, raised by P4b-2's gate — for MCP 2.2, not for this phase)** `same_revert` is
+   set-equality, not order-equality, so a `purge --log-duplicates` survivor may carry the same
+   file entries in a **different order** than the record that was dropped. A diff cursor replayed
+   across that purge would resume against the reordered list and could re-deliver or skip an
+   entry. Unreachable today — the CLI never paginates `diff` and the daemon writes one record per
+   turn — and outside P4b's byte-equivalence charter. It becomes live the moment a paginating
+   consumer exists, which is exactly MCP 2.2.
+
 ## Manual E2E (after P4b-4, before P4b-5)
 
 Run against the live dogfood repo, observing output — not just exit codes:
