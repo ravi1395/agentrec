@@ -1,4 +1,4 @@
-# Plan: Perf-evidence round — measure the three evidenced hot-path gaps (4 phases, branch/worktree: `fix/perf-evidence-round`, cut from `main` @ `834f477`)
+# Plan: Perf-evidence round — measure the three evidenced hot-path gaps (4 phases, branch/worktree: `fix/perf-evidence-round`, cut from `main` @ `1ece033`)
 
 **Revision 6 — plan-level skeptic gate: PASS (2026-07-28).** Gate history: v1 FAIL (B1–B7:
 wrong enum-change shape, unnamed test landmines, unobservable counters, ambiguous neuters,
@@ -120,17 +120,49 @@ measurement, record the figure under Decision 3.
   over bucket (i) + per-outcome counts. Empty/absent → `no hook invocations recorded`,
   exit 0. Percentiles: nearest-rank, sorted sample.
 **Acceptance criteria:**
-- [ ] AC1.1: forced-bail seam active → appended line carries `elapsed_ms` whichever bail
-      site wins. Neuter: remove from **both** :792 and :802 → red deterministically.
-      Separate assertion covers the success path (:847).
-- [ ] AC1.2: fixture with elapsed values 1..=100 + one pre-upgrade line + one torn line →
-      exactly p50=50, p99=99, `1 pre-upgrade lines (no elapsed_ms)`, `1 unparseable lines
-      skipped`. Neuter: merge either bucket into another → red.
-- [ ] AC1.3 (ledger, not CI): release build, 10k-record `memory.jsonl` (schema per
-      `seed_capped_stale_heavy_corpus`, integration.rs:6196; seeding commands verbatim in
-      the ledger row), ≥100 real `agentrec hook` subprocess runs on this machine; p50/p99 +
-      injected-vs-budget_exceeded split recorded in VERIFY-LEDGER.md:16. Row transitions per
-      Decision 3.
+- [x] AC1.1 **MET** (`c784714`): forced-bail seam active → appended line carries `elapsed_ms`
+      whichever bail site wins. Neuter: remove from **both** :792 and :802 → red
+      deterministically. Separate assertion covers the success path (:847).
+      *Independently re-derived by the phase reviewer: neuter RED 3/3 for the right reason
+      (assertion message, not a compile error), source restored byte-identically to
+      `d1f3f30a…`. The success-path assert is load-bearing — neutering site 6 alone reds it
+      by name.*
+      **PLAN CORRECTION (measured, 2026-07-28):** this AC's stated rationale — that the two
+      bail sites "race under the forced-bail seam (either arm wins)" — is **FALSE**. The
+      reviewer instrumented both arms with a discriminator and measured **60/60 in favour of
+      the `recv_timeout` Err arm** (30 clean + 30 under 6-way CPU load); site 3 never fired.
+      Cause: std's `recv_timeout` does an optimistic `try_recv` before `recv_deadline(now+0)`,
+      and the freshly-spawned worker has not sent yet. The AC still holds as written (its
+      neuter removes the field from **both** sites, so it cannot pass on one arm alone), but
+      the consequence is a real residual: **sites 3, 4 and 5 carry `elapsed_ms` with no test
+      asserting it**, and site 3 is precisely the one whose value passes through the
+      `u128 as u64` cast. Not closed this round — the ratchet forbids the reviewer widening
+      an AC, and widening it now would be tightening after the fact. Recorded as a residual.
+- [x] AC1.2 **MET** (`c784714`): fixture with elapsed values 1..=100 + one pre-upgrade line +
+      one torn line → exactly p50=50, p99=99, `1 pre-upgrade lines (no elapsed_ms)`,
+      `1 unparseable lines skipped`. Neuter: merge either bucket into another → red.
+      *Reviewer re-derived the neuter in **both** directions (pre-upgrade→torn and
+      torn→pre-upgrade), each RED for the right reason, restored to `0bdc2c87…`. Percentiles
+      confirmed exactly nearest-rank on the real binary (p50=50 p90=90 p99=99 max=100 — no
+      interpolation, no off-by-one). The load-bearing isolation constraint was verified
+      empirically, not just read: a corrupt `memory.jsonl` alongside a healthy
+      `memory-stats.jsonl` still reports, while plain `memories` on the same store returns
+      nothing.*
+      *Note: the **count** asserts carry the neuter; the percentile asserts do not
+      discriminate a pre-upgrade→measurable merge (n=101 over [0,1..100] still yields p50=50,
+      p99=99) — they exist to pin the exact-value demand, which is what the AC asked for.*
+- [x] AC1.3 **MET → ledger row CLOSED** (2026-07-28, release build at `051a9a4`): 10k-record
+      `memory.jsonl` (schema per `seed_capped_stale_heavy_corpus`, integration.rs:6196),
+      **360** real `agentrec hook` subprocess runs in a throwaway root, 0 nonzero exits.
+      Three legs of 120: (A) stale-heavy/capped **p99=16 ms**, (B) fresh-first/injecting
+      **p99=13 ms** with 120/120 injected, (C) leg B under 8-way CPU load **p99=22 ms**.
+      **Zero `budget_exceeded` across all 360 runs** — the envelope holds on the merits, not
+      via the fail-open suppression the criterion would also have accepted. Row transitions
+      to CLOSED per Decision 3 (criterion is p99 < 50 ms; worst leg is 22 ms, ~2.3× margin).
+      Leg C was added beyond the AC because an unloaded sequential run is the "reasoned safe,
+      unobserved" class this repo has repeatedly been burned by; it carries a positive control
+      (the load shifted p50 10→16, p99 13→22, so it was not a no-op). Full figure, honest
+      bounds, and verbatim reproduction commands in VERIFY-LEDGER.md.
 **Expected test outputs:** **430 / 0 / 1** (+2:
 `hook_stats_lines_carry_elapsed_ms_on_either_bail_site`,
 `memories_stats_three_bucket_summary`).
@@ -167,19 +199,19 @@ map lines + extend `status_json_carries_degraded_fields` at cmds.rs:1602).
 - `state.rs`: two fields, per-field parse, default 0; pre-instrumentation `state.json`
   renders 0, never resets siblings.
 **Acceptance criteria:**
-- [ ] AC3.1 (unit, daemon.rs tests module, driving `Recorder::stage` directly — no live
+- [x] AC3.1 (unit, daemon.rs tests module, driving `Recorder::stage` directly — no live
       daemon, no hook, so persist-path callers cannot inflate): same content staged twice →
       `dedup_hits == 1`, `dedup_reread_bytes == <len>`; content change → no increment;
       over-cap file → no increment. Neuter: hardcode `deduped: false` at store.rs:94 → red.
-- [ ] AC3.2: `status --json` exposes both counters (extension inside
+- [x] AC3.2: `status --json` exposes both counters (extension inside
       `status_json_carries_degraded_fields`); missing-field `state.json` renders 0 for both,
       siblings preserved (extend the existing forward-compat test; cite the extension in
       the claim).
-- [ ] AC3.3: heal (store.rs:591) and mtime-bump (store.rs:609) assert the same *behavior*;
+- [x] AC3.3: heal (store.rs:591) and mtime-bump (store.rs:609) assert the same *behavior*;
       the heal test's `assert_eq!` names the Decision 6 concrete values
       (`deduped: false, reread_bytes: 0`) — an executor inventing different values is a
       plan violation, not a judgment call.
-- [ ] AC3.4: `Recorder::stage` alone never touches `state.json` (assert the file is absent/
+- [x] AC3.4: `Recorder::stage` alone never touches `state.json` (assert the file is absent/
       byte-identical after staging a batch containing dedup hits); it changes only after
       `drain_recorder_stats` runs. Neuter: move the counter persistence into `stage`'s
       per-file loop → red. *(Retargeted per gate NB7 — v3 probed the drain fn itself, which
@@ -224,13 +256,13 @@ retention.rs's own tests module alongside the existing ones (retention.rs:247+).
   Existing retention tests (retention.rs:247-520) pass **unmodified** — this is the
   refactor's whole discriminator.
 **Acceptance criteria:**
-- [ ] AC2a.1: every existing retention test passes with zero edits — pure regression
+- [x] AC2a.1: every existing retention test passes with zero edits — pure regression
       criterion. *(B12 correction: `enforce_budget_skips_a_candidate_touched_after_pass_
       start` (retention.rs:444-480) pins the guard **pair** via the delete outcome only —
       under the both-halves design, execute's re-check masks a deleted plan-side guard from
       every deletion-observable assertion, so this test canNOT red a plan-only neuter. The
       plan-side guard's own discriminator lives in AC2a.2.)*
-- [ ] AC2a.2 (new unit — carries the plan-side guard's discriminator, per B12): fixture
+- [x] AC2a.2 (new unit — carries the plan-side guard's discriminator, per B12): fixture
       where `enforce_budget` would evict V and protect P, **plus** a boundary candidate F
       whose mtime is future-dated past `pass_start` (future-dating is correct on THIS leg —
       the plan *report* is under test, not the delete-time re-check), **plus** one candidate
@@ -246,7 +278,7 @@ retention.rs's own tests module alongside the existing ones (retention.rs:247+).
       plan-side freshness guard → F appears in victims; (ii) reorder the guard ahead of
       protect-retain → `protected_bytes` shrinks; (iii) make `plan_eviction` delete →
       byte-identical assert reds.
-- [ ] AC2a.3 (new unit — the deterministic replacement for v3's vacuous AC2b.4): an old,
+- [x] AC2a.3 (new unit — the deterministic replacement for v3's vacuous AC2b.4): an old,
       boundary-evictable turn references blob X (plus a newer turn, so A5 newest-turn
       protection cannot mask the result); `plan_eviction` lists X as victim; the test then
       bumps X's mtime via a **real-now dedup-put of identical bytes** (store.rs:83-84 sets
@@ -333,19 +365,19 @@ needs (NB3)). README.md (docs).
   staleness is covered by execute's mtime re-check (AC2a.3). The honesty-round's
   "narrowed not closed" `undo`-race residual carries over unchanged.
 **Acceptance criteria (Q1 = (a)):**
-- [ ] AC2b.1: text `status` on an over-budget store leaves `.agentrec/objects/` byte-,
+- [x] AC2b.1: text `status` on an over-budget store leaves `.agentrec/objects/` byte-,
       mtime-, count-identical, while still printing the over-budget notice AND the
       protected-bytes clause. (Objects-tree scope only — the store-mutation claim, not
       "status writes nothing anywhere".) Neuter: swap `plan_eviction` back to
       `enforce_budget` in `status_report` → red.
-- [ ] AC2b.2: live daemon (seam interval ~2s, seam budget) on an over-budget store evicts
+- [x] AC2b.2: live daemon (seam interval ~2s, seam budget) on an over-budget store evicts
       within 2× interval: oldest unprotected blob gone + one stderr eviction line (captured
       via the new stderr-file spawn variant); torn-line ref and pin blob survive. Neuter:
       delete the tick call → red.
-- [ ] AC2b.3: daemon-down + over-budget → `status` prints `nothing is evicting`, deletes
+- [x] AC2b.3: daemon-down + over-budget → `status` prints `nothing is evicting`, deletes
       nothing. (Accepted residual, stated in-product: CLI-only writers — `undo` — can grow
       a store no daemon shrinks.)
-- [ ] AC2b.4: full suite green with exactly the three dispositions above; no other test
+- [x] AC2b.4: full suite green with exactly the three dispositions above; no other test
       deleted or weakened; unit-level `open.json` harvest test present. *(v3's AC2b.4 —
       "freshly-staged blob survives the tick" — is deleted as vacuous per gate B10: a
       staged blob is not in `log.jsonl` until the turn closes, so it is never a candidate

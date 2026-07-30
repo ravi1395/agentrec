@@ -1,5 +1,5 @@
 stdout:
-{"epoch_ignore_rebuilds":0,"epoch_ignore_rebuilds_stale":true,"ignore_rebuilds":0,"io_failed":[],"last_bad_field":null,"last_ignore_rebuild_ms":null,"prompt_put_failures":0,"snapshot_failures":0,"state_parse_failures":0}
+{"dedup_hits":0,"dedup_reread_bytes":0,"epoch_ignore_rebuilds":0,"epoch_ignore_rebuilds_stale":true,"ignore_rebuilds":0,"io_failed":[],"last_bad_field":null,"last_ignore_rebuild_ms":null,"prompt_put_failures":0,"snapshot_failures":0,"state_parse_failures":0}
 
 --stderr--
 

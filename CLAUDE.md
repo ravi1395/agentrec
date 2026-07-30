@@ -79,13 +79,22 @@ carries only current state, what's next, and standing debts.
     **P5's entry condition**, since a `--json` serializer reimplementing diff or blame
     interpretation in `cli/src` reopens the seam P4 closed.
 
-- **`main` @ `204ff04`** — docs-only chain on top of `1ece033`. Test baseline **428 / 0 / 1**
-  (re-verified at `834f477`). Live daemon records this repo; store healthy post-purge.
-- **`fix/perf-evidence-round` (pushed, NO PR yet)** — perf-evidence round executed and
-  GATE-PASSED: **443 / 0 / 1**, 10k/50ms recall envelope closed (p99 11–23 ms, AC1.3
-  founder-attested), dedup counters, retention plan/execute split, eviction moved to a daemon
-  tick, 3 real defects fixed (symlink dedup loss, `--stats` uninit, tick gap). Opening a PR is
-  what unlocks the Linux CI timing leg.
+- **`main`** — carries the perf-evidence round: [PR #8](https://github.com/ravi1395/agentrec/pull/8)
+  **squash-merged** to `main` as `4e04438` on 2026-07-30 (per-phase history survives only in the
+  PR, not on `main`), then reconciled with the local docs-only chain by merge, then absorbed into
+  `feat/phase-2-0-substrate` (this branch) by a further merge. Test baseline on `main` **443 / 0
+  / 1**; the substrate's own baseline is tracked separately above (P4: 537/0/2, pre-merge).
+- **Perf-evidence round (delivered, GATE PASS, now on `main` and merged into substrate)** —
+  10k/50ms recall envelope closed (p99 11–23 ms, AC1.3 founder-attested), dedup counters,
+  retention plan/execute split, eviction moved to a daemon tick, 3 real defects fixed (symlink
+  dedup loss, `--stats` uninit, tick gap). **Linux CI leg now real:** run
+  [30552318400](https://github.com/ravi1395/agentrec/actions/runs/30552318400) — all 5 jobs
+  green (`ubuntu-22.04`, `ubuntu-24.04`, `macos-14`, lint, induced-low-watches). The macOS leg
+  went red on its first attempt and green on rerun; cause recorded under residuals, not
+  hand-waved. **Collision with P4b-4:** this round split `enforce_budget` into
+  `plan_eviction`/`execute` and moved eviction off the `status` read verb onto a daemon tick —
+  P4b-4's AC16 fixture must target `plan_eviction`, not `enforce_budget` called from `status`;
+  see `docs/superpowers/plans/2026-07-30-p4b-branch-merge-state.md` §3.
 - **Phase 2 spec hardened + gated (2026-07-28, 6 skeptic rounds, commits
   `bd0b679`/`bde8146`/`90202f6`/`204ff04`):** founder decisions 5–10 in
   `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` — (5) protocol freeze behind
@@ -176,15 +185,23 @@ carries only current state, what's next, and standing debts.
   `clm_07FVVKJGHZS8ZFSR2998HE7QRP`) — multi-filter `cargo test`. Underlying tests pass under a
   corrected invocation, but REFUTED is not amendable and re-declaring an equivalent is forbidden
   as dodging.
-- Open the PR for `fix/perf-evidence-round` (Linux CI evidence + merge of the 443-test round).
-  Still the only thing unlocking the **Linux CI leg**, which closes P1's AC7 residual (the
-  `ru_maxrss` divisor is `#[cfg]`-selected; its arithmetic is unit-tested from one machine but
-  Linux's constant selection is unproven).
+- ~~Open the PR for `fix/perf-evidence-round`~~ **done** — PR #8 merged to `main`
+  (`4e04438`/`72c4b82`/`34bbb0c`) and absorbed into this branch by merge; Linux CI leg is real
+  (run `30552318400`, 5/5 green). **P1's AC7 residual is NOT closed by this** — checked before
+  claiming it: no test anywhere calls `peak_rss_mb()` (only `rss_raw_to_mb` is unit-tested, with
+  both divisors passed explicitly, regardless of host OS), so the Linux `#[cfg(target_os =
+  "linux")]`-selected `RSS_DIVISOR` constant is still unexercised on a real Linux runner. The
+  green suite proves the Linux build compiles and the rest of the suite passes, nothing about
+  this specific constant. Still open; needs an assertion on `import --dry-run`'s reported
+  `peak_rss_mb` running under Linux CI to close.
 - `rm` retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498`
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
   over 2026-07-28).
-- 4 claimd claims DECLARED awaiting manual attestation (never self-attested).
+- 5 claimd claims DECLARED awaiting manual attestation (never self-attested).
+- **66 claimd claims STALE on scope-drift** after the PR #8 merge brought the round's file
+  content onto `main` (`claimd status`, 2026-07-30). Re-confirmation is owed and was NOT done
+  in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
 - Demand/launch gate (Show HN etc.) never run — ROADMAP Phase 0's 30-day kill criterion has
@@ -201,7 +218,15 @@ carries only current state, what's next, and standing debts.
 - P1 probe verdict bounded: fixture aging can't reproduce weeks-old FSEvents journal history;
   the dogfood daemon is the observatory.
 - Perf/timing margins are macOS+one-Colima-VM evidence; population-level claims close only
-  over CI history (hence the PR above).
+  over CI history. PR #8 contributed the first two GitHub-runner Linux data points for this
+  round; one PR is not a population.
+- **`hook_recall_hard_wall_deadline` is runner-coupled** (first observed PR #8, macos-14 job
+  `90903831567`): it timed **204.1 ms** against a `< 200 ms` assert and passed on rerun. The
+  invariant held both times — a 600 ms blocked pin read was abandoned, not waited on — but the
+  assert measures *whole-process* wall including fork+exec, leaving ~4 ms of margin on a shared
+  runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
+  block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
+  spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
 - Memory dogfood ladder effectively not started (store prepped 2026-07-17; clock never ran
   clean).
 

@@ -1944,7 +1944,7 @@ mod persist {
                     let excerpt = agentrec_core::scrub::excerpt(text);
                     let full = agentrec_core::scrub::scrub(text);
                     let prompt_ref = match store.put_result(full.as_bytes()) {
-                        PutResult::Stored(hash) => Some(hash),
+                        PutResult::Stored { hash, .. } => Some(hash),
                         PutResult::OverCap | PutResult::IoError(_) => None,
                     };
                     (prompt_ref, Some(excerpt))
@@ -2221,7 +2221,7 @@ mod persist {
 
         if let Some(b) = &before_bytes {
             match store.put_result(b) {
-                PutResult::Stored(h) => before_ref = Some(h),
+                PutResult::Stored { hash, .. } => before_ref = Some(hash),
                 PutResult::OverCap => {
                     skipped = true;
                     skipped_reason = Some(skip_reason::OVER_CAP.to_string());
@@ -2235,7 +2235,7 @@ mod persist {
         if !skipped {
             if let Some(a) = &after_bytes {
                 match store.put_result(a) {
-                    PutResult::Stored(h) => after_ref = Some(h),
+                    PutResult::Stored { hash, .. } => after_ref = Some(hash),
                     PutResult::OverCap => {
                         skipped = true;
                         skipped_reason = Some(skip_reason::OVER_CAP.to_string());
