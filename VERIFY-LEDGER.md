@@ -431,3 +431,34 @@ are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
   AC. Recorded rather than backdated.
 - Test delta is **+29**, not the task file's "+18" — the ladder there is stale, and the ratchet
   only tightens.
+
+### Round 1 of the gate FAILED. Two defects, both real, both now fixed with the test that catches them
+
+- **AC6 FAIL — a cursor's `after_id` is not identity.** Turn ids are NOT unique in real ledgers:
+  a pre-fix daemon's orphan recovery re-appends a turn under its reserved id (the shape
+  `same_revert` and `purge --log-duplicates` exist for), and the known import defect appends a
+  second turn under a resumed `sessionId`. `list` resolved the cursor by FIRST match, so on
+  ledger `[t_0, t_DUP, t_1, t_DUP, t_2]` a cursor minted at the second `t_DUP` re-delivered
+  `t_1` and `t_DUP` after a **pure append** — silently, no `Stale`. That is AC6's growth clause
+  violated verbatim. `Cursor` now carries `after_occurrence`; losing the named occurrence is
+  `Stale`. Tests: `a_cursor_after_a_duplicated_id_resumes_at_the_right_occurrence`,
+  `losing_the_named_occurrence_of_a_duplicated_id_is_stale`.
+  **Note the shape: this is the second time this phase that binding to a "unique" identifier was
+  wrong, and both times the ledger already documented the non-uniqueness.**
+- **The signature defect, fourth instance — mine.** `record::parse_log_line` guarded on the
+  `type` tag being a *string*, so `{"type": 5}` fell through to the legacy no-tag fallback and
+  was coerced into a turn — beside a retained comment promising that a line carrying a `type`
+  is never coerced. Pre-P4 `load_log` keyed on **presence**. An unsanctioned behavior change for
+  every reader, caught by the gate probing the comment rather than reading it. Now presence-keyed;
+  `a_non_string_type_tag_is_never_coerced_into_a_turn` pins it.
+- **`limit: Some(0)` reported end-of-ledger** on a non-empty ledger. An empty page has no honest
+  continuation (no record to sit after), so it is now refused with `CursorError::ZeroLimit`
+  rather than answered with a lie a pager would act on.
+
+### Skeptic's honest UNTESTED rows (round 1), carried forward
+
+- The 504 baseline was not re-executed in the gate worktree (`git checkout` is forbidden there).
+  Arithmetic is consistent and matches this ledger; it rests on the orchestrator's run.
+- The latency figures need the live dogfood log the gate must not touch. Not an AC; UNTESTED by
+  the gate, measured by the orchestrator.
+- No release-mode **test** run (clippy/fmt were verified on release; the tests were not).

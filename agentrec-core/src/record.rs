@@ -266,12 +266,21 @@ pub fn parse_log_line(line: &str) -> ParsedLine {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return ParsedLine::Unparsed;
     };
-    match value.get("type").and_then(|t| t.as_str()) {
-        Some(t) if !KNOWN_RECORD_TYPES.contains(&t) => ParsedLine::UnknownType,
-        Some(_) => ParsedLine::Unparsed,
+    // Keyed on PRESENCE of `type`, not on it being a string: a line tagged
+    // `"type": 5` is still a line that carries a type, and coercing it into a
+    // turn is exactly the misparse this guard exists to prevent.
+    match value.get("type") {
         None => match serde_json::from_str::<TurnRecord>(trimmed) {
             Ok(turn) => ParsedLine::Record(LogRecord::Turn(turn)),
             Err(_) => ParsedLine::Unparsed,
+        },
+        Some(tag) => match tag.as_str() {
+            // A kind this binary predates. Tolerated and counted.
+            Some(t) if !KNOWN_RECORD_TYPES.contains(&t) => ParsedLine::UnknownType,
+            // A kind we know, written malformed — corruption, not a newer
+            // producer. A non-string tag is no kind at all, and lands here
+            // for the same reason: it is not evidence a producer exists.
+            _ => ParsedLine::Unparsed,
         },
     }
 }

@@ -280,15 +280,26 @@ pub struct Page<T> {
 
 /// Where a paginated read left off.
 ///
-/// A cursor is bound to BOTH the query it was produced by and the ledger
-/// state it observed. `observed` is the id of the last item returned, not a
+/// A cursor is bound to BOTH the query it produced from and the ledger state
+/// it observed. The observed part is the last returned record's id, not a
 /// byte offset or an index: `purge --log-duplicates` is a sanctioned rewrite
 /// that can leave `log.jsonl` the same length or longer while shifting every
 /// position, so a length- or offset-keyed cursor would silently resume at
 /// the wrong record instead of reporting staleness.
+///
+/// The id alone is NOT identity. A ledger written by a pre-fix daemon can
+/// hold two records under one id (PR #2's orphan-recovery double-emit — the
+/// shape `same_revert` and `purge --log-duplicates` exist for), and an
+/// import can append a second turn under a resumed `sessionId`. Resolving
+/// such a cursor by first match re-delivers every record between the two
+/// occurrences. `after_occurrence` disambiguates: it is the 0-based index of
+/// this id among the records sharing it, in ledger order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
     pub after_id: String,
+    /// Which record bearing `after_id` this cursor sits after, counting from
+    /// the start of the ledger. Zero whenever the id is unique.
+    pub after_occurrence: usize,
     /// Fingerprint of the query that produced this cursor; replaying it
     /// against a different query is a caller bug, not a page boundary.
     pub query: String,
@@ -303,6 +314,11 @@ pub enum CursorError {
     Stale,
     /// The cursor came from a different query.
     QueryMismatch,
+    /// `limit: Some(0)` was asked for. Refused rather than served: an empty
+    /// page over a non-empty ledger has no honest continuation to report —
+    /// there is no record to sit "after" — and answering "no more" would
+    /// stop a pager early on data that is still there.
+    ZeroLimit,
 }
 
 /// What to list, and how much of it.
@@ -446,7 +462,17 @@ impl RepositoryView {
                 // still very much present in the log — resolving against the
                 // filtered list would call that append a rewrite and report
                 // Stale on a ledger nothing rewrote.
-                let Some(ledger_idx) = all.iter().position(|t| t.id == c.after_id) else {
+                let Some(ledger_idx) = all
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.id == c.after_id)
+                    .map(|(i, _)| i)
+                    .nth(c.after_occurrence)
+                else {
+                    // Either the id is gone entirely, or a rewrite removed
+                    // the occurrence this cursor sat after. Both are stale;
+                    // falling back to another occurrence would re-deliver
+                    // every record between them.
                     return Err(CursorError::Stale);
                 };
                 selected
@@ -456,6 +482,9 @@ impl RepositoryView {
             }
         };
 
+        if q.limit == Some(0) {
+            return Err(CursorError::ZeroLimit);
+        }
         let end = match q.limit {
             Some(n) => (start + n).min(selected.len()),
             None => selected.len(),
@@ -473,10 +502,16 @@ impl RepositoryView {
             })
             .collect();
         let next = if end < selected.len() {
-            items.last().map(|t| Cursor {
-                after_id: t.id.clone(),
-                query: q.fingerprint(),
-            })
+            selected[start.min(selected.len())..end]
+                .last()
+                .map(|(ledger_idx, t)| Cursor {
+                    after_id: t.id.clone(),
+                    after_occurrence: all[..*ledger_idx]
+                        .iter()
+                        .filter(|prior| prior.id == t.id)
+                        .count(),
+                    query: q.fingerprint(),
+                })
         } else {
             None
         };
@@ -1016,5 +1051,147 @@ mod tests {
             .expect("a pure append must not invalidate an outstanding cursor");
         let ids: Vec<&str> = page.items.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["t_2", "t_RICH"]);
+    }
+    // ---- Gate round 1 findings -------------------------------------------
+
+    // GATE FAIL (round 1, AC6). Ids are NOT unique in real ledgers: a pre-fix
+    // daemon's orphan recovery re-appended a turn under its reserved id (the
+    // shape `same_revert` and `purge --log-duplicates` exist for), and an
+    // import can append a second turn under a resumed sessionId. Resolving a
+    // cursor by FIRST match re-delivered every record between the two
+    // occurrences — silently, with no Stale.
+    #[test]
+    fn a_cursor_after_a_duplicated_id_resumes_at_the_right_occurrence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ledger = [
+            turn_line("t_0"),
+            turn_line("t_DUP"),
+            turn_line("t_1"),
+            turn_line("t_DUP"),
+            turn_line("t_2"),
+        ];
+        write_log(root, &ledger.iter().map(String::as_str).collect::<Vec<_>>());
+        let view = RepositoryView::open(root).unwrap();
+
+        let first = view
+            .list(&TurnQuery {
+                limit: Some(4),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = first.items.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t_0", "t_DUP", "t_1", "t_DUP"]);
+        let cursor = first.next.unwrap();
+        assert_eq!(
+            cursor.after_occurrence, 1,
+            "cursor sits after the SECOND t_DUP"
+        );
+
+        // Pure append — the AC's growth case.
+        let mut grown: Vec<String> = ledger.to_vec();
+        grown.push(turn_line("t_3"));
+        write_log(root, &grown.iter().map(String::as_str).collect::<Vec<_>>());
+
+        let page = view
+            .list(&TurnQuery {
+                limit: Some(10),
+                after: Some(cursor),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t_2", "t_3"], "no record may be delivered twice");
+    }
+
+    #[test]
+    fn losing_the_named_occurrence_of_a_duplicated_id_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ledger = [turn_line("t_0"), turn_line("t_DUP"), turn_line("t_DUP")];
+        write_log(root, &ledger.iter().map(String::as_str).collect::<Vec<_>>());
+        let view = RepositoryView::open(root).unwrap();
+        let cursor = view
+            .list(&TurnQuery {
+                limit: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
+        // Page covered the whole ledger, so mint a cursor by paging shorter.
+        assert!(cursor.next.is_none());
+        let cursor = view
+            .list(&TurnQuery {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap()
+            .next
+            .unwrap();
+        assert_eq!(cursor.after_occurrence, 0);
+
+        // `purge --log-duplicates` collapses the pair to one record. The
+        // occurrence the cursor named is still there, so paging continues —
+        // but dropping to ONE occurrence when the cursor named the second
+        // must be stale, not a silent restart.
+        write_log(root, &[&turn_line("t_0"), &turn_line("t_DUP")]);
+        let after_second = Cursor {
+            after_id: "t_DUP".to_string(),
+            after_occurrence: 1,
+            query: TurnQuery::default().fingerprint(),
+        };
+        assert_eq!(
+            view.list(&TurnQuery {
+                limit: Some(2),
+                after: Some(after_second),
+                ..Default::default()
+            })
+            .unwrap_err(),
+            CursorError::Stale
+        );
+    }
+
+    // A zero-length page is not end-of-ledger, and it has no honest cursor
+    // either — so it is refused rather than answered. Dark-launched surface,
+    // but a pager told "no more" on a non-empty ledger stops early and loses
+    // data.
+    #[test]
+    fn a_zero_limit_query_is_refused_rather_than_answered_end_of_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let lines: Vec<String> = (0..3).map(|i| turn_line(&format!("t_{i}"))).collect();
+        write_log(root, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            RepositoryView::open(root)
+                .unwrap()
+                .list(&TurnQuery {
+                    limit: Some(0),
+                    ..Default::default()
+                })
+                .unwrap_err(),
+            CursorError::ZeroLimit
+        );
+    }
+    // GATE finding (round 1): the `type` guard keyed on the tag being a
+    // STRING, so `"type": 5` fell through to the legacy no-tag fallback and
+    // was coerced into a turn — while the comment beside it promised a line
+    // carrying a `type` is never coerced. Pre-P4 `load_log` keyed on
+    // presence; this pins that back.
+    #[test]
+    fn a_non_string_type_tag_is_never_coerced_into_a_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut v: serde_json::Value = serde_json::from_str(&turn_line("t_A")).unwrap();
+        v["type"] = serde_json::json!(5);
+        write_log(root, &[&v.to_string()]);
+        let ledger = RepositoryView::open(root).unwrap().ledger();
+        assert!(
+            ledger.records.is_empty(),
+            "a line carrying a type tag must never be read as a turn"
+        );
+        assert_eq!(
+            ledger.unknown_type_lines, 0,
+            "a number is not a record kind"
+        );
+        assert_eq!(ledger.unparsed_lines, 1);
     }
 }
