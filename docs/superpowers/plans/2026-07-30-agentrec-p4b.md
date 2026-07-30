@@ -133,6 +133,20 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    turn — and outside P4b's byte-equivalence charter. It becomes live the moment a paginating
    consumer exists, which is exactly MCP 2.2.
 
+7. **(non-blocking, raised by P4b-3's gate — also MCP 2.2, not this phase)** Two recall-paging
+   surfaces are unexercised by any shipped caller, because the CLI never sets `after`:
+   - `RecallPage::capped`'s page-relative recompute (`fetch.capped && end >= fetch.hits.len()`).
+     Both `capped` tests are uncursored, where the recompute provably reduces to `fetch.capped`
+     (`recall_impl` breaks on `out.len() >= k`, so the fetch never exceeds `k` and the page always
+     consumes it). The cursored branch — walk capped, page short of the fetch, so `capped: false` —
+     has no test.
+   - The cursor-staleness asymmetry: a memory that was Stale at page 1 and Fresh at page 2 *enters*
+     the ranking, and if it sorts above the cursor's id, page 2 starts past it and it is silently
+     never returned — no `Stale`, no reported hole. `list`/`diff` cannot have this because their
+     corpus is append-only; recall's is freshness-mutable. Disclosed on `RecallQuery::after`.
+
+   Both are owed tests by whichever task first pages `recall` for real.
+
 ## Manual E2E (after P4b-4, before P4b-5)
 
 Run against the live dogfood repo, observing output — not just exit codes:

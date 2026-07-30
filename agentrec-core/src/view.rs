@@ -628,6 +628,17 @@ pub struct MemoryHit {
 #[derive(Debug, Clone)]
 pub struct RecallPage {
     pub page: Page<MemoryHit>,
+    /// The verify walk stopped at [`RECALL_VERIFY_CAP`] with candidates still
+    /// unchecked, **and this page reaches the end of what that walk fetched**
+    /// — i.e. "matches may be missing from what you are holding".
+    ///
+    /// The second half is why this is not simply the underlying walk's flag.
+    /// On the cursored path the fetch is taken at `RECALL_VERIFY_CAP` rather
+    /// than at `k`, so a caller asking for `k = 2` and receiving 2 items would
+    /// otherwise see `capped: true` and render "results may be incomplete"
+    /// about a page that is complete. On the uncursored path the two are the
+    /// same value: `recall_impl` breaks on `out.len() >= k`, so the fetch
+    /// never exceeds `k` and the page always consumes it.
     pub capped: bool,
     pub store_corrupt: bool,
     pub store_empty: bool,
