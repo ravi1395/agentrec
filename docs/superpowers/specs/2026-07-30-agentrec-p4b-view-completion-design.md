@@ -1,9 +1,12 @@
 # P4b — `RepositoryView` completion (diff / blame / recall / wire `list`)
 
-> **Status:** design, revision 4 — amended after skeptic rounds 1 (FAIL, 5 blocking), 2 (FAIL, 3
-> blocking), and 3 (FAIL, 3 blocking). Rounds 2 and 3 each found every defect in the *previous
-> revision's own new material*, so each round's fixes are the next round's attack surface. Every
-> finding independently verified against the tree before amending. Written 2026-07-30 against
+> **Status:** design, revision 5 — amended after skeptic rounds 1 (FAIL, 5 blocking), 2 (FAIL, 3),
+> 3 (FAIL, 3), and 4 (FAIL, 1 blocking + 4 non-blocking). Each round found its defects in the
+> *previous revision's own new material*, so each round's fixes were the next round's attack
+> surface. Round 4's explicit convergence judgment: defects are converging, not structural — the
+> core (interface shape, decisions 1–12, commit sequence, golden-first instrument, AC16/AC17
+> mechanisms) has been stable since revision 3, and the remaining fix is mechanical. Every finding
+> independently verified against the tree before amending. Written 2026-07-30 against
 > `feat/phase-2-0-substrate` @ `638290d`. Parent spec:
 > `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Deep module 1).
 > Parent plan: `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`.
@@ -34,6 +37,14 @@
 > unknown-turn prose embeds a ledger range a bare typed error cannot carry — making revision 3's
 > AC17 jointly unsatisfiable with AC1; R12 added `list_of` so `status` keeps its single ledger
 > parse instead of gaining a two-parse consistency window.
+>
+> **Revision 5 changelog** (§Skeptic round 4 records the full findings):
+> R13 added `BlameError` + AC19 — revision 4's "`blame` needs no analogue" was true of the ledger
+> range and false of blame's own error data, leaving AC17/AC18/AC1/decision 9 jointly unsatisfiable
+> for `blame`; and made `DiffError::Lookup.ledger` an `Option` since `NoTurns` has no range to name.
+> R14 enumerated the sanctioned render opts and closed the closure-capture loophole. R15 gave
+> `recall`'s two-stream output an explicit contract. R16 recorded the `Page<FileDiff>`
+> materialization as an accepted resource-shape change.
 
 ## Why this phase exists
 
@@ -192,9 +203,38 @@ P4b additions:
 RepositoryView::list_records(q: &TurnQuery) -> Result<Page<TurnRecord>, CursorError>
 RepositoryView::list_of(l: &Ledger, q: &TurnQuery) -> Result<Page<TurnSummary>, CursorError>
 RepositoryView::diff(q: &DiffQuery)         -> Result<Page<FileDiff>, DiffError>
-RepositoryView::blame(q: &BlameQuery)       -> Result<BlameResult, RepoError>
+RepositoryView::blame(q: &BlameQuery)       -> Result<BlameResult, BlameError>
 RepositoryView::recall(q: &RecallQuery)     -> Result<RecallPage, RecallError>
 ```
+
+Error types, per decision 9 (each carries the data its adapter's prose needs, and no prose):
+
+```rust
+pub struct TurnRangeSummary { pub oldest_id: String, pub newest_id: String, pub count: usize }
+
+pub enum DiffError {
+    /// `ledger` is `None` only for `LookupError::NoTurns`, where there is no
+    /// oldest/newest id to name (R13).
+    Lookup { err: LookupError, ledger: Option<TurnRangeSummary> },
+    Cursor(CursorError),
+    Io(String),
+}
+
+pub enum BlameError {                 // R13 — blame is NOT error-data-free
+    FileNotFound,                     // adapter renders "<path>: not found"
+    LineOutOfRange { lines: usize },  // adapter renders "<path> has only N line(s)"
+    Io(String),
+}
+```
+
+`BlameError` exists because revision 4 asserted "`blame` needs no analogue". That was true of the
+*ledger range* and false of blame's own error data (R13): `blame_line` has two user-error arms —
+`"<path>: not found"` and `"<path> has only N line(s)"`, the latter byte-pinned by
+`blame_line_out_of_range.golden` — and the line count is computed from the worktree bytes that this
+phase moves *into* `view::blame`. With `blame -> Result<_, RepoError>` (a single `Io(String)`
+variant), the only way `?` reproduces those bytes is prose crafted in core, which violates
+decision 9 head-on and misfiles a user-input error as I/O. The path comes from the query, so the
+adapter owns both prose strings from a bare discriminant plus `lines`.
 
 `list_of` (R12) takes an already-parsed `Ledger`, mirroring the `health`/`health_of` pair P4
 established for exactly this reason. `status` needs it: today it derives its count, rich-rate,
@@ -410,14 +450,32 @@ all.
       `&Path`/`root`, no `BlobStore`, no `&[LogRecord]`, no store or ledger handle of any kind:
 
       ```rust
-      fn render_diff(page: &Page<FileDiff>, /* render opts */) -> String
-      fn render_blame(result: &BlameResult, /* render opts */) -> String
+      fn render_diff(page: &Page<FileDiff>, opts: &DiffRenderOpts) -> String
+      fn render_blame(result: &BlameResult, opts: &BlameRenderOpts) -> String
       ```
 
       A per-verb expression contract then pins stdout: `diff <turn>` ≡ `render_diff(&view.diff(q)?)`,
       `blame <target>` ≡ `render_blame(&view.blame(q)?)`, and the same shape for the human `log`
       and human `recall` forms. Because the renderer cannot reach a store or a ledger, an adapter
       physically cannot render from a direct read while satisfying the contract.
+
+      **The opts slot is the residual smuggling channel, so it is enumerated, not open** (R14).
+      Sanctioned opts, per verb, are exactly: `log` — `now_ms`, `utc`, `color`, `all_files`, and a
+      prebuilt `NoiseMatcher` (root-derived at *build* time, pure at render time); `recall` —
+      `now_ms`, `color`; `diff`/`blame` — `color` and whatever the task file enumerates when it
+      reads the renderers. Anything not on that list requires amending this design. A closure or
+      trait object that captures a store, ledger, or root (e.g. `impl Fn(&str) -> Vec<u8>`) **counts
+      as a handle** and is banned by the same rule — the constraint is on reachability, not on the
+      literal type name.
+
+      **`recall` renders to two streams**, so its contract is stated separately (R15): the F3 capped
+      notice and the "no memories yet" zero-state go to **stderr** while hits and "no fresh memories
+      match" go to **stdout**, and a `-> String` renderer cannot produce both. Sanctioned shape:
+      `render_recall(&RecallPage, opts) -> (String, String)` (stdout, stderr), or a `-> String`
+      renderer for stdout plus adapter-side `eprintln!` driven **solely** by `RecallPage`'s
+      `capped`/`store_empty`/`store_corrupt` flags — which are view-typed data, so either shape
+      keeps the constraint intact. This is not a conflict with AC2/AC10/AC11; it is how they are
+      jointly satisfied.
 
       This replaces revision 3's mechanism, which was gameable three ways (R11): an adapter could
       call `view.diff()` only to map its error, discard the page on `Ok`, and render the happy
@@ -443,8 +501,22 @@ all.
       DiffError::Lookup { err: LookupError, ledger: TurnRangeSummary }
       ```
 
-      Both the `Unknown` and `Ambiguous` arms are covered; `NoTurns` needs no range. `blame` needs
-      no analogue — it takes a path, not a turn ref, so its error prose embeds no ledger range.
+      Both the `Unknown` and `Ambiguous` arms are covered; `NoTurns` carries `None` (R13 — a bare
+      `TurnRangeSummary` is unconstructible on an empty ledger, so the field is `Option`).
+
+      The count is over the **unfiltered** turn vec — today's `readcmds::diff` feeds `turn_range` its
+      unfiltered `turns`, which is why the golden reads `(8 turns)` over 7 distinct ids (the DUP id
+      appears twice). `fmt::short_id` truncation stays in the CLI adapter; the view ships full ids.
+- [ ] **AC19** *(R13.)* `blame`'s two user-error arms are byte-identical to today while the adapter
+      owns their prose: `blame <file>:<n>` past end of file → stderr `agentrec: <path> has only N
+      line(s)`, exit 1, matching `blame_line_out_of_range.golden`; `blame <missing>:<n>` → stderr
+      `agentrec: <path>: not found`, exit 1. Both are rendered by the adapter from
+      `BlameError::{LineOutOfRange{lines}, FileNotFound}` plus the query's path — **no prose
+      crosses into `agentrec-core`** (decision 9). RED if `view::blame` returns a message string.
+
+      Note: the not-found arm is **not** currently golden-pinned (it sits in `golden.rs`'s documented
+      residual list), so this AC's instrument for that arm is a new integration assertion, not an
+      existing golden. Stated so the coverage claim is not read as stronger than it is.
 
 **Supplementary — negative-space, scoped to be literally runnable** (revision 1's versions were
 not; see §Skeptic round 1, B1 and B4):
@@ -529,7 +601,15 @@ zero-turn tempdir prints `[]`, exit 0; `agentrec status` output unchanged before
 - Two revisions of this document each broke on the same class of error: asserting which fields a
   consumer needs after reading only part of the consuming function. Before wiring any adapter to
   a view method, read the **whole** consumer, including its error, over-budget, and DEGRADED
-  branches.
+  branches. Rounds 3 and 4 then hit the same class *on error paths specifically* — an error arm is
+  a consumer too, and is the easiest one to forget.
+- **Accepted resource-shape change (R16):** `Page<FileDiff>` pre-resolves every entry's content, so
+  a pure `render_diff` holds a whole turn's blobs at once, where `print_entry` streams one pair at
+  a time and drops it. Worst case is bounded by the store's existing 10 MiB per-blob cap times the
+  turn's entry count, plus the assembled output `String`. Correctness and goldens are unaffected;
+  peak memory is. Accepted deliberately as the price of the signature constraint — if it ever
+  bites, the fix is the CLI adapter paging `DiffQuery.limit` internally, which the type already
+  supports.
 
 ## Skeptic round 1 (2026-07-30) — FAIL, 5 blocking, all verified real
 
@@ -627,3 +707,47 @@ that had already survived a round. Two distinct recurring failure modes:
    error-path pins) was gamed within one round. The AC that finally holds — AC17's
    signature-constrained renderers — makes the bypass unrepresentable instead. Prefer
    type-level impossibility over greppable prohibition for anything load-bearing.
+
+## Skeptic round 4 (2026-07-30) — FAIL, 1 blocking + 4 non-blocking; defects converging
+
+Round 4 verified R10's fixture genuinely discriminates (walking `enforce_budget`'s boundary
+arithmetic for both loss classes in both directions, and confirming `protect_newest` does not
+interfere with either shape), confirmed AC18 reproduces `diff_unknown_id.golden` byte-for-byte
+including `fmt::short_id` truncation and the `(8 turns)` count over the unfiltered vec, confirmed
+`FileDiff` **can** carry every arm `print_entry` renders without a render-time store lookup (the
+mandate's suspected hole — it is not one), confirmed R12's `list_of` preserves both status goldens,
+and confirmed AC17's supplementary grep is correctly scoped. One blocking finding:
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | **Revision 4's "`blame` needs no analogue" was half-true and load-bearing.** True of the ledger range; false of blame's own error data. `blame_line` has two user-error arms — `"<path>: not found"` and `"<path> has only N line(s)"`, the latter byte-pinned by `blame_line_out_of_range.golden` — and the line count comes from the worktree bytes this phase moves *into* `view::blame`. With `blame -> Result<_, RepoError>` (one `Io(String)` variant), the only way `?` yields those bytes is prose crafted in core, violating decision 9 and misfiling a user-input error as I/O. AC17 + AC18 + AC1 + decision 9 were jointly unsatisfiable for `blame`. Same disease as round 3's B2 — the error path not read as a consumer — one seam over, in the very sentence revision 4 added to close it | R13: `BlameError{FileNotFound, LineOutOfRange{lines}, Io}` added to the interface contract; **AC19** pins both arms byte-identical with the prose adapter-side; AC18's sentence corrected to "no *ledger-range* analogue"; the not-found arm flagged as not currently golden-pinned so its instrument is named honestly |
+
+Non-blocking, all folded in: **R13** also made `DiffError::Lookup.ledger` an `Option<TurnRangeSummary>`
+(a bare struct is unconstructible on an empty ledger, which the `NoTurns` arm reaches). **R14**
+enumerated the sanctioned render opts per verb and stated that a closure or trait object capturing a
+store/ledger/root counts as a handle — the constraint is on reachability, not on type names, closing
+the `/* render opts */` smuggling channel. **R15** gave `recall` a two-stream contract, since its F3
+capped notice and zero-state go to stderr while hits go to stdout and a `-> String` renderer cannot
+produce both. **R16** recorded the `Page<FileDiff>` materialization as an accepted resource-shape
+change with its 10 MiB-per-blob bound named and the paging escape hatch identified.
+
+**Convergence, as assessed by the reviewer and recorded here because it governs whether to keep
+revising or restructure:** round 1 found five blockers, several resting on false factual premises;
+round 2 found three including a data-loss path; round 3 found three, both in the two newest ACs;
+round 4 found one — a single error-arm typing gap in one sentence — plus four wording/enumeration
+patches. The core has been stable since revision 3. R13 applies the design's own already-proven
+pattern (a typed error carrying the data its adapter's prose needs) to the one verb that lacked it,
+so it creates no new attack surface of the kind rounds 2–4 exploited. A rewrite is not warranted.
+
+**Two lessons for the task file, both earned the hard way:**
+
+1. **Error arms are consumers.** Three consecutive rounds found the same class of defect — asserting
+   what a consumer needs after reading only part of it — and rounds 3 and 4 both found it on an
+   *error* path specifically, after §Risks had already been amended to warn about partial-consumer
+   reading. When extracting a seam, inventory every `Err` arm's data needs before designing the
+   error type, not after.
+2. **Prefer impossibility to prohibition.** Every AC that tried to *detect* bypass — `rg` shapes,
+   relocation checks, error-path pins — was gamed within one round. The mechanisms that finally hold
+   are the ones that make the wrong thing unrepresentable: signature-constrained renderers, typed
+   errors carrying their own render data, and a fixture whose RED depends on shared state rather than
+   on absence.
