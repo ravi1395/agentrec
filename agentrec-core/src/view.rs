@@ -467,6 +467,13 @@ pub enum DiffError {
     },
     Cursor(CursorError),
     /// An I/O failure that is not "absent". Carries the error, not prose.
+    ///
+    /// Unreachable today: `load_ledger` treats an unreadable log as an empty
+    /// one and every blob failure resolves to
+    /// [`FileDiffState::Unresolvable`] instead — which is the pre-existing
+    /// behavior this seam preserves verbatim. Kept so a stricter reader has
+    /// somewhere to report, and so the adapter has an arm rather than a
+    /// panic.
     Io(String),
 }
 
@@ -783,9 +790,13 @@ impl RepositoryView {
             .map(|e| resolve_file_diff(&store, e))
             .collect();
         let next = if end < selected.len() {
+            // Clamped in the slice expression, as `list` does: `end >= 1`
+            // holds here only because a zero-limit query was refused above,
+            // and an index must not rest on a non-local argument.
+            let last_idx = end.saturating_sub(1);
             selected[start..end].last().map(|e| Cursor {
                 after_id: e.path.clone(),
-                after_occurrence: selected[..end - 1]
+                after_occurrence: selected[..last_idx]
                     .iter()
                     .filter(|prior| prior.path == e.path)
                     .count(),
@@ -1879,16 +1890,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let files = vec![entry("src/a.rs", None, None)];
-        let a = turn("t_DUP", "2026-01-01T00:00:00Z", files.clone());
+        // `same_revert` compares id + file entries only, so `tool` may drift
+        // between the two records of one turn — which makes it the field
+        // that reveals WHICH record the collapse picked. `turn_id` cannot:
+        // it is equal on both by construction.
+        let mut a = turn("t_DUP", "2026-01-01T00:00:00Z", files.clone());
+        a.tool = Some("first-record".to_string());
         let mut b = turn("t_DUP", "2026-01-01T09:00:00Z", files);
         b.truncated = true;
+        b.tool = Some("second-record".to_string());
         seed(root, &[&a, &b]);
         let view = RepositoryView::open(root).unwrap();
         let q = DiffQuery {
             turn: "t_DUP".to_string(),
             ..Default::default()
         };
-        assert_eq!(view.diff(&q).unwrap().turn_id, "t_DUP");
+        let collapsed = view.diff(&q).unwrap();
+        assert_eq!(collapsed.turn_id, "t_DUP");
+        assert_eq!(
+            collapsed.tool.as_deref(),
+            Some("first-record"),
+            "the collapse resolves to the FIRST matching record"
+        );
 
         // Same id, DIFFERENT revert — must not collapse.
         let mut c = turn(
@@ -2096,6 +2119,18 @@ mod tests {
     // AC13 (diff half). The cursor names an entry, not an index: a rewrite
     // that dropped it must be Stale, never a silent reslide onto whatever
     // now sits at that position.
+    //
+    // SUBSTITUTED REWRITE (founder-ratified). AC13 names `purge
+    // --log-duplicates`, which a diff cursor provably cannot be staled by:
+    // that command drops only duplicates `same_revert` accepts, and
+    // `same_revert` requires SET-EQUAL file entries — so the surviving
+    // record's entry list is identical to the dropped one's, and a
+    // path-keyed cursor still resolves. The same rewrite CLASS (a
+    // same-length, in-place `log.jsonl` rewrite that changes what the
+    // resolved turn holds) stands in, and the `before_len` guard below is
+    // what keeps the substitution honest: without it the test would also
+    // pass against a length-keyed cursor, which is the very design this
+    // assertion exists to refuse.
     #[test]
     fn a_diff_cursor_into_a_rewritten_turn_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2278,8 +2313,14 @@ mod tests {
         ));
     }
 
+    // A TRAILING STOP is an uncovered interval but not a CRASH, and the two
+    // levels answer it differently on one fixture: the file level keys on
+    // `has_crash_gap` and so says "no turn touches", while the line walk
+    // keys on `has_gap_after(records, "")` and so refuses to claim the line
+    // predates recording. Holding both on one ledger is what makes this more
+    // than a restatement of `blame_untouched_file_no_gap.golden`.
     #[test]
-    fn blame_of_an_untouched_path_without_a_crash_gap_says_no_turn_touches() {
+    fn an_untouched_path_answers_differently_at_file_and_line_level() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_log(
@@ -2290,10 +2331,20 @@ mod tests {
             ],
         );
         touch(root, "orphan.rs", b"line one\n");
-        assert!(matches!(
-            blame_of(root, "orphan.rs", None).state,
-            BlameState::NoTurnTouches
-        ));
+        assert!(
+            matches!(
+                blame_of(root, "orphan.rs", None).state,
+                BlameState::NoTurnTouches
+            ),
+            "a deliberate stop is not a crash, so the file level names no gap"
+        );
+        assert!(
+            matches!(
+                blame_of(root, "orphan.rs", Some(1)).state,
+                BlameState::LineOriginGap
+            ),
+            "the line walk must not call an uncovered origin 'before recording began'"
+        );
     }
 
     // The two predicates stay unconflated: `modified` is hash-≠-after;

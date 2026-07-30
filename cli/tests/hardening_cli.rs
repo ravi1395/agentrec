@@ -517,13 +517,67 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
     let out = agentrec(root, &["blame", "f.rs:3"]);
     assert!(out.status.success(), "blame failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("attribution stale — recording gap"),
-        "stdout: {stdout}"
+    // EXACT, and the `f.rs:3: ` prefix is the load-bearing half. This is the
+    // POST-WALK gap answer — the walk ran, found no turn introducing the
+    // line, and refused to call it predating. A `contains` assertion here
+    // passes even with the post-walk and PRE-WALK arms wired backwards,
+    // because the two differ only by this prefix; see
+    // `e2_line_level_gap_before_the_walk_answers_without_a_line_prefix`.
+    assert_eq!(
+        stdout, "f.rs:3: attribution stale — recording gap\n",
+        "the post-walk gap answer is about a LINE, so it carries the prefix"
     );
-    assert!(
-        !stdout.contains("before recording began"),
-        "a gap-hidden origin must not be reported as predating all recording: {stdout}"
+}
+
+// The PRE-WALK sibling of the test above, and the only case that reaches it
+// at line level: `blame_line` short-circuits before ever reading the file
+// when the last touching turn is both modified-since and followed by an
+// uncovered interval. That answer is about recording COVERAGE, not about a
+// line, so it renders with NO `<path>:<line>: ` prefix — the byte
+// difference that makes the two states distinct rather than one state.
+#[test]
+fn e2_line_level_gap_before_the_walk_answers_without_a_line_prefix() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"a\nb\n").unwrap();
+    let turn = make_turn(
+        "t_E2LINETURN0000000000000001",
+        "2026-07-06T09:00:00.000Z",
+        "2026-07-06T09:00:00.000Z",
+        Some("create g.rs"),
+        vec![FileEntry {
+            path: "g.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    // An uncovered interval AFTER the turn ended...
+    seed_epoch(root, "stop", "2026-07-06T09:01:00.000Z");
+    seed_epoch(root, "start", "2026-07-06T09:02:00.000Z");
+    // ...and on-disk content that diverges from the turn's recorded `after`.
+    // Both are required: either alone leaves the walk to run normally.
+    std::fs::write(root.join("g.rs"), b"a\nchanged\n").unwrap();
+
+    let out = agentrec(root, &["blame", "g.rs:2"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "attribution stale — recording gap\n",
+        "the pre-walk answer carries no line prefix"
     );
 }
 
