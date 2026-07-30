@@ -907,7 +907,7 @@ fn process_session_file(
 /// component (`Path::join` does not collapse one on its own).
 ///
 /// Fix 2 (T1.5 fabrication round): a bare `./`-strip does not collapse `..`
-/// — a key like `../sutra-focus/src/composer.ts` joined against `cwd`
+/// — a key like `../beta/src/composer.ts` joined against `cwd`
 /// produces a path string that can never equal any real (already-absolute,
 /// `..`-free) `filePath`, so every such key silently failed to match,
 /// looking like "no `..` keys ever resolve" when the real cause was that the
@@ -2488,10 +2488,8 @@ mod tests {
             PathBuf::from("/c")
         );
         assert_eq!(
-            lexical_normalize(Path::new(
-                "/Users/ravichandrasekhar/Projects/sutra-focus/../sutra-focus/src/composer.ts"
-            )),
-            PathBuf::from("/Users/ravichandrasekhar/Projects/sutra-focus/src/composer.ts")
+            lexical_normalize(Path::new("/home/dev/Projects/beta/../beta/src/composer.ts")),
+            PathBuf::from("/home/dev/Projects/beta/src/composer.ts")
         );
     }
 
@@ -2521,10 +2519,10 @@ mod tests {
     fn normalize_backup_key_resolves_relative_dotdot_key_against_cwd() {
         // Reproduces the real-corpus shape from Fix 2's brief: a
         // `trackedFileBackups` key that climbs one directory above `cwd`.
-        let cwd = Path::new("/Users/ravichandrasekhar/Projects/sutra");
+        let cwd = Path::new("/home/dev/Projects/alpha");
         assert_eq!(
-            normalize_backup_key("../sutra-focus/src/composer.ts", cwd),
-            "/Users/ravichandrasekhar/Projects/sutra-focus/src/composer.ts"
+            normalize_backup_key("../beta/src/composer.ts", cwd),
+            "/home/dev/Projects/beta/src/composer.ts"
         );
     }
 

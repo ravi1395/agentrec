@@ -125,9 +125,11 @@ implementer were independent of each other, but both derived the type literal fr
 under-specified brief. Recorded as a standing lesson: **fixture-only evidence cannot close a
 corpus-shape claim; the real-corpus run is the gate.**
 
-**Still open after this row:** T2-candidate bytes are detected, never resolved (P1 scope — the
-963 candidates are a ceiling, not a proven recovery rate; P2 resolves git blobs and will
-convert some fraction of them to real recoveries and the rest to T3).
+**Closed by P2 (2026-07-30), not still open:** T2-candidate bytes were detected but never
+resolved in P1 scope — the **897** candidates (corrected; an earlier reading of 963 is
+superseded and must not be re-cited) were always a ceiling, never a proven recovery rate. P2
+resolved git blobs and converted a small fraction to real recoveries, the rest to T3. See
+the P2 row below for the measured outcome and its caveats.
 
 ### Anti-overclaim rider (added at the final skeptic gate — read before quoting any figure)
 
@@ -229,3 +231,139 @@ _(see the Open table near the top.)_ **J3 (CI matrix), I++1 (Linux perms), Y++2 
 - **CONCERN #2 — FIXED:** the torture default seed was a fixed constant, so a nightly D36 run with an unset seed would repeat one interleaving 7× and never broaden INV2 coverage. `env_seed()` now derives from the wall clock when `AGENTREC_TORTURE_SEED` is unset (explicit seed still honored + printed for reproducibility). Verified: two unset-seed runs print different seeds.
 - **CONCERN #1 (accepted):** the 1200-op run exercised INV2 (undo-of-undo byte-exact) on only 2/21 checkpoints; INV2 also has dedicated integration coverage. With the varying nightly seed (above), the 7-night streak will accumulate broader INV2 coverage — folded into the D36 launch-gate ladder row.
 - **CONCERN #3 (accepted, cosmetic):** idempotent `init` re-run reprints "scaffolded"/"set 0700" lines though it redid no work (operation is genuinely idempotent — no hook dup). Message-only nicety, deferred.
+
+---
+
+## Phase 2.0 P2 + P3 — GATE PASS (2026-07-30, skeptic round 2 at `32ee9b7`)
+
+Binding done-gate: a Fable skeptic in an isolated worktree, per-AC, after a FAILED round 1.
+**All 13 ACs PASS** (8 P2 incl. the added AC5b, 5 P3). Verified on the merged tree:
+`cargo test --workspace -- --test-threads=3` → **504 passed / 0 failed / 2 ignored**
+(pre-P2/P3 baseline **460 / 0 / 1** measured at `c6bd069`); clippy `-D warnings` clean debug
+**and** release; `fmt --check` exit 0; `strings target/release/agentrec` → 0 hits for both
+debug seams (`AGENTREC_IMPORT_DEBUG_ENTRIES`, `AGENTREC_IMPORT_T2_ORACLE`).
+
+Round 1 FAILED on two blockers, both since resolved — recorded because the first is the third
+instance on this plan of the same defect class:
+
+1. **Silent uncounted drop of 23.4% of file-producing entries.** The persist path's
+   `strip_prefix(cwd).ok()?` discarded any entry whose `filePath` was not under the session's
+   first `cwd` — no `FileEntry`, no counter, no stderr — while the adjacent comment asserted cwd
+   "is lexically a prefix of `file_path` in every real transcript". Measured false: **507 of
+   2,170** entries (24 mid-session cwd moves; 196 under the first cwd's *parent*). Dry-run
+   tier-counted those same entries as reconstructible, so the two ladders disagreed on ~23% of
+   the corpus. Fixed by a `skipped_out_of_cwd` counter (text + `--json`), a corrected comment,
+   and `blocker1_out_of_cwd_entry_is_counted_not_silently_dropped`. **Countability was the
+   requirement; recovery of the 507 was explicitly not authorized.** The figure now has three
+   independent derivations that agree (round-1 analysis, the implementer's counter, the round-2
+   skeptic's own release-binary run).
+2. **AC5b's claim text was unattestable** — see the rider below.
+
+### T2 resolution — the measured outcome, with its mandatory caveats
+
+**17 T2 resolutions, n=1133 → 1.50%**, over the population the deployed guard actually serves
+(entries with no inline `originalFile`, not a `create` op). Refusal breakdown: gate 1 (path
+already edited earlier in the session) 853, `structuredPatch` line check 188, uniqueness 43,
+other (not git / no commit / no `oldString`) 32.
+
+**Two caveats travel with that figure, always:**
+
+- **(a) Never render it as "897 → 17".** P1's 897 T2-candidates and this 1133 use different
+  definitions; the denominators are not comparable and the arrow implies a conversion rate that
+  was never measured.
+- **(b) The oracle channel and the population channel are DISJOINT — overlap 0** — both
+  coincidentally n=17. So **none of the 17 population resolutions is scorable for correctness**:
+  the fabrication rate on the population T2 actually serves is unmeasured, and unmeasurable by
+  this oracle. The 0/17 fabrication result below applies to a different 17.
+
+A T2 resolution rate far below the 41.5% candidate share is **the honest outcome the plan
+predicted, not a failure** — git holds committed states only, so a mid-session intermediate edit
+was never committed at all. Gate 1 causes 75% of the loss and its refusals are structurally
+correct (an agent editing one file repeatedly in a session is the normal case).
+
+### Founder decision — both T2 gates retained (2026-07-30)
+
+Measured trade-off over 1655 real transcripts: **gate 1 alone → 137 resolved / 5.1% fabricated /
+130 correct**; **both gates → 17 resolved / 0% / 17 correct**. Gate 2 therefore discards **127 of
+144 previously-correct resolutions (88%)** to remove 7 fabricated ones — a 7.6x recall cost.
+The founder chose zero fabrication: a wrong `before` is a wrong-byte revert source in
+user-visible undo history, and no per-entry "unverified" marker exists that would make shipping
+one acceptable. Recorded so the cost is visible, not silent. An earlier code comment claimed the
+discarded cases "were exactly the fabrication-prone ones" — **false, 60% of what gate 2 refuses
+was correct**; the comment has been corrected to measured reality.
+
+### Anti-overclaim rider — AC5b's bar was set wrong and cannot be met
+
+**Never state that import's fabrication rate is "≤1%".** The bar was added mid-flight (by the
+orchestrating agent, not the founder) without checking whether the sample size could support it.
+It cannot: the oracle's guard-admitted channel is **n=17**, giving a one-sided Clopper-Pearson
+95% upper bound of **16.2%**; establishing ≤1% needs ~299 clean samples and the entire verifiable
+channel holds **228**. This is an impossibility result, not a "measure more later".
+
+**The defensible statement, verbatim:** *0 fabrications observed in 17 guard-admitted real-corpus
+samples (95% upper bound 16.2%). The ≤1% bar is not establishable on this corpus by this oracle;
+the whole verifiable channel is 228 cases.*
+
+Claim `clm_4KSWSEZXS894D2P0DC92ZHH8MA` carries the unmeetable "at most 1 percent" wording. It
+stays **DECLARED and unattested, permanently, as the honesty record** — a bar was set, tested,
+and found unmeetable. It was never self-attested and must not be. The founder re-declared the
+criterion with the honest wording; the implemented ratchet is `mismatches == 0`, asserted (not
+merely printed) in `ac5b_oracle_real_corpus_measurement`.
+
+### Import honesty semantics established here
+
+- **Derived bytes are marked, never presented as observed.** `after` is sometimes reconstructed
+  by applying `oldString`→`newString` to a resolved `before`. Such bytes carry
+  `FileEntry.after_synthesized`, `modified_cause` returns a derived-bytes reason *before* any
+  later-turn or gap signal, and `diff` prints an explicit DERIVED notice. Before this marker
+  existed, `undo` reported `modified since (human or external edit)` on files nothing had
+  edited — fabricated attribution, and it trained users toward `--allow-modified`, the flag spec
+  decision 6 says must never be auto-honored. Synthesized bytes never reach a working tree:
+  `execute_revert` re-snapshots actual disk bytes first.
+- **`status`'s rich-rate excludes imported turns** (founder decision, 2026-07-30). The metric
+  warns "your hooks may be broken"; an imported turn is `rich` without any hook having fired, so
+  a bulk import could flood the trailing-20 window and make a dead hook read 100% healthy. Git
+  turns were already excluded. Protected by
+  `status_rich_rate_still_reflects_broken_hooks_alongside_imported_turns` (20 imported + 10 bare
+  → `0% over trailing 10`, warning still fires).
+- **P1's figures re-measured and NOT stale** after the secret-path parity fix: fresh dry-run gave
+  `skipped_secret_path: 0`, reproducing 99.6% importable (with its rider), t1 859, t1_5 90,
+  t2_cand 898, t3 323, RSS 16.56 MB. The bans on **92.3%**, the **~85% ceiling**, and bare
+  **99.6%** without its rider all stand.
+
+### Goldens: two deliberate recaptures, each audited to the line
+
+P3's goldens pin today's CLI bytes so P4's byte-equivalence claim becomes falsifiable. Their
+**capture point is the integration commit, not the P3 branch** — the imported turn's
+serialization only exists once P2 lands, and its rendering shifts again with P2's marker
+(reasoning and the two rejected alternatives are recorded in `P3.md`). Recapture 1 (P2 merge):
+exactly 4 lines — the `partial file list (imported)` marker on `log`/`log --all`/`log --explain`,
+plus the two new keys on `log --json`. Recapture 2 (rich-rate fix): exactly 1 line in
+`status.golden`. **P4 must not regenerate these to make extraction pass** — that is the ratchet.
+
+### Non-blocking residuals carried forward (skeptic-accepted)
+
+- **Latent duplicate-`sessionId` append** — `existing_ids` never gains ids appended during the
+  current run. The shape is real, not hypothetical: the corpus holds one `sessionId` in two
+  project dirs (a worktree-resumed session), inert today only because one copy is a 1-line
+  cwd-less stub. Two in-root copies with file entries would append two turns sharing an id, and
+  `diff`/`show`/`undo <id>` would error "ambiguous". One-line fix; **recommended before plan
+  exit.**
+- Persist path lacks session-level skip counters (no-cwd / canonicalize-fail / out-of-root
+  sessions return empty silently) where dry-run counts them — posture parity gap, not AC-required.
+- `skipped_out_of_cwd` is corpus-wide, so it counts entries in sessions wholly outside `--root`
+  that would never import — overstates loss in the conservative direction.
+- Imported turns store the raw `--root` string (e.g. `"root":"."`) where daemon records carry
+  absolute paths. Cosmetic today (all verbs resolve from `--root`); take the `root_canon`
+  one-liner in the next wire-touching round with a FORMAT-CHANGELOG entry. Golden-safe.
+- Real `kill -9` mid-import remains **UNTESTED** — simulated at a deterministic interruption
+  point. The mechanism argument was independently checked: `append_line_synced` is a single
+  `write_all` + `sync_all`, so a SIGKILL cannot tear a line; torn-line duplication is
+  power-loss-only. Idempotency is re-derived from `log.jsonl` ids, not `state.json` offsets.
+- `UPDATE_GOLDEN=1` regeneration verified in round 1 but **permission-blocked** for the round-2
+  skeptic, which confirmed that branch by code-read only. The RED half it proved itself: a
+  one-char `fmt::SEP` mutation failed 13 of 27 goldens, restored `shasum`-identical.
+- P3 AC2 has no failing-invocation golden for `log` — `log` takes no id, so the AC's
+  "(unknown id)" form does not exist for it. Ruled inapplicable rather than unmet.
+- Linux legs (the `ru_maxrss` divisor, two release-only `#[cfg(not(debug_assertions))]` tests)
+  still close only on the unopened CI PR.
