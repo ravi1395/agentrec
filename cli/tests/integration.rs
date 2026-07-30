@@ -6286,6 +6286,54 @@ fn recall_cli_fresh_only_and_json() {
     );
 }
 
+/// P4b-3: the human `recall` HITS line has no golden pin (`golden.rs`'s own
+/// module doc says only the two empty states are captured) — this is the
+/// one recall-rendering surface P4b-3's `format_memory_hit_line` extraction
+/// touches with no byte-exact test guarding it. Not a byte-exact assertion
+/// (the line embeds a relative timestamp, which goldens avoid for exactly
+/// this reason), but a substantive one: every field a hit line is supposed
+/// to show (freshness label, fact text, pin path) must actually appear, on
+/// stdout, in the plain (non-JSON, non-for-hook) form.
+#[test]
+fn recall_human_hit_line_shows_freshness_fact_and_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed rotation"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fresh"),
+        "expected the fresh freshness label: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("nightly seed rotation keeps torture runs reproducible"),
+        "expected the fact text: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("src/a.rs"),
+        "expected the pin path: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("[pins:"),
+        "expected the pins bracket: stdout={stdout}"
+    );
+}
+
 /// Seeds `memory.jsonl` directly (no daemon, no subprocess-per-record) with
 /// a stale-heavy corpus shaped exactly like `agentrec-core::memory::tests::
 /// recall_bounds_verification_on_stale_heavy_corpus`'s scenario 2: an

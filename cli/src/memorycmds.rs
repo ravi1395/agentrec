@@ -12,6 +12,7 @@ use agentrec_core::diff;
 use agentrec_core::memory::{self, EffectiveMemory, Freshness, MemoryOp, MemoryRecord, Pin};
 use agentrec_core::record::{append_log_line, LogRecord, SignalEvent, TurnRecord};
 use agentrec_core::store::{BlobStore, StoreError};
+use agentrec_core::view;
 use agentrec_core::{id, scrub};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -507,19 +508,26 @@ pub const HOOK_MAX_FACTS_DEFAULT: usize = 5;
 /// Max total chars (fence lines included) of a `--for-hook` block.
 const HOOK_MAX_CHARS: usize = 800;
 
-/// `recall`: rank-then-verify search over pinned memories (`memory::recall`
-/// already guarantees every returned entry is `Freshness::Fresh` — INV-M2).
+/// `recall`: rank-then-verify search over pinned memories, routed through
+/// [`view::RepositoryView::recall`] (P4b-3) — this function is a renderer
+/// over the view's typed `RecallPage`, never a second interpreter of
+/// `memory.jsonl`.
 ///
 /// Three output modes, checked in this order:
 /// - `for_hook`: fail-open always. An uninitialized repo, a recall error, or
 ///   zero hits all produce empty stdout + exit 0 — never stderr, never a
 ///   nonzero exit. A hit prints exactly one fenced block (see
-///   `build_hook_block`), no ids/hashes.
-/// - `json`: the effective records (all `Freshness::Fresh` by construction)
-///   as a JSON array — `[]` on zero hits, same PD4 convention as `log --json`.
-/// - human: a plain per-line listing; an empty *store* (never any memory
-///   recorded) gets the PD3 zero-state message on stderr, exit 0; an empty
-///   *result set* against a nonempty store gets a plain stdout notice.
+///   `build_hook_block`), no ids/hashes. Untouched by this seam — see
+///   [`recall_for_hook`]'s own doc comment.
+/// - `json`: `page.items` (all `Freshness::Fresh` by construction, INV-M2)
+///   as a JSON array — `[]` on zero hits, same PD4 convention as `log
+///   --json`. Serializes the items alone, never `RecallPage` itself
+///   (decision 3 — `capped`/`store_corrupt`/`store_empty` must never reach
+///   `--json`).
+/// - human: a plain per-line listing via [`render_recall`]; an empty
+///   *store* (never any memory recorded) gets the PD3 zero-state message on
+///   stderr, exit 0; an empty *result set* against a nonempty store gets a
+///   plain stdout notice.
 ///
 /// Outside `for_hook`, an uninitialized repo (`.agentrec/` missing) is a
 /// real error — exit 1, stderr — matching every other read verb's posture.
@@ -542,47 +550,19 @@ pub fn recall_cmd(
         return Err("not initialized — run `agentrec init`".to_string());
     }
 
-    let outcome = memory::recall_outcome(root, query, k)?;
-    let hits = outcome.hits;
+    let repo = view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let q = view::RecallQuery {
+        query: query.to_string(),
+        k,
+        after: None,
+    };
+    let page = repo.recall(&q).map_err(|e| recall_error_text(&e))?;
 
     if json {
-        // `recall` only ever returns Fresh, non-retracted memories (INV-M2),
-        // so there is never a retract reason to surface here. `--json` is
-        // deliberately out of scope for the F3 capped notice below — a
-        // machine consumer parses a fixed array shape; a human-readable
-        // warning line has no well-defined place in it without a schema
-        // bump, and no caller has asked for one yet.
-        let arr: Vec<EffectiveJson> = hits
-            .iter()
-            .map(|m| effective_json(m, Freshness::Fresh, None))
-            .collect();
         println!(
             "{}",
-            serde_json::to_string(&arr).map_err(|e| e.to_string())?
+            serde_json::to_string(&page.page.items).map_err(|e| e.to_string())?
         );
-        return Ok(());
-    }
-
-    // F3: the verify walk may have stopped at RECALL_VERIFY_CAP with fresh
-    // matches still unreached — `hits` alone can't distinguish that from
-    // "genuinely nothing fresh matched", so surface it explicitly. STDERR
-    // (not stdout) keeps `recall`'s stdout parseable/pipeable; this is the
-    // interactive human path only (see the `json` branch above and
-    // `recall_for_hook`, which never prints this).
-    if outcome.capped {
-        eprintln!(
-            "verification capped at {} candidates — results may be incomplete",
-            memory::RECALL_VERIFY_CAP
-        );
-    }
-
-    if hits.is_empty() {
-        let all = memory::load_effective(root).map_err(|e| e.to_string())?;
-        if all.is_empty() {
-            eprintln!("no memories yet — agentrec remember \"<fact>\" --from <file>");
-        } else {
-            println!("no fresh memories match \"{query}\"");
-        }
         return Ok(());
     }
 
@@ -591,13 +571,126 @@ pub fn recall_cmd(
         std::io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").is_some(),
     );
-    for m in &hits {
-        println!(
-            "{}",
-            format_memory_line(m, Freshness::Fresh, now_ms, color, None)
-        );
+    let (stdout, stderr) = render_recall(
+        &page,
+        RecallOpts {
+            now_ms,
+            color,
+            query,
+        },
+    );
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    if !stdout.is_empty() {
+        print!("{stdout}");
     }
     Ok(())
+}
+
+/// The human prose for a [`view::RecallError`] — unreachable from this CLI
+/// path today (it never sets `RecallQuery::after`, the only way to reach a
+/// [`view::CursorError`], and every arm of the underlying `memory::` calls
+/// returns `Ok`), but stated rather than unwrapped so a future paging caller
+/// gets a real message instead of a panic. Mirrors `readcmds::diff_error_text`'s
+/// `Cursor` arm verbatim — the same shared `CursorError` type, the same prose.
+fn recall_error_text(e: &view::RecallError) -> String {
+    match e {
+        view::RecallError::Cursor(c) => match c {
+            view::CursorError::Stale => {
+                "cursor is stale — the log was rewritten; restart the query".to_string()
+            }
+            view::CursorError::QueryMismatch => {
+                "cursor came from a different query — restart the query".to_string()
+            }
+            view::CursorError::ZeroLimit => "a limit of 0 has no honest page".to_string(),
+        },
+        view::RecallError::Io(msg) => msg.clone(),
+    }
+}
+
+/// Sanctioned `recall` render opts (design R17), complete: `now_ms`/`color`
+/// for [`format_memory_hit_line`], and `query` because the no-match line
+/// embeds it verbatim (`no fresh memories match "<query>"`, golden-pinned).
+/// Nothing else — no root, no store, no ledger handle is reachable from
+/// here or from [`render_recall`]'s signature.
+struct RecallOpts<'a> {
+    now_ms: u64,
+    color: bool,
+    query: &'a str,
+}
+
+/// `recall`'s whole two-stream output (design AC17/R15), built purely from
+/// the view's typed [`view::RecallPage`] plus [`RecallOpts`] — no `&Path`,
+/// no [`BlobStore`], no records slice, and no closure over any of them is
+/// reachable from this signature, so a bypass of the seam is structurally
+/// impossible here, not merely disciplined by convention (mirrors
+/// `readcmds::render_diff`/`render_blame`'s wiring gate). Returns
+/// `(stdout, stderr)`; emission order matches today's exactly — the F3
+/// capped notice always precedes the empty-state branch.
+fn render_recall(page: &view::RecallPage, opts: RecallOpts) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    // F3: the verify walk may have stopped at RECALL_VERIFY_CAP with fresh
+    // matches still unreached — the page alone can't distinguish that from
+    // "genuinely nothing fresh matched", so surface it explicitly. STDERR
+    // (not stdout) keeps `recall`'s stdout parseable/pipeable.
+    if page.capped {
+        stderr.push_str(&format!(
+            "verification capped at {} candidates — results may be incomplete\n",
+            view::RECALL_VERIFY_CAP
+        ));
+    }
+
+    if page.page.items.is_empty() {
+        if page.store_empty {
+            stderr.push_str("no memories yet — agentrec remember \"<fact>\" --from <file>\n");
+        } else {
+            stdout.push_str(&format!("no fresh memories match \"{}\"\n", opts.query));
+        }
+        return (stdout, stderr);
+    }
+
+    for m in &page.page.items {
+        stdout.push_str(&format_memory_hit_line(m, opts.now_ms, opts.color));
+        stdout.push('\n');
+    }
+    (stdout, stderr)
+}
+
+/// One line of `recall`'s human hit listing — same visual shape as
+/// [`format_memory_line`], built from a [`view::MemoryHit`] (the `recall`
+/// seam's own type) rather than an `EffectiveMemory`. `recall`'s hits are
+/// always Fresh and never retracted (INV-M2), so unlike `format_memory_line`
+/// this never threads a separately-derived freshness or a joined-in reason —
+/// both already ride on `MemoryHit` itself. The duplication with
+/// `format_memory_line` is bounded and deliberate: P4b-2's open-question-4
+/// resolution already established that a shared helper across `recall` and
+/// `memories` doesn't survive the seam split cleanly once one side takes a
+/// view type and the other an `EffectiveMemory`.
+fn format_memory_hit_line(m: &view::MemoryHit, now_ms: u64, color: bool) -> String {
+    let id = fmt::paint(&short_id(&m.id), "36", color);
+    let label = if m.retracted {
+        "retracted"
+    } else {
+        m.freshness
+    };
+    let when = fmt::relative_time(&agentrec_core::time::rfc3339(m.ts), now_ms);
+    let pins: Vec<String> = m
+        .pins
+        .iter()
+        .map(|p| fmt::sanitize_terminal(&p.path))
+        .collect();
+    let mut line = format!(
+        "{id}  {label:8}  {when}  {}  [pins: {}]",
+        fmt::sanitize_terminal(&m.fact),
+        pins.join(", ")
+    );
+    if let Some(r) = &m.reason {
+        line.push_str(&format!("  reason: {}", fmt::sanitize_terminal(r)));
+    }
+    line
 }
 
 /// `memories`: full audit listing (not a query). Base set is every

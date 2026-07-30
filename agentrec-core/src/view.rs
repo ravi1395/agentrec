@@ -5,7 +5,9 @@
 //! (and of `fmt::short_id`) while `--json` and, later, MCP read the same
 //! interpretation without going through a string.
 
+use crate::memory::{self, Pin};
 use crate::record::{FileEntry, LogRecord, TurnRecord};
+use serde::Serialize;
 
 /// Why an interval of wall time carries no recording coverage.
 ///
@@ -559,6 +561,81 @@ pub enum BlameError {
     Io(String),
 }
 
+// ---- recall ---------------------------------------------------------------
+
+/// Verify-walk cap re-export (R23(b)): `recall_cmd`'s F3 notice embeds this
+/// number. Re-exporting it here lets the adapter read `view::RECALL_VERIFY_CAP`
+/// instead of reaching into `memory::` directly, which is what AC15's grep
+/// checks for, without widening [`RecallPage`] past its spec'd four fields
+/// (the rejected alternative, R23(a)).
+pub use crate::memory::RECALL_VERIFY_CAP;
+
+/// Which memories to recall, how many, and (for a future paginating caller —
+/// MCP 2.2, not the CLI, which never sets `after`) where to resume.
+#[derive(Debug, Clone, Default)]
+pub struct RecallQuery {
+    pub query: String,
+    pub k: usize,
+    pub after: Option<Cursor>,
+}
+
+impl RecallQuery {
+    /// Stable identity of the query a cursor was minted against, mirroring
+    /// [`DiffQuery::fingerprint`]. `k` is excluded — it is page size, not
+    /// filter identity.
+    fn fingerprint(&self) -> String {
+        format!("recall:query={}", self.query)
+    }
+}
+
+/// One memory, reduced to what `recall`/`memories --json` render — byte-
+/// identical to today's `EffectiveJson` (decision 3): field order and
+/// `reason`'s `skip_serializing_if` are load-bearing, `serde_json` emits
+/// declaration order.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryHit {
+    pub id: String,
+    pub fact: String,
+    pub pins: Vec<Pin>,
+    pub origin: String,
+    pub ts: u64,
+    pub retracted: bool,
+    pub freshness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A page of recall hits plus the flags that split `recall_cmd`'s empty-
+/// state branches (F3 `capped`, F10 `store_corrupt`, PD3 `store_empty`).
+///
+/// Deliberately NOT `Serialize` — decision 3 requires `--json` to emit only
+/// `page.items`, never these flags; leaving the type unserializable makes
+/// that structurally impossible to violate by accident, not merely
+/// conventional (the adapter must explicitly reach for `.page.items`).
+#[derive(Debug, Clone)]
+pub struct RecallPage {
+    pub page: Page<MemoryHit>,
+    pub capped: bool,
+    pub store_corrupt: bool,
+    pub store_empty: bool,
+}
+
+/// Why a recall could not be produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallError {
+    /// A paginated (`after`-bearing) call's cursor could not be honored —
+    /// unreachable from the CLI today (it never pages recall), reachable
+    /// only by a future MCP 2.2 caller. Reuses [`CursorError`] rather than
+    /// inventing recall-specific prose, the same choice [`DiffError::Cursor`]
+    /// already made for the identical shared-`Cursor` contract.
+    Cursor(CursorError),
+    /// Unreachable today: every arm of `memory::recall_impl` returns `Ok`
+    /// (R21) — corruption, cap, and deadline are surfaced as
+    /// [`memory::RecallOutcome`] flags, not errors. Kept so a stricter
+    /// reader has somewhere to report instead of a panic.
+    Io(String),
+}
+
 /// One seam over a recorded repository. Holds no open handles: every method
 /// reads the ledger fresh, so a view is safe to keep across daemon writes.
 #[derive(Debug)]
@@ -857,6 +934,122 @@ impl RepositoryView {
             path: q.path.clone(),
             line: q.line,
             state,
+        })
+    }
+
+    /// Rank-then-verify recall (INV-M2) over `.agentrec/memory.jsonl`. A seam
+    /// swap under a stable contract (decision 3): this delegates to the
+    /// already-hardened walk in [`memory::recall_outcome`] rather than
+    /// reimplementing BM25 ranking or freshness verification here — F2's
+    /// deadline cooperation, F3's cap accounting, and F10's corruption
+    /// detection all stay exactly as memory.rs already proved them, once.
+    ///
+    /// Pagination (`q.after`) is honest, not speculative, about what a
+    /// single call can know: the CLI (the only caller today) never sets it,
+    /// so that path is EXACTLY today's `recall_outcome(root, query, k)` call
+    /// — same work, same bytes, no added I/O. A cursored call resolves
+    /// identity against one `k = RECALL_VERIFY_CAP` fetch (the largest
+    /// result a single call can ever produce — recall's own hard budget
+    /// wall), so `next` is only ever minted when that same fetch already
+    /// proves more items exist, never guessed from "the page happened to be
+    /// full".
+    pub fn recall(&self, q: &RecallQuery) -> Result<RecallPage, RecallError> {
+        struct Fetch {
+            hits: Vec<memory::EffectiveMemory>,
+            capped: bool,
+            store_corrupt: bool,
+            start: usize,
+            /// Whether `hits` is the full within-cap view, so `next` can be
+            /// computed exactly rather than left unknown (see doc comment).
+            exhaustive: bool,
+        }
+
+        let fetch = match &q.after {
+            None => {
+                let outcome =
+                    memory::recall_outcome(&self.root, &q.query, q.k).map_err(RecallError::Io)?;
+                Fetch {
+                    hits: outcome.hits,
+                    capped: outcome.capped,
+                    store_corrupt: outcome.store_corrupt,
+                    start: 0,
+                    exhaustive: false,
+                }
+            }
+            Some(c) => {
+                if c.query != q.fingerprint() {
+                    return Err(RecallError::Cursor(CursorError::QueryMismatch));
+                }
+                let outcome = memory::recall_outcome(&self.root, &q.query, RECALL_VERIFY_CAP)
+                    .map_err(RecallError::Io)?;
+                // Identity, not position (mirrors `list`/`diff`): a memory
+                // that dropped out of the candidate set (retracted, or
+                // verified no-longer-Fresh) since the cursor was minted must
+                // surface as stale rather than silently resume at whatever
+                // now sits nearby.
+                let Some(idx) = outcome.hits.iter().position(|m| m.id == c.after_id) else {
+                    return Err(RecallError::Cursor(CursorError::Stale));
+                };
+                Fetch {
+                    hits: outcome.hits,
+                    capped: outcome.capped,
+                    store_corrupt: outcome.store_corrupt,
+                    start: idx + 1,
+                    exhaustive: true,
+                }
+            }
+        };
+
+        let start = fetch.start.min(fetch.hits.len());
+        let end = (start + q.k).min(fetch.hits.len());
+        let items: Vec<MemoryHit> = fetch.hits[start..end]
+            .iter()
+            .map(|m| MemoryHit {
+                id: m.id.clone(),
+                fact: m.fact.clone(),
+                pins: m.pins.clone(),
+                origin: m.origin.clone(),
+                ts: m.ts,
+                retracted: m.retracted,
+                // INV-M2: `recall_outcome` only ever returns Fresh,
+                // non-retracted entries, so this is never anything but
+                // "fresh" reachable from here — the general 3-state label
+                // (and a live `reason`) is `memories`' concern, not this
+                // method's.
+                freshness: "fresh",
+                reason: None,
+            })
+            .collect();
+        let next = if fetch.exhaustive && end < fetch.hits.len() {
+            fetch.hits.get(end.saturating_sub(1)).map(|m| Cursor {
+                after_id: m.id.clone(),
+                after_occurrence: 0,
+                query: q.fingerprint(),
+            })
+        } else {
+            None
+        };
+
+        // PD3: distinguishes "no memory ever recorded" (stderr zero-state)
+        // from "nothing fresh matched" (stdout notice) — `recall_cmd`'s
+        // existing split. Computed lazily (only when this page is empty) to
+        // preserve the current work profile: a non-empty page trivially
+        // implies a non-empty store, and `load_effective`'s tolerant fold
+        // (not `recall_outcome`'s corruption-sensitive one) is the same
+        // function `recall_cmd` already called for this today.
+        let store_empty = if items.is_empty() {
+            memory::load_effective(&self.root)
+                .map_err(RecallError::Io)?
+                .is_empty()
+        } else {
+            false
+        };
+
+        Ok(RecallPage {
+            page: Page { items, next },
+            capped: fetch.capped,
+            store_corrupt: fetch.store_corrupt,
+            store_empty,
         })
     }
 }
@@ -2652,5 +2845,459 @@ mod tests {
             "precondition: ghost must be genuinely unresolvable"
         );
         assert_eq!(load_text(&store, Some(&ghost)), None);
+    }
+
+    // ---- recall (P4b-3, AC2-AC4, AC10-AC12) ------------------------------
+
+    /// Appends one hand-built `assert` line to `.agentrec/memory.jsonl` —
+    /// never through `memory::append_memory` (which scrubs/fsyncs
+    /// unnecessarily for a fixture), mirroring `cli/tests/golden.rs`'s
+    /// `seed_memory` helper.
+    fn seed_memory(
+        root: &std::path::Path,
+        id: &str,
+        fact: &str,
+        pin_path: &str,
+        pin_hash: &str,
+        ts: u64,
+        retracted: bool,
+    ) {
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let path = memory::memory_path(root);
+        let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let assert_rec = memory::MemoryRecord {
+            v: 1,
+            kind: "memory".to_string(),
+            id: id.to_string(),
+            op: memory::MemoryOp::Assert,
+            fact: fact.to_string(),
+            pins: vec![Pin {
+                path: pin_path.to_string(),
+                hash: pin_hash.to_string(),
+            }],
+            source_turns: vec![],
+            origin: "human".to_string(),
+            ts,
+            reason: None,
+        };
+        existing.push_str(&serde_json::to_string(&assert_rec).unwrap());
+        existing.push('\n');
+        if retracted {
+            let retract_rec = memory::MemoryRecord {
+                op: memory::MemoryOp::Retract,
+                ts: ts + 1,
+                ..assert_rec
+            };
+            existing.push_str(&serde_json::to_string(&retract_rec).unwrap());
+            existing.push('\n');
+        }
+        std::fs::write(&path, existing).unwrap();
+    }
+
+    /// Writes `content` to `root/rel` and returns its hash, so a seeded
+    /// memory's pin verifies Fresh.
+    fn write_pin(root: &std::path::Path, rel: &str, content: &[u8]) -> String {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, content).unwrap();
+        crate::store::hash_bytes(content)
+    }
+
+    /// Same two-doc-corpus shape `cli/tests/golden.rs::build_recall_fixture`
+    /// uses, and for the same reason (see that fixture's doc comment): a
+    /// single-document corpus can't clear `SCORE_FLOOR`, so a genuine BM25
+    /// match needs a second, non-matching document to keep `idf` above the
+    /// floor. `throttle` occurring three times (twice in the fact, once in
+    /// the pin path) is load-bearing, not a wording choice.
+    fn seed_recall_corpus(root: &std::path::Path) {
+        let match_hash = write_pin(root, "src/throttle.rs", b"fn throttle() {}\n");
+        seed_memory(
+            root,
+            "MATCH0000000000000000MEM1A",
+            "throttle limiter guards the API from bursty traffic via throttle checks",
+            "src/throttle.rs",
+            &match_hash,
+            1_000,
+            false,
+        );
+        let other_hash = write_pin(root, "src/changelog.rs", b"fn changelog() {}\n");
+        seed_memory(
+            root,
+            "THER0000000000000000MEM2AB",
+            "the release changelog script lives under scripts",
+            "src/changelog.rs",
+            &other_hash,
+            2_000,
+            false,
+        );
+    }
+
+    fn recall_of(root: &std::path::Path, query: &str, k: usize) -> RecallPage {
+        RepositoryView::open(root)
+            .unwrap()
+            .recall(&RecallQuery {
+                query: query.to_string(),
+                k,
+                after: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn recall_hit_carries_every_effective_json_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let page = recall_of(root, "throttle", 5);
+        assert_eq!(page.page.items.len(), 1, "{:?}", page.page.items);
+        let hit = &page.page.items[0];
+        assert_eq!(hit.id, "MATCH0000000000000000MEM1A");
+        assert_eq!(
+            hit.fact,
+            "throttle limiter guards the API from bursty traffic via throttle checks"
+        );
+        assert_eq!(hit.pins.len(), 1);
+        assert_eq!(hit.pins[0].path, "src/throttle.rs");
+        assert_eq!(hit.origin, "human");
+        assert_eq!(hit.ts, 1_000);
+        assert!(!hit.retracted);
+        assert_eq!(hit.freshness, "fresh");
+        assert_eq!(hit.reason, None);
+        assert!(!page.capped);
+        assert!(!page.store_corrupt);
+        assert!(!page.store_empty);
+    }
+
+    /// Two-sided pin on the verify walk (mirrors
+    /// `cli/tests/golden.rs::golden_recall_json_stale_pin`'s rationale at the
+    /// view level): drifting the pin AFTER the hash is recorded must exclude
+    /// the memory, proving `view::recall` doesn't silently skip freshness
+    /// verification.
+    #[test]
+    fn recall_excludes_a_memory_whose_pin_has_drifted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        write_pin(root, "src/throttle.rs", b"fn throttle() { /* edited */ }\n");
+        let page = recall_of(root, "throttle", 5);
+        assert!(
+            page.page.items.is_empty(),
+            "a drifted pin must never verify Fresh: {:?}",
+            page.page.items
+        );
+        assert!(!page.store_empty, "the store itself is non-empty");
+    }
+
+    #[test]
+    fn recall_store_empty_true_when_no_memory_ever_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let page = recall_of(root, "anything", 5);
+        assert!(page.page.items.is_empty());
+        assert!(page.store_empty);
+    }
+
+    #[test]
+    fn recall_store_empty_false_when_nonempty_store_has_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let page = recall_of(root, "zzzznomatch", 5);
+        assert!(page.page.items.is_empty());
+        assert!(
+            !page.store_empty,
+            "a non-empty store with no fresh match must not read as store_empty"
+        );
+    }
+
+    /// Blind spot a permissive `store_empty` implementation could miss: a
+    /// store holding ONLY a retracted memory is non-empty by
+    /// `load_effective`'s fold (retracted entries are folded in, not
+    /// dropped), so `store_empty` must stay `false` even though `recall`
+    /// itself never returns a retracted hit (INV-M2).
+    #[test]
+    fn recall_store_empty_false_for_a_retracted_only_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let hash = write_pin(root, "src/only.rs", b"fn only() {}\n");
+        seed_memory(
+            root,
+            "RETD0000000000000000MEM3AC",
+            "a fact that gets retracted",
+            "src/only.rs",
+            &hash,
+            1_000,
+            true,
+        );
+        let page = recall_of(root, "zzzznomatch", 5);
+        assert!(page.page.items.is_empty());
+        assert!(
+            !page.store_empty,
+            "a retracted-only store is non-empty, not store_empty"
+        );
+    }
+
+    /// `k=0` is a real, reachable CLI input (`agentrec recall <q> -k 0`) and
+    /// today's `memory::recall_outcome(root, query, 0)` answers it with an
+    /// empty, non-error result — never `CursorError::ZeroLimit`, which
+    /// exists for `list`/`diff`'s "no honest continuation to report" reason.
+    /// `recall`'s `k` is a results budget, not a pagination limit; nothing
+    /// about `k=0` is dishonest to answer directly, so this must NOT error.
+    #[test]
+    fn recall_k_zero_is_an_empty_ok_result_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let page = recall_of(root, "throttle", 0);
+        assert!(page.page.items.is_empty());
+        assert!(!page.capped);
+    }
+
+    /// The verify-cap re-export AC15 needs: `view::RECALL_VERIFY_CAP` must
+    /// be the exact same constant `memory::recall_outcome` bounds its walk
+    /// by, not a second, driftable copy.
+    #[test]
+    fn recall_verify_cap_reexport_matches_memory() {
+        assert_eq!(RECALL_VERIFY_CAP, memory::RECALL_VERIFY_CAP);
+    }
+
+    /// F3: `capped` mirrors `memory::RecallOutcome::capped` through the seam
+    /// unchanged. Reuses the same stale-heavy-corpus shape
+    /// `cli/tests/integration.rs::seed_capped_stale_heavy_corpus` uses: an
+    /// orphaned block strictly larger than `RECALL_VERIFY_CAP`, sharing one
+    /// high-scoring fact, so the walk exhausts the cap before finding any
+    /// Fresh match.
+    #[test]
+    fn recall_capped_is_set_when_the_verify_walk_hits_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let path = memory::memory_path(root);
+        let mut lines = String::new();
+        // Mirrors `cli/tests/integration.rs::seed_capped_stale_heavy_corpus`
+        // exactly (fresh_count=0): an orphaned block strictly larger than
+        // `RECALL_VERIFY_CAP`, sharing one fact, PLUS a filler block of a
+        // different fact — the filler is load-bearing, not padding: without
+        // it `df(kraken)` == corpus size and `idf` collapses toward zero,
+        // dropping every candidate below `SCORE_FLOOR` before the verify
+        // walk (and hence `capped`) is ever reached — the same
+        // vacuous-for-the-wrong-reason trap `build_stale_recall_fixture`'s
+        // doc comment (golden.rs) warns about.
+        let orphaned_count = RECALL_VERIFY_CAP as u64 + 12;
+        for i in 0..orphaned_count {
+            let rec = serde_json::json!({
+                "v": 1,
+                "type": "memory",
+                "id": format!("orph{i:0>10}"),
+                "op": "assert",
+                "fact": "kraken telemetry batching",
+                "pins": [{"path": format!("missing{i}.rs"), "hash": format!("sha256:{i:064}")}],
+                "source_turns": [],
+                "origin": "agent",
+                "ts": 1_000 + i,
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        for i in 0..100u64 {
+            let rec = serde_json::json!({
+                "v": 1,
+                "type": "memory",
+                "id": format!("filler{i:0>6}"),
+                "op": "assert",
+                "fact": "unrelated housekeeping chore",
+                "pins": [{"path": format!("filler_missing{i}.rs"), "hash": format!("sha256:{i:064}")}],
+                "source_turns": [],
+                "origin": "agent",
+                "ts": 3_000 + i,
+            });
+            lines.push_str(&rec.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(&path, lines).unwrap();
+
+        let page = recall_of(root, "kraken telemetry batching", 5);
+        assert!(page.page.items.is_empty(), "{:?}", page.page.items);
+        assert!(page.capped, "the walk must report it hit the verify cap");
+        assert!(!page.store_empty);
+    }
+
+    /// AC12: `view::recall` performs zero writes. Checked at the
+    /// filesystem level (byte length + a full directory listing of
+    /// `.agentrec`, not a single file's mtime, which is exactly the vacuity
+    /// trap the task file warns about — mtime equality holds trivially if
+    /// the file in question never existed either before or after).
+    #[test]
+    fn recall_performs_zero_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+
+        fn snapshot(dir: &std::path::Path) -> Vec<(String, u64)> {
+            let mut out: Vec<(String, u64)> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().to_string(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let before = snapshot(&root.join(".agentrec"));
+        let page = recall_of(root, "throttle", 5);
+        assert!(!page.page.items.is_empty(), "sanity: fixture must match");
+        let after = snapshot(&root.join(".agentrec"));
+        assert_eq!(
+            before, after,
+            "recall must not create, grow, or shrink any file under .agentrec"
+        );
+    }
+
+    #[test]
+    fn recall_cursor_pages_by_identity_with_no_repeats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Empty query -> the ts-descending fallback (`memory::recall_impl`),
+        // not BM25 — deterministic order with no `SCORE_FLOOR` concern, so
+        // three memories with distinct `ts` give a known, stable rank.
+        for (i, id) in ["AAAA", "BBBB", "CCCC"].iter().enumerate() {
+            let rel = format!("src/f{i}.rs");
+            let hash = write_pin(root, &rel, format!("content {i}").as_bytes());
+            seed_memory(
+                root,
+                &format!("{id}0000000000000000MEM{i}A"),
+                &format!("fact number {i}"),
+                &rel,
+                &hash,
+                1_000 + i as u64,
+                false,
+            );
+        }
+
+        let view = RepositoryView::open(root).unwrap();
+        let q1 = RecallQuery {
+            query: String::new(),
+            k: 1,
+            after: None,
+        };
+        let page1 = view.recall(&q1).unwrap();
+        assert_eq!(page1.page.items.len(), 1);
+        assert!(
+            page1.page.next.is_none(),
+            "the first (no-cursor) page never speculatively mints a next cursor"
+        );
+
+        // Manually mint what a paginating caller would have gotten had the
+        // first page's fetch been exhaustive — resolve identity by asking
+        // for everything, then page 2 by hand.
+        let full = view
+            .recall(&RecallQuery {
+                query: String::new(),
+                k: 3,
+                after: None,
+            })
+            .unwrap();
+        assert_eq!(full.page.items.len(), 3);
+        let cursor = Cursor {
+            after_id: full.page.items[0].id.clone(),
+            after_occurrence: 0,
+            query: q1.fingerprint(),
+        };
+        let page2 = view
+            .recall(&RecallQuery {
+                query: String::new(),
+                k: 2,
+                after: Some(cursor),
+            })
+            .unwrap();
+        let page2_ids: Vec<&str> = page2.page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            page2_ids,
+            vec![
+                full.page.items[1].id.as_str(),
+                full.page.items[2].id.as_str()
+            ],
+            "page 2 must continue exactly where page 1's identity left off, no repeat"
+        );
+        assert!(
+            page2.page.next.is_none(),
+            "an exhaustive fetch that reaches the end must not mint a next cursor"
+        );
+    }
+
+    #[test]
+    fn recall_cursor_from_a_different_query_is_a_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let foreign = Cursor {
+            after_id: "MATCH0000000000000000MEM1A".to_string(),
+            after_occurrence: 0,
+            query: "recall:query=some other query".to_string(),
+        };
+        let err = RepositoryView::open(root)
+            .unwrap()
+            .recall(&RecallQuery {
+                query: "throttle".to_string(),
+                k: 1,
+                after: Some(foreign),
+            })
+            .unwrap_err();
+        assert_eq!(err, RecallError::Cursor(CursorError::QueryMismatch));
+    }
+
+    /// A memory a cursor named can drop out of the candidate set entirely
+    /// (here: retracted between the two calls) — this must surface as
+    /// `Stale`, never a silent resume at whatever now sits nearby.
+    #[test]
+    fn recall_cursor_naming_a_now_retracted_memory_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let cursor = Cursor {
+            after_id: "MATCH0000000000000000MEM1A".to_string(),
+            after_occurrence: 0,
+            query: "recall:query=throttle".to_string(),
+        };
+
+        // Retract the only match by appending a retract record.
+        let path = memory::memory_path(root);
+        let existing = std::fs::read_to_string(&path).unwrap();
+        let retract_rec = memory::MemoryRecord {
+            v: 1,
+            kind: "memory".to_string(),
+            id: "MATCH0000000000000000MEM1A".to_string(),
+            op: memory::MemoryOp::Retract,
+            fact: "throttle limiter guards the API from bursty traffic via throttle checks"
+                .to_string(),
+            pins: vec![],
+            source_turns: vec![],
+            origin: "human".to_string(),
+            ts: 9_999,
+            reason: None,
+        };
+        std::fs::write(
+            &path,
+            existing + &serde_json::to_string(&retract_rec).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let err = RepositoryView::open(root)
+            .unwrap()
+            .recall(&RecallQuery {
+                query: "throttle".to_string(),
+                k: 1,
+                after: Some(cursor),
+            })
+            .unwrap_err();
+        assert_eq!(err, RecallError::Cursor(CursorError::Stale));
     }
 }
