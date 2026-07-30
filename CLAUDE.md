@@ -50,6 +50,35 @@ carries only current state, what's next, and standing debts.
   - P1's figures re-measured and **NOT stale** after the secret-path parity fix
     (`skipped_secret_path: 0`).
 
+- **P4 EXECUTED and GATE-PASSED (2026-07-30) on `feat/phase-2-0-p4`. Nothing pushed, no PR; NOT
+  yet merged to `feat/phase-2-0-substrate` at time of writing.**
+  `RepositoryView` extracted into `agentrec-core/src/view.rs`. **537 / 0 / 2** (baseline
+  re-measured on clean substrate: 504 / 0 / 2 — P4.md's "410 tests" and "21 goldens" are BOTH
+  stale, goldens are 27). Fable skeptic in an isolated worktree: **round 1 GATE FAIL, round 2
+  GATE PASS on all 7 ACs**, both mutation proofs re-run by the skeptic itself.
+  - Gap logic **unified, not relocated**: one `view::recording_gaps` returns every uncovered
+    interval tagged `Crash`/`Restart`/`TrailingStop`. The three old callers are NOT equivalent —
+    `status` and blame's no-turn fallback are crash-only, staleness is any-kind-after-a-timestamp
+    — so a naive collapse to one boolean would have moved blame output.
+  - `health()` is a pure read; `status` calls it and then `enforce_budget` explicitly. Proven both
+    ways (re-inserting the eviction fails the purity test).
+  - **AC6 failed round 1 for a reason worth keeping: a cursor keyed on a turn id assumed
+    uniqueness the ledger itself documents as false.** Orphan-recovery double-emit and resumed
+    import `sessionId`s both put two records under one id; resolving by first match re-delivered
+    records after a **pure append**, silently. Cursors now carry an occurrence ordinal.
+  - **The signature defect struck a fourth time, and this time the agent introduced it.**
+    `parse_log_line` guarded on the `type` tag being a *string*, so `{"type": 5}` was coerced into
+    a turn — beside a retained comment promising a line carrying a `type` is never coerced. The
+    gate caught it by probing the comment rather than reading it. Pre-P4 behavior (presence-keyed)
+    restored.
+  - A **+54% `status` latency regression** (13.4 → 20.6 ms on the real 2143-line log) from parsing
+    `log.jsonl` twice was found by measuring rather than shipped: `load_log` and `load_ledger` now
+    share one per-line classifier. Flat at **6.4 ms vs 6.6 ms**.
+  - **Deviations, recorded in VERIFY-LEDGER.md:** `health(&self, budget)` not the contract's no-arg
+    form (core stays free of CLI config); **`diff`/`blame`/`recall` NOT implemented** — that is
+    **P5's entry condition**, since a `--json` serializer reimplementing diff or blame
+    interpretation in `cli/src` reopens the seam P4 closed.
+
 - **`main` @ `204ff04`** — docs-only chain on top of `1ece033`. Test baseline **428 / 0 / 1**
   (re-verified at `834f477`). Live daemon records this repo; store healthy post-purge.
 - **`fix/perf-evidence-round` (pushed, NO PR yet)** — perf-evidence round executed and
@@ -114,8 +143,10 @@ carries only current state, what's next, and standing debts.
 
 ### Now / next (in order)
 
-1. **P4** (`RepositoryView` extraction — consumes P2's imported-turn fields **and** P3's goldens,
-   both now landed) → **P5** (`--json`) → the plan's 9-checkbox "Final acceptance — plan exit"
+1. ~~**P4**~~ done (gate-passed, see above) → **P5** (`--json`), whose entry condition is that it
+   consumes `RepositoryView` rather than reimplementing `diff`/`blame` interpretation in
+   `cli/src` — those three methods are deliberately unimplemented, so P5 either adds them to the
+   seam or reopens it → the plan's 9-checkbox "Final acceptance — plan exit"
    section. **P4 must not weaken or regenerate P3's goldens to make extraction pass** — they are
    the byte-equivalence instrument for the whole plan, and that is the ratchet.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.

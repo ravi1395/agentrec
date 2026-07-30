@@ -367,3 +367,116 @@ plus the two new keys on `log --json`. Recapture 2 (rich-rate fix): exactly 1 li
   "(unknown id)" form does not exist for it. Ruled inapplicable rather than unmet.
 - Linux legs (the `ru_maxrss` divisor, two release-only `#[cfg(not(debug_assertions))]` tests)
   still close only on the unopened CI PR.
+
+## Phase 2.0 P4 — `RepositoryView` extraction (agent round, pre-skeptic)
+
+Branch `feat/phase-2-0-p4` off `feat/phase-2-0-substrate` @ `f19c17d`. Baseline re-measured on
+clean substrate: **504 / 0 / 2** (P4.md's "410" and its "21 goldens" are both stale — goldens
+are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
+
+| AC | Verdict | Evidence |
+|---|---|---|
+| AC1 gap logic unified, not relocated | MET | `rg 'fn has_recording_gap\|fn has_gap_after\|fn count_gaps' cli/src` → 0. One primitive `view::recording_gaps` returns every uncovered interval tagged `Crash`/`Restart`/`TrailingStop`; the three callers are one-line filters over it. |
+| AC2 lookup choke point moved | MET | `rg 'fn same_revert\|fn resolve_turn' cli/src` → 0. `resolve_turn` returns a typed `LookupError`; the CLI shim renders prose and holds no matching logic. `purgecmd` rewired to the core symbol. |
+| AC3 goldens byte-identical | MET | 27/27 pass; `git diff` over `cli/tests/fixtures/golden` empty at every commit. |
+| AC4 `health()` is a pure read | MET | `health_performs_no_writes_on_an_over_budget_store` asserts store bytes + `log.jsonl` length + `state.json` mtime unchanged. **Falsifiability proven**: re-inserting `enforce_budget` into `health()` fails it on the store-bytes assertion; restored → green. |
+| AC5 human `status` still evicts | MET | `status_prints_over_budget_notice` unmodified (`git diff` on it empty) and passing. |
+| AC6 cursor bound to query + ledger identity | MET | Cursor carries the last item's **id** plus a query fingerprint. Same-length `purge --log-duplicates`-shaped rewrite → `Stale` (the test asserts the rewrite really is same-length, or it proves nothing). Truncation → `Stale`. Different query → `QueryMismatch`. |
+| AC7 unknown fields/types tolerated and counted | MET | `Ledger` carries `unknown_type_lines` + `unparsed_lines`, surfaced through `health()`. Blobs referenced only by an unknown-type record survive a real over-budget eviction. |
+
+### Two defects caught in review, both fixed with the regression test that catches them
+
+- **Cursor went spuriously `Stale` on a pure append.** The cursor resolved its id inside the
+  *post-filter* list, so a retroactive merge (PROTOCOL §4 — append-only, documented engine
+  behavior) absorbing an already-returned turn dropped it from `selected` and read as a rewrite.
+  AC6 names exactly that case. Now resolved against the unfiltered ledger:
+  `a_retroactive_merge_appended_after_a_cursor_is_not_treated_as_a_rewrite`, proven falsifying by
+  reverting the fix.
+- **`unknown_type_lines` counted malformed known records.** A `{"type":"turn"}` line missing
+  required fields incremented the "a newer producer wrote a kind we predate" counter — a counter
+  asserting a false fact about the corpus, the same defect class that blocked P2/P3 round 1.
+  Now gated on the `type` *value* against `record::KNOWN_RECORD_TYPES`.
+
+### Deliberate deviations (recorded, not silent)
+
+- **`health(&self, budget: u64)`, not the contract's no-arg `health()`.** The budget stays
+  injected for the same reason `status_report(root, budget)` already injects it (AC I+: an
+  over-budget store is otherwise untestable without a real multi-GiB store), and it keeps
+  `agentrec-core` free of the CLI's config surface. P5 consumes this signature.
+- **`diff`/`blame`/`recall` are NOT implemented this phase.** No AC constrains them, and shipping
+  an unexercised second interpretation path is how a byte-equivalence claim gets quietly broken.
+  **This is P5's entry condition, not a free pass**: a `--json` serializer that reimplements diff
+  or blame interpretation in `cli/src` reopens the seam P4 exists to close.
+- **AC7 reading, stated so it is evaluated as written**: "counted" attaches to unknown record
+  *types*; unknown *fields* on a known record are tolerated by serde and are correctly counted as
+  neither unknown-type nor unparsed. A test pins that reading.
+- **`RepositoryView::open` deliberately has no "not initialized" error.** An early cut returned
+  one, which silently changed `agentrec status` in an uninitialized directory from a printed
+  report to exit 1 — an unsanctioned behavior change (`log` there still prints "no turns
+  recorded"). Caught by running the binary, not by a test; a test now pins the tolerant reading.
+
+### Measured, not assumed
+
+- **`status` latency is flat.** Routing `status` through the view initially made it parse
+  `log.jsonl` twice: **13.4 ms → 20.6 ms** per invocation on a copy of this project's real
+  2143-line / 2.3 MB dogfood log (50 warm runs, macOS release build). Fixed by giving
+  `load_log` and `load_ledger` one shared per-line classifier (`record::parse_log_line`) and
+  letting `status_report` read the ledger once: **6.4 ms vs 6.6 ms baseline**. The shared
+  classifier is also a correctness win — the records a reader gets and the census of what it
+  skipped can no longer disagree.
+
+### Residuals
+
+- Claims for P4 were declared **mid-phase, after the first commit landed**, not declare-first per
+  AC. Recorded rather than backdated.
+- Test delta is **+29**, not the task file's "+18" — the ladder there is stale, and the ratchet
+  only tightens.
+
+### Round 1 of the gate FAILED. Three defects, all real, each now fixed with the test that catches it
+
+- **AC6 FAIL — a cursor's `after_id` is not identity.** Turn ids are NOT unique in real ledgers:
+  a pre-fix daemon's orphan recovery re-appends a turn under its reserved id (the shape
+  `same_revert` and `purge --log-duplicates` exist for), and the known import defect appends a
+  second turn under a resumed `sessionId`. `list` resolved the cursor by FIRST match, so on
+  ledger `[t_0, t_DUP, t_1, t_DUP, t_2]` a cursor minted at the second `t_DUP` re-delivered
+  `t_1` and `t_DUP` after a **pure append** — silently, no `Stale`. That is AC6's growth clause
+  violated verbatim. `Cursor` now carries `after_occurrence`; losing the named occurrence is
+  `Stale`. Tests: `a_cursor_after_a_duplicated_id_resumes_at_the_right_occurrence`,
+  `losing_the_named_occurrence_of_a_duplicated_id_is_stale`.
+  **Note the shape: this is the second time this phase that binding to a "unique" identifier was
+  wrong, and both times the ledger already documented the non-uniqueness.**
+- **The signature defect, fourth instance — mine.** `record::parse_log_line` guarded on the
+  `type` tag being a *string*, so `{"type": 5}` fell through to the legacy no-tag fallback and
+  was coerced into a turn — beside a retained comment promising that a line carrying a `type`
+  is never coerced. Pre-P4 `load_log` keyed on **presence**. An unsanctioned behavior change for
+  every reader, caught by the gate probing the comment rather than reading it. Now presence-keyed;
+  `a_non_string_type_tag_is_never_coerced_into_a_turn` pins it.
+- **`limit: Some(0)` reported end-of-ledger** on a non-empty ledger. An empty page has no honest
+  continuation (no record to sit after), so it is now refused with `CursorError::ZeroLimit`
+  rather than answered with a lie a pager would act on.
+
+### Skeptic's honest UNTESTED rows (round 1), carried forward
+
+- The 504 baseline was not re-executed in the gate worktree (`git checkout` is forbidden there).
+  Arithmetic is consistent and matches this ledger; it rests on the orchestrator's run.
+- The latency figures need the live dogfood log the gate must not touch. Not an AC; UNTESTED by
+  the gate, measured by the orchestrator.
+- No release-mode **test** run (clippy/fmt were verified on release; the tests were not).
+
+### Round 2: GATE PASS (all 7 ACs), with one residual found and NOT charged
+
+Both mutations (the `health()` eviction re-insert and a `render_turn` perturbation) were re-run by
+the skeptic on the fix commit, RED then green. Six further cursor attacks held: triple-duplicate
+ids paged one at a time, growth appending another record under the cursor's own id, purge-collapse
+of an occurrence *earlier* than the named one (→ `Stale`, correct: occurrence indices shift down
+and re-anchoring would silently skip), truncation, and query mismatch. The parser fix was verified
+by construction over five tag shapes, including that the legacy no-`type` C6 fallback still works.
+
+- **Residual, recorded not charged — an id-preserving REORDER rewrite defeats the cursor.** Two
+  same-id records with different content, reordered in place: page 2 re-delivers the seen one and
+  never delivers the other, with no `Stale`. Not charged because the only sanctioned rewrite is
+  `purge --log-duplicates`, which collapses and never reorders, and everything else is append-only
+  — no cursor keyed on anything short of a full-record content hash could tell the two apart.
+  **Revisit if MCP 2.2 ever pages a ledger exposed to hand edits.**
+- The gate hit and corrected a multi-filter `cargo test` invocation that silently runs nothing —
+  the same malformed-replay shape that permanently REFUTED two P1 claims. One TESTNAME per replay.

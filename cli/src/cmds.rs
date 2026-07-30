@@ -261,9 +261,17 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
 /// the over-budget eviction path is unit-testable with a tiny injected
 /// `budget`, instead of requiring a real 2 GiB store — AC I+).
 fn status_report(root: &Path, budget: u64) -> Result<String, String> {
-    let records = agentrec_core::record::load_log(&log_path(root));
     let store = BlobStore::new(objects_dir(root));
-    let size = store.total_bytes();
+    // P4: the read is the view's; the eviction below is this adapter's own
+    // explicit call. `status` keeps today's user-visible behavior by making
+    // both — but a caller that only wants the facts now has one that writes
+    // nothing. One ledger read feeds both this function's record walks and
+    // the health figures.
+    let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let ledger = view.ledger();
+    let health = view.health_of(&ledger, budget).map_err(|e| e.to_string())?;
+    let records = ledger.records;
+    let size = health.store_bytes;
 
     let superseded = merged_ids(&records);
     let all_turns: Vec<&TurnRecord> = records
@@ -279,7 +287,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         .filter(|t| !superseded.contains(&t.id) && t.tool.as_deref() != Some("git"))
         .collect();
 
-    let gaps = count_gaps(&records);
+    let gaps = health.crash_gaps;
 
     // Read once, reused below for the ignore-reload line and (further down)
     // the memory/DEGRADED sections — same single-read pattern those already
@@ -432,7 +440,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // AC I+: the store is checked (and, if over, evicted) here rather than
     // from the daemon's turn-close path — see DEVIATIONS in the delivery
     // receipt for why. Prompt blobs are exempt; only snapshot blobs evict.
-    if size > budget {
+    if health.over_budget {
         let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
         // SAFETY (Phase 1 honesty fix): harvest the protect-set as late as
         // possible, immediately before calling `enforce_budget`, to narrow
@@ -878,28 +886,6 @@ pub(crate) fn merged_ids(records: &[LogRecord]) -> HashSet<String> {
     out
 }
 
-/// A recording gap is any `start` epoch that follows a prior `start` with no
-/// intervening `stop` (kill -9 left the first unterminated).
-fn count_gaps(records: &[LogRecord]) -> usize {
-    let mut gaps = 0;
-    let mut open = false;
-    for r in records {
-        if let LogRecord::Epoch(e) = r {
-            match e.event.as_str() {
-                "start" => {
-                    if open {
-                        gaps += 1; // previous session never cleanly stopped
-                    }
-                    open = true;
-                }
-                "stop" => open = false,
-                _ => {}
-            }
-        }
-    }
-    gaps
-}
-
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -1055,6 +1041,89 @@ mod tests {
         assert!(
             !store.contains(&hash),
             "the only snapshot blob should have been evicted"
+        );
+    }
+
+    // P4 AC4: reading a repository's health is a pure read. An over-budget
+    // store is the case where that is falsifiable — the pre-P4 read path
+    // evicted from inside `status_report`, so a caller that only wanted to
+    // ask "how is this repo doing?" silently deleted blobs. Asserted on all
+    // three write surfaces at once (store bytes, log length, state.json
+    // mtime) because eviction touches the first and any accidental
+    // re-introduction of a write would most likely land on one of the other
+    // two.
+    #[test]
+    fn health_performs_no_writes_on_an_over_budget_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let hash = store.put(&[0u8; 5_000]).unwrap();
+        let turn = turn_with_snapshot("t_PUREHEALTH00000000000001", "big.bin", &hash);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        crate::state::write_state(root, &crate::state::State::default()).unwrap();
+
+        let state_path = crate::state_path(root);
+        let before_bytes = store.total_bytes();
+        let before_log = std::fs::metadata(log_path(root)).unwrap().len();
+        let before_mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        let view = agentrec_core::view::RepositoryView::open(root).unwrap();
+        let health = view.health(1_000).unwrap();
+
+        assert!(health.over_budget, "fixture must actually be over budget");
+        assert_eq!(
+            store.total_bytes(),
+            before_bytes,
+            "health() evicted from the store"
+        );
+        assert_eq!(
+            std::fs::metadata(log_path(root)).unwrap().len(),
+            before_log,
+            "health() appended to log.jsonl"
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            before_mtime,
+            "health() rewrote state.json"
+        );
+        assert!(store.contains(&hash), "the blob must survive a pure read");
+    }
+
+    // P4 AC7, second half: tolerating an unknown record `type` must not
+    // drop the blobs that record references out of the protect-set. A future
+    // producer's record kind is unreadable to this binary — which is exactly
+    // why its refs must be harvested from the raw line rather than inferred
+    // from a parse that did not happen.
+    #[test]
+    fn an_unknown_record_type_still_contributes_to_the_protected_ref_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let referenced = store.put(&[0xCCu8; 4_000]).unwrap();
+
+        let line = serde_json::json!({
+            "type": "future_thing",
+            "v": 1,
+            "files": [{"path": "x.bin", "before": null, "after": referenced, "op": "modify"}]
+        })
+        .to_string();
+        let log = log_path(root);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+
+        assert!(
+            extra_protected_refs(root).contains(&referenced),
+            "a blob referenced only by an unknown-type record must stay protected"
+        );
+
+        // And it survives the real over-budget path, not just the harvest.
+        let out = status_report(root, 100).unwrap();
+        assert!(out.contains("over"), "fixture must be over budget: {out}");
+        assert!(
+            store.contains(&referenced),
+            "eviction dropped a blob referenced by a record it could not parse"
         );
     }
 

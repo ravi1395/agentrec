@@ -222,6 +222,69 @@ fn open_append(path: &Path, line: &str) -> Result<fs::File, String> {
     Ok(file)
 }
 
+/// The `type` tags [`LogRecord`] knows. Used to tell "a record kind this
+/// binary predates" apart from "a kind we know, written malformed" — the two
+/// are indistinguishable by parse failure alone, and conflating them makes a
+/// census that asserts a producer exists on evidence of corruption.
+pub const KNOWN_RECORD_TYPES: [&str; 2] = ["turn", "epoch"];
+
+/// What one `log.jsonl` line turned out to be.
+// Same rationale as `LogRecord`: the record-bearing variant dominates real
+// logs and is consumed straight into a Vec, so the gap to the unit variants
+// is immaterial.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ParsedLine {
+    Record(LogRecord),
+    /// Well-formed JSON tagged with a `type` this binary does not know. A
+    /// newer producer is allowed to write these; consumers tolerate them.
+    UnknownType,
+    /// Not interpretable at all — a torn tail line after a crash, or a
+    /// known record kind written malformed.
+    Unparsed,
+    Blank,
+}
+
+/// Classify one line. The single parser: both [`load_log`] and
+/// `view::load_ledger` go through here, so the records a reader gets and the
+/// census of what it skipped can never disagree.
+pub fn parse_log_line(line: &str) -> ParsedLine {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return ParsedLine::Blank;
+    }
+    // `type` defaults to turn for lines written before epochs existed.
+    if let Ok(rec) = serde_json::from_str::<LogRecord>(trimmed) {
+        return ParsedLine::Record(rec);
+    }
+    // The bare-TurnRecord fallback exists only for legacy lines that predate
+    // the `type` tag entirely (C6). A line that DOES have a `type` field —
+    // just one `LogRecord` doesn't recognize, e.g. a future additive record
+    // kind — must never be coerced into a turn: serde ignores unknown fields
+    // by default, so a `type:"future_thing"` line with turn-shaped fields
+    // would otherwise silently misparse.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return ParsedLine::Unparsed;
+    };
+    // Keyed on PRESENCE of `type`, not on it being a string: a line tagged
+    // `"type": 5` is still a line that carries a type, and coercing it into a
+    // turn is exactly the misparse this guard exists to prevent.
+    match value.get("type") {
+        None => match serde_json::from_str::<TurnRecord>(trimmed) {
+            Ok(turn) => ParsedLine::Record(LogRecord::Turn(turn)),
+            Err(_) => ParsedLine::Unparsed,
+        },
+        Some(tag) => match tag.as_str() {
+            // A kind this binary predates. Tolerated and counted.
+            Some(t) if !KNOWN_RECORD_TYPES.contains(&t) => ParsedLine::UnknownType,
+            // A kind we know, written malformed — corruption, not a newer
+            // producer. A non-string tag is no kind at all, and lands here
+            // for the same reason: it is not evidence a producer exists.
+            _ => ParsedLine::Unparsed,
+        },
+    }
+}
+
 /// Load all parseable records; torn/corrupt lines are skipped, never fatal
 /// (a bad line must not wipe history — lesson inherited from Sutra).
 pub fn load_log(path: &Path) -> Vec<LogRecord> {
@@ -232,29 +295,8 @@ pub fn load_log(path: &Path) -> Vec<LogRecord> {
     let mut out = vec![];
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // `type` defaults to turn for lines written before epochs existed.
-        if let Ok(rec) = serde_json::from_str::<LogRecord>(trimmed) {
+        if let ParsedLine::Record(rec) = parse_log_line(&line) {
             out.push(rec);
-            continue;
-        }
-        // The bare-TurnRecord fallback exists only for legacy lines that
-        // predate the `type` tag entirely (C6). A line that DOES have a
-        // `type` field — just one `LogRecord` doesn't recognize, e.g. a
-        // future additive record kind — must never be coerced into a turn:
-        // serde ignores unknown fields by default, so a `type:"future_thing"`
-        // line with turn-shaped fields would otherwise silently misparse.
-        let has_type_field = serde_json::from_str::<serde_json::Value>(trimmed)
-            .ok()
-            .and_then(|v| v.as_object().map(|o| o.contains_key("type")))
-            .unwrap_or(false);
-        if !has_type_field {
-            if let Ok(turn) = serde_json::from_str::<TurnRecord>(trimmed) {
-                out.push(LogRecord::Turn(turn));
-            }
         }
     }
     out
