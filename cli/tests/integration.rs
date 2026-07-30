@@ -5450,6 +5450,75 @@ fn log_json_zero_turns_prints_empty_array() {
     assert_eq!(stdout.trim(), "[]", "stdout: {stdout:?}");
 }
 
+// AC3 (log half) + AC4 (log half): on a NON-EMPTY fixture, `log --json`
+// stdout is exactly `page.items.iter().rev().take(limit)` with one
+// `serde_json::to_string` line each. The `.rev().take(limit)` reordering is
+// the adapter's only sanctioned transformation — the expected value here is
+// computed by calling the seam itself, so any field construction, reshaping,
+// or re-derived filter in the adapter reds this.
+//
+// That equality is also AC4's real content: the adapter serializes the
+// view's own `TurnRecord` and names no field, so a field added to
+// `TurnRecord` appears in `log --json` with no adapter edit. The fixture
+// deliberately includes a git turn and a superseded turn so a filter drift
+// between the adapter and `TurnQuery { include_all: false }` also reds.
+#[test]
+fn log_json_is_serde_of_the_views_items_reversed_and_limited() {
+    use agentrec_core::view::{RepositoryView, TurnQuery};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    for i in 0..4 {
+        seed_turn(
+            root,
+            &base_turn(&format!("t_JSONSEAM000000000000000{i}"), vec![]),
+        );
+    }
+    let mut git = base_turn("t_JSONSEAMGIT00000000000001", vec![]);
+    git.tool = Some("git".into());
+    seed_turn(root, &git);
+    let dropped = base_turn("t_JSONSEAMSUPERSEDED0000001", vec![]);
+    seed_turn(root, &dropped);
+    let mut newest = base_turn("t_JSONSEAMNEWEST00000000001", vec![]);
+    newest.merges = vec![dropped.id.clone()];
+    seed_turn(root, &newest);
+
+    let view = RepositoryView::open(root).unwrap();
+    let page = view
+        .list_records(&TurnQuery {
+            include_all: false,
+            limit: None,
+            after: None,
+        })
+        .unwrap();
+    assert_eq!(
+        page.items.len(),
+        5,
+        "fixture precondition: 7 seeded, 2 hidden"
+    );
+
+    // A limit strictly below the page length, so `.take(limit)` is load-bearing
+    // rather than a no-op.
+    let limit = 3usize;
+    let expected: String = page
+        .items
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|t| format!("{}\n", serde_json::to_string(t).unwrap()))
+        .collect();
+
+    let out = agentrec(root, &["log", "--json", "--limit", &limit.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "log --json failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "log --json must be serde of the view's items and nothing else"
+    );
+}
+
 #[test]
 fn log_default_is_relative_utc_is_absolute() {
     let tmp = tempfile::tempdir().unwrap();

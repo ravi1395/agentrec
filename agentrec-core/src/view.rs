@@ -721,110 +721,177 @@ impl RepositoryView {
     }
 
     /// List turns oldest-first, the order they were appended.
+    ///
+    /// Thin wrapper over [`Self::list_of`] on a freshly-read ledger (P4b-4
+    /// open question 2, decided: `list` survives as the delegating form so
+    /// its existing unit tests keep exercising the same selection logic).
     pub fn list(&self, q: &TurnQuery) -> Result<Page<TurnSummary>, CursorError> {
-        let ledger = self.ledger();
-        let superseded: std::collections::HashSet<&str> = ledger
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                LogRecord::Turn(t) => Some(t),
-                LogRecord::Epoch(_) => None,
-            })
-            .flat_map(|t| t.merges.iter().map(String::as_str))
-            .collect();
-        let all: Vec<&TurnRecord> = ledger
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                LogRecord::Turn(t) => Some(t),
-                LogRecord::Epoch(_) => None,
-            })
-            .collect();
-        // Carries each selected turn's position in the UNFILTERED ledger:
-        // staleness is a question about the ledger, not about this query's
-        // filter (see the cursor resolution below).
-        let selected: Vec<(usize, &TurnRecord)> = all
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, t)| {
-                q.include_all
-                    || (!superseded.contains(t.id.as_str()) && t.tool.as_deref() != Some("git"))
-            })
-            .collect();
-
-        let start = match &q.after {
-            None => 0,
-            Some(c) => {
-                if c.query != q.fingerprint() {
-                    return Err(CursorError::QueryMismatch);
-                }
-                // Identity, not position: a rewrite that dropped the named
-                // record must surface as stale rather than resume at
-                // whatever now sits at that index.
-                //
-                // Resolved against the unfiltered ledger on purpose. A pure
-                // append can retroactively merge an already-returned turn
-                // (PROTOCOL §4), which removes it from `selected` while it is
-                // still very much present in the log — resolving against the
-                // filtered list would call that append a rewrite and report
-                // Stale on a ledger nothing rewrote.
-                let Some(ledger_idx) = all
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.id == c.after_id)
-                    .map(|(i, _)| i)
-                    .nth(c.after_occurrence)
-                else {
-                    // Either the id is gone entirely, or a rewrite removed
-                    // the occurrence this cursor sat after. Both are stale;
-                    // falling back to another occurrence would re-deliver
-                    // every record between them.
-                    return Err(CursorError::Stale);
-                };
-                selected
-                    .iter()
-                    .position(|(i, _)| *i > ledger_idx)
-                    .unwrap_or(selected.len())
-            }
-        };
-
-        if q.limit == Some(0) {
-            return Err(CursorError::ZeroLimit);
-        }
-        let end = match q.limit {
-            Some(n) => (start + n).min(selected.len()),
-            None => selected.len(),
-        };
-        let items: Vec<TurnSummary> = selected[start.min(selected.len())..end]
-            .iter()
-            .map(|(_, t)| TurnSummary {
-                id: t.id.clone(),
-                grade: t.grade.clone(),
-                tool: t.tool.clone(),
-                started: t.started.clone(),
-                ended: t.ended.clone(),
-                file_count: t.files.len(),
-                imported: t.imported.unwrap_or(false),
-            })
-            .collect();
-        let next = if end < selected.len() {
-            selected[start.min(selected.len())..end]
-                .last()
-                .map(|(ledger_idx, t)| Cursor {
-                    after_id: t.id.clone(),
-                    after_occurrence: all[..*ledger_idx]
-                        .iter()
-                        .filter(|prior| prior.id == t.id)
-                        .count(),
-                    query: q.fingerprint(),
-                })
-        } else {
-            None
-        };
-        Ok(Page { items, next })
+        self.list_of(&self.ledger(), q)
     }
 
+    /// [`Self::list`] over a ledger the caller already read — the same
+    /// `health`/`health_of` pairing, and for the same reason: `status` feeds
+    /// its counting surface, its health figures, and its eviction protect-set
+    /// from ONE parse of `log.jsonl`. A second parse would open a window in
+    /// which a daemon append makes the printed turn count disagree with the
+    /// health figures computed off the other read.
+    pub fn list_of(
+        &self,
+        ledger: &Ledger,
+        q: &TurnQuery,
+    ) -> Result<Page<TurnSummary>, CursorError> {
+        let page = select_turns(ledger, q)?;
+        Ok(Page {
+            items: page
+                .items
+                .into_iter()
+                .map(|t| TurnSummary {
+                    id: t.id.clone(),
+                    grade: t.grade.clone(),
+                    tool: t.tool.clone(),
+                    started: t.started.clone(),
+                    ended: t.ended.clone(),
+                    file_count: t.files.len(),
+                    imported: t.imported.unwrap_or(false),
+                })
+                .collect(),
+            next: page.next,
+        })
+    }
+
+    /// The same selection as [`Self::list`], but carrying whole
+    /// [`TurnRecord`]s instead of the lossy [`TurnSummary`] projection.
+    ///
+    /// Two consumers need the full record and cannot be served by a summary:
+    /// the human `log` line renders `prompt_excerpt`/`truncated`/
+    /// `files_complete` and folds per-file paths, `log --json` emits the
+    /// record verbatim, and `status`'s eviction protect-set needs
+    /// `prompt_ref` plus every `files[]` blob hash. Widening `TurnSummary`
+    /// to cover them is rejected: "prompt contents are opt-in data, never
+    /// included in generic summaries".
+    pub fn list_records(&self, q: &TurnQuery) -> Result<Page<TurnRecord>, CursorError> {
+        self.list_records_of(&self.ledger(), q)
+    }
+
+    /// [`Self::list_records`] over an already-read ledger — the single-parse
+    /// twin, same rationale as [`Self::list_of`].
+    pub fn list_records_of(
+        &self,
+        ledger: &Ledger,
+        q: &TurnQuery,
+    ) -> Result<Page<TurnRecord>, CursorError> {
+        let page = select_turns(ledger, q)?;
+        Ok(Page {
+            items: page.items.into_iter().cloned().collect(),
+            next: page.next,
+        })
+    }
+}
+
+/// The one selection + pagination walk behind [`RepositoryView::list_of`] and
+/// [`RepositoryView::list_records_of`]. Borrows out of `ledger`; the callers
+/// decide whether to project or to clone, so the filter, the cursor
+/// resolution, and the staleness rules cannot drift between the summary and
+/// the record form.
+fn select_turns<'a>(
+    ledger: &'a Ledger,
+    q: &TurnQuery,
+) -> Result<Page<&'a TurnRecord>, CursorError> {
+    let superseded: std::collections::HashSet<&str> = ledger
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            LogRecord::Turn(t) => Some(t),
+            LogRecord::Epoch(_) => None,
+        })
+        .flat_map(|t| t.merges.iter().map(String::as_str))
+        .collect();
+    let all: Vec<&TurnRecord> = ledger
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            LogRecord::Turn(t) => Some(t),
+            LogRecord::Epoch(_) => None,
+        })
+        .collect();
+    // Carries each selected turn's position in the UNFILTERED ledger:
+    // staleness is a question about the ledger, not about this query's
+    // filter (see the cursor resolution below).
+    let selected: Vec<(usize, &TurnRecord)> = all
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, t)| {
+            q.include_all
+                || (!superseded.contains(t.id.as_str()) && t.tool.as_deref() != Some("git"))
+        })
+        .collect();
+
+    let start = match &q.after {
+        None => 0,
+        Some(c) => {
+            if c.query != q.fingerprint() {
+                return Err(CursorError::QueryMismatch);
+            }
+            // Identity, not position: a rewrite that dropped the named
+            // record must surface as stale rather than resume at
+            // whatever now sits at that index.
+            //
+            // Resolved against the unfiltered ledger on purpose. A pure
+            // append can retroactively merge an already-returned turn
+            // (PROTOCOL §4), which removes it from `selected` while it is
+            // still very much present in the log — resolving against the
+            // filtered list would call that append a rewrite and report
+            // Stale on a ledger nothing rewrote.
+            let Some(ledger_idx) = all
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.id == c.after_id)
+                .map(|(i, _)| i)
+                .nth(c.after_occurrence)
+            else {
+                // Either the id is gone entirely, or a rewrite removed
+                // the occurrence this cursor sat after. Both are stale;
+                // falling back to another occurrence would re-deliver
+                // every record between them.
+                return Err(CursorError::Stale);
+            };
+            selected
+                .iter()
+                .position(|(i, _)| *i > ledger_idx)
+                .unwrap_or(selected.len())
+        }
+    };
+
+    if q.limit == Some(0) {
+        return Err(CursorError::ZeroLimit);
+    }
+    let end = match q.limit {
+        Some(n) => (start + n).min(selected.len()),
+        None => selected.len(),
+    };
+    let items: Vec<&TurnRecord> = selected[start.min(selected.len())..end]
+        .iter()
+        .map(|(_, t)| *t)
+        .collect();
+    let next = if end < selected.len() {
+        selected[start.min(selected.len())..end]
+            .last()
+            .map(|(ledger_idx, t)| Cursor {
+                after_id: t.id.clone(),
+                after_occurrence: all[..*ledger_idx]
+                    .iter()
+                    .filter(|prior| prior.id == t.id)
+                    .count(),
+                query: q.fingerprint(),
+            })
+    } else {
+        None
+    };
+    Ok(Page { items, next })
+}
+
+impl RepositoryView {
     /// One turn's file changes, with every entry's content already resolved.
     ///
     /// The turn is looked up against the UNFILTERED turn vec — superseded
@@ -2063,6 +2130,176 @@ mod tests {
             "a number is not a record kind"
         );
         assert_eq!(ledger.unparsed_lines, 1);
+    }
+
+    // ---- list_of / list_records (P4b-4) ----------------------------------
+
+    /// The summary and the record form must be the SAME selection — one
+    /// `select_turns` walk behind both — or `status`'s counting page and its
+    /// eviction protect-set could disagree about which turns exist. Fixture
+    /// carries the two classes the filter decides on (a git turn and a
+    /// superseded turn) plus a plain one, checked under both `include_all`
+    /// settings so a filter that only differed in one direction still reds.
+    #[test]
+    fn list_of_and_list_records_of_select_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let mut git = turn("t_LISTGIT", "2026-01-01T00:00:01Z", vec![]);
+        git.tool = Some("git".to_string());
+        let dropped = turn("t_LISTDROPPED", "2026-01-01T00:00:02Z", vec![]);
+        let mut newest = turn("t_LISTNEWEST", "2026-01-01T00:00:03Z", vec![]);
+        newest.merges = vec![dropped.id.clone()];
+        write_log(
+            root,
+            &[
+                &turn_line("t_LISTPLAIN"),
+                &serde_json::to_string(&LogRecord::Turn(git)).unwrap(),
+                &serde_json::to_string(&LogRecord::Turn(dropped)).unwrap(),
+                &serde_json::to_string(&LogRecord::Turn(newest)).unwrap(),
+            ],
+        );
+
+        let view = RepositoryView::open(root).unwrap();
+        let ledger = view.ledger();
+        for include_all in [false, true] {
+            let q = TurnQuery {
+                include_all,
+                limit: None,
+                after: None,
+            };
+            let summaries = view.list_of(&ledger, &q).unwrap();
+            let records = view.list_records_of(&ledger, &q).unwrap();
+            let ids: Vec<&str> = summaries.items.iter().map(|t| t.id.as_str()).collect();
+            let rec_ids: Vec<&str> = records.items.iter().map(|t| t.id.as_str()).collect();
+            assert_eq!(ids, rec_ids, "include_all={include_all}");
+            assert_eq!(summaries.next, records.next, "include_all={include_all}");
+        }
+        // The filter itself, so the equality above cannot be satisfied
+        // vacuously by two identically-broken selections.
+        assert_eq!(
+            view.list_records_of(&ledger, &TurnQuery::default())
+                .unwrap()
+                .items
+                .len(),
+            2,
+            "git and superseded turns are hidden by default"
+        );
+        assert_eq!(
+            view.list_records_of(
+                &ledger,
+                &TurnQuery {
+                    include_all: true,
+                    limit: None,
+                    after: None,
+                }
+            )
+            .unwrap()
+            .items
+            .len(),
+            4
+        );
+    }
+
+    /// `list_records` carries fields `TurnSummary` drops — the exact reason
+    /// the record form exists (`log`'s human line, `log --json`, and the
+    /// eviction protect-set's `prompt_ref` + `files[]` hashes).
+    #[test]
+    fn list_records_carries_the_fields_the_summary_projection_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut t = turn(
+            "t_LISTRECFIELDS",
+            "2026-01-01T00:00:01Z",
+            vec![FileEntry {
+                path: "a.rs".to_string(),
+                before: None,
+                after: Some("sha256:aa".to_string()),
+                op: "create".to_string(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        t.prompt_ref = Some("sha256:bb".to_string());
+        t.prompt_excerpt = Some("do the thing".to_string());
+        t.truncated = true;
+        t.files_complete = Some(false);
+        write_log(
+            root,
+            &[&serde_json::to_string(&LogRecord::Turn(t)).unwrap()],
+        );
+
+        let view = RepositoryView::open(root).unwrap();
+        let got = view.list_records(&TurnQuery::default()).unwrap();
+        let rec = &got.items[0];
+        assert_eq!(rec.prompt_ref.as_deref(), Some("sha256:bb"));
+        assert_eq!(rec.prompt_excerpt.as_deref(), Some("do the thing"));
+        assert!(rec.truncated);
+        assert_eq!(rec.files_complete, Some(false));
+        assert_eq!(rec.files[0].after.as_deref(), Some("sha256:aa"));
+    }
+
+    /// Cursor semantics are the shared walk's, so they hold for the record
+    /// form too: a page boundary continues, and a cursor whose record the
+    /// ledger no longer carries is `Stale`, never a silently holed page.
+    #[test]
+    fn list_records_paginates_and_reports_a_stale_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_log(
+            root,
+            &[&turn_line("t_RA"), &turn_line("t_RB"), &turn_line("t_RC")],
+        );
+        let view = RepositoryView::open(root).unwrap();
+
+        let first = view
+            .list_records(&TurnQuery {
+                include_all: false,
+                limit: Some(2),
+                after: None,
+            })
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t_RA", "t_RB"]
+        );
+        let cursor = first.next.clone().expect("a third turn remains");
+
+        let second = view
+            .list_records(&TurnQuery {
+                include_all: false,
+                limit: Some(2),
+                after: Some(cursor.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t_RC"]
+        );
+        assert!(second.next.is_none());
+
+        // A rewrite that drops the cursor's record must surface as Stale.
+        write_log(root, &[&turn_line("t_RA"), &turn_line("t_RC")]);
+        assert_eq!(
+            view.list_records(&TurnQuery {
+                include_all: false,
+                limit: Some(2),
+                after: Some(cursor),
+            })
+            .err(),
+            Some(CursorError::Stale)
+        );
     }
 
     // ---- diff (AC7, AC8, AC13) -------------------------------------------
