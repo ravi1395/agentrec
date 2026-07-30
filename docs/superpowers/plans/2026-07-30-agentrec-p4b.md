@@ -92,7 +92,14 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    one and states which; no downstream task depends on the choice.
 2. **(non-blocking)** Whether `list()` survives as a delegating wrapper over `list_of` or is replaced
    by it. Round 6 noted `list()`'s 17 unit tests exercise it either way. P4b-4 decides.
-3. **(blocking, answered in P4b-2)** `print_entry`/`load_blob`/`load_text` are shared with `show`
+3. **(BLOCKING for P4b-4; P4b-1..3 unaffected)** `fix/perf-evidence-round` is not in the
+   substrate and collides semantically with P4b-4 — it splits `enforce_budget` into
+   `plan_eviction`/`execute` and moves eviction out of `status` onto the daemon tick, which makes
+   P4b-4's "`status` still evicts" AC false by design there and points AC16's fixture at the wrong
+   function. AC16's substance survives (the unfiltered `owned_turns` slice is still what
+   `plan_eviction` receives). Full analysis and three candidate orderings:
+   `docs/superpowers/plans/2026-07-30-p4b-branch-merge-state.md` §3. **Answer before P4b-4 starts.**
+4. **(blocking, answered in P4b-2)** `print_entry`/`load_blob`/`load_text` are shared with `show`
    and `undo`. P4b-2 must not break either. The resolution is stated in that task file: the shared
    helpers **stay** in `readcmds.rs` for `show`/`undo`, and `view::diff` gets its own resolution
    logic rather than importing the CLI's. Duplication here is deliberate and bounded — the
