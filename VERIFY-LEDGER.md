@@ -432,7 +432,7 @@ are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
 - Test delta is **+29**, not the task file's "+18" — the ladder there is stale, and the ratchet
   only tightens.
 
-### Round 1 of the gate FAILED. Two defects, both real, both now fixed with the test that catches them
+### Round 1 of the gate FAILED. Three defects, all real, each now fixed with the test that catches it
 
 - **AC6 FAIL — a cursor's `after_id` is not identity.** Turn ids are NOT unique in real ledgers:
   a pre-fix daemon's orphan recovery re-appends a turn under its reserved id (the shape
@@ -462,3 +462,21 @@ are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
 - The latency figures need the live dogfood log the gate must not touch. Not an AC; UNTESTED by
   the gate, measured by the orchestrator.
 - No release-mode **test** run (clippy/fmt were verified on release; the tests were not).
+
+### Round 2: GATE PASS (all 7 ACs), with one residual found and NOT charged
+
+Both mutations (the `health()` eviction re-insert and a `render_turn` perturbation) were re-run by
+the skeptic on the fix commit, RED then green. Six further cursor attacks held: triple-duplicate
+ids paged one at a time, growth appending another record under the cursor's own id, purge-collapse
+of an occurrence *earlier* than the named one (→ `Stale`, correct: occurrence indices shift down
+and re-anchoring would silently skip), truncation, and query mismatch. The parser fix was verified
+by construction over five tag shapes, including that the legacy no-`type` C6 fallback still works.
+
+- **Residual, recorded not charged — an id-preserving REORDER rewrite defeats the cursor.** Two
+  same-id records with different content, reordered in place: page 2 re-delivers the seen one and
+  never delivers the other, with no `Stale`. Not charged because the only sanctioned rewrite is
+  `purge --log-duplicates`, which collapses and never reorders, and everything else is append-only
+  — no cursor keyed on anything short of a full-record content hash could tell the two apart.
+  **Revisit if MCP 2.2 ever pages a ledger exposed to hand edits.**
+- The gate hit and corrected a multi-filter `cargo test` invocation that silently runs nothing —
+  the same malformed-replay shape that permanently REFUTED two P1 claims. One TESTNAME per replay.
