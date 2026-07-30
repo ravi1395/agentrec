@@ -154,8 +154,17 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    *descriptive* occurrences were rewritten to break the literal without losing meaning; the two
    self-quoting ones are irreducible. Ratified substitution: 0 matches in every task file, with
    `P4b-5.md`'s remaining matches confined to the check quoting itself — recorded in `P4b-5.md`
-   beneath the AC. The AC's intent (no task file asserts a stale golden figure) is met, not
-   weakened. Docs hygiene only; zero functional surface.
+   beneath the AC. Docs hygiene only; zero functional surface.
+
+   **The first attempt at this substitution GATE-FAILED and the failure is kept on the record.**
+   It excluded `P4b-5.md` wholesale, which let a real stale figure survive inside the excluded
+   file ("actual 27 before this phase, 32 after"), and its justification — "no task file asserts a
+   stale golden figure" — was independently false: `P4b-1.md`, `P4b-2.md`, `P4b-3.md` and
+   `P4b-4.md` each asserted **32**, wrong from `9d30e51` onward once P4b-1's own gate added a 6th
+   golden mid-task. All are corrected to **33**, and the ratified check was re-scoped from
+   file-level to **content-level** (it excludes only lines that literally contain the invocation
+   `rg '21 passed'`, so there is nowhere to hide and no line number to rot). The lesson generalizes:
+   a blanket exclusion in a verification command is a hiding place, and the gate found it.
 
 9. **(non-blocking, raised by P4b-4's gate — a scope gap, not a regression)** `cli/src/readcmds.rs`
    (two call sites) and `cli/src/memorycmds.rs` still call `load_log` on **production** paths.

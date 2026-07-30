@@ -20,7 +20,9 @@ carries only current state, what's next, and standing debts.
   them plus `DiffResult`/`DiffError`/`BlameError`/`RecallPage`/`RecallError` and a shared
   `select_turns` walk (`list_records`/`list_records_of`, with `list()` surviving as a
   delegating wrapper). Test baseline **602 / 0 / 2** (was 595/0/2 pre-P4b-4); **33 goldens**
-  (not 32, not 21 — both stale figures corrected across `P3.md`/`P4.md`/`P5.md` in this round).
+  (not 32, not 21 — the stale `21` was corrected in `P3.md`/`P4.md`/`P5.md`, and a stale `32`,
+  which P4b-5's gate caught surviving in `P4b-1.md` through `P4b-5.md`, was corrected there too;
+  32 was already wrong from `9d30e51` onward, when P4b-1's own gate added a 6th golden mid-task).
   Manual E2E: all 9 steps pass, pre- vs post-P4b binaries byte-identical on both a frozen
   dogfood clone (steps 1/2/4/5/9) and the live dogfood repo read-only (steps 6/7/8) — **caveat:
   step 7 (`recall --json`) is weakly discriminating**, the dogfood store has 0 fresh/3 stale
