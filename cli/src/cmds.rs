@@ -279,7 +279,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         .filter(|t| !superseded.contains(&t.id) && t.tool.as_deref() != Some("git"))
         .collect();
 
-    let gaps = count_gaps(&records);
+    let gaps = agentrec_core::view::crash_gap_count(&records);
 
     // Read once, reused below for the ignore-reload line and (further down)
     // the memory/DEGRADED sections — same single-read pattern those already
@@ -876,28 +876,6 @@ pub(crate) fn merged_ids(records: &[LogRecord]) -> HashSet<String> {
         }
     }
     out
-}
-
-/// A recording gap is any `start` epoch that follows a prior `start` with no
-/// intervening `stop` (kill -9 left the first unterminated).
-fn count_gaps(records: &[LogRecord]) -> usize {
-    let mut gaps = 0;
-    let mut open = false;
-    for r in records {
-        if let LogRecord::Epoch(e) = r {
-            match e.event.as_str() {
-                "start" => {
-                    if open {
-                        gaps += 1; // previous session never cleanly stopped
-                    }
-                    open = true;
-                }
-                "stop" => open = false,
-                _ => {}
-            }
-        }
-    }
-    gaps
 }
 
 fn human_bytes(n: u64) -> String {

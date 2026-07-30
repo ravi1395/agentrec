@@ -8,6 +8,7 @@ use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
 use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
+use agentrec_core::view;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
@@ -26,7 +27,7 @@ pub fn diff(root: &Path, turn_ref: &str) -> Result<(), String> {
         })
         .collect();
 
-    let turn = resolve_turn(&turns, turn_ref)?;
+    let turn = turn_by_ref(&turns, turn_ref)?;
 
     let store = BlobStore::new(objects_dir(root));
     println!("{}", header_line(turn));
@@ -57,7 +58,7 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Resul
         })
         .collect();
 
-    let turn = resolve_turn(&turns, turn_ref)?;
+    let turn = turn_by_ref(&turns, turn_ref)?;
 
     if !prompt {
         println!("{}", render_turn(turn));
@@ -119,75 +120,25 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Resul
     Ok(())
 }
 
-/// Match `turn_ref` against recorded turn ids, exact or unambiguous prefix
-/// (K+). Zero matches is an error naming the valid id range so the caller can
-/// retry (F4). Multiple matches error as ambiguous UNLESS they are the same
-/// turn re-emitted under one id by a pre-fix daemon's orphan recovery (PR #2),
-/// in which case they collapse to one — see [`same_turn_ignoring_time`].
-fn resolve_turn<'a>(turns: &[&'a TurnRecord], turn_ref: &str) -> Result<&'a TurnRecord, String> {
-    if turns.is_empty() {
-        return Err("no turns recorded — is `agentrec record` running?".to_string());
-    }
-    let matches: Vec<&'a TurnRecord> = turns
-        .iter()
-        .copied()
-        .filter(|t| t.id == turn_ref || t.id.starts_with(turn_ref))
-        .collect();
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => Err(format!(
+/// Prose shim over [`view::resolve_turn`]: the lookup itself lives in
+/// `agentrec-core`, and this renders its typed failure into the human
+/// message (F4 names the valid id range so the caller can retry). No
+/// matching logic here — adding any would reintroduce the second
+/// implementation the seam exists to prevent.
+fn turn_by_ref<'a>(turns: &[&'a TurnRecord], turn_ref: &str) -> Result<&'a TurnRecord, String> {
+    view::resolve_turn(turns, turn_ref).map_err(|e| match e {
+        view::LookupError::NoTurns => {
+            "no turns recorded — is `agentrec record` running?".to_string()
+        }
+        view::LookupError::Unknown => format!(
             "unknown turn id '{turn_ref}' — recorded turns: {}",
             turn_range(turns)
-        )),
-        n => {
-            // Curative dedup for PR #2: the engine fix stops a post-fix daemon
-            // WRITING a same-id duplicate, but a log.jsonl already written by a
-            // pre-fix daemon can still hold two records for one turn (the
-            // kill-9 window between persist and journal clear made orphan
-            // recovery re-append it under its reserved id). Collapse them when
-            // resolving to either yields an identical revert; a genuine id
-            // collision (two DIFFERENT turns minted with one id) does not, and
-            // still surfaces as ambiguous.
-            let first = matches[0];
-            if matches.iter().copied().all(|t| same_revert(first, t)) {
-                Ok(first)
-            } else {
-                Err(format!(
-                    "ambiguous turn id '{turn_ref}' — matches {n} turns; recorded turns: {}",
-                    turn_range(turns)
-                ))
-            }
-        }
-    }
-}
-
-/// Would undoing `a` and undoing `b` touch the worktree identically? True iff
-/// they share an id AND the exact same set of file entries (path + before/
-/// after hashes + op + flags), order-independent.
-///
-/// This is the precise safety condition for collapsing PR #2's orphan-recovery
-/// double-emit: `undo` consumes only `id` and `files`, so two records equal on
-/// both revert byte-for-byte the same and either may be picked. Fields that
-/// legitimately drift between the steady `persist` path and `recover_orphan`
-/// for the *same* turn are deliberately NOT compared — recovery recomputes
-/// `ended` from the crash journal's last-change time, forces `model: None`,
-/// and forces `truncated: true` for a bracket turn — so comparing them would
-/// wrongly refuse to collapse a real duplicate. Conversely, two records whose
-/// `before`/`after` differ would revert to DIFFERENT content, so they are left
-/// ambiguous rather than silently collapsed to an arbitrary one.
-///
-/// `pub(crate)`: also the discriminator for `purgecmd::purge_log_duplicates`
-/// (the store-level repair of this same class of duplicate) — a single choke
-/// point for "these two turn records are the same duplicate", never
-/// reimplemented at the second call site.
-pub(crate) fn same_revert(a: &TurnRecord, b: &TurnRecord) -> bool {
-    if a.id != b.id || a.files.len() != b.files.len() {
-        return false;
-    }
-    // A turn holds at most one entry per path, so equal length + every entry of
-    // `a` present in `b` is set equality (order-independent — recovery's
-    // journaled file order need not match the steady-close order).
-    a.files.iter().all(|fa| b.files.contains(fa))
+        ),
+        view::LookupError::Ambiguous { matched } => format!(
+            "ambiguous turn id '{turn_ref}' — matches {matched} turns; recorded turns: {}",
+            turn_range(turns)
+        ),
+    })
 }
 
 /// `<oldest_short>..<newest_short> (N turns)` — turns are append order
@@ -350,7 +301,7 @@ pub fn blame(root: &Path, target: &str) -> Result<(), String> {
     // no turn to bound an interval-aware check against (unchanged semantics —
     // AC blame_untouched_file_exit0 depends on a balanced start/stop NOT
     // counting as a gap here).
-    let no_turn_gap = has_recording_gap(&records);
+    let no_turn_gap = view::has_crash_gap(&records);
 
     let turns: Vec<&TurnRecord> = records
         .iter()
@@ -403,28 +354,6 @@ fn parse_target(target: &str) -> (String, Option<usize>) {
     (target.to_string(), None)
 }
 
-/// A recording gap is any `start` epoch that follows a prior `start` with no
-/// intervening `stop` (mirrors `cmds::count_gaps`, kept boolean here since
-/// blame only needs "does any gap exist").
-fn has_recording_gap(records: &[LogRecord]) -> bool {
-    let mut open = false;
-    for r in records {
-        if let LogRecord::Epoch(e) = r {
-            match e.event.as_str() {
-                "start" => {
-                    if open {
-                        return true;
-                    }
-                    open = true;
-                }
-                "stop" => open = false,
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
 /// True when the file's on-disk content differs from `turn`'s recorded
 /// `after` for it (PROTOCOL §5 `modified-since`). Covers "went missing when
 /// it shouldn't have" and "reappeared after a delete" the same way, since
@@ -475,7 +404,7 @@ fn blame_file(
     // E2: interval-aware — a gap only makes THIS turn's attribution stale
     // when it occurs after the turn ended (a gap entirely before it is
     // irrelevant to whether the current on-disk state is explained).
-    let gap_stale = has_gap_after(records, &t.ended) && modified;
+    let gap_stale = view::has_gap_after(records, &t.ended) && modified;
 
     let mut line = render_turn(t);
     if deleted {
@@ -513,7 +442,7 @@ fn blame_line(
     // E2: interval-aware, bounded to the last touching turn's end — mirrors
     // blame_file's gap_stale check.
     let gap_stale = match last {
-        Some(t) => has_gap_after(records, &t.ended) && modified_since(t, file, current_hash),
+        Some(t) => view::has_gap_after(records, &t.ended) && modified_since(t, file, current_hash),
         None => no_turn_gap,
     };
     if gap_stale {
@@ -605,7 +534,7 @@ fn blame_line(
         // uncovered interval (then folded into a later turn's unchanged
         // `before`) would otherwise be misreported as predating all
         // recording, when really its origin is just unknown.
-        None if has_gap_after(records, "") => {
+        None if view::has_gap_after(records, "") => {
             println!("{file}:{line_no}: attribution stale — recording gap");
         }
         _ => println!("{file}:{line_no}: before recording began"),
@@ -658,7 +587,7 @@ pub fn undo(
         .collect();
 
     let target = match turn_ref {
-        Some(r) => resolve_turn(&turns, r)?,
+        Some(r) => turn_by_ref(&turns, r)?,
         None => resolve_panic_target(&turns, &superseded)?,
     };
     // `turns` borrows from `target`'s own source, so this position lookup
@@ -1032,54 +961,10 @@ fn modified_cause(
     if later_touches {
         return "later agent turn".to_string();
     }
-    if has_gap_after(records, &target.ended) {
+    if view::has_gap_after(records, &target.ended) {
         return "recording gap".to_string();
     }
     "human or external edit".to_string()
-}
-
-/// True when the daemon was NOT recording for some interval that falls after
-/// `since` (RFC 3339 strings compare lexically in time order at fixed
-/// width). Three shapes, all uncovered intervals (E2):
-///   - crash-shaped: an unbalanced `start` (no intervening `stop`) — the
-///     interval from the first `start` to the second is unaccounted for.
-///   - clean restart: a `stop` followed later by a `start` — the daemon was
-///     deliberately off for that interval, however short.
-///   - trailing stop: the last epoch is a `stop` with nothing after it — the
-///     daemon is (or was, as of the log) simply not running.
-///
-/// Only the *start* of the uncovered interval needs to be after `since` —
-/// once recording has stopped, everything from there on is uncovered.
-fn has_gap_after(records: &[LogRecord], since: &str) -> bool {
-    let mut open = false;
-    let mut pending_stop: Option<&str> = None;
-    for r in records {
-        if let LogRecord::Epoch(e) = r {
-            match e.event.as_str() {
-                "start" => {
-                    if open && e.ts.as_str() > since {
-                        return true; // crash-shaped
-                    }
-                    if pending_stop.is_some() && e.ts.as_str() > since {
-                        return true; // clean restart: stop -> (later) start
-                    }
-                    open = true;
-                    pending_stop = None;
-                }
-                "stop" => {
-                    open = false;
-                    pending_stop = Some(e.ts.as_str());
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(stop_ts) = pending_stop {
-        if stop_ts > since {
-            return true; // trailing stop: daemon currently not running
-        }
-    }
-    false
 }
 
 fn print_plan(target: &TurnRecord, plans: &[Plan]) {

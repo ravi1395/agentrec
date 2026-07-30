@@ -559,7 +559,7 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
                 scanned += 1;
                 let is_duplicate = kept_turns
                     .iter()
-                    .any(|kept| crate::readcmds::same_revert(kept, &t));
+                    .any(|kept| agentrec_core::view::same_revert(kept, &t));
                 if is_duplicate {
                     removed += 1;
                 } else {
