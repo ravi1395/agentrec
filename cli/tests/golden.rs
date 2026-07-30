@@ -415,11 +415,14 @@ fn build_recall_fixture(root: &Path) {
 /// golden emit the stale memory instead of `[]`, and it reds.
 fn build_stale_recall_fixture(root: &Path) {
     // Reuse the two-memory corpus verbatim. This is load-bearing, not laziness:
-    // a one-memory store gives n=1, so idf = ln(0.5/1.5 + 1) ≈ 0.288, far under
-    // SCORE_FLOOR 0.8 — the memory would be dropped by BM25 before freshness was
-    // ever consulted, and the golden would capture `[]` for the wrong reason. It
-    // was written that way first, and the permissive-freshness neuter below
-    // stayed green, which is exactly how the vacuity surfaced.
+    // a one-memory store gives n=1, so idf = ln(0.5/1.5 + 1) ≈ 0.288, and the
+    // largest score reachable at ANY tf is idf × (k1 + 1) = 0.633 — under
+    // SCORE_FLOOR 0.8. (The floor binds the score, not the idf; the bound is
+    // stated in that form because it is what makes the conclusion airtight.) So
+    // the memory would be dropped by BM25 before freshness was ever consulted,
+    // and the golden would capture `[]` for the wrong reason. It was written
+    // that way first, and the permissive-freshness neuter stayed green, which is
+    // exactly how the vacuity surfaced.
     build_recall_fixture(root);
     // Drift the pinned file AFTER the hash is bound — this is what makes it stale.
     write_file(root, MEMORY_MATCH_PIN_PATH, MEMORY_STALE_PIN_CONTENT);
