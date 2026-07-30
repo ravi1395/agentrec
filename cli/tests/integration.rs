@@ -2245,6 +2245,55 @@ fn diff_prefix_match() {
     assert!(stdout.contains("0 file"), "stdout: {stdout}");
 }
 
+// P4b-2 AC8: a fileless turn is DATA, not an error — `diff` renders the
+// header alone, exit 0. `diff_prefix_match` above only asserts a substring
+// of stdout, so an empty page that also dropped the header (or gained a
+// stray line) would have regressed silently; this pins the whole stream.
+#[test]
+fn diff_fileless_turn_prints_the_header_alone_exit_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = base_turn("t_FILELESSTURN00000000000001", vec![]);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("turn {} · claude · 0 files\n", short_id_of(&turn.id)),
+        "a fileless turn renders its header and nothing else"
+    );
+    assert!(out.stderr.is_empty(), "stderr: {out:?}");
+}
+
+// P4b-2 AC19 (the arm nothing pinned): `blame <missing>:<n>` is a user
+// error, not an attribution — stderr `agentrec: <path>: not found`, exit 1.
+// The fixture is deliberately gap-free (no epoch records at all), because a
+// crash gap would short-circuit into the recording-gap state and never reach
+// the error.
+#[test]
+fn blame_line_on_a_missing_file_reports_not_found_exit_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A ledger with a turn, but none touching the queried path.
+    seed_turn(root, &base_turn("t_UNRELATEDTURN0000000000001", vec![]));
+
+    let out = agentrec(root, &["blame", "nope.rs:1"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "agentrec: nope.rs: not found\n"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a refusal must not also print an attribution: {out:?}"
+    );
+}
+
 // --- AC PD2: `agentrec show <turn> [--prompt]` (SPEC §Prompt posture item
 // 4, excerpt discipline). Bare `show` prints only the header; the full
 // post-scrub prompt requires the explicit flag. Every case below asserts
