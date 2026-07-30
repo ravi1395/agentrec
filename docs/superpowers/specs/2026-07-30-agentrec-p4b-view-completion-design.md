@@ -1,8 +1,9 @@
 # P4b — `RepositoryView` completion (diff / blame / recall / wire `list`)
 
-> **Status:** design, revision 2 — amended after skeptic round 1 returned FAIL with 5 blocking
-> findings (all independently verified, all real). Written 2026-07-30 against
-> `feat/phase-2-0-substrate` @ `638290d`. Parent spec:
+> **Status:** design, revision 3 — amended after skeptic rounds 1 (FAIL, 5 blocking) and 2
+> (FAIL, 3 blocking, all in revision 2's new material). Every finding independently verified
+> against the tree before amending. Written 2026-07-30 against `feat/phase-2-0-substrate` @
+> `638290d`. Parent spec:
 > `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Deep module 1).
 > Parent plan: `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`.
 > Conflict order: PROTOCOL.md > IMPLEMENTATION.md > parent spec > this doc.
@@ -13,6 +14,14 @@
 > which revision 1 failed to inventory; R4 replaced the unmechanizable `rg`-path ACs with
 > positive behavioral gates; R5 added `store_empty` to `RecallPage`; R6 corrected the
 > §Why P4 gate-PASSed thesis, which was literally false as first written.
+>
+> **Revision 3 changelog** (§Skeptic round 2 records the full findings):
+> R7 corrected decision 5 / G4 again — `status_report` has **two** turn consumers, and the
+> eviction path needs unfiltered full records (revision 2 inventoried only the rich-rate
+> window, leaving a **blob-eviction data-loss path**); R8 rewrote AC3, which was jointly
+> unsatisfiable with AC6 and wrong on ordering and on `recall`'s target; R9 added positive
+> wiring ACs for `diff`/`blame`, which revision 2 pinned by nothing load-bearing — P4's exact
+> failure mode had survived for two of the three new methods.
 
 ## Why this phase exists
 
@@ -76,13 +85,29 @@ doc commit corrects those three files.
 - **G4 — `view::list` has zero callers; `cmds::status_report` re-implements it.**
   `status_report` derives `merged_ids`, filters superseded ids, and filters `tool != "git"` —
   which is `TurnQuery{include_all:false}` verbatim, matching `TurnQuery::include_all`'s own doc
-  comment ("include turns superseded by a retroactive merge, and git turns"). Every field
-  `status` then consumes (`imported`, `grade`, `tool`, and a count) is already on `TurnSummary`,
-  so `list()` fits with **no type widening**. An unwired seam is an unverified seam — which is
-  how P4's drift survived a gate.
+  comment ("include turns superseded by a retroactive merge, and git turns").
+
+  **`status_report` has TWO turn consumers, and they need different types** (R7 — revision 2
+  inventoried only the first, and skeptic round 2 showed the omission opens a data-loss path):
+
+  | Consumer | Set | Fields needed | Served by |
+  |---|---|---|---|
+  | turn count, rich-rate window | **filtered** (`turns`) | `imported`, `grade`, `tool`, `.len()` | `list(&TurnQuery{include_all:false})` — all present on `TurnSummary`, no widening |
+  | eviction protect-set (`retention::enforce_budget`) | **unfiltered** (`all_turns`) | `prompt_ref` and every `files[]` blob hash | `view.ledger().records`, or `list_records(&TurnQuery{include_all:true})` — **never** the filtered page |
+
+  `enforce_budget` protects `prompt_ref` from **any** turn (its own comment: "protect any blob
+  referenced as a prompt by ANY turn, not just kept ones") and derives snapshot hashes via
+  `turn_snapshot_hashes`. `TurnSummary` carries neither `prompt_ref` nor `files[]`.
+
+  **This is a data-loss path, not a golden break.** An executor who routes `status` wholesale
+  through `list()` and derives `owned_turns` from the filtered page hands `enforce_budget` a
+  protect-set missing every superseded and git turn's blobs; eviction then deletes blobs still
+  referenced by superseded turns, breaking `undo` of merged history. AC16 exists to make that
+  RED.
 - **G5 — `log --json` hand-rolls its serializer.** A fourth one-serializer violation, outside
-  P5's scope (P5 covers diff/blame/status only). The parent spec's MCP table requires
-  `agentrec_log` to mirror the `--json` contract through the same serializer.
+  P5's scope (P5 covers diff/blame/status only). Justified by the one-serializer invariant
+  itself — *not* by an MCP mirror: under decision 12 the parent spec's `agentrec_log` row
+  mirrors `list()`'s summary contract, not `log --json`.
 
 ### Out of scope, with the reason recorded so a fresh executor cannot resurrect it
 
@@ -193,12 +218,16 @@ states — a half-bypassed seam that revision 1's ACs did not catch.
 5. **Two typed values for turns, with distinct consumers.** `TurnSummary` is a lossy projection —
    it drops `v`, `truncated`, `model`, `session`, `root`, `prompt_ref`, `prompt_excerpt`,
    `merges`, `files_complete`, and reduces `files[]` to a count.
-   - `list() -> Page<TurnSummary>` serves **`status`** (G4) and, later, MCP 2.2's bounded
-     "≤200 turn summaries".
-   - `list_records() -> Page<TurnRecord>` serves **both** `log` forms. The human `log` line needs
-     `prompt_excerpt`, `truncated`, and `files_complete` (`fmt::turn_list_line`) and the noise
-     fold needs per-file paths (`cmds::log`); `log --json` emits the full record, pinned by
-     `log_json.golden`. Revision 1 wrongly claimed `list()` serves human `log` (R2).
+   - `list() -> Page<TurnSummary>` serves **`status`'s counting surface** — turn count and the
+     rich-rate window (G4's first row) — and, later, MCP 2.2's bounded "≤200 turn summaries".
+   - `list_records() -> Page<TurnRecord>` serves **both `log` forms** and **`status`'s eviction
+     path**. The human `log` line needs `prompt_excerpt`, `truncated`, and `files_complete`
+     (`fmt::turn_list_line`) and the noise fold needs per-file paths (`cmds::log`); `log --json`
+     emits the full record, pinned by `log_json.golden`; the eviction protect-set needs
+     `prompt_ref` + `files[]` over the **unfiltered** set (G4's second row).
+   - `status` therefore makes **two** view calls, or one `ledger()` read plus one `list()` — it
+     is not a single-query consumer. Revision 1 wrongly claimed `list()` serves human `log`
+     (R2); revision 2 wrongly claimed `TurnSummary` covers all of `status` (R7).
 
    Rejected: widening `TurnSummary` to cover the human `log` line — the parent spec's rule
    "prompt contents are opt-in data, never included in generic summaries" makes
@@ -250,14 +279,21 @@ for P4.
    README rides this commit if any documented behavior of `diff`/`blame` changes.
 3. **`recall` into `view.rs`** + adapter. `MemoryHit` carries `EffectiveJson`'s serde shape;
    `RecallPage` carries `capped`/`store_corrupt`/`store_empty`.
-4. **G4 + G5:** `cmds::status_report` → `list()`; `cmds::log` (both forms) → `list_records()`.
-   No empty-case contract change (decision 6). README rides this commit if any documented flag
-   behavior changed.
+4. **G4 + G5:** `cmds::status_report`'s counting surface → `list()`; its **eviction path** →
+   `view.ledger().records` or `list_records(&TurnQuery{include_all:true})`, never the filtered
+   page (G4's table, AC16); `cmds::log` (both forms) → `list_records()`, keeping the
+   `.rev().take(limit)` reordering in the adapter (AC3). No empty-case contract change
+   (decision 6). README rides this commit if any documented flag behavior changed.
 5. **Docs:** parent spec §Deep module 1 amendment (decisions 8, 10) and the `agentrec_log` MCP
    row amendment (decision 12); `P5.md` dependency line corrected `P4` → `P4b`; the stale
    "21 passed" golden figure corrected in P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
 
 ## Acceptance criteria
+
+AC ids are **stable identifiers, appended in discovery order and never renumbered** — the skeptic
+rounds and claimd declarations reference them by number. That is why the load-bearing block runs
+AC1–AC13 plus AC16–AC17 while the supplementary block holds AC14–AC15: the two blocks are
+semantic, the numbering is chronological.
 
 **Load-bearing — positive and behavioral.** These are the gates; they fail if behavior moved at
 all.
@@ -267,10 +303,22 @@ all.
 - [ ] **AC2** The 5 goldens captured in commit 1 are byte-identical after commits 2–4. RED proof
       required: a `MemoryHit` omitting any `EffectiveJson` field, or a `RecallPage` without
       `store_empty`, must fail this AC — demonstrate the failure once in-test, then fix.
-- [ ] **AC3** `cmds::log`'s output equals `serde_json` of exactly what the view returned:
-      a test asserts `log --json` stdout is byte-equal to serializing
-      `view.list_records(&TurnQuery{include_all, ..})`'s items with no adapter-side field
-      construction. Same assertion for `recall --json` against `view.recall(..)`.
+- [ ] **AC3** The `--json` adapters serialize the view's returned items and nothing else, stated
+      as an **expression-level** contract (R8 — revision 2's "byte-equal to the items" wording
+      was unsatisfiable three ways: `cmds::log` renders newest-first via `.rev().take(limit)`
+      with `--limit` default 50 while `list_records` returns oldest-first and its `TurnQuery.limit`
+      takes the *first* n, so the limit cannot be pushed into the query; the empty case emits
+      `[]`, which is not the per-line serialization of zero items; and serializing `RecallPage`
+      whole would break decision 3):
+      - On a **non-empty** fixture, `log --json` stdout ≡ `page.items.iter().rev().take(limit)`
+        with one `serde_json::to_string` line each. The `.rev().take(limit)` reordering is the
+        adapter's **only** sanctioned transformation; no field construction, no reshaping.
+      - The **empty** case is governed solely by AC6; the retained `println!("[]")` branch is the
+        one sanctioned hand-built JSON literal in this phase, named here so AC3 and AC6 are not
+        read as contradictory.
+      - `recall --json` stdout ≡ `serde_json::to_string(&view.recall(..).page.items)` — the
+        `items`, never the `RecallPage` (whose `capped`/`store_corrupt`/`store_empty` must not
+        reach the JSON, decision 3).
 - [ ] **AC4** A field added to `TurnRecord` appears in `log --json` with no adapter edit; a field
       added to `MemoryHit` appears in `recall --json` with no adapter edit (both proven by adding
       a temp field in-test).
@@ -302,6 +350,21 @@ all.
 - [ ] **AC13** Cursor semantics carry over: a cursor from `list_records` or `diff` replayed after
       a `purge --log-duplicates` rewrite returns `stale_cursor`, never a silently holed page —
       the same guarantee already proven for `list`.
+- [ ] **AC16** *(R7 — the data-loss gate.)* `status`'s eviction protect-set is built from the
+      **unfiltered** turn set. RED fixture: an over-budget store containing a superseded turn
+      whose snapshot blob is referenced by no surviving turn, plus a git turn with a
+      `prompt_ref`. After `status` evicts, both blobs still exist. Deriving `owned_turns` from
+      `list()`'s filtered page must fail this AC.
+- [ ] **AC17** *(R9 — the `diff`/`blame` wiring gate.)* The `diff` and `blame` **adapters** call
+      the view, proven positively and not by `rg` alone: `rg '\.diff\(|\.blame\(' cli/src` → ≥1
+      match each (cheap check), plus a behavioral pin per verb whose output is reachable *only*
+      through the view — a fixture where `view::diff` returns `DiffError::Lookup(Unknown)` and
+      the adapter's prose is produced by mapping that typed error, and likewise for `blame`'s
+      gap-honesty state. RED before the rewiring: with the adapters still on their direct
+      `load_log`/`BlobStore` path, these pins must fail. This AC exists because revision 2 pinned
+      `diff`/`blame` behavior only at the view level, so an executor could have landed the view
+      methods, left the adapters untouched, and passed every load-bearing AC — P4's exact failure
+      mode, one revision after diagnosing it.
 
 **Supplementary — negative-space, scoped to be literally runnable** (revision 1's versions were
 not; see §Skeptic round 1, B1 and B4):
@@ -313,7 +376,17 @@ not; see §Skeptic round 1, B1 and B4):
       (decision 11).
 - [ ] **AC15** `rg 'memory::' cli/src/memorycmds.rs` no longer matches inside `recall_cmd` —
       including `memory::load_effective`, which revision 1's `memory::recall`-only grep missed.
-      Hook-path functions keep their matches.
+      Hook-path functions keep their matches. Two caveats stated so this AC is not over-read:
+      (a) `recall_cmd` also references `memory::RECALL_VERIFY_CAP` inside the F3 notice, so the
+      cap must reach the adapter another way — carried on `RecallPage`, or via a `view`
+      re-export named as sanctioned in the task file; (b) a module-top
+      `use agentrec_core::memory::…` defeats this grep while preserving the coupling, so AC15 is
+      a tripwire, not a proof — AC2/AC10/AC11 are what actually pin the behavior.
+
+Note on AC2's RED proof: without `store_empty`, an adapter that bypasses the seam via
+`memory::load_effective` still renders both human empty states correctly and passes AC2's
+goldens. AC2's RED claim therefore holds only jointly with AC15's bypass prohibition. Stated
+rather than left implicit.
 
 ## Verification
 
@@ -367,8 +440,16 @@ zero-turn tempdir prints `[]`, exit 0; `agentrec status` output unchanged before
   the most intricate logic in the file. It must move verbatim; the blame goldens are the
   instrument (AC9).
 - `status` is behaviorally dense (rich-rate window, DEGRADED section, eviction on the human path
-  from P4's split). Rewiring its turn source must not disturb the eviction behavior P4
-  deliberately preserved — `status.golden` and `status_json.golden` are the instrument.
+  from P4's split) and has **two** turn consumers with different type needs. Rewiring its turn
+  source must not disturb the eviction behavior P4 deliberately preserved — `status.golden` and
+  `status_json.golden` are the instrument for the rendering, but the over-budget line is not in
+  the golden fixture, so **AC16's dedicated RED fixture is the only real gate on the protect-set**.
+  Do not rely on an unnamed existing eviction test to catch it; skeptic round 2 explicitly
+  declined to certify that one exists.
+- Two revisions of this document each broke on the same class of error: asserting which fields a
+  consumer needs after reading only part of the consuming function. Before wiring any adapter to
+  a view method, read the **whole** consumer, including its error, over-budget, and DEGRADED
+  branches.
 
 ## Skeptic round 1 (2026-07-30) — FAIL, 5 blocking, all verified real
 
@@ -399,3 +480,30 @@ independently re-verified every factual claim in §Measured starting state excep
 corrected above. It flagged that the "founder-confirmed" annotation on revision 1's decisions had
 no artifact in the tree; decisions 1–5 and 7–12 are founder-confirmed in session on 2026-07-30,
 decision 6 was withdrawn by the founder after B2 was surfaced, and this document is the artifact.
+
+## Skeptic round 2 (2026-07-30) — FAIL, 3 blocking, all in revision 2's new material
+
+Round 2 confirmed R1, R3, R5, and R6 as closing their round-1 findings, and re-verified the
+"17" match count, the `status_report`-duplicates-`list()`-verbatim claim, the golden harness's
+stderr capture, and the 27 + 5 = 32 arithmetic. It **refuted** one concern raised against
+revision 2 (AC5's RED wording survives the `merged_ids` other-caller check: the surviving `undo`
+caller does not falsify a function-scoped RED condition). Three new blocking findings:
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | Decision 5 / G4's field claim was false **a second time**: `status_report`'s eviction path (`cmds::status_report` → `retention::enforce_budget`) consumes the **unfiltered** turn set's `prompt_ref` and `files[]` blob hashes — neither on `TurnSummary`. Revision 2 inventoried only the rich-rate window. Not a golden break but a **data-loss path**: a filtered protect-set lets eviction delete blobs still referenced by superseded turns, breaking `undo` of merged history | R7: G4 now tables both consumers with their type needs; decision 5 states `status` makes two calls; commit 4 names the eviction path's source explicitly; **AC16** is a dedicated RED fixture |
+| B2 | AC3 was unsatisfiable three ways: `cmds::log` renders newest-first (`.rev().take(limit)`, `--limit` default 50) while `list_records` returns oldest-first and limits from the *first* n, so the limit cannot be pushed into the query; the `[]` empty case is not the per-line serialization of zero items, making AC3 jointly unsatisfiable with AC6; and `recall --json` must serialize `page.items`, not the `RecallPage` | R8: AC3 rewritten as an expression-level contract naming the sanctioned `.rev().take(limit)` transformation, deferring the empty case wholly to AC6, and targeting `page.items` for recall |
+| B3 | `diff`/`blame` adapter wiring was pinned by **nothing load-bearing** — AC7/AC8/AC9 assert view-level behavior, satisfiable with the adapters still on their direct `load_log`/`BlobStore` path, and AC14 (supplementary) is satisfiable by relocating the functions. P4's exact failure mode survived for two of the three new methods, in the revision that exists to prevent it. `log`/`recall` had AC3 as a wiring pin; `diff`/`blame` had no analogue | R9: **AC17** adds a positive per-verb wiring pin — the adapter's prose must be produced by mapping the view's typed error, RED before rewiring |
+
+Non-blocking, folded in: AC15 now states both its limits (the `RECALL_VERIFY_CAP` reference needs
+a sanctioned source; a module-top `use` defeats the grep, so AC15 is a tripwire and AC2/AC10/AC11
+are the real pins); AC2's `store_empty` RED proof is stated as holding only jointly with AC15;
+G5's rationale corrected — it rests on the one-serializer invariant, not on an MCP mirror that
+decision 12 redirects.
+
+Round 2 again declined to certify the "founder-confirmed" annotation absent an artifact, and
+noted that B1 and B2 alter decision 5's factual basis and AC3's substance, so those two need
+re-confirmation. Decision 5's *shape* (two typed values, distinct consumers) is unchanged and
+stands; what changed is the inventory of which consumer needs which — a correction of fact, not a
+reversal of the decision. AC3's rewrite likewise preserves its intent (the adapter serializes
+what the view returned) and fixes only its expression.
