@@ -214,6 +214,9 @@ const MEMORY_MATCH_PIN_PATH: &str = "src/throttle.rs";
 const MEMORY_OTHER_PIN_PATH: &str = "src/changelog.rs";
 const MEMORY_MATCH_PIN_CONTENT: &[u8] = b"fn throttle() {}\n";
 const MEMORY_OTHER_PIN_CONTENT: &[u8] = b"fn changelog() {}\n";
+/// Replaces `MEMORY_MATCH_PIN_CONTENT` on disk after its hash is recorded, so
+/// the pin verifies Stale. See `build_stale_recall_fixture`.
+const MEMORY_STALE_PIN_CONTENT: &[u8] = b"fn throttle() { /* edited */ }\n";
 // Free-text query terms — not ids/timestamps/hashes, so AC-1c's "traces to a
 // named const" requirement doesn't bind them, but named here anyway for the
 // same readability the id/fact/path consts above give.
@@ -393,6 +396,33 @@ fn build_recall_fixture(root: &Path) {
         &other_hash,
         MEMORY_OTHER_TS,
     );
+}
+
+/// Same store as [`build_recall_fixture`]'s matching memory, except the pin's
+/// worktree bytes are REWRITTEN after the hash is recorded, so
+/// `memory::hash_pin` reads content that no longer matches and the memory
+/// verifies Stale. `recall` returns only Fresh entries (INV-M2), so the
+/// correct output is the empty array.
+///
+/// This fixture exists to close a one-sided blind spot the P4b-1 skeptic gate
+/// found by experiment: breaking freshness in the STRICT direction (treat
+/// everything as stale) reds `recall_json_hits`, but breaking it in the
+/// PERMISSIVE direction (treat everything as fresh) left all goldens green,
+/// because no fixture held a stale memory for a too-permissive filter to
+/// wrongly admit. A silently dropped verify walk is a permissive break — and
+/// that is exactly the failure mode available to P4b-3, which reimplements
+/// `recall` behind `view.rs`. With this fixture, dropping the walk makes the
+/// golden emit the stale memory instead of `[]`, and it reds.
+fn build_stale_recall_fixture(root: &Path) {
+    // Reuse the two-memory corpus verbatim. This is load-bearing, not laziness:
+    // a one-memory store gives n=1, so idf = ln(0.5/1.5 + 1) ≈ 0.288, far under
+    // SCORE_FLOOR 0.8 — the memory would be dropped by BM25 before freshness was
+    // ever consulted, and the golden would capture `[]` for the wrong reason. It
+    // was written that way first, and the permissive-freshness neuter below
+    // stayed green, which is exactly how the vacuity surfaced.
+    build_recall_fixture(root);
+    // Drift the pinned file AFTER the hash is bound — this is what makes it stale.
+    write_file(root, MEMORY_MATCH_PIN_PATH, MEMORY_STALE_PIN_CONTENT);
 }
 
 /// Builds a complete, deterministic fixture repo: real `git init`, real
@@ -1271,6 +1301,24 @@ fn golden_recall_json_hits() {
     build_recall_fixture(root);
     assert_golden(
         "recall_json_hits",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_MATCH, "--json"]),
+    );
+}
+
+/// Same query and same single memory as [`golden_recall_json_hits`], but the
+/// pin has drifted, so freshness verification must exclude it and the output
+/// must be `[]`. Pairs with that test as a two-sided pin on the verify walk:
+/// `recall_json_hits` reds if freshness is broken STRICTLY (a fresh memory
+/// wrongly excluded), this one reds if it is broken PERMISSIVELY (a stale
+/// memory wrongly admitted). Only the strict direction was covered before —
+/// see `build_stale_recall_fixture` for why that gap mattered.
+#[test]
+fn golden_recall_json_stale_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_stale_recall_fixture(root);
+    assert_golden(
+        "recall_json_stale_pin",
         &agentrec(root, &["recall", MEMORY_RECALL_QUERY_MATCH, "--json"]),
     );
 }
