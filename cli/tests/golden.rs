@@ -93,6 +93,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use agentrec_core::memory::{memory_path, MemoryOp, MemoryRecord, Pin};
 use agentrec_core::record::{
     append_line_synced, append_log, EpochRecord, FileEntry, LogRecord, TurnRecord,
 };
@@ -155,6 +156,36 @@ const BASELINE_UNKNOWN_AFTER: &[u8] = b"first seen mid-session\n";
 const MISSING_BLOB_GHOST: &[u8] = b"never actually stored\n";
 const CORRUPT_BLOB_REAL: &[u8] = b"real content at write time\n";
 const CORRUPT_BLOB_TAMPERED: &[u8] = b"tampered after the fact\n";
+
+// ---------------------------------------------------------------------------
+// Memory recall fixture constants (P4b-1) — same discipline as the turn
+// fixture above: every id/timestamp/hash reaching a captured `recall` golden
+// originates from exactly one of these named consts. Pin hashes are not
+// literal strings (a memory's pin hash is content-addressed, computed from
+// the pinned file's real bytes — `memory::hash_pin` reads the working-tree
+// file directly, it never consults the CAS) — they are derived at fixture-
+// build time via `store::hash_bytes` over the named `MEMORY_*_PIN_CONTENT`
+// byte const, mirroring exactly how `build_fixture` above derives blob
+// hashes from `APP_BEFORE` et al. via `store.put`. Never `memory::remember`'s
+// real `id::ulid()` generator, never `SystemTime::now()`.
+// ---------------------------------------------------------------------------
+
+const MEMORY_MATCH_ID: &str = "m_MATCH0000000000000000MEM1";
+const MEMORY_OTHER_ID: &str = "m_OTHR00000000000000000MEM2";
+const MEMORY_MATCH_TS: u64 = 1_577_923_200_000; // 2020-01-02T00:00:00.000Z
+const MEMORY_OTHER_TS: u64 = 1_577_923_260_000; // 2020-01-02T00:01:00.000Z
+const MEMORY_MATCH_FACT: &str =
+    "throttle limiter guards the API from bursty traffic via throttle checks";
+const MEMORY_OTHER_FACT: &str = "the release changelog script lives under scripts";
+const MEMORY_MATCH_PIN_PATH: &str = "src/throttle.rs";
+const MEMORY_OTHER_PIN_PATH: &str = "src/changelog.rs";
+const MEMORY_MATCH_PIN_CONTENT: &[u8] = b"fn throttle() {}\n";
+const MEMORY_OTHER_PIN_CONTENT: &[u8] = b"fn changelog() {}\n";
+// Free-text query terms — not ids/timestamps/hashes, so AC-1c's "traces to a
+// named const" requirement doesn't bind them, but named here anyway for the
+// same readability the id/fact/path consts above give.
+const MEMORY_RECALL_QUERY_MATCH: &str = "throttle";
+const MEMORY_RECALL_QUERY_NO_MATCH: &str = "zzzznomatch";
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -269,6 +300,65 @@ fn seed_epoch(root: &Path, event: &str, ts: &str) {
         }),
     )
     .expect("seed epoch");
+}
+
+/// Hand-seeds one `assert` line into `.agentrec/memory.jsonl` — never via
+/// `memorycmds::remember`/`memory::append_memory` (which would scrub the fact
+/// and fsync through the real write path unnecessarily for a fixture) and
+/// never via `id::ulid()`/`SystemTime::now()`. Mirrors `seed_turn`'s
+/// hand-construct-then-serialize style, just against `MemoryRecord` instead
+/// of `TurnRecord`.
+fn seed_memory(root: &Path, id: &str, fact: &str, pin_path: &str, pin_hash: &str, ts: u64) {
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: id.to_string(),
+        op: MemoryOp::Assert,
+        fact: fact.to_string(),
+        pins: vec![Pin {
+            path: pin_path.to_string(),
+            hash: pin_hash.to_string(),
+        }],
+        source_turns: vec![],
+        origin: "human".to_string(),
+        ts,
+        reason: None,
+    };
+    let line = serde_json::to_string(&rec).expect("serialize memory record");
+    append_line_synced(&memory_path(root), &line).expect("seed memory");
+}
+
+/// Builds a minimal, deterministic `recall` fixture: an initialized repo with
+/// exactly two Fresh, non-retracted, pinned memories — `MEMORY_MATCH_*`
+/// (matches `MEMORY_RECALL_QUERY_MATCH` via BM25) and `MEMORY_OTHER_*`
+/// (shares no term with `MEMORY_MATCH_*`, so it never appears in either
+/// query's results — it exists purely to make the store non-empty for
+/// `recall_json_no_match`/`recall_human_no_match`, which need "nothing fresh
+/// matched" to be distinguishable from "no memories were ever recorded").
+/// Both pins' real worktree bytes are written first so `memory::hash_pin`
+/// verifies them Fresh (INV-M2) when `recall` walks the ranking.
+fn build_recall_fixture(root: &Path) {
+    init(root);
+    write_file(root, MEMORY_MATCH_PIN_PATH, MEMORY_MATCH_PIN_CONTENT);
+    write_file(root, MEMORY_OTHER_PIN_PATH, MEMORY_OTHER_PIN_CONTENT);
+    let match_hash = agentrec_core::store::hash_bytes(MEMORY_MATCH_PIN_CONTENT);
+    let other_hash = agentrec_core::store::hash_bytes(MEMORY_OTHER_PIN_CONTENT);
+    seed_memory(
+        root,
+        MEMORY_MATCH_ID,
+        MEMORY_MATCH_FACT,
+        MEMORY_MATCH_PIN_PATH,
+        &match_hash,
+        MEMORY_MATCH_TS,
+    );
+    seed_memory(
+        root,
+        MEMORY_OTHER_ID,
+        MEMORY_OTHER_FACT,
+        MEMORY_OTHER_PIN_PATH,
+        &other_hash,
+        MEMORY_OTHER_TS,
+    );
 }
 
 /// Builds a complete, deterministic fixture repo: real `git init`, real
@@ -1128,6 +1218,97 @@ fn golden_show_unknown_id_fails() {
     let out = agentrec(root, &["show", "t_DOESNOTEXIST0000000000001"]);
     assert!(!out.status.success(), "expected show to fail: {out:?}");
     assert_golden("show_unknown_id", &out);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: goldens for `recall` (P4b-1) — pre-refactor byte pins for the three
+// `recall --json` states and the human empty-state pair. Zero production
+// changes accompany these; they exist so P4b-3's `recall` → `view.rs`
+// extraction (design decision 2: `recall --json` output stays byte-
+// identical) is falsifiable rather than merely asserted, the same
+// instrument role P3's goldens played for P4.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn golden_recall_json_hits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_recall_fixture(root);
+    assert_golden(
+        "recall_json_hits",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_MATCH, "--json"]),
+    );
+}
+
+/// `recall_json_no_match` and [`golden_recall_json_empty_store`] both
+/// capture the literal `[]` — byte-identical stdout, from two DIFFERENT
+/// fixtures (a non-empty store with no fresh match here, vs. a store that
+/// never had a memory recorded at all in the sibling test). This is expected
+/// duplication, not a bug to "fix" by merging or deleting one of them:
+/// `memorycmds::recall_cmd`'s `--json` branch returns the (possibly-empty)
+/// `arr` before the human branch's `hits.is_empty()` check ever runs, so
+/// `--json` mode cannot distinguish "nothing recorded" from "nothing fresh
+/// matched" by construction (design decision 2, P4b-1 plan) — the human pair
+/// below (`recall_human_no_memories` / `recall_human_no_match`) is the ONLY
+/// place that distinction is actually observable. A future reader should not
+/// deduplicate these two `--json` goldens on the theory that identical bytes
+/// mean redundant tests.
+#[test]
+fn golden_recall_json_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_recall_fixture(root);
+    assert_golden(
+        "recall_json_no_match",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_NO_MATCH, "--json"]),
+    );
+}
+
+/// See [`golden_recall_json_no_match`]'s doc comment: this and that test
+/// capture byte-identical `[]` stdout from different fixtures, deliberately.
+#[test]
+fn golden_recall_json_empty_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root); // initialized repo, no memory.jsonl ever written
+    assert_golden(
+        "recall_json_empty_store",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_NO_MATCH, "--json"]),
+    );
+}
+
+/// A store with NO memories ever recorded: `memorycmds::recall_cmd`'s human
+/// branch loads the full effective set, finds it empty, and prints the PD3
+/// zero-state message to **stderr** (never stdout) at exit 0 — matching
+/// `log`/`status`'s convention that an honest "nothing here yet" notice is
+/// not a failure.
+#[test]
+fn golden_recall_human_no_memories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    assert_golden(
+        "recall_human_no_memories",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_NO_MATCH]),
+    );
+}
+
+/// A non-empty store whose one query term matches nothing fresh: the human
+/// branch's effective set is non-empty, so this takes the OTHER half of the
+/// same `if all.is_empty() { .. } else { .. }` — the plain notice on
+/// **stdout** (never stderr), also exit 0. This and
+/// [`golden_recall_human_no_memories`] are the pair `RecallPage::store_empty`
+/// exists to preserve; see that test's doc comment for why the `--json`
+/// twins of these two cannot show the same distinction.
+#[test]
+fn golden_recall_human_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_recall_fixture(root);
+    assert_golden(
+        "recall_human_no_match",
+        &agentrec(root, &["recall", MEMORY_RECALL_QUERY_NO_MATCH]),
+    );
 }
 
 // ---------------------------------------------------------------------------
