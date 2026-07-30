@@ -1,9 +1,10 @@
 # P4b — `RepositoryView` completion (diff / blame / recall / wire `list`)
 
-> **Status:** design, revision 3 — amended after skeptic rounds 1 (FAIL, 5 blocking) and 2
-> (FAIL, 3 blocking, all in revision 2's new material). Every finding independently verified
-> against the tree before amending. Written 2026-07-30 against `feat/phase-2-0-substrate` @
-> `638290d`. Parent spec:
+> **Status:** design, revision 4 — amended after skeptic rounds 1 (FAIL, 5 blocking), 2 (FAIL, 3
+> blocking), and 3 (FAIL, 3 blocking). Rounds 2 and 3 each found every defect in the *previous
+> revision's own new material*, so each round's fixes are the next round's attack surface. Every
+> finding independently verified against the tree before amending. Written 2026-07-30 against
+> `feat/phase-2-0-substrate` @ `638290d`. Parent spec:
 > `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` (§Deep module 1).
 > Parent plan: `docs/superpowers/plans/2026-07-25-agentrec-phase-2-0.md`.
 > Conflict order: PROTOCOL.md > IMPLEMENTATION.md > parent spec > this doc.
@@ -22,6 +23,17 @@
 > unsatisfiable with AC6 and wrong on ordering and on `recall`'s target; R9 added positive
 > wiring ACs for `diff`/`blame`, which revision 2 pinned by nothing load-bearing — P4's exact
 > failure mode had survived for two of the three new methods.
+>
+> **Revision 4 changelog** (§Skeptic round 3 records the full findings):
+> R10 respecified AC16's fixture around **shared hashes** — revision 3's version was theater,
+> passing identically under the buggy implementation because eviction candidates come only from
+> the turns passed in, so a blob referenced *only* by an excluded turn is invisible rather than
+> deleted; R11 replaced AC17's mechanism with **signature-constrained renderers** (revision 3's
+> error-path pin was satisfiable while the happy path still read the ledger directly, and the
+> human `log`/`recall` branches were pinned by prose alone) and added AC18, because the
+> unknown-turn prose embeds a ledger range a bare typed error cannot carry — making revision 3's
+> AC17 jointly unsatisfiable with AC1; R12 added `list_of` so `status` keeps its single ledger
+> parse instead of gaining a two-parse consistency window.
 
 ## Why this phase exists
 
@@ -92,7 +104,7 @@ doc commit corrects those three files.
 
   | Consumer | Set | Fields needed | Served by |
   |---|---|---|---|
-  | turn count, rich-rate window | **filtered** (`turns`) | `imported`, `grade`, `tool`, `.len()` | `list(&TurnQuery{include_all:false})` — all present on `TurnSummary`, no widening |
+  | turn count, rich-rate window | **filtered** (`turns`) | `imported`, `grade`, `tool`, `.len()` | `list_of(&ledger, &TurnQuery{include_all:false})` — all present on `TurnSummary`, no widening |
   | eviction protect-set (`retention::enforce_budget`) | **unfiltered** (`all_turns`) | `prompt_ref` and every `files[]` blob hash | `view.ledger().records`, or `list_records(&TurnQuery{include_all:true})` — **never** the filtered page |
 
   `enforce_budget` protects `prompt_ref` from **any** turn (its own comment: "protect any blob
@@ -178,10 +190,18 @@ P4b additions:
 
 ```rust
 RepositoryView::list_records(q: &TurnQuery) -> Result<Page<TurnRecord>, CursorError>
+RepositoryView::list_of(l: &Ledger, q: &TurnQuery) -> Result<Page<TurnSummary>, CursorError>
 RepositoryView::diff(q: &DiffQuery)         -> Result<Page<FileDiff>, DiffError>
 RepositoryView::blame(q: &BlameQuery)       -> Result<BlameResult, RepoError>
 RepositoryView::recall(q: &RecallQuery)     -> Result<RecallPage, RecallError>
 ```
+
+`list_of` (R12) takes an already-parsed `Ledger`, mirroring the `health`/`health_of` pair P4
+established for exactly this reason. `status` needs it: today it derives its count, rich-rate,
+gaps, and eviction set from **one** `view.ledger()` parse, so calling `list()` (which re-reads
+`log.jsonl` internally) would open a window where a daemon append makes the printed turn count
+disagree with the health figures from the other parse. `status` therefore does one `ledger()` read
+feeding `health_of` + `list_of` + the unfiltered eviction set.
 
 Query types mirror the parent spec's MCP tool inputs, so 2.2 needs no second interpretation:
 
@@ -225,9 +245,11 @@ states — a half-bypassed seam that revision 1's ACs did not catch.
      (`fmt::turn_list_line`) and the noise fold needs per-file paths (`cmds::log`); `log --json`
      emits the full record, pinned by `log_json.golden`; the eviction protect-set needs
      `prompt_ref` + `files[]` over the **unfiltered** set (G4's second row).
-   - `status` therefore makes **two** view calls, or one `ledger()` read plus one `list()` — it
-     is not a single-query consumer. Revision 1 wrongly claimed `list()` serves human `log`
-     (R2); revision 2 wrongly claimed `TurnSummary` covers all of `status` (R7).
+   - `status` therefore does **one** `ledger()` read feeding `health_of` + `list_of` + the
+     unfiltered eviction set — not a single *query*, but a single *parse* (R12; a second parse
+     would let a daemon append desync the printed count from the health figures). Revision 1
+     wrongly claimed `list()` serves human `log` (R2); revision 2 wrongly claimed `TurnSummary`
+     covers all of `status` (R7).
 
    Rejected: widening `TurnSummary` to cover the human `log` line — the parent spec's rule
    "prompt contents are opt-in data, never included in generic summaries" makes
@@ -279,11 +301,12 @@ for P4.
    README rides this commit if any documented behavior of `diff`/`blame` changes.
 3. **`recall` into `view.rs`** + adapter. `MemoryHit` carries `EffectiveJson`'s serde shape;
    `RecallPage` carries `capped`/`store_corrupt`/`store_empty`.
-4. **G4 + G5:** `cmds::status_report`'s counting surface → `list()`; its **eviction path** →
-   `view.ledger().records` or `list_records(&TurnQuery{include_all:true})`, never the filtered
-   page (G4's table, AC16); `cmds::log` (both forms) → `list_records()`, keeping the
-   `.rev().take(limit)` reordering in the adapter (AC3). No empty-case contract change
-   (decision 6). README rides this commit if any documented flag behavior changed.
+4. **G4 + G5:** `cmds::status_report` keeps its **single** `view.ledger()` parse, feeding
+   `health_of` + `list_of` (counting surface) + the **unfiltered** records (eviction protect-set,
+   never the filtered page — G4's table, AC16); `cmds::log` (both forms) → `list_records()`,
+   keeping the `.rev().take(limit)` reordering in the adapter (AC3). Both `log` forms and both
+   `recall` forms render through signature-constrained `render_*` functions (AC17). No empty-case
+   contract change (decision 6). README rides this commit if any documented flag behavior changed.
 5. **Docs:** parent spec §Deep module 1 amendment (decisions 8, 10) and the `agentrec_log` MCP
    row amendment (decision 12); `P5.md` dependency line corrected `P4` → `P4b`; the stale
    "21 passed" golden figure corrected in P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
@@ -322,11 +345,13 @@ all.
 - [ ] **AC4** A field added to `TurnRecord` appears in `log --json` with no adapter edit; a field
       added to `MemoryHit` appears in `recall --json` with no adapter edit (both proven by adding
       a temp field in-test).
-- [ ] **AC5** `list()` has at least one production caller, and it is `status`: `rg '\.list\('
-      cli/src` → **≥1 match**, and a test asserts `status`'s turn count, rich-rate, and
-      git-hidden accounting are computed from `list()`'s page rather than a re-derived filter
-      (RED if `status_report` still calls `merged_ids` itself). This AC exists because revision 1
-      would have left `list()` dead a second time.
+- [ ] **AC5** The summary projection has at least one production caller, and it is `status`:
+      `rg '\.list_of\(|\.list\(' cli/src` → **≥1 match**, and a test asserts `status`'s turn
+      count, rich-rate, and git-hidden accounting are computed from that page rather than a
+      re-derived filter (RED if `status_report` still calls `merged_ids` itself — a
+      function-scoped condition; `undo`'s surviving `merged_ids` caller is out of scope and does
+      not falsify it). This AC exists because revision 1 would have left the projection dead a
+      second time.
 - [ ] **AC6** `log --json` on a zero-turn repo still prints `[]`, exit 0 —
       `integration.rs::log_json_zero_turns_prints_empty_array` passes **unmodified**. D-PD4 is
       not weakened, deleted, or inverted (decision 6).
@@ -350,21 +375,76 @@ all.
 - [ ] **AC13** Cursor semantics carry over: a cursor from `list_records` or `diff` replayed after
       a `purge --log-duplicates` rewrite returns `stale_cursor`, never a silently holed page —
       the same guarantee already proven for `list`.
-- [ ] **AC16** *(R7 — the data-loss gate.)* `status`'s eviction protect-set is built from the
-      **unfiltered** turn set. RED fixture: an over-budget store containing a superseded turn
-      whose snapshot blob is referenced by no surviving turn, plus a git turn with a
-      `prompt_ref`. After `status` evicts, both blobs still exist. Deriving `owned_turns` from
-      `list()`'s filtered page must fail this AC.
-- [ ] **AC17** *(R9 — the `diff`/`blame` wiring gate.)* The `diff` and `blame` **adapters** call
-      the view, proven positively and not by `rg` alone: `rg '\.diff\(|\.blame\(' cli/src` → ≥1
-      match each (cheap check), plus a behavioral pin per verb whose output is reachable *only*
-      through the view — a fixture where `view::diff` returns `DiffError::Lookup(Unknown)` and
-      the adapter's prose is produced by mapping that typed error, and likewise for `blame`'s
-      gap-honesty state. RED before the rewiring: with the adapters still on their direct
-      `load_log`/`BlobStore` path, these pins must fail. This AC exists because revision 2 pinned
-      `diff`/`blame` behavior only at the view level, so an executor could have landed the view
-      methods, left the adapters untouched, and passed every load-bearing AC — P4's exact failure
-      mode, one revision after diagnosing it.
+- [ ] **AC16** *(R7 — the data-loss gate; fixture respecified in R10.)* `status`'s eviction
+      protect-set is built from the **unfiltered** turn set.
+
+      **The fixture must share hashes.** `enforce_budget` derives its eviction `candidates`
+      *exclusively* from `turn_snapshot_hashes` over the turns it is passed, and the remove loop
+      iterates only `candidates` — so a blob referenced **only** by an excluded turn is invisible
+      to eviction and survives under both implementations. Revision 3's fixture (a superseded
+      turn whose blob no surviving turn references) therefore distinguished nothing (R10). Two
+      shared-hash loss classes, both required:
+      - **(a) prompt-protection loss.** One blob that is simultaneously an old, past-boundary
+        surviving turn's snapshot hash **and** the excluded git turn's `prompt_ref`. Unfiltered:
+        `protected_prompts` saves it ("protect any blob referenced as a prompt by ANY turn, not
+        just kept ones"). Filtered: the git turn is absent, its `prompt_ref` never enters
+        `protected_prompts`, and the blob is evicted.
+      - **(b) keep-set loss.** One blob shared between an excluded superseded turn near the
+        ledger tail (inside the keep window when included) and an older surviving candidate turn.
+        Unfiltered: `keep` holds it via the tail turn, so the candidate walk skips it. Filtered:
+        it is absent from `keep` and is evicted.
+
+      Backdate blob mtimes past `pass_start` (the existing `cmds::tests::backdate` pattern) so
+      `enforce_budget`'s A3(c) same-pass guard cannot rescue the blobs vacuously and mask the
+      difference. Assert **deletion** under the filtered derivation (RED) and **survival** under
+      the unfiltered one.
+
+      Do **not** satisfy a failing AC16 by widening `extra_protected_refs`. Its comment — "a
+      validly-parsed line's hashes are already reachable through `owned_turns`, so re-adding them
+      here would over-protect" — is true only while `owned_turns` is unfiltered; widening it would
+      mask the bug and break the deliberate over-protect boundary. The fix is unfiltering
+      `owned_turns`.
+- [ ] **AC17** *(R9 — the wiring gate; mechanism replaced in R11.)* Bypass must be **structurally
+      impossible**, not merely greppable. Each read verb's human and `--json` output is produced
+      by a pure `render_*` function **whose signature admits only the view's typed values** — no
+      `&Path`/`root`, no `BlobStore`, no `&[LogRecord]`, no store or ledger handle of any kind:
+
+      ```rust
+      fn render_diff(page: &Page<FileDiff>, /* render opts */) -> String
+      fn render_blame(result: &BlameResult, /* render opts */) -> String
+      ```
+
+      A per-verb expression contract then pins stdout: `diff <turn>` ≡ `render_diff(&view.diff(q)?)`,
+      `blame <target>` ≡ `render_blame(&view.blame(q)?)`, and the same shape for the human `log`
+      and human `recall` forms. Because the renderer cannot reach a store or a ledger, an adapter
+      physically cannot render from a direct read while satisfying the contract.
+
+      This replaces revision 3's mechanism, which was gameable three ways (R11): an adapter could
+      call `view.diff()` only to map its error, discard the page on `Ok`, and render the happy
+      path from a **relocated** direct-read helper — passing AC17's error pin, AC14 (no tokens
+      left *inside* `readcmds::diff`), and AC1 (goldens unchanged by construction). Revision 3
+      also left the human `log` and human `recall` branches pinned by commit-4 prose alone, and
+      by this document's own thesis prose carries no gate weight.
+
+      Supplementary mechanizable check: `rg 'load_log\(' cli/src/cmds.rs` → **0 matches outside
+      `mod tests`** (today: production at `cmds::log` plus a test helper — the AC scopes out the
+      helper).
+- [ ] **AC18** *(R11.)* `diff`'s lookup-failure prose is byte-identical to
+      `diff_unknown_id.golden` **while the adapter computes nothing from the ledger.** Today
+      `readcmds::turn_by_ref` renders `LookupError::Unknown` as `unknown turn id '<ref>' —
+      recorded turns: <oldest>..<newest> (N turns)` via `turn_range`, which needs the oldest id,
+      newest id, and count over the unfiltered turn list. A bare `DiffError::Lookup(Unknown)`
+      cannot reproduce those bytes, and AC14 forbids the adapter re-loading the log — so revision
+      3's AC17 was jointly unsatisfiable with AC1 (R11). The typed error therefore **carries the
+      range**:
+
+      ```rust
+      pub struct TurnRangeSummary { pub oldest_id: String, pub newest_id: String, pub count: usize }
+      DiffError::Lookup { err: LookupError, ledger: TurnRangeSummary }
+      ```
+
+      Both the `Unknown` and `Ambiguous` arms are covered; `NoTurns` needs no range. `blame` needs
+      no analogue — it takes a path, not a turn ref, so its error prose embeds no ledger range.
 
 **Supplementary — negative-space, scoped to be literally runnable** (revision 1's versions were
 not; see §Skeptic round 1, B1 and B4):
@@ -507,3 +587,43 @@ re-confirmation. Decision 5's *shape* (two typed values, distinct consumers) is 
 stands; what changed is the inventory of which consumer needs which — a correction of fact, not a
 reversal of the decision. AC3's rewrite likewise preserves its intent (the adapter serializes
 what the view returned) and fixes only its expression.
+
+## Skeptic round 3 (2026-07-30) — FAIL, 3 blocking, all in revision 3's new material
+
+Round 3 confirmed R8 as writable-as-specified, confirmed R7's two-consumer table complete after
+reading all of `status_report`, confirmed R7's data-loss premise real, and verified every new
+factual claim (`enforce_budget` protecting `prompt_ref` from any turn and deriving hashes via
+`turn_snapshot_hashes`; `TurnSummary` carrying neither `prompt_ref` nor `files[]`; `cmds::log`'s
+newest-first render with `--limit` default 50; `list`/`list_records` returning oldest-first and
+limiting from the first n). It additionally confirmed `recall`'s human renderer needs nothing
+beyond `MemoryHit` + `RecallPage`'s flags, and that `blame` needs no ledger-range analogue. Three
+new blocking findings — every one in AC16/AC17, the two ACs revision 3 added:
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | **AC16 was theater.** `enforce_budget` derives eviction `candidates` *exclusively* from `turn_snapshot_hashes` over the turns passed in, and the remove loop iterates only `candidates` — so a blob referenced **only** by an excluded turn is *invisible* to eviction, not deleted. Revision 3's fixture (superseded turn whose blob no surviving turn references) therefore **passes under the buggy filtered-page implementation too**; the RED condition never fires. The data-loss premise is real, but only via **shared-hash** shapes, which the fixture lacked | R10: fixture respecified around two shared-hash loss classes — prompt-protection loss (blob is both a surviving turn's snapshot hash and the excluded git turn's `prompt_ref`) and keep-set loss (blob shared between an excluded tail-window superseded turn and an older surviving candidate) — with mtime backdating so A3(c) cannot rescue vacuously, asserting deletion under the filtered derivation and survival under the unfiltered |
+| B2 | **AC17's prose-mapping mechanism could not reproduce the pinned bytes.** `readcmds::turn_by_ref` renders `LookupError::Unknown` as `unknown turn id '<ref>' — recorded turns: <oldest>..<newest> (N turns)` via `turn_range`, needing the oldest id, newest id, and count over the unfiltered turn list — bytes pinned by `diff_unknown_id.golden`. A bare `DiffError::Lookup(Unknown)` carries none of it, and AC14 forbids the adapter re-loading the log, making revision 3's AC17 jointly unsatisfiable with AC1. Same disease as rounds 1–2, this time on the *error* consumer | R11: **AC18** added — the typed error carries `TurnRangeSummary{oldest_id, newest_id, count}`, covering both the `Unknown` and `Ambiguous` arms; `NoTurns` needs no range, and `blame` needs no analogue since it takes a path, not a turn ref |
+| B3 | **Wiring pins covered only a slice of each verb.** An adapter could call `view.diff()` solely to map its error, discard the page on `Ok`, and render the happy path from a **relocated** direct-read helper — passing AC17's error pin, AC14 (no tokens inside `readcmds::diff`), and AC1 (goldens unchanged by construction). The human `log` and human `recall` branches were pinned by commit-4 prose alone, which by this document's own thesis carries no gate weight | R11: AC17's mechanism replaced with **signature-constrained renderers** — `render_*` functions whose signatures admit only the view's typed values (no `&Path`, no `BlobStore`, no `&[LogRecord]`), plus per-verb expression contracts for every human and `--json` form, making happy-path bypass structurally impossible rather than merely detectable; supplementary `rg 'load_log\(' cli/src/cmds.rs` → 0 outside `mod tests` |
+
+Non-blocking, folded in: **R12** adds `list_of(&Ledger, &TurnQuery)` alongside P4's existing
+`health_of`, so `status` keeps its **single** ledger parse — revision 3's "two view calls" would
+have opened a window where a daemon append desyncs the printed turn count from the health figures
+computed off the other parse. AC16 now also carries the warning that `extra_protected_refs`' "a
+validly-parsed line's hashes are already reachable through `owned_turns`" comment is true only
+while `owned_turns` is unfiltered, so a failing AC16 must be fixed by unfiltering `owned_turns`,
+never by widening the protect-set harvest (which would mask the bug and break the deliberate
+over-protect boundary).
+
+**Pattern worth carrying into the task file.** Three revisions, three rounds, and every round
+found its defects in the immediately preceding revision's *new* material — never in the parts
+that had already survived a round. Two distinct recurring failure modes:
+
+1. **Partial-consumer reading.** Asserting which fields a consumer needs after reading only part
+   of the consuming function. Round 1 hit it on `log`'s renderer, round 2 on `status`'s eviction
+   path, round 3 on `diff`'s *error* renderer. The mitigation now in §Risks — read the whole
+   consumer including its error, over-budget, and degraded branches — was written after round 2
+   and still did not prevent round 3's B2, because the error path was not read as a "consumer".
+2. **Detection instead of prevention.** Every AC that tried to *detect* bypass (`rg` shapes,
+   error-path pins) was gamed within one round. The AC that finally holds — AC17's
+   signature-constrained renderers — makes the bypass unrepresentable instead. Prefer
+   type-level impossibility over greppable prohibition for anything load-bearing.
