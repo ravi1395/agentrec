@@ -55,6 +55,16 @@
 > unsatisfiable), and the pass also found `diff`/`blame` need **no** opts at all. R18 stated the
 > adapter-transformation rule for the human `log` form, which is why `limit`/`explain` are not
 > opts. R19 added the decision-9 error-type signatures to commit 5's parent-spec amendment list.
+>
+> **Revision 7 changelog** (§Skeptic round 6 records the full findings — a **fresh** reviewer, cold
+> read of the whole design):
+> R20 replaced `diff`'s bare `Page<FileDiff>` with a `DiffResult` envelope — the golden-pinned turn
+> header had no sanctioned carrier under AC17's zero-opt rule, and `Page`'s serde
+> (`{"items":…,"next":…}`) could never satisfy P5's required `{"files":[]}`, so the phase built to
+> unblock P5 would have left it blocked; one envelope closes both, plus an explicit fileless-turn
+> ruling. R21 defined `RecallError`, named in revision 5 but never specified. R22 corrected two
+> false instrument citations (AC9's line-level arms and AC19's not-found arm are pinned by
+> integration tests, not goldens — AC19's arm by nothing at all yet).
 
 ## Why this phase exists
 
@@ -95,7 +105,7 @@ violation. *(Skeptic round 1 confirmed this diagnosis as correct and not oversta
 | `recall --json` golden | **none** — `cli/tests/fixtures/golden/` has `log_json`, `status_json`, no recall |
 | `readcmds.rs` ledger/blob users | `rg -c 'load_log\|BlobStore' cli/src/readcmds.rs` → **17** — `diff`, **`show`**, `blame`, **`undo`/`execute_revert`**, and shared helpers `print_entry`, `load_blob`, `load_text` |
 | `status_report` duplicates `list()`'s filter | `cmds::status_report` re-derives `merged_ids` + superseded filter + `tool != "git"` — `TurnQuery{include_all:false}` verbatim |
-| `log --json` empty case **is** pinned | `cli/tests/integration.rs::log_json_zero_turns_prints_empty_array` asserts `[]`; **D-PD4**, `HANDOVER-PD-FIXES.md:20` |
+| `log --json` empty case **is** pinned | `cli/tests/integration.rs::log_json_zero_turns_prints_empty_array` asserts `[]`; **D-PD4**, `HANDOVER-PD-FIXES.md` §D-PD4 |
 
 Revision 1 asserted the `log --json` empty case was unpinned. It is pinned — by an integration
 test, not a golden; revision 1 checked only golden files. Revision 1 also inventoried only
@@ -212,10 +222,47 @@ P4b additions:
 ```rust
 RepositoryView::list_records(q: &TurnQuery) -> Result<Page<TurnRecord>, CursorError>
 RepositoryView::list_of(l: &Ledger, q: &TurnQuery) -> Result<Page<TurnSummary>, CursorError>
-RepositoryView::diff(q: &DiffQuery)         -> Result<Page<FileDiff>, DiffError>
+RepositoryView::diff(q: &DiffQuery)         -> Result<DiffResult, DiffError>
 RepositoryView::blame(q: &BlameQuery)       -> Result<BlameResult, BlameError>
 RepositoryView::recall(q: &RecallQuery)     -> Result<RecallPage, RecallError>
 ```
+
+**`diff` returns an envelope, not a bare `Page`** (R20 — a correction of the parent spec's own
+`Page<FileDiff>` signature, amended in commit 5):
+
+```rust
+pub struct DiffResult {
+    pub turn_id: String,      // full id; `fmt::short_id` truncation stays adapter-side
+    pub tool: Option<String>,
+    pub total_files: usize,   // the turn's own count, independent of the page
+    pub files: Page<FileDiff>,
+}
+```
+
+Two independent defects forced this, both found by a cold sixth-round read:
+
+1. **The header had no sanctioned carrier.** Every diff golden opens with
+   `turn t_RICH…TUR1 · claude · 5 files`, produced by `readcmds::header_line` from the turn's id,
+   tool, and file count. `Page<T>` is `{items, next}` — no turn-level slot — and AC17's opts table
+   gives `diff` *zero* opts, so under revision 6 nothing could carry those three facts to the
+   renderer. Embedding them on each `FileDiff` fails outright on **AC8**: a fileless turn returns an
+   empty page, so `turn <id> · <tool> · 0 files` would be unproducible — and no test pins the
+   fileless case (`rg '0 files' cli/tests` → 0), so that regression would have been silent.
+2. **P5 would have stayed unexecutable** — the very thing this phase exists to fix. P5's AC1
+   requires `diff --json` to emit `serde_json` of the exact typed value, and its empty-case AC
+   requires a fileless turn to yield `{"files":[]}`. Serde of `Page<FileDiff>` is
+   `{"items":[],"next":null}`; `Page` is generic and shared with
+   `Page<TurnSummary>`/`Page<TurnRecord>`, so renaming `items` → `files` is unavailable, and adapter
+   reshaping is banned by P5's own AC1. The envelope makes `{"files":…}` the natural serde with no
+   reshaping.
+
+`total_files` is deliberately distinct from `files.items.len()`: the page may be limited while the
+header reports the turn's own count — conflating them would break the header under any paginated
+`DiffQuery`.
+
+**Fileless-turn ruling (R20):** `diff` on a fileless turn renders the header alone
+(`turn <id> · <tool> · 0 files`), exit 0 — today's behavior, stated explicitly because AC8 makes the
+empty page routine and nothing currently pins it.
 
 Error types, per decision 9 (each carries the data its adapter's prose needs, and no prose):
 
@@ -235,7 +282,16 @@ pub enum BlameError {                 // R13 — blame is NOT error-data-free
     LineOutOfRange { lines: usize },  // adapter renders "<path> has only N line(s)"
     Io(String),
 }
+
+pub enum RecallError { Io(String) }   // R21 — named in revision 5, defined here
 ```
+
+`RecallError` was declared in revision 5's interface block and never defined (R21). It is a bare
+`Io(String)`: today every arm of `memory::recall_impl` and `load_effective_checked` returns `Ok`,
+with corruption, deadline, and cap surfaced as `RecallOutcome` flags rather than errors, so no
+pinned byte depends on its shape. Making `recall` infallible is the equally valid alternative and
+the task file may take it; what is not acceptable is leaving the type named-but-undefined in a
+document whose last three gate failures were all "an error type nobody designed".
 
 `BlameError` exists because revision 4 asserted "`blame` needs no analogue". That was true of the
 *ledger range* and false of blame's own error data (R13): `blame_line` has two user-error arms —
@@ -305,7 +361,7 @@ states — a half-bypassed seam that revision 1's ACs did not catch.
    "prompt contents are opt-in data, never included in generic summaries" makes
    `prompt_excerpt`-in-a-summary-type a direct collision.
 6. **Withdrawn (R1).** Revision 1 proposed changing `log --json`'s empty case from `[]` to zero
-   lines. That reverses **D-PD4** (`HANDOVER-PD-FIXES.md:20`, gate-PASSED, pinned by
+   lines. That reverses **D-PD4** (`HANDOVER-PD-FIXES.md` §D-PD4, gate-PASSED, pinned by
    `integration.rs::log_json_zero_turns_prints_empty_array`, rationale "blank stdout is not
    valid JSON"), on the false premise that the case was unpinned. `[]` stays; the empty-case
    test is not weakened, deleted, or inverted. G5 narrows to *routing* `log --json` through the
@@ -412,12 +468,16 @@ all.
       on a duplicated id it returns the collapsed turn (not `Ambiguous`) — the P3
       duplicate-collapse golden still passes, and a distinct-turns-sharing-an-id fixture still
       errors ambiguous.
-- [ ] **AC8** `RepositoryView::diff` on a fileless turn returns an empty `Page<FileDiff>`, not an
+- [ ] **AC8** `RepositoryView::diff` on a fileless turn returns a `DiffResult` whose `files` page is
+      empty **while `turn_id`/`tool`/`total_files` still carry the turn's header facts** (R20), not an
       error (P5 needs `{"files":[]}` over this).
 - [ ] **AC9** `RepositoryView::blame` on an uncovered path returns a `BlameResult` carrying the
       recording-gap state with **no** attributor — never a guess. Gap-honesty goldens unchanged.
-      `blame_line`'s exact-line-text heuristic is preserved verbatim, proven by the line-level
-      goldens.
+      `blame_line`'s exact-line-text heuristic is preserved verbatim. **Instrument correction
+      (R22):** its most intricate arms — "attribution unavailable — snapshot unavailable", "before
+      recording began", and the unresolvable-poisoning logic — are pinned by **integration tests**,
+      not by goldens (`golden.rs`'s residual list says so explicitly). Revision 6 named the wrong
+      instrument here; a task-file author would have copied it.
 - [ ] **AC10** `RecallPage::capped` is set when the verify walk stops at `RECALL_VERIFY_CAP` and
       the human adapter still prints the F3 stderr notice; `--json` still omits it (decision 3).
 - [ ] **AC11** `RecallPage::store_empty` distinguishes an empty store from a no-fresh-match
@@ -546,9 +606,10 @@ all.
       `BlameError::{LineOutOfRange{lines}, FileNotFound}` plus the query's path — **no prose
       crosses into `agentrec-core`** (decision 9). RED if `view::blame` returns a message string.
 
-      Note: the not-found arm is **not** currently golden-pinned (it sits in `golden.rs`'s documented
-      residual list), so this AC's instrument for that arm is a new integration assertion, not an
-      existing golden. Stated so the coverage claim is not read as stronger than it is.
+      Note: the not-found arm is **not** currently pinned by anything — no golden, and
+      `rg ': not found' cli/tests/integration.rs` → 0 — so this AC's instrument for that arm is a
+      **new** integration assertion. Revision 6 claimed it sat in `golden.rs`'s documented residual
+      list; it does not (R22 — the substantive claim was right, the citation was false).
 
 **Supplementary — negative-space, scoped to be literally runnable** (revision 1's versions were
 not; see §Skeptic round 1, B1 and B4):
@@ -841,3 +902,51 @@ only this spec would still be missing:
 - **Test placement and the claimd declare-first mapping** of AC1–AC19 to specific test names and
   files, including which existing suites gain assertions versus which files are new.
 - **The `blame` not-found integration assertion's exact location**, since that arm has no golden.
+- **`diff`'s `Cursor.query` fingerprint scheme** (R23) — `TurnQuery::fingerprint` covers only
+  `include_all`, so a diff-scoped fingerprint must incorporate the turn ref and the `paths` filter.
+  **AC13 is unimplementable for `diff` without this decision**, which makes it the highest-priority
+  item on this list.
+- **The five new goldens' fixture-identity constants**, per `golden.rs`'s "documented stable
+  mapping" discipline — every id/timestamp/hash reaching a golden must originate from a named
+  `const`, never from a generator.
+- **Whether `recall` is infallible or keeps `RecallError::Io`** (R21 sanctions either).
+
+## Skeptic round 6 (2026-07-30) — FAIL, 2 blocking (shared root cause) + 4 non-blocking
+
+**A fresh reviewer, deliberately unanchored.** The reviewer who gated rounds 1–5 hit an API session
+limit before it could read revision 6. Rather than resume it, a new Fable skeptic was given a cold
+read of the *whole* design — five rounds with one reviewer can accumulate shared blind spots, and
+revision 6 had never been read by anyone without prior anchoring. That choice paid for itself
+immediately: the fresh reader found a defect on `diff`'s **happy path** that five rounds of
+delta-focused review had walked past.
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1 | **`diff`'s golden-pinned header had no sanctioned carrier.** Every diff golden opens with `turn t_RICH…TUR1 · claude · 5 files` (`readcmds::header_line`, needing the turn's id, tool, and file count). `Page<T>` is `{items, next}` — no turn-level slot — and AC17's opts table gives `diff` **zero** opts, so nothing could carry those three facts to `render_diff`. Embedding them per-`FileDiff` fails on **AC8**: a fileless turn yields an empty page, making `turn <id> · <tool> · 0 files` unproducible — and `rg '0 files' cli/tests` → 0, so the regression would have been **silent**, contradicting the AC preamble's claim that the load-bearing gates fail if behavior moved at all | R20: `DiffResult{turn_id, tool, total_files, files: Page<FileDiff>}`; `total_files` deliberately distinct from `files.items.len()` so pagination cannot corrupt the header; explicit fileless-turn ruling added |
+| B2 | **P5 would have stayed unexecutable for `diff --json`** — the exact condition this phase exists to remove. P5's AC1 demands `serde_json` of the exact typed value and its empty-case AC demands `{"files":[]}`; serde of `Page<FileDiff>` is `{"items":[],"next":null}`, `Page` is generic and shared so `items`→`files` renaming is unavailable, and adapter reshaping is banned by P5's own AC1 — jointly unsatisfiable | R20: the same envelope makes `{"files":…}` the natural serde with no reshaping. Commit 5's parent-spec amendment list now also covers `diff`'s signature change |
+
+Non-blocking, all folded in: **R21** defined `RecallError`, which revision 5 named in the interface
+block and never specified — pointed out as especially poor form in a document whose previous three
+gate failures were all "an error type nobody designed" (the task file may instead make `recall`
+infallible; today every arm of `memory::recall_impl` returns `Ok`, with corruption/deadline/cap as
+`RecallOutcome` flags). **R22** corrected two false instrument citations: AC19 claimed the blame
+not-found arm sits in `golden.rs`'s residual list — it does not, and `rg ': not found'
+cli/tests/integration.rs` → 0, so it is pinned by *nothing* today; and AC9 attributed
+`blame_line`'s intricate arms to "the line-level goldens" when they are pinned by integration tests.
+Both substantive claims were right and both citations were wrong — the kind of error a task-file
+author copies forward. **R23** added `diff`'s `Cursor.query` fingerprint scheme to the task-file
+scope list and flagged it as the highest-priority item there: `TurnQuery::fingerprint` covers only
+`include_all`, so **AC13 is unimplementable for `diff`** until that decision is made.
+
+**What round 6 confirmed by independent re-derivation** (not inherited from earlier rounds):
+AC16's two shared-hash loss classes genuinely discriminate under `enforce_budget`'s candidate walk;
+AC18/AC19's typed errors carry exactly what the pinned prose needs with no prose in core; AC3's
+expression contract is writable; the 537/0/2 baseline and 27/24 golden counts; the central P5
+diagnosis (which it judged *understated*, per B2); and that decisions 8/10/12 are genuine ratchet-ups
+against real parent-spec deltas.
+
+**Reviewer's judgment on whether further rounds have value:** the remaining defect class is one a
+design document *can* eliminate — B1 is the same enumeration-completeness defect blocked in rounds
+4, 5, and 6 (blame's error data, recall's query, now diff's turn header), and the design's own
+mechanism closes it mechanically once applied to `header_line`'s inputs. It is not an
+implementation-time residual. Everything else the reviewer attacked survived.
