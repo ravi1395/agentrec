@@ -187,13 +187,15 @@ carries only current state, what's next, and standing debts.
   as dodging.
 - ~~Open the PR for `fix/perf-evidence-round`~~ **done** — PR #8 merged to `main`
   (`4e04438`/`72c4b82`/`34bbb0c`) and absorbed into this branch by merge; Linux CI leg is real
-  (run `30552318400`, 5/5 green). **P1's AC7 residual is NOT closed by this** — checked before
-  claiming it: no test anywhere calls `peak_rss_mb()` (only `rss_raw_to_mb` is unit-tested, with
-  both divisors passed explicitly, regardless of host OS), so the Linux `#[cfg(target_os =
-  "linux")]`-selected `RSS_DIVISOR` constant is still unexercised on a real Linux runner. The
-  green suite proves the Linux build compiles and the rest of the suite passes, nothing about
-  this specific constant. Still open; needs an assertion on `import --dry-run`'s reported
-  `peak_rss_mb` running under Linux CI to close.
+  (run `30552318400`, 5/5 green — note this run predates `import`, which lives on
+  `feat/phase-2-0-substrate`, not `main`; the Linux matrix has never run this branch's HEAD).
+  **P1's AC7 residual is NOT closed by this** — checked before claiming it: `cli/tests/
+  import_claude.rs` does execute `peak_rss_mb()` in-process (spawns the real binary, asserts
+  `report["peak_rss_mb"].is_number()`), but `is_number()` passes under either the macOS or Linux
+  `RSS_DIVISOR` — it can't discriminate which constant fired. `rss_raw_to_mb` itself is
+  unit-tested with both divisors passed explicitly, which proves the arithmetic, not the
+  `#[cfg(target_os = "linux")]` selection. Still open; needs a magnitude assertion on `import
+  --dry-run`'s reported `peak_rss_mb` running under Linux CI on this branch's HEAD to close.
 - `rm` retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498`
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
