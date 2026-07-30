@@ -14,6 +14,42 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **P2 + P3 EXECUTED and GATE-PASSED (2026-07-30) — merged into `feat/phase-2-0-substrate` at
+  `73d01b9`, ledger + hygiene follow-ups at `6fa0de1`. Nothing pushed, no PR.**
+  Method: sonnet implementers in parallel worktrees → opus reviewers → a Fable skeptic in an
+  isolated worktree as the binding done-gate. **Round 1 of the gate FAILED; round 2 PASSED all
+  13 ACs** (8 P2 incl. an added AC5b, 5 P3). `cargo test --workspace -- --test-threads=3` →
+  **504 / 0 / 2** (pre-P2/P3 baseline 460/0/1); clippy `-D warnings` + fmt clean on debug **and**
+  release; both import debug seams absent from release `strings`. 12 of 13 claims `EVIDENCED`.
+  Full evidence, caveats, and residuals: `VERIFY-LEDGER.md` § "Phase 2.0 P2 + P3".
+  - **T2 resolution measured at last: 17 resolved / n=1133 = 1.50%.** Two caveats are mandatory
+    and must travel with the figure: **never render it "897 → 17"** (P1's 897 is a different
+    definition), and **the oracle and population channels are disjoint, overlap 0** (both
+    coincidentally n=17), so **none of the 17 population resolutions is scorable for
+    correctness**. A rate far below the 41.5% candidate share is the honest outcome the plan
+    predicted — git holds committed states only.
+  - **Founder decision: both T2 gates retained**, at a measured cost of **127 of 144 correct
+    resolutions discarded to remove 7 fabricated** (gate 1 alone: 137 resolved / 5.1% fabricated;
+    both: 17 / 0%). Zero fabrication chosen — a wrong `before` is a wrong-byte revert source in
+    undo history. The cost is recorded, not silent.
+  - **AC5b's ≤1% bar was set wrong (by the orchestrating agent) and is unmeetable: NEVER quote
+    it.** n=17 gives a 95% upper bound of 16.2%; ≤1% needs ~299 clean samples against a channel
+    of 228. Honest phrasing: *0 fabrications in 17 guard-admitted samples (95% UB 16.2%)*. Claim
+    `clm_4KSWSEZXS894D2P0DC92ZHH8MA` stays DECLARED-unattested as the permanent honesty record.
+  - **The gate's round-1 blocker was the third instance of this plan's signature defect:** a
+    confidently-worded comment asserting a real-corpus fact that was false. `strip_prefix(cwd)
+    .ok()?` silently dropped **507 of 2,170 (23.4%)** file-producing entries, uncounted, beside a
+    comment claiming cwd "is lexically a prefix in every real transcript". Two implementers, two
+    opus reviewers, and an integration audit all read that line without measuring it. Fixed by a
+    `skipped_out_of_cwd` counter — **countability was required; recovery was not authorized.**
+    The figure now has three independent agreeing derivations.
+  - Import honesty semantics established: derived `after` bytes carry `after_synthesized` and are
+    never presented as observed (before this, `undo` fabricated "human or external edit" on files
+    nothing touched); `status`'s rich-rate **excludes** imported turns, so a bulk import can no
+    longer mask a dead hook at 100% rich.
+  - P1's figures re-measured and **NOT stale** after the secret-path parity fix
+    (`skipped_secret_path: 0`).
+
 - **`main` @ `204ff04`** — docs-only chain on top of `1ece033`. Test baseline **428 / 0 / 1**
   (re-verified at `834f477`). Live daemon records this repo; store healthy post-purge.
 - **`fix/perf-evidence-round` (pushed, NO PR yet)** — perf-evidence round executed and
@@ -78,23 +114,27 @@ carries only current state, what's next, and standing debts.
 
 ### Now / next (in order)
 
-1. **Execute P2 and P3 in parallel worktrees** (`docs/superpowers/plans/tasks/P2.md`, `P3.md`) —
-   they touch disjoint files. `HANDOFF.md` at the root of `feat/phase-2-0-substrate` carries the
-   exact next steps, gotchas, and founder-pending items; ingest it and delete it.
-   **Founder-directed method: sonnet implementers → opus reviewers → one final Fable skeptic as
-   the binding done-gate (isolated worktree). Done means the skeptic says the ACs are met.**
-   P2 resolves T2 git blobs — the work that converts the 897 T2-candidates into a real recovery
-   rate (expect well below 41.5%; git holds committed states only, and that is the honest
-   outcome, not a failure). P3's fixture needs an imported turn: if P2 hasn't landed, seed the
-   line into `log.jsonl` directly rather than blocking.
-2. Then P4 (`RepositoryView` — needs P2 **and** P3's goldens) → P5 (`--json`) → plan-exit
-   checklist.
+1. **P4** (`RepositoryView` extraction — consumes P2's imported-turn fields **and** P3's goldens,
+   both now landed) → **P5** (`--json`) → the plan's 9-checkbox "Final acceptance — plan exit"
+   section. **P4 must not weaken or regenerate P3's goldens to make extraction pass** — they are
+   the byte-equivalence instrument for the whole plan, and that is the ratchet.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.
+2. **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
+   `existing_ids` never gains ids appended during the current run, so two session files sharing a
+   `sessionId` in one run would append two turns with the same id and different `files`, making
+   `diff`/`show`/`undo <id>` error "ambiguous". The shape is real, not hypothetical — the corpus
+   holds one such `sessionId` across two project dirs (worktree-resumed session), inert today only
+   because one copy is a 1-line cwd-less stub.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
 ### Founder-pending (agent cannot or may not do these)
 
+- **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
+  agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
+  indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the
+  guard-admitted channel (n=17); 95% upper bound 16.2%; the whole verifiable channel is 228
+  cases, so a bar below that bound is not establishable by this oracle.*
 - **Pinned decision 14 conflicts with the corpus — needs a ruling.** P1.md pins `cwd` as
   session-level (first line carrying one wins) and marks it non-re-litigable, but **67 sessions
   carry more than one distinct `cwd`** (usually a subdirectory move). Resolving each backup key
