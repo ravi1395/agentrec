@@ -166,6 +166,25 @@ before dispatching) → per-task commit. Never weaken an AC to pass; escalate to
    `rg '21 passed'`, so there is nowhere to hide and no line number to rot). The lesson generalizes:
    a blanket exclusion in a verification command is a hiding place, and the gate found it.
 
+   **This AC took three gate rounds; rounds 2 and 3 are recorded here so the plan carries the whole
+   arc, not just its first failure.** Round 2 FAILED again — on a defect the *round-1 fix* created:
+   correcting `P4b-1.md`'s golden sum from 32 to 33 left its addend at 5, producing "27 + 5 = 33"
+   inside an AC line. The round's own rule ("a correction that introduces a new wrong number is a
+   fresh failure") turned on the corrector. Round 2 also found the occurrence count wrong for the
+   second consecutive time and a Verification block asserting `# 0` against a grep that returns 4.
+   Round 3 PASSED after: the addend fixed, the count **removed** rather than re-counted (the check
+   is count-independent, so a count is only a thing to get wrong), the Verification block carrying
+   the ratified form, and — found while fixing, not by the gate — obligation B, added in round 2,
+   turning out to carry the identical self-quoting hazard one level down and being made
+   self-excluding the same way. **Remaining risk the gate named and no wording can remove:** any
+   content-scoped self-exclusion is defeatable by a future line that embeds the invocation
+   substring beside a false assertion. That is a property of grep-based self-reference; it is
+   checkable only by re-enumerating matches, which is what the round-3 gate did.
+
+   **Still owed:** the founder ratified the substitution *concept*; no artifact distinguishes
+   ratifying the round-1 file-scoped wording from the round-3 content-scoped one (which also
+   carries obligation B, added after ratification). Re-attestation is open, not closed.
+
 9. **(non-blocking, raised by P4b-4's gate — a scope gap, not a regression)** `cli/src/readcmds.rs`
    (two call sites) and `cli/src/memorycmds.rs` still call `load_log` on **production** paths.
    AC17's grep was scoped to `cmds.rs`, so these are outside what P4b gated, and P4b-5 is docs-only
