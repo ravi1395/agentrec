@@ -14,13 +14,19 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
-- **`main` @ `204ff04`** — docs-only chain on top of `1ece033`. Test baseline **428 / 0 / 1**
-  (re-verified at `834f477`). Live daemon records this repo; store healthy post-purge.
-- **`fix/perf-evidence-round` (pushed, NO PR yet)** — perf-evidence round executed and
-  GATE-PASSED: **443 / 0 / 1**, 10k/50ms recall envelope closed (p99 11–23 ms, AC1.3
-  founder-attested), dedup counters, retention plan/execute split, eviction moved to a daemon
-  tick, 3 real defects fixed (symlink dedup loss, `--stats` uninit, tick gap). Opening a PR is
-  what unlocks the Linux CI timing leg.
+- **`main`** — carries the perf-evidence round: [PR #8](https://github.com/ravi1395/agentrec/pull/8)
+  **squash-merged** to `main` as `4e04438` on 2026-07-30 (per-phase history survives only in the
+  PR, not on `main`), then reconciled here with the local docs-only chain (`204ff04`..`2ade38a`)
+  by merge. Test baseline **443 / 0 / 1**. Live daemon records this repo; store healthy
+  post-purge.
+- **Perf-evidence round (delivered, GATE PASS, now on `main`)** — 10k/50ms recall envelope
+  closed (p99 11–23 ms, AC1.3 founder-attested), dedup counters, retention plan/execute split,
+  eviction moved to a daemon tick, 3 real defects fixed (symlink dedup loss, `--stats` uninit,
+  tick gap). **Linux CI leg now real:** run
+  [30552318400](https://github.com/ravi1395/agentrec/actions/runs/30552318400) — all 5 jobs
+  green (`ubuntu-22.04`, `ubuntu-24.04`, `macos-14`, lint, induced-low-watches). The macOS leg
+  went red on its first attempt and green on rerun; cause recorded under residuals, not
+  hand-waved.
 - **Phase 2 spec hardened + gated (2026-07-28, 6 skeptic rounds, commits
   `bd0b679`/`bde8146`/`90202f6`/`204ff04`):** founder decisions 5–10 in
   `docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md` — (5) protocol freeze behind
@@ -36,7 +42,8 @@ carries only current state, what's next, and standing debts.
   honest, 92.3% banned).
 - **Phase 2.0 plan chunked:** `docs/superpowers/plans/tasks/P1..P5.md` (standalone,
   fresh-executor-ready); plan has a 9-checkbox "Final acceptance — plan exit" section.
-  **`HANDOFF.md` at repo root points the next session at P1** — ingest it, execute, delete it.
+  Execution lives on `feat/phase-2-0-substrate` (P1–P4 landed there; P4b planned, `d364ef6`) —
+  that branch carries its own Status; this section tracks `main`.
 
 ### Now / next (in order)
 
@@ -52,7 +59,6 @@ carries only current state, what's next, and standing debts.
 
 ### Founder-pending (agent cannot or may not do these)
 
-- Open the PR for `fix/perf-evidence-round` (Linux CI evidence + merge of the 443-test round).
 - `rm` retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498`
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
@@ -74,7 +80,13 @@ carries only current state, what's next, and standing debts.
 - P1 probe verdict bounded: fixture aging can't reproduce weeks-old FSEvents journal history;
   the dogfood daemon is the observatory.
 - Perf/timing margins are macOS+one-Colima-VM evidence; population-level claims close only
-  over CI history (hence the PR above).
+  over CI history. PR #8 contributed the first two GitHub-runner Linux data points for this
+  round; one PR is not a population.
+- **`hook_recall_hard_wall_deadline` is runner-coupled** (first observed PR #8, macos-14 job
+  `90903831567`): it timed **204.1 ms** against a `< 200 ms` assert and passed on rerun. The
+  invariant held both times — a 600 ms blocked pin read was abandoned, not waited on — but the
+  assert measures *whole-process* wall including fork+exec, leaving ~4 ms of margin on a shared
+  runner. Bound not yet changed; see the next commit.
 - Memory dogfood ladder effectively not started (store prepped 2026-07-17; clock never ran
   clean).
 
