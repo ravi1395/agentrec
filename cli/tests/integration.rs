@@ -8608,8 +8608,15 @@ fn hook_recall_hard_wall_deadline() {
         out.status.success(),
         "hook must exit 0 even while the pin read is blocked: {out:?}"
     );
+    // 300ms, not 200: this measures WHOLE-PROCESS wall — fork+exec of the hook
+    // binary is inside the number — so on a shared CI runner the old 200ms bound
+    // left ~4ms of headroom and went red at 204.1ms on macos-14 (PR #8, job
+    // 90903831567) while the invariant itself held. 300ms still sits 2x under the
+    // 600ms injected block, so the discriminating neuter — make this wait on the
+    // worker (`rx.recv()`) instead of abandoning it at the deadline
+    // (`rx.recv_timeout(remaining)`, cmds.rs) — still reds, measured at 615.7ms.
     assert!(
-        elapsed < Duration::from_millis(200),
+        elapsed < Duration::from_millis(300),
         "hook took {elapsed:?} — a blocked 600ms pin read must not push wall \
          time anywhere near that far past the 50ms budget (hard wall must \
          abandon the worker, not wait on it)"

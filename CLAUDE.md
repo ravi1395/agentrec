@@ -63,7 +63,10 @@ carries only current state, what's next, and standing debts.
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
   over 2026-07-28).
-- 4 claimd claims DECLARED awaiting manual attestation (never self-attested).
+- 5 claimd claims DECLARED awaiting manual attestation (never self-attested).
+- **66 claimd claims STALE on scope-drift** after the PR #8 merge brought the round's file
+  content onto `main` (`claimd status`, 2026-07-30). Re-confirmation is owed and was NOT done
+  in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
 - Demand/launch gate (Show HN etc.) never run — ROADMAP Phase 0's 30-day kill criterion has
@@ -86,7 +89,9 @@ carries only current state, what's next, and standing debts.
   `90903831567`): it timed **204.1 ms** against a `< 200 ms` assert and passed on rerun. The
   invariant held both times — a 600 ms blocked pin read was abandoned, not waited on — but the
   assert measures *whole-process* wall including fork+exec, leaving ~4 ms of margin on a shared
-  runner. Bound not yet changed; see the next commit.
+  runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
+  block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
+  spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
 - Memory dogfood ladder effectively not started (store prepped 2026-07-17; clock never ran
   clean).
 
