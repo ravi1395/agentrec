@@ -65,6 +65,16 @@
 > ruling. R21 defined `RecallError`, named in revision 5 but never specified. R22 corrected two
 > false instrument citations (AC9's line-level arms and AC19's not-found arm are pinned by
 > integration tests, not goldens — AC19's arm by nothing at all yet).
+>
+> **Revision 8 changelog** (§Skeptic round 7 records the full findings): both blockers were
+> **incomplete propagation of R20 itself**, not new design defects.
+> R24 propagated the envelope into AC17 — revision 7 left `render_diff` taking `&Page<FileDiff>`,
+> so the binding wiring gate still could not reach the header, re-creating round 6's B1 verbatim.
+> R25 corrected revision 7's over-claim that the envelope satisfies P5's `{"files":[]}`: it does
+> not (three extra keys, and `files` is an object not an array), so commit 5 now **amends P5.md's
+> literal** in both places rather than pretending the conflict is resolved. R26 actually added the
+> `Page<FileDiff>` → `DiffResult` parent-spec delta to commit 5's list — revision 7's interface
+> block claimed it was listed there when it was not.
 
 ## Why this phase exists
 
@@ -253,8 +263,24 @@ Two independent defects forced this, both found by a cold sixth-round read:
    requires a fileless turn to yield `{"files":[]}`. Serde of `Page<FileDiff>` is
    `{"items":[],"next":null}`; `Page` is generic and shared with
    `Page<TurnSummary>`/`Page<TurnRecord>`, so renaming `items` → `files` is unavailable, and adapter
-   reshaping is banned by P5's own AC1. The envelope makes `{"files":…}` the natural serde with no
-   reshaping.
+   reshaping is banned by P5's own AC1.
+
+   **The envelope does not by itself satisfy P5's literal, and revision 7 wrongly claimed it did**
+   (R25). Serde of `DiffResult` for a fileless turn is:
+
+   ```json
+   {"turn_id":"t_…","tool":"claude","total_files":0,"files":{"items":[],"next":null}}
+   ```
+
+   — which differs from `{"files":[]}` in **both** ways: three extra top-level keys, and a `files`
+   value that is an object, never a bare array. A custom serializer flattening `files` to an array
+   would drop the cursor, which the parent spec's `agentrec_diff` MCP row requires ("limit,
+   cursor"), and would still leave the extra keys.
+
+   **Resolution: P5.md's literal is amended in commit 5, not worked around.** P5's `{"files":[]}`
+   was written before anyone had designed the type; its *intent* — "empty cases are data, not
+   errors, exit 0" — survives intact and is what AC8 preserves. The literal changes to the
+   envelope's true serde. `blame --json` and `status --json` are unaffected.
 
 `total_files` is deliberately distinct from `files.items.len()`: the page may be limited while the
 header reports the turn's own count — conflating them would break the header under any paginated
@@ -413,12 +439,17 @@ for P4.
    keeping the `.rev().take(limit)` reordering in the adapter (AC3). Both `log` forms and both
    `recall` forms render through signature-constrained `render_*` functions (AC17). No empty-case
    contract change (decision 6). README rides this commit if any documented flag behavior changed.
-5. **Docs:** parent spec §Deep module 1 amendments — decisions 8 and 10, the **error-type
+5. **Docs:** parent spec §Deep module 1 amendments — decisions 8 and 10; the **error-type
    signatures per decision 9** (`diff -> DiffError`, `blame -> BlameError`, `list -> CursorError`,
    where the spec says `RepoError` for all; R19 — revision 5 left these off the list even though
-   they are real spec deltas), and the `agentrec_log` MCP row (decision 12); `P5.md` dependency
-   line corrected `P4` → `P4b`; the stale "21 passed" golden figure corrected in
-   P3.md/P4.md/P5.md; `CLAUDE.md` Status per house rule.
+   they are real spec deltas); **`diff`'s Ok-side signature** (`DiffResult`, where the spec says
+   `Page<FileDiff>` — R20's delta, which revision 7 claimed was listed here but was not, R26); and
+   the `agentrec_log` MCP row (decision 12).
+
+   **`P5.md` amendments** (all three, in this commit): the dependency line `P4` → `P4b`; the stale
+   "21 passed" golden figure (also corrected in P3.md/P4.md); and **the empty-case literal**
+   `{"files":[]}` → the envelope's true serde, in both places P5.md states it — its AC block and
+   its manual-verification line (R25). `CLAUDE.md` Status per house rule.
 
 ## Acceptance criteria
 
@@ -470,7 +501,9 @@ all.
       errors ambiguous.
 - [ ] **AC8** `RepositoryView::diff` on a fileless turn returns a `DiffResult` whose `files` page is
       empty **while `turn_id`/`tool`/`total_files` still carry the turn's header facts** (R20), not an
-      error (P5 needs `{"files":[]}` over this).
+      error (P5's empty-case AC rides on this — its `{"files":[]}` literal is amended in commit 5 to
+      the envelope's true serde, R25; the AC's intent, "empty cases are data not errors, exit 0",
+      is what this AC preserves).
 - [ ] **AC9** `RepositoryView::blame` on an uncovered path returns a `BlameResult` carrying the
       recording-gap state with **no** attributor — never a guess. Gap-honesty goldens unchanged.
       `blame_line`'s exact-line-text heuristic is preserved verbatim. **Instrument correction
@@ -523,9 +556,16 @@ all.
       `&Path`/`root`, no `BlobStore`, no `&[LogRecord]`, no store or ledger handle of any kind:
 
       ```rust
-      fn render_diff(page: &Page<FileDiff>, opts: &DiffRenderOpts) -> String
-      fn render_blame(result: &BlameResult, opts: &BlameRenderOpts) -> String
+      fn render_diff(result: &DiffResult) -> String    // zero opts — no opts parameter at all
+      fn render_blame(result: &BlameResult) -> String  // zero opts
       ```
+
+      `diff` and `blame` take **no opts parameter whatsoever** (R24) — the table below gives both an
+      empty set, so an opts struct would be an empty slot inviting exactly the smuggling R14 closed.
+      Revision 7 left `render_diff` taking `&Page<FileDiff>` after R20 had moved the header facts
+      onto `DiffResult`, which re-created round 6's B1 verbatim: the sanctioned renderer could not
+      reach the header its own goldens require. A signature change in the interface block must
+      propagate here in the same edit.
 
       A per-verb expression contract then pins stdout: `diff <turn>` ≡ `render_diff(&view.diff(q)?)`,
       `blame <target>` ≡ `render_blame(&view.blame(q)?)`, and the same shape for the human `log`
@@ -541,7 +581,7 @@ all.
       |---|---|---|
       | `log` (human) | `now_ms`, `utc`, `color`, `all_files`, prebuilt `NoiseMatcher` | `fmt::turn_list_line` + `cmds::log`'s fold branch. **`limit` and `explain` are NOT opts** — see the adapter-transformation rule below |
       | `recall` (human) | `now_ms`, `color`, **`query: &str`** | `format_memory_line` takes `now_ms`/`color`; the no-match line embeds the query (R17) |
-      | `diff` | **none** | `header_line` takes only the record; `print_entry` needs only the resolved `FileDiff`; `rg 'paint\|should_color' cli/src/readcmds.rs` → 0 — `diff` has never colorized |
+      | `diff` | **none** | The turn header's facts ride `DiffResult` (`turn_id`/`tool`/`total_files`, R20 — they are *not* opts); `print_entry` needs only the resolved `FileDiff`; `rg 'paint\|should_color' cli/src/readcmds.rs` → 0 — `diff` has never colorized |
       | `blame` | **none** | `render_turn` → `fmt::turn_detail_header` with `hhmm` derived from the record's own `started`; no color, no clock |
 
       Anything not in this table requires amending this design. A closure or trait object that
@@ -923,7 +963,7 @@ delta-focused review had walked past.
 | # | Finding | Resolution |
 |---|---|---|
 | B1 | **`diff`'s golden-pinned header had no sanctioned carrier.** Every diff golden opens with `turn t_RICH…TUR1 · claude · 5 files` (`readcmds::header_line`, needing the turn's id, tool, and file count). `Page<T>` is `{items, next}` — no turn-level slot — and AC17's opts table gives `diff` **zero** opts, so nothing could carry those three facts to `render_diff`. Embedding them per-`FileDiff` fails on **AC8**: a fileless turn yields an empty page, making `turn <id> · <tool> · 0 files` unproducible — and `rg '0 files' cli/tests` → 0, so the regression would have been **silent**, contradicting the AC preamble's claim that the load-bearing gates fail if behavior moved at all | R20: `DiffResult{turn_id, tool, total_files, files: Page<FileDiff>}`; `total_files` deliberately distinct from `files.items.len()` so pagination cannot corrupt the header; explicit fileless-turn ruling added |
-| B2 | **P5 would have stayed unexecutable for `diff --json`** — the exact condition this phase exists to remove. P5's AC1 demands `serde_json` of the exact typed value and its empty-case AC demands `{"files":[]}`; serde of `Page<FileDiff>` is `{"items":[],"next":null}`, `Page` is generic and shared so `items`→`files` renaming is unavailable, and adapter reshaping is banned by P5's own AC1 — jointly unsatisfiable | R20: the same envelope makes `{"files":…}` the natural serde with no reshaping. Commit 5's parent-spec amendment list now also covers `diff`'s signature change |
+| B2 | **P5 would have stayed unexecutable for `diff --json`** — the exact condition this phase exists to remove. P5's AC1 demands `serde_json` of the exact typed value and its empty-case AC demands `{"files":[]}`; serde of `Page<FileDiff>` is `{"items":[],"next":null}`, `Page` is generic and shared so `items`→`files` renaming is unavailable, and adapter reshaping is banned by P5's own AC1 — jointly unsatisfiable | R20 + R25: the envelope is necessary but **not sufficient** — revision 7 wrongly claimed it closed this. `DiffResult`'s serde still is not `{"files":[]}`, so commit 5 amends P5.md's literal in both places it appears, and also carries the `Page<FileDiff>` → `DiffResult` parent-spec delta that revision 7 claimed to have listed but had not (R26) |
 
 Non-blocking, all folded in: **R21** defined `RecallError`, which revision 5 named in the interface
 block and never specified — pointed out as especially poor form in a document whose previous three
@@ -950,3 +990,35 @@ design document *can* eliminate — B1 is the same enumeration-completeness defe
 4, 5, and 6 (blame's error data, recall's query, now diff's turn header), and the design's own
 mechanism closes it mechanically once applied to `header_line`'s inputs. It is not an
 implementation-time residual. Everything else the reviewer attacked survived.
+
+## Skeptic round 7 (2026-07-30) — FAIL, 2 blocking, both incomplete propagation of R20
+
+Round 7 verified R20's envelope itself against every attack: `DiffResult` carries exactly what
+`header_line` needs and nothing more (no prompt fields, so no collision with the parent spec's
+prompt-in-summaries rule); every byte of all three diff goldens is reachable from it, re-walked
+arm-by-arm through `print_entry` (withheld, skipped, Missing/Corrupt via `unresolvable_msg`, binary
+byte counts, baseline-unknown, `after_synthesized`, per-op unified diffs); the fileless ruling
+matches today's `readcmds::diff` exactly; `total_files` distinct from `files.items.len()` is sound
+under pagination; the duplicate-collapse header is reproducible; and AC7/AC13/AC18 stay coherent
+across the signature change. `RecallError`, both R22 citation corrections, the N4 fix, and R23's
+additions all checked out. **The envelope survived; its propagation did not.**
+
+| # | Finding | Resolution |
+|---|---|---|
+| B1' | **R20 was not propagated into AC17.** The binding wiring gate still specified `fn render_diff(page: &Page<FileDiff>, opts: &DiffRenderOpts) -> String`, while the expression contract `diff <turn>` ≡ `render_diff(&view.diff(q)?)` now passes a `&DiffResult` — type-incoherent, and the header facts R20 added were formally unreachable by the very function AC17 names. Round 6's B1, restated in the fix for round 6's B1 | R24: signature is `fn render_diff(result: &DiffResult) -> String`, with **no opts parameter at all** for `diff` or `blame` (their sanctioned sets are empty, so an opts struct would be a smuggling slot with no legitimate contents); the opts table's `diff` row now states the header facts ride the envelope and are not opts |
+| B2' | **Round 6's B2 was moved, not closed, and revision 7 claimed otherwise** — worse than silence, because a task-file author copies the claim. Serde of `DiffResult` for a fileless turn is `{"turn_id":…,"tool":…,"total_files":0,"files":{"items":[],"next":null}}`, differing from P5's `{"files":[]}` in both the extra keys and the object-vs-array shape. Flattening `files` to a bare array would drop the cursor the parent spec's `agentrec_diff` row requires. Commit 5 also still did **not** list the `Page<FileDiff>` → `DiffResult` parent-spec delta, despite the interface block asserting it was listed | R25: the over-claim is replaced with the actual serde bytes and an explicit resolution — **P5.md's literal is amended in commit 5**, in both the AC block and the manual-verification line. P5's `{"files":[]}` predates the type's design; its intent ("empty cases are data, not errors, exit 0") survives and is what AC8 preserves. R26: the parent-spec delta is now genuinely in commit 5's list |
+
+**Process note.** The coordinator told the reviewer that commit 5 already covered `diff`'s
+signature change. It did not — the claim existed only as a parenthetical in the interface block.
+The reviewer checked the tree rather than accepting the summary, and recorded "the tree governs".
+That is the correct posture for every claim in this document, including this sentence.
+
+**Reviewer's judgment on further rounds — recorded because it ends the loop.** Both blockers are
+clerical propagation gaps in a fix that was itself correct, not new structural defects. After these
+edits, *nothing remains that a design document can catch*: the residual risk — does the implemented
+`FileDiff` reproduce every `print_entry` arm, does AC16's fixture arithmetic actually discriminate,
+does the seam stay unbypassed — is precisely what AC1–AC19's specified tests exist to catch at
+implementation time. Round 8 is therefore scoped as a **narrow verification of these edits only**
+(AC17's signature, the opts-table row, the AC8 parenthetical, and commit 5's two new entries), not
+another adversarial pass. A further full round would have **negative** value: the document's defects
+are now being generated faster by revision churn than by design content.
