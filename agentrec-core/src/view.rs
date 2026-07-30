@@ -572,6 +572,19 @@ pub use crate::memory::RECALL_VERIFY_CAP;
 
 /// Which memories to recall, how many, and (for a future paginating caller —
 /// MCP 2.2, not the CLI, which never sets `after`) where to resume.
+///
+/// `after`'s staleness check is one-sided: it catches a memory that LEFT the
+/// candidate set between two calls (retracted, or its pin verified no
+/// longer Fresh) and correctly reports `CursorError::Stale` rather than
+/// silently resuming past it. It does NOT catch the opposite case — a
+/// memory that was Stale (or didn't exist) when the cursor was minted and
+/// is Fresh by the time the next page is fetched. Such a memory can ENTER
+/// the ranking and sort ahead of the cursor's identity; the next page then
+/// starts strictly after that identity and never returns it, with no error
+/// and no gap reported. `list`/`diff` don't have this asymmetry because
+/// their underlying corpus (the turn log) is append-only; `recall`'s
+/// freshness is derived from the live worktree and can change in either
+/// direction between two calls.
 #[derive(Debug, Clone, Default)]
 pub struct RecallQuery {
     pub query: String,
@@ -946,8 +959,12 @@ impl RepositoryView {
     ///
     /// Pagination (`q.after`) is honest, not speculative, about what a
     /// single call can know: the CLI (the only caller today) never sets it,
-    /// so that path is EXACTLY today's `recall_outcome(root, query, k)` call
-    /// — same work, same bytes, no added I/O. A cursored call resolves
+    /// so the RANKING/VERIFY WORK on that path is EXACTLY today's
+    /// `recall_outcome(root, query, k)` call. (`store_empty`'s own extra
+    /// `load_effective` parse below is a separate, spec-mandated cost that
+    /// applies on this path too when the page is empty — see its own
+    /// comment; it is not new relative to today's human `recall_cmd`, only
+    /// relative to today's `--json` empty case.) A cursored call resolves
     /// identity against one `k = RECALL_VERIFY_CAP` fetch (the largest
     /// result a single call can ever produce — recall's own hard budget
     /// wall), so `next` is only ever minted when that same fetch already
@@ -959,9 +976,14 @@ impl RepositoryView {
             capped: bool,
             store_corrupt: bool,
             start: usize,
-            /// Whether `hits` is the full within-cap view, so `next` can be
-            /// computed exactly rather than left unknown (see doc comment).
-            exhaustive: bool,
+            /// Whether this fetch went through the cursor-resolution path
+            /// (`k = RECALL_VERIFY_CAP`), so `hits` is the full within-cap
+            /// view rather than only-as-much-as-`q.k`-demanded — letting
+            /// `next` be computed exactly instead of left unknown. NOT a
+            /// claim that the walk found every Fresh match in the corpus;
+            /// `capped` (recomputed below, page-relative) still answers
+            /// that question independently.
+            from_cursor: bool,
         }
 
         let fetch = match &q.after {
@@ -973,7 +995,7 @@ impl RepositoryView {
                     capped: outcome.capped,
                     store_corrupt: outcome.store_corrupt,
                     start: 0,
-                    exhaustive: false,
+                    from_cursor: false,
                 }
             }
             Some(c) => {
@@ -987,15 +1009,32 @@ impl RepositoryView {
                 // verified no-longer-Fresh) since the cursor was minted must
                 // surface as stale rather than silently resume at whatever
                 // now sits nearby.
+                //
+                // One-sided by construction, not a bug this check can close:
+                // a memory that was Stale when page 1 was minted and is
+                // Fresh now can ENTER the ranking and sort ahead of the
+                // cursor's id — if so, page 2 starts past it and it is
+                // never returned, silently, no `Stale` reported. `list`/
+                // `diff` don't have this because their corpus is
+                // append-only; recall's freshness is worktree-mutable. See
+                // `RecallQuery::after`'s doc comment.
                 let Some(idx) = outcome.hits.iter().position(|m| m.id == c.after_id) else {
                     return Err(RecallError::Cursor(CursorError::Stale));
                 };
+                // A page of size 0 past a cursor has no honest continuation
+                // to report (mirrors `list`/`diff`'s `CursorError::ZeroLimit`
+                // — see that variant's doc comment) — unlike `q.after: None`,
+                // where `k=0` is a real, already-supported "give me nothing"
+                // request with no pagination promise attached to it.
+                if q.k == 0 {
+                    return Err(RecallError::Cursor(CursorError::ZeroLimit));
+                }
                 Fetch {
                     hits: outcome.hits,
                     capped: outcome.capped,
                     store_corrupt: outcome.store_corrupt,
                     start: idx + 1,
-                    exhaustive: true,
+                    from_cursor: true,
                 }
             }
         };
@@ -1020,8 +1059,16 @@ impl RepositoryView {
                 reason: None,
             })
             .collect();
-        let next = if fetch.exhaustive && end < fetch.hits.len() {
-            fetch.hits.get(end.saturating_sub(1)).map(|m| Cursor {
+        // Minted from the PAGE slice, not `fetch.hits` positionally: when
+        // the page is empty (`start == end`, reachable via `q.k == 0` on the
+        // `after: None` path — deliberately still an `Ok`, not refused, see
+        // above), `fetch.hits.get(end - 1)` would return the item at
+        // `start - 1` — the cursor's OWN previous item on the cursored path,
+        // or an unrelated item on the uncursored one — minting a `next`
+        // that never advances. `[start..end].last()` is `None` on an empty
+        // slice by construction, the same idiom `list`/`diff` use.
+        let next = if fetch.from_cursor && end < fetch.hits.len() {
+            fetch.hits[start..end].last().map(|m| Cursor {
                 after_id: m.id.clone(),
                 after_occurrence: 0,
                 query: q.fingerprint(),
@@ -1030,13 +1077,31 @@ impl RepositoryView {
             None
         };
 
+        // F3, page-relative: a cursored fetch always requests
+        // `RECALL_VERIFY_CAP` internally regardless of `q.k` (see above), so
+        // `fetch.capped` by itself answers "did the WHOLE within-cap fetch
+        // hit the wall", not "is THIS page capped" — a caller paging with a
+        // small `q.k` must not see `capped: true` merely because the
+        // 128-candidate probe happened to run out, when this page was
+        // already fully satisfied by items already in hand. A page is
+        // honestly capped only when it consumes every fetched item AND that
+        // fetch hit the wall; `end == fetch.hits.len()` always holds on the
+        // uncursored path (that fetch's own `k` was `q.k`), so this reduces
+        // to `fetch.capped` there unchanged.
+        let capped = fetch.capped && end >= fetch.hits.len();
+
         // PD3: distinguishes "no memory ever recorded" (stderr zero-state)
         // from "nothing fresh matched" (stdout notice) — `recall_cmd`'s
         // existing split. Computed lazily (only when this page is empty) to
-        // preserve the current work profile: a non-empty page trivially
-        // implies a non-empty store, and `load_effective`'s tolerant fold
-        // (not `recall_outcome`'s corruption-sensitive one) is the same
-        // function `recall_cmd` already called for this today.
+        // preserve the current work profile on the human path: a non-empty
+        // page trivially implies a non-empty store, and `load_effective`'s
+        // tolerant fold (not `recall_outcome`'s corruption-sensitive one) is
+        // the same function `recall_cmd` already called for this today. This
+        // IS a genuinely new parse on the `--json` empty-result path
+        // specifically — today's `--json` branch returns `[]` before ever
+        // touching `load_effective`; `RecallPage::store_empty` existing at
+        // all is spec-mandated (design decision, not re-litigable here), so
+        // that added cost is accepted, not an oversight.
         let store_empty = if items.is_empty() {
             memory::load_effective(&self.root)
                 .map_err(RecallError::Io)?
@@ -1047,7 +1112,7 @@ impl RepositoryView {
 
         Ok(RecallPage {
             page: Page { items, next },
-            capped: fetch.capped,
+            capped,
             store_corrupt: fetch.store_corrupt,
             store_empty,
         })
@@ -2968,6 +3033,18 @@ mod tests {
         assert!(!page.capped);
         assert!(!page.store_corrupt);
         assert!(!page.store_empty);
+
+        // Field-level struct assertions above can't catch a reordered field
+        // or a dropped `skip_serializing_if` — the two properties this
+        // test's name and AC2 are actually about (order IS separately pinned
+        // by `recall_json_hits.golden`, but that lives at the CLI level; the
+        // load-bearing property should also be tested where the type
+        // itself lives). Serialize and compare bytes directly.
+        let match_hash = crate::store::hash_bytes(b"fn throttle() {}\n");
+        let expected = format!(
+            r#"{{"id":"MATCH0000000000000000MEM1A","fact":"throttle limiter guards the API from bursty traffic via throttle checks","pins":[{{"path":"src/throttle.rs","hash":"{match_hash}"}}],"origin":"human","ts":1000,"retracted":false,"freshness":"fresh"}}"#
+        );
+        assert_eq!(serde_json::to_string(hit).unwrap(), expected);
     }
 
     /// Two-sided pin on the verify walk (mirrors
@@ -3059,6 +3136,13 @@ mod tests {
     /// The verify-cap re-export AC15 needs: `view::RECALL_VERIFY_CAP` must
     /// be the exact same constant `memory::recall_outcome` bounds its walk
     /// by, not a second, driftable copy.
+    ///
+    /// This cannot fail today — `pub use crate::memory::RECALL_VERIFY_CAP`
+    /// is the same item under two names, so the two sides of `assert_eq!`
+    /// are identical by construction. Its only job is becoming a real
+    /// tripwire if a future edit replaces the re-export with a copied
+    /// `const RECALL_VERIFY_CAP: usize = 128;` — the exact drift this test
+    /// exists to catch, even though it is presently unfalsifiable.
     #[test]
     fn recall_verify_cap_reexport_matches_memory() {
         assert_eq!(RECALL_VERIFY_CAP, memory::RECALL_VERIFY_CAP);
@@ -3136,17 +3220,36 @@ mod tests {
         let root = tmp.path();
         seed_recall_corpus(root);
 
-        fn snapshot(dir: &std::path::Path) -> Vec<(String, u64)> {
-            let mut out: Vec<(String, u64)> = std::fs::read_dir(dir)
-                .unwrap()
-                .map(|e| {
-                    let e = e.unwrap();
-                    (
-                        e.file_name().to_string_lossy().to_string(),
-                        e.metadata().unwrap().len(),
-                    )
-                })
-                .collect();
+        /// Recursive (unlike a bare `read_dir`, which would miss everything
+        /// under `.agentrec/objects/`) name + length + mtime snapshot — AC12
+        /// names `memory.jsonl`'s length AND `memory-stats.jsonl`'s mtime
+        /// verbatim; a length-only, non-recursive check would pass on an
+        /// equal-length in-place rewrite, or on a write nested under
+        /// `objects/`, neither of which is "zero writes".
+        fn snapshot(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTime)> {
+            fn walk(
+                dir: &std::path::Path,
+                root: &std::path::Path,
+                out: &mut Vec<(String, u64, std::time::SystemTime)>,
+            ) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let meta = entry.metadata().unwrap();
+                    if meta.is_dir() {
+                        walk(&path, root, out);
+                    } else {
+                        let rel = path
+                            .strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string();
+                        out.push((rel, meta.len(), meta.modified().unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(dir, dir, &mut out);
             out.sort();
             out
         }
@@ -3157,7 +3260,7 @@ mod tests {
         let after = snapshot(&root.join(".agentrec"));
         assert_eq!(
             before, after,
-            "recall must not create, grow, or shrink any file under .agentrec"
+            "recall must not create, grow, shrink, or touch the mtime of any file under .agentrec (recursively, including objects/)"
         );
     }
 
@@ -3166,9 +3269,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Empty query -> the ts-descending fallback (`memory::recall_impl`),
-        // not BM25 — deterministic order with no `SCORE_FLOOR` concern, so
-        // three memories with distinct `ts` give a known, stable rank.
-        for (i, id) in ["AAAA", "BBBB", "CCCC"].iter().enumerate() {
+        // not BM25 — deterministic order with no `SCORE_FLOOR` concern. FOUR
+        // memories (not three) so a `k=1` cursored page still has real
+        // remainder behind it — the shape that exercises the production
+        // `next`-minting branch at all (a page that exactly exhausts the
+        // fetch, as three memories at `k=2` did in an earlier revision of
+        // this test, always takes the `end == fetch.hits.len()` -> `None`
+        // arm and never runs the `Some` arm it's supposed to prove).
+        for (i, id) in ["AAAA", "BBBB", "CCCC", "DDDD"].iter().enumerate() {
             let rel = format!("src/f{i}.rs");
             let hash = write_pin(root, &rel, format!("content {i}").as_bytes());
             seed_memory(
@@ -3195,42 +3303,119 @@ mod tests {
             "the first (no-cursor) page never speculatively mints a next cursor"
         );
 
-        // Manually mint what a paginating caller would have gotten had the
-        // first page's fetch been exhaustive — resolve identity by asking
-        // for everything, then page 2 by hand.
+        // The full ts-descending order, for asserting identity below —
+        // reading the answer independently, never used as a substitute for
+        // production cursor minting (see page2/page3 below, which chain
+        // through `view.recall`'s OWN `page.next`, never a hand-built one).
         let full = view
             .recall(&RecallQuery {
                 query: String::new(),
-                k: 3,
+                k: 4,
                 after: None,
             })
             .unwrap();
-        assert_eq!(full.page.items.len(), 3);
-        let cursor = Cursor {
-            after_id: full.page.items[0].id.clone(),
+        assert_eq!(full.page.items.len(), 4);
+
+        // The ONE hand-built cursor in this test: entering the cursored
+        // regime at all requires a starting point, and page 1 above
+        // deliberately never mints one (by design — see its own assertion).
+        // Every cursor from here on is production-minted.
+        let cursor1 = Cursor {
+            after_id: page1.page.items[0].id.clone(),
             after_occurrence: 0,
             query: q1.fingerprint(),
         };
+
+        // Page 2: k=1, one cursored page in from the start, with 2 more
+        // memories still behind it (4 total - 1 already consumed - 1 this
+        // page = 2 remain) — this is what actually runs
+        // `view.rs`'s `Some` arm of the `next`-minting `if`, not merely
+        // compiles it.
         let page2 = view
             .recall(&RecallQuery {
                 query: String::new(),
-                k: 2,
-                after: Some(cursor),
+                k: 1,
+                after: Some(cursor1),
             })
             .unwrap();
-        let page2_ids: Vec<&str> = page2.page.items.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
-            page2_ids,
+            page2.page.items.len(),
+            1,
+            "sanity: page 2 must return exactly one item"
+        );
+        assert_eq!(page2.page.items[0].id, full.page.items[1].id);
+        let cursor2 = page2.page.next.clone().unwrap_or_else(|| {
+            panic!(
+                "page 2 must mint a next cursor — 2 more memories remain behind it: {:?}",
+                page2.page.items
+            )
+        });
+        assert_eq!(
+            cursor2.after_id, page2.page.items[0].id,
+            "a minted cursor must name the LAST item this page actually returned"
+        );
+
+        // Page 3, fed with page 2's OWN production-minted cursor: must
+        // continue exactly where page 2 left off, no repeat, and — having
+        // now consumed everything — must NOT mint a further cursor.
+        let page3 = view
+            .recall(&RecallQuery {
+                query: String::new(),
+                k: 2,
+                after: Some(cursor2),
+            })
+            .unwrap();
+        let page3_ids: Vec<&str> = page3.page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            page3_ids,
             vec![
-                full.page.items[1].id.as_str(),
-                full.page.items[2].id.as_str()
+                full.page.items[2].id.as_str(),
+                full.page.items[3].id.as_str()
             ],
-            "page 2 must continue exactly where page 1's identity left off, no repeat"
+            "page 3 must continue exactly where page 2's production cursor left off, no repeat"
         );
         assert!(
-            page2.page.next.is_none(),
-            "an exhaustive fetch that reaches the end must not mint a next cursor"
+            page3.page.next.is_none(),
+            "a fetch that reaches the end must not mint a further next cursor"
         );
+    }
+
+    /// MAJOR 1 regression pin: `after: Some(cursor)` with `q.k == 0` must be
+    /// refused, not answered with a silent, self-referential `next` cursor
+    /// (the bug: `fetch.hits.get(end - 1)` on an empty page resolved to the
+    /// CURSOR'S OWN item, so a paginating caller asking for zero more items
+    /// got back a `next` identical to what it already had — an infinite
+    /// loop that never advances). Mirrors `CursorError::ZeroLimit`'s
+    /// existing role for `list`/`diff`. `after: None` with `k == 0` stays
+    /// non-erroring (see `recall_k_zero_is_an_empty_ok_result_not_an_error`)
+    /// — the two are deliberately different because only one of them
+    /// carries a pagination promise to break.
+    #[test]
+    fn recall_cursored_k_zero_is_refused_not_a_silent_self_referential_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_recall_corpus(root);
+        let view = RepositoryView::open(root).unwrap();
+        let q1 = RecallQuery {
+            query: "throttle".to_string(),
+            k: 1,
+            after: None,
+        };
+        let page1 = view.recall(&q1).unwrap();
+        assert_eq!(page1.page.items.len(), 1);
+        let cursor = Cursor {
+            after_id: page1.page.items[0].id.clone(),
+            after_occurrence: 0,
+            query: q1.fingerprint(),
+        };
+        let err = view
+            .recall(&RecallQuery {
+                query: "throttle".to_string(),
+                k: 0,
+                after: Some(cursor),
+            })
+            .unwrap_err();
+        assert_eq!(err, RecallError::Cursor(CursorError::ZeroLimit));
     }
 
     #[test]

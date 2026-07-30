@@ -628,6 +628,14 @@ struct RecallOpts<'a> {
 /// `readcmds::render_diff`/`render_blame`'s wiring gate). Returns
 /// `(stdout, stderr)`; emission order matches today's exactly — the F3
 /// capped notice always precedes the empty-state branch.
+///
+/// NOTE: `page.store_corrupt` (F10) is never read here — a corrupt store
+/// renders identically to a healthy "no fresh matches" (via `store_empty`,
+/// which `recall_outcome` also leaves `false` on that path). This is
+/// unchanged from pre-refactor `recall_cmd`, which never distinguished the
+/// two either; F10's `store_corrupt` bit exists on `RecallPage` for a future
+/// consumer (this task's Notes section: "fail-open posture preserved on the
+/// CLI path"), not wired to a distinct human message yet.
 fn render_recall(page: &view::RecallPage, opts: RecallOpts) -> (String, String) {
     let mut stdout = String::new();
     let mut stderr = String::new();
