@@ -6789,6 +6789,188 @@ fn memories_stale_shows_drifted_pin_and_when() {
     );
 }
 
+/// Perf-evidence round, AC1.2: `agentrec memories --stats` reads
+/// `memory-stats.jsonl` directly and sorts every non-blank line into exactly
+/// one of three buckets — measurable (parses AND carries `elapsed_ms`),
+/// parseable-pre-upgrade (parses but no `elapsed_ms`), and torn (fails to
+/// parse as a JSON object at all). Fixture: 100 measurable lines with
+/// `elapsed_ms` 1..=100 (so nearest-rank percentiles land on exact,
+/// hand-checkable values), one pre-upgrade line, one torn line. The named
+/// neuter — merging either bucket into another (e.g. counting the
+/// pre-upgrade line as torn, or vice versa, or letting a torn line slip into
+/// the measurable sample) — must red this test.
+#[test]
+fn memories_stats_three_bucket_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut lines: Vec<String> = (1..=100u64)
+        .map(|i| serde_json::json!({ "ts": i, "n": 1, "elapsed_ms": i }).to_string())
+        .collect();
+    // Parseable pre-upgrade: a valid JSON object, no `elapsed_ms` at all —
+    // exactly what every stats line looked like before this phase.
+    lines.push(serde_json::json!({ "ts": 9999, "n": 2 }).to_string());
+    // Torn: not valid JSON at all.
+    lines.push("{not valid json".to_string());
+    let content = lines.join("\n") + "\n";
+    std::fs::write(root.join(".agentrec/memory-stats.jsonl"), content).unwrap();
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert!(out.status.success(), "memories --stats failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("p50=50"),
+        "expected nearest-rank p50=50 over 1..=100: {stdout}"
+    );
+    assert!(
+        stdout.contains("p99=99"),
+        "expected nearest-rank p99=99 over 1..=100: {stdout}"
+    );
+    // Whole-line match, not `contains` (finding 8, review round): a bare
+    // substring check on "1 pre-upgrade lines ..." / "1 unparseable lines
+    // skipped" would also be satisfied by "11 pre-upgrade lines ..." /
+    // "11 unparseable lines skipped", so a future off-by-one in either count
+    // could pass silently. Not reachable with this fixture today (both
+    // neuters land on 2, which already reds a substring check), but a prefix
+    // match is the wrong invariant to assert regardless.
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "1 pre-upgrade lines (no elapsed_ms)"),
+        "expected exactly one pre-upgrade line reported: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "1 unparseable lines skipped"),
+        "expected exactly one torn line reported: {stdout}"
+    );
+}
+
+/// Review-round finding 3: a capped injection (`cmds::inject_memory` site 6 —
+/// `n` present AND `capped:true`, the hook found fresh hits but hit
+/// `RECALL_VERIFY_CAP` on the way there) must be visible to the readout that
+/// exists to answer "how many recalls hit the verify cap" — not swallowed
+/// into `injected` with no trace. Fixture: 2 capped-and-injected lines, 1
+/// zero-hit-capped line (the only case the four mutually-exclusive buckets
+/// can name directly), 1 plain injection with no cap at all. Named neuter:
+/// restore the pre-fix bucketing (an `else if capped` arm reachable only
+/// after `n.is_some()` has already been tested and failed, with no
+/// cross-cutting total at all) — this test's `capped_total=3` assertion reds
+/// because the field no longer exists in the pre-fix line shape, and
+/// `capped_empty=1`'s renamed label reds too.
+#[test]
+fn memories_stats_capped_injection_counted_in_capped_total() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let lines = [
+        serde_json::json!({ "ts": 1, "n": 2, "elapsed_ms": 10, "capped": true }),
+        serde_json::json!({ "ts": 2, "n": 1, "elapsed_ms": 20, "capped": true }),
+        serde_json::json!({ "ts": 3, "elapsed_ms": 30, "capped": true }),
+        serde_json::json!({ "ts": 4, "n": 3, "elapsed_ms": 40 }),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    std::fs::write(root.join(".agentrec/memory-stats.jsonl"), lines).unwrap();
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert!(out.status.success(), "memories --stats failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim() == "injected=3 budget_exceeded=0 failure=0 capped_empty=1"),
+        "expected the mutually-exclusive buckets (2 capped-injections + 1 plain\
+         injection = injected=3, 1 zero-hit-capped = capped_empty=1): {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim().starts_with("capped_total=3")),
+        "expected capped_total=3 (both capped-injections plus the \
+         zero-hit-capped line, regardless of which bucket each fell into): {stdout}"
+    );
+}
+
+/// Review-round finding 4: `--stats` combined with `--json`/`--stale`/`--all`
+/// must be rejected by clap, not silently accepted with the other flags
+/// ignored — same precedent as `status --ack-degraded --json`
+/// (`ack_degraded_json_is_not_prose` above). Named neuter: drop
+/// `conflicts_with_all` from the `stats` field — this test's non-success
+/// assertions red because clap then accepts every combination and the
+/// (ignored) `--json`/`--stale`/`--all` branch never fires.
+#[test]
+fn memories_stats_conflicts_with_json_stale_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    for flag in ["--json", "--stale", "--all"] {
+        let out = agentrec(root, &["memories", "--stats", flag]);
+        assert!(
+            !out.status.success(),
+            "the --stats/{flag} combination must be rejected, not silently accepted: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "expected a clap conflict message on stderr for {flag}: {stderr:?}"
+        );
+    }
+}
+
+/// Review-round finding 5: `--stats` on an uninitialized repo must return the
+/// same honest "not initialized" refusal + exit 1 as plain `memories`
+/// (PD1-class), not a measured-looking "no hook invocations recorded" at
+/// exit 0 — those are different facts (never set up vs set up but quiet).
+/// Asserts the contrast directly: the same command in an *initialized* repo
+/// with no stats file yet must still print the honest empty-store message at
+/// exit 0. Named neuter: restore `unwrap_or_default()` with no init-gate —
+/// the uninitialized-repo assertions red (exit 0, no "not initialized" text)
+/// while the initialized-empty-repo assertions keep passing, which is
+/// exactly the two-different-facts distinction this test exists to pin.
+#[test]
+fn memories_stats_requires_init() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Deliberately no `agentrec init`.
+
+    let out = agentrec(root, &["memories", "--stats"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "an uninitialized repo must never print a measured-looking stats readout: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not initialized — run"),
+        "expected the init remedy on stderr: {stderr:?}"
+    );
+
+    // Contrast: an *initialized* repo with no stats file yet is a different
+    // fact and must render differently — exit 0, honest empty-store message.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    init(root2);
+    let out2 = agentrec(root2, &["memories", "--stats"]);
+    assert!(
+        out2.status.success(),
+        "an initialized repo with no stats yet must exit 0: {out2:?}"
+    );
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("no hook invocations recorded"),
+        "expected the honest empty-store message: {stdout2:?}"
+    );
+}
+
 // F7 part B: design spec §Lifecycle promises `verify <id>` shows a "diff
 // summary via CAS" on drift, not only two hashes. Pre-fix, `verify` prints
 // exactly `old <hash> -> new <hash>` and nothing else.
@@ -8230,6 +8412,131 @@ fn hook_recall_bails_at_injected_deadline() {
     );
 }
 
+/// Perf-evidence round, AC1.1: every `memory-stats.jsonl` append site inside
+/// `inject_memory` must carry `elapsed_ms` (monotonic, `started.elapsed()`),
+/// including the two early-bail sites — thread-spawn failure and the
+/// `recv_timeout` hard-wall timeout/disconnect — which previously never
+/// computed it at all. Those two bail sites emit a byte-identical
+/// `{"ts","budget_exceeded":true}` line and RACE under
+/// `AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED` (an already-expired deadline
+/// makes `recv_timeout(0)` a coin flip between "the worker already sent"
+/// and "timed out first") — so this test asserts the invariant on whichever
+/// `budget_exceeded` line actually lands, never on a specific arm. The named
+/// neuter (removing `elapsed_ms` from BOTH bail sites) reds this test
+/// deterministically regardless of which side of the race fires on a given
+/// run; removing it from only one side would not, which is exactly why both
+/// must carry it. A second, independent assertion below covers the success
+/// (`n`-bearing) path.
+#[test]
+fn hook_stats_lines_carry_elapsed_ms_on_either_bail_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    agentrec(root, &["init", "--no-service"]);
+
+    // -- Bail-site leg: force an already-expired deadline. --
+    std::fs::write(root.join("bail_fresh.rs"), b"fn bail_fresh() {}\n").unwrap();
+    let bail_hash = memory::hash_pin(root, "bail_fresh.rs").expect("hash bail_fresh.rs");
+    let bail_rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-elapsed-bail",
+        "op": "assert",
+        "fact": "elapsed ms bail probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "bail_fresh.rs", "hash": bail_hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 1,
+    });
+    std::fs::write(root.join(".agentrec/memory.jsonl"), format!("{bail_rec}\n")).unwrap();
+
+    let bail_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"elapsed ms bail probe fact"}"#;
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_FORCE_RECALL_BUDGET_EXCEEDED", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bail_payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "hook must exit 0 even on a bailed recall: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an already-expired deadline must never print a block: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let stats = memory_stats_lines(root);
+    let bail = stats
+        .iter()
+        .find(|l| l.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true))
+        .unwrap_or_else(|| {
+            panic!("expected a budget_exceeded line in memory-stats.jsonl: {stats:?}")
+        });
+    assert!(
+        bail.get("elapsed_ms").and_then(|v| v.as_u64()).is_some(),
+        "budget_exceeded line (whichever bail arm won the race) must carry \
+         elapsed_ms: {bail:?}"
+    );
+
+    // -- Success leg: a normal call, no forced deadline, that really injects
+    // (site 6, the `n`-bearing append). Adds a second, independently-fresh
+    // pinned memory rather than reusing the bail leg's fact, so a match here
+    // cannot be explained by anything left over from the bail call above.
+    std::fs::write(root.join("success_fresh.rs"), b"fn success_fresh() {}\n").unwrap();
+    let ok_hash = memory::hash_pin(root, "success_fresh.rs").expect("hash success_fresh.rs");
+    let ok_rec = serde_json::json!({
+        "v": 1,
+        "type": "memory",
+        "id": "m-elapsed-success",
+        "op": "assert",
+        "fact": "elapsed ms success probe fact is genuinely fresh and really pinned",
+        "pins": [{ "path": "success_fresh.rs", "hash": ok_hash }],
+        "source_turns": [],
+        "origin": "agent",
+        "ts": 2,
+    });
+    std::fs::write(
+        root.join(".agentrec/memory.jsonl"),
+        format!("{bail_rec}\n{ok_rec}\n"),
+    )
+    .unwrap();
+
+    let ok_payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s2","prompt":"elapsed ms success probe fact"}"#;
+    let ok_out = send_hook_capture(root, ok_payload);
+    assert!(
+        ok_out.status.success(),
+        "sanity: success-leg hook call failed: {ok_out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&ok_out.stdout).starts_with("```agentrec memory"),
+        "sanity: expected a real injection on the success leg: {:?}",
+        String::from_utf8_lossy(&ok_out.stdout)
+    );
+
+    let stats_after = memory_stats_lines(root);
+    let success = stats_after
+        .iter()
+        .find(|l| l.get("n").is_some())
+        .unwrap_or_else(|| {
+            panic!("expected an n-bearing injection line in memory-stats.jsonl: {stats_after:?}")
+        });
+    assert!(
+        success.get("elapsed_ms").and_then(|v| v.as_u64()).is_some(),
+        "success-path (n-bearing) line must carry elapsed_ms: {success:?}"
+    );
+}
+
 /// F8: the 50ms hook budget must be a HARD WALL, not just cooperative
 /// between-step checks. `hook_recall_bails_at_injected_deadline` above
 /// proves the cooperative deadline bails once it is checked — but every
@@ -8778,102 +9085,375 @@ fn hook_corrupt_store_safe_under_concurrent_real_daemon() {
     );
 }
 
-// Phase 1 (honesty-fixes round) — call-site wiring: proves `status`
-// actually threads its harvested protect-set into `enforce_budget`, not
-// just that the core mechanism honors one when handed one directly (that's
-// already unit-tested in `cli/src/cmds.rs`'s `eviction_keeps_*` tests). A
-// real ~2 GiB store is infeasible here, so this drives the real binary with
-// the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` override (compiled out
-// of release — see `cmds::effective_store_budget`), seeding an old,
-// otherwise-evictable turn whose blob is ALSO the in-flight open turn's
-// `before` — exactly the live-daemon scenario this phase's defect
-// describes (open.json's before is typically the previous committed
-// turn's after for the same file).
+/// Like [`SingleDaemonGuard`] but redirects the daemon's stderr to a file
+/// instead of discarding it (perf-evidence round, Phase 2b): today's
+/// `spawn_record` nulls stderr (integration.rs:28-35) and no existing test
+/// asserts on daemon stderr at all — this phase's eviction pass needs to,
+/// since its only steady-state observable besides the store itself is one
+/// stderr line per pass that evicted something. `extra_env` lets a caller
+/// drive the debug-only `AGENTREC_TEST_STORE_BUDGET_BYTES` /
+/// `AGENTREC_TEST_EVICT_INTERVAL_MS` seams (both compiled out of release).
+struct StderrCapturingDaemonGuard(Option<Child>);
+
+impl StderrCapturingDaemonGuard {
+    fn spawn(root: &Path, stderr_path: &Path, extra_env: &[(&str, &str)]) -> Self {
+        let stderr_file = std::fs::File::create(stderr_path).expect("create stderr capture file");
+        let mut cmd = Command::new(bin());
+        cmd.args(["record", "--root", root.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file));
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn record with captured stderr");
+        // Bounded-poll for the daemon to actually be up, same discipline as
+        // `SingleDaemonGuard::spawn`.
+        wait_for_live_daemon(root);
+        StderrCapturingDaemonGuard(Some(child))
+    }
+
+    fn kill(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            sigkill(&c);
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for StderrCapturingDaemonGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn backdate_blob(objects_dir: &Path, hash: &str, secs_ago: u64) {
+    let hex = hash.strip_prefix("sha256:").unwrap();
+    let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
+    let past = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+}
+
+// Phase 2b (perf-evidence round, Decision 7 Q1=(a)) — retargets the old
+// `status_eviction_keeps_open_turn_blob` (which proved `status` threaded
+// its harvested protect-set into `enforce_budget`) at the daemon's own
+// eviction tick instead, since eviction itself moved off the `status` read
+// verb entirely. `open.json` can no longer be a protect-channel fixture
+// here — gate-proven infeasible (B9): the daemon's own `sync_journal` idle
+// arm deletes `open.json` within ~250ms of there being no open turn
+// (daemon.rs), long before any eviction seam could observe it protecting
+// anything. This test uses channels the daemon only ever APPENDS to
+// instead: an unparseable-but-newline-terminated `log.jsonl` line, and a
+// `memory.jsonl` pin. `open.json`'s own protection keeps its coverage at
+// the unit level —
+// `cmds::tests::harvest_protects_open_json_refs_at_plan_level`.
 #[test]
-fn status_eviction_keeps_open_turn_blob() {
+fn daemon_eviction_keeps_protected_refs() {
     use agentrec_core::record::FileEntry;
     use agentrec_core::store::BlobStore;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     init(root);
-    let store = BlobStore::new(root.join(".agentrec/objects"));
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
 
-    let old = store.put(&[0xAAu8; 500]).unwrap();
-    // Backdate well before `enforce_budget`'s internal `pass_start` so the
-    // pre-existing A3(c) freshness guard can't rescue it vacuously.
-    {
-        let hex = old.strip_prefix("sha256:").unwrap();
-        let path = root
-            .join(".agentrec/objects")
-            .join(&hex[..2])
-            .join(&hex[2..]);
-        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-    }
+    // The genuine victim: an old, UNprotected candidate the daemon must
+    // actually evict — otherwise a run that protects everything would
+    // trivially pass with zero evictions and prove nothing.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    // Protected via an unparseable-but-newline-terminated log.jsonl line.
+    let torn = store.put(&[0x22u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &torn, 3600);
+    // Protected via a memory.jsonl pin.
+    let pinned = store.put(&[0x33u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &pinned, 3600);
+    // Newest — kept by the budget itself, no protection needed.
     let new = store.put(&[0xCCu8; 5]).unwrap();
 
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }
+    }
+
+    // Oldest -> newest, matching load_log order. Each protected blob is
+    // ALSO a normal, structurally-visible eviction candidate via a valid
+    // committed turn — proving survival is due to the protect-channel, not
+    // ordinary A5/A2 protection.
     seed_turn(
         root,
         &base_turn(
-            "t_OPENWIRE0000000000000001",
-            vec![FileEntry {
-                path: "old.bin".into(),
-                before: None,
-                after: Some(old.clone()),
-                op: "create".into(),
-                skipped: false,
-                withheld: false,
-                baseline_unknown: false,
-                skipped_reason: None,
-            }],
+            "t_DAEMONEVICTVICTIM00001",
+            vec![file_entry("victim.bin", &victim)],
         ),
     );
     seed_turn(
         root,
         &base_turn(
-            "t_OPENWIRENEW000000000001",
-            vec![FileEntry {
-                path: "new.bin".into(),
-                before: None,
-                after: Some(new.clone()),
-                op: "create".into(),
-                skipped: false,
-                withheld: false,
-                baseline_unknown: false,
-                skipped_reason: None,
-            }],
+            "t_DAEMONEVICTTORN000001",
+            vec![file_entry("torn.bin", &torn)],
         ),
     );
-
-    // Simulates the daemon's crash journal: the in-flight open turn's
-    // `before` cites the same blob as the old committed turn's `after`.
-    std::fs::write(
-        root.join(".agentrec/open.json"),
-        format!(r#"{{"before":"{old}"}}"#),
-    )
-    .unwrap();
-
-    let out = Command::new(bin())
-        .args(["status", "--root", root.to_str().unwrap()])
-        .env("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")
-        .output()
-        .expect("run agentrec status");
-    assert!(out.status.success(), "status failed: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("over"),
-        "expected over-budget notice: {stdout}"
+    seed_turn(
+        root,
+        &base_turn(
+            "t_DAEMONEVICTPINNED0001",
+            vec![file_entry("pinned.bin", &pinned)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_DAEMONEVICTNEW0000001", vec![file_entry("new.bin", &new)]),
     );
 
-    assert!(
-        store.contains(&old),
-        "the in-flight turn's blob must survive a real `status` eviction pass: {stdout}"
+    // Unparseable but `\n`-terminated — so the daemon's own epoch-start
+    // append lands on a fresh line instead of concatenating onto this one
+    // (`open_append` is O_APPEND with no leading newline; `harvest_refs` is
+    // a raw byte scan and survives either way, but the fixture must exist
+    // in the shape this test's own doc comment claims).
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".agentrec/log.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_DAEMONEVICTTORNLINE","files":[{{"before":"{torn}"#
+        )
+        .unwrap();
+    }
+
+    // A memory.jsonl pin citing the same hash — the daemon only ever
+    // appends to this file, never rewrites it, so it's a safe live-daemon
+    // protect-channel fixture (unlike open.json).
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: "daemon eviction protect-channel fixture".to_string(),
+        pins: vec![Pin {
+            path: "pinned.bin".to_string(),
+            hash: pinned.clone(),
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
     );
-    assert!(store.contains(&new));
+
+    // Within 2x the seam interval, the daemon's tick must have evicted the
+    // sole unprotected victim.
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob was not evicted by the live daemon within the timeout"
+    );
+
+    daemon.kill();
+
+    assert!(
+        store.contains(&torn),
+        "torn-log-line-cited blob must survive a real daemon eviction pass"
+    );
+    assert!(
+        store.contains(&pinned),
+        "memory-pin-cited blob must survive a real daemon eviction pass"
+    );
+    assert!(store.contains(&new), "newest blob must survive");
+
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        stderr_text.contains("evicted") && stderr_text.contains("blob"),
+        "expected one stderr eviction line from the daemon: {stderr_text}"
+    );
+}
+
+// Coverage gap disclosed by the Phase 2b implementer:
+// `daemon_eviction_keeps_protected_refs` above seeds its over-budget store
+// BEFORE spawning the daemon, so the eviction it observes is necessarily
+// the STARTUP pass (`run_eviction_pass` at daemon.rs, which runs strictly
+// before the watcher arms — daemon.rs:131-136). The RECURRING tick
+// (`if last_eviction.elapsed() >= effective_evict_interval()` inside
+// `run`'s main loop) is never exercised by that test and could be broken
+// entirely — never fires, wrong comparison, `last_eviction` never reset —
+// without it going red. This test spawns the daemon on a store that is
+// genuinely under budget (empty), waits for it to be confirmed live, and
+// only THEN pushes the store over budget by appending directly to the CAS
+// and `log.jsonl` (both append-only; never rewritten). The victim blob did
+// not exist at startup, so only the recurring tick can be what evicts it.
+#[test]
+fn daemon_periodic_tick_evicts_after_startup_pass() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+        }
+    }
+
+    let stderr_path = root.join("daemon-stderr.log");
+    // 2s eviction interval — the same value `daemon_eviction_keeps_
+    // protected_refs` already proved stable. Long enough that the handful
+    // of small file writes done immediately below (a few `store.put`s and
+    // `seed_turn` appends, sub-millisecond to low-tens-of-ms) cannot itself
+    // straddle a tick boundary; short enough that a 6s (3x) poll timeout
+    // stays fast. POLL is 250ms, so 2s gives an 8x margin against ordinary
+    // daemon-loop jitter — tight enough to keep the test fast, not so
+    // tight it races the daemon's own tick granularity.
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
+    );
+
+    // `StderrCapturingDaemonGuard::spawn` already blocked on
+    // `wait_for_live_daemon`, which only returns once
+    // `watcher_armed_nonce == epoch_nonce` in state.json — and daemon.rs's
+    // `run` calls the startup eviction pass strictly BEFORE arming the
+    // watcher. So the startup pass has unconditionally already run, on an
+    // empty (trivially under-budget) store, by the time control reaches
+    // here. Nothing below existed for it to see or evict — that ordering
+    // is the entire point of this test.
+
+    // NOW push the store over budget, entirely after the startup pass.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    // Protected via an unparseable-but-newline-terminated log.jsonl line.
+    let torn = store.put(&[0x22u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &torn, 3600);
+    // Protected via a memory.jsonl pin.
+    let pinned = store.put(&[0x33u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &pinned, 3600);
+    // Newest — kept by the budget itself, no protection needed.
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+
+    // Oldest -> newest, matching load_log order, same shape as
+    // `daemon_eviction_keeps_protected_refs` — just written post-spawn.
+    seed_turn(
+        root,
+        &base_turn(
+            "t_PERIODICVICTIM0000001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_PERIODICTORN0000001", vec![file_entry("torn.bin", &torn)]),
+    );
+    seed_turn(
+        root,
+        &base_turn(
+            "t_PERIODICPINNED000001",
+            vec![file_entry("pinned.bin", &pinned)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_PERIODICNEW00000001", vec![file_entry("new.bin", &new)]),
+    );
+
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".agentrec/log.jsonl"))
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"turn","id":"t_PERIODICTORNLINE","files":[{{"before":"{torn}"#
+        )
+        .unwrap();
+    }
+
+    let rec = MemoryRecord {
+        v: 1,
+        kind: "memory".to_string(),
+        id: agentrec_core::id::ulid(),
+        op: MemoryOp::Assert,
+        fact: "periodic-tick protect-channel fixture".to_string(),
+        pins: vec![Pin {
+            path: "pinned.bin".to_string(),
+            hash: pinned.clone(),
+        }],
+        source_turns: vec![],
+        origin: "agent".to_string(),
+        ts: 1_700_000_000_000,
+        reason: None,
+    };
+    memory::append_memory(root, &rec).unwrap();
+
+    // Only the RECURRING tick can be responsible for evicting this —
+    // none of it existed when the startup pass ran.
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob (created strictly AFTER the confirmed-live startup \
+         pass) was not evicted within the timeout — the recurring \
+         eviction tick appears not to be running"
+    );
+
+    daemon.kill();
+
+    assert!(
+        store.contains(&torn),
+        "torn-log-line-cited blob must survive the periodic eviction pass"
+    );
+    assert!(
+        store.contains(&pinned),
+        "memory-pin-cited blob must survive the periodic eviction pass"
+    );
+    assert!(store.contains(&new), "newest blob must survive");
+
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        stderr_text.contains("evicted") && stderr_text.contains("blob"),
+        "expected one stderr eviction line from the daemon: {stderr_text}"
+    );
 }

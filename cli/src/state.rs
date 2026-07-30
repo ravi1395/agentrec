@@ -141,6 +141,26 @@ pub struct State {
     /// armed / unknown", including for a pre-this-field `state.json`.
     #[serde(default)]
     pub watcher_armed_nonce: String,
+    /// Count of clean dedup-hit verification reads on the daemon's
+    /// snapshot path (perf-evidence round): every `put_result` call inside
+    /// `Recorder::stage`, including the symlink-target put — `persist`'s
+    /// and `recover_orphan`'s prompt `put_result` calls are the only
+    /// deliberately-uncounted ones. **Epoch-scoped, not a lifetime total:**
+    /// this field MIRRORS `Recorder::dedup_hits` at each
+    /// `drain_recorder_stats` call (an overwrite, not an accumulation), so
+    /// after a daemon restart the previous epoch's figure stays here,
+    /// unchanged, until the new epoch's first dedup hit overwrites it —
+    /// there is no epoch-nonce gate on this pair the way there is on the
+    /// ignore-reload counters. A pre-instrumentation `state.json` has no
+    /// such key and renders 0, same `#[serde(default)]` posture as every
+    /// other counter here.
+    #[serde(default)]
+    pub dedup_hits: u64,
+    /// Total bytes re-read across all hits counted by `dedup_hits`
+    /// (Decision 6: the corrupt-fallthrough heal path never contributes —
+    /// see `agentrec_core::store::PutResult::Stored`'s doc).
+    #[serde(default)]
+    pub dedup_reread_bytes: u64,
 }
 
 /// Sentinel `last_bad_field` value for a file that could not be parsed as a
@@ -218,6 +238,8 @@ pub fn read_state(root: &Path) -> State {
         epoch_nonce: field!("epoch_nonce"),
         epoch_reload_nonce: field!("epoch_reload_nonce"),
         watcher_armed_nonce: field!("watcher_armed_nonce"),
+        dedup_hits: field!("dedup_hits"),
+        dedup_reread_bytes: field!("dedup_reread_bytes"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read

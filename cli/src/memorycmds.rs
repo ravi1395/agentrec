@@ -676,6 +676,152 @@ pub fn memories(root: &Path, stale: bool, all: bool, json: bool) -> Result<(), S
     Ok(())
 }
 
+/// `memories --stats` (perf-evidence round, AC1.2): summarizes per-hook
+/// recall latency from `memory-stats.jsonl` — the hook-owned append-only log
+/// `cmds::inject_memory` writes on every UserPromptSubmit recall outcome,
+/// carrying `elapsed_ms` on every site since Phase 1 of that round.
+///
+/// **Gates on initialization first** (finding 5, review round): an absent
+/// `.agentrec/` reads `memory-stats.jsonl` as `""` via `unwrap_or_default`
+/// exactly like a genuinely-empty file in an *initialized* repo would — those
+/// are different facts (never-set-up vs set-up-but-quiet) and must render
+/// differently. An uninitialized repo gets the same honest refusal + exit 1
+/// as [`memories`]; only past that gate does an empty/absent stats file print
+/// the honest `no hook invocations recorded` at exit 0.
+///
+/// **Deliberately does NOT call [`memories`] or `memory::load_effective`.**
+/// This reads `memory-stats.jsonl` directly and only that file — a corrupt
+/// `memory.jsonl` (the file `load_effective` parses) must not poison a stats
+/// readout of a *different*, unrelated file. Getting this wrong (routing
+/// through `memories()`'s preconditions at this function's own `load_effective`
+/// call above) would make `--stats` fail on a store whose memory feature is
+/// broken but whose hook latency log is perfectly readable.
+///
+/// Every line is sorted into exactly one of three buckets:
+/// - **measurable** — parses as a JSON object AND carries `elapsed_ms` as an
+///   integer. Feeds the p50/p90/p99/max (nearest-rank on the sorted sample)
+///   and a per-outcome breakdown that is mutually exclusive and sums to the
+///   measurable count: injected / budget_exceeded / failure / `capped_empty`
+///   (a capped walk that surfaced zero fresh hits — the one case with no
+///   other outcome to bucket under).
+/// - **parseable-pre-upgrade** — parses as a JSON object but yields no
+///   *u64* `elapsed_ms` (a line written before this phase). Precisely: the
+///   key is absent, OR present with a non-u64 type, since both fail
+///   `as_u64()` identically. No producer emits the wrong-typed shape today
+///   — every append site writes `elapsed_ms` as a u64 — so in practice this
+///   bucket is exactly the pre-phase lines; the wider wording is here so a
+///   future reader is not surprised by a hand-edited or foreign line landing
+///   here rather than in "torn". Counted, never silently dropped.
+/// - **torn** — fails to parse as a JSON object at all. Counted, never
+///   silently dropped or folded into "pre-upgrade" — conflating the two
+///   would hide real corruption behind an honest-looking version skew.
+///
+/// **`capped_total` is a separate, cross-cutting count (finding 3, review
+/// round)**, deliberately NOT one of the four mutually-exclusive buckets
+/// above: `cmds::inject_memory` site 6 (a successful injection, `n` present)
+/// can *also* carry `capped:true` when the verify walk hit
+/// `RECALL_VERIFY_CAP` on the way to finding those hits — that line lands in
+/// `injected`, not `capped_empty`, because `injected`/`capped_empty` answer
+/// "what happened to this recall" (mutually exclusive by construction) while
+/// `capped_total` answers a different question — "how many recalls hit the
+/// verify cap at all" — which needs every line where `capped:true`,
+/// regardless of which of the four buckets it landed in. Naming both
+/// `capped` would silently hide a capped-but-injected recall from the
+/// question `capped_total` exists to answer.
+///
+/// Blank lines are skipped entirely (not counted in any bucket), matching
+/// the convention `status`'s own memory-stats readers already use. An
+/// empty-or-absent (but initialized) file prints `no hook invocations
+/// recorded` and returns — this is checked before any bucket accounting, so
+/// it never fires merely because every line happened to land in one bucket.
+pub fn memories_stats(root: &Path) -> Result<(), String> {
+    if !crate::agentrec_dir(root).is_dir() {
+        return Err("not initialized — run `agentrec init`".to_string());
+    }
+
+    let text = std::fs::read_to_string(crate::memory_stats_path(root)).unwrap_or_default();
+    if text.trim().is_empty() {
+        println!("no hook invocations recorded");
+        return Ok(());
+    }
+
+    let mut measurable: Vec<u64> = Vec::new();
+    let mut pre_upgrade = 0usize;
+    let mut torn = 0usize;
+    let mut injected = 0usize;
+    let mut budget_exceeded = 0usize;
+    let mut failure = 0usize;
+    let mut capped_empty = 0usize;
+    let mut capped_total = 0usize;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                torn += 1;
+                continue;
+            }
+        };
+        match value.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            Some(ms) => {
+                measurable.push(ms);
+                let is_capped = value.get("capped").and_then(|v| v.as_bool()) == Some(true);
+                if is_capped {
+                    capped_total += 1;
+                }
+                if value.get("budget_exceeded").and_then(|v| v.as_bool()) == Some(true) {
+                    budget_exceeded += 1;
+                } else if value.get("failure").and_then(|v| v.as_bool()) == Some(true) {
+                    failure += 1;
+                } else if value.get("n").is_some() {
+                    injected += 1;
+                } else if is_capped {
+                    capped_empty += 1;
+                }
+            }
+            None => pre_upgrade += 1,
+        }
+    }
+
+    if !measurable.is_empty() {
+        measurable.sort_unstable();
+        let n = measurable.len();
+        // Nearest-rank: rank = ceil(p/100 * n), 1-indexed into the sorted
+        // sample, clamped into range (rank can't exceed n or fall below 1).
+        let percentile = |p: f64| -> u64 {
+            let rank = ((p / 100.0) * n as f64).ceil() as usize;
+            let idx = rank.clamp(1, n) - 1;
+            measurable[idx]
+        };
+        let max = *measurable.last().expect("non-empty checked above");
+        println!(
+            "{n} hook invocations recorded — p50={} p90={} p99={} max={}",
+            percentile(50.0),
+            percentile(90.0),
+            percentile(99.0),
+            max,
+        );
+        println!(
+            "  injected={injected} budget_exceeded={budget_exceeded} failure={failure} capped_empty={capped_empty}"
+        );
+        println!(
+            "  capped_total={capped_total} (recalls that hit RECALL_VERIFY_CAP, injected or not)"
+        );
+    }
+
+    if pre_upgrade > 0 {
+        println!("{pre_upgrade} pre-upgrade lines (no elapsed_ms)");
+    }
+    if torn > 0 {
+        println!("{torn} unparseable lines skipped");
+    }
+
+    Ok(())
+}
+
 /// One drifted pin's turn-log join (design spec §Read path). `current` is
 /// `None` for an orphaned pin (path no longer readable); `turn` is `None`
 /// when neither join strategy in [`find_drift_turn`] finds a candidate — an

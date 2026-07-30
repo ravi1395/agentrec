@@ -8,6 +8,184 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## Status (update after every delivery round — house rule)
 
+**Perf-evidence round — ALL 4 PHASES DELIVERED (2026-07-28, branch `fix/perf-evidence-round`
+cut from `main` @ `1ece033`, `c784714..aa9fec4`, 19 commits, not pushed, no PR).** macOS
+**428 → 443 tests, 0 failed, 1 ignored**; clippy `-D warnings` + fmt clean; release `strings`
+carries no `AGENTREC_TEST`. Sonnet implementer per phase, a fresh-context **Opus review pass
+per phase**, and the orchestrator re-ran the full suite after every phase independent of every
+implementer — **every count agreed twice**. Merge order P1 → P3 → P2a → P2b as the plan
+required (P2b depends on P2a's API). **Binding fable skeptical-reviewer done-gate: GATE PASS
+on the first pass, 0 blocking findings, all 14 ACs MET** — and it did not take the round's
+word for anything load-bearing: it re-derived the neuters itself, independently **replicated
+the AC1.3 headline measurement** (its own 40-run leg on a fresh 10k store measured p99=12 ms
+against leg B's 13 ms), and reproduced firsthand the one claim the round most depended on —
+that under a neuter deleting *only* the periodic tick, the new tick test fails while the
+pre-existing `daemon_eviction_keeps_protected_refs` still passes. Its ruling on AC2b.2 is
+worth preserving verbatim in substance: **`98bd074` alone did NOT satisfy AC2b.2** under the
+strict reading of the AC's own neuter; the criterion is MET only *with* the `009ecd0`
+addition. Both plan-reserved legs settled affirmatively: the call site is one unbroken
+sequence (`daemon.rs:92-112`, with the tick invocation at `:275-278` sitting **before**
+`drain_watch_events` in the single-threaded loop), and the timing leg ran **10/10 and 10/10**
+solo. Two NON-BLOCKING findings, **both closed at `9d0a1af` rather than recorded**: the
+plan-mandated P2b ledger ride-along had been silently dropped (now measured — see below), and
+AC1.3's "verbatim reproduction" block named seeder scripts that existed nowhere (the seeder is
+now embedded in the ledger row itself).
+**The dropped-then-closed ride-along, because it is real evidence:** eviction-pass cost on the
+**live production store** (2064 turns, 76 MB objects) — `status`'s text path is exactly the
+sequence the daemon tick runs, so timing the whole process is a strict upper bound. **30 runs,
+all exit 0: p50 = 12.9 ms, p90 = 13.1 ms, max = 14.2 ms**, object count unchanged at 256
+across all 40 invocations — AC2b.1's zero-write property confirmed on the *real* store, not
+only a fixture. Against a 10-minute `EVICT_INTERVAL` that is ~2×10⁻⁵ of the daemon loop; not
+a turn-closure risk at this store size, and the figure grows with both turn count and object
+count, so re-measure before assuming it stays negligible.
+**The +15 test delta is the story: 9 came from the plan's own ACs, 6 from defects that review
+found and no acceptance criterion would have caught.**
+**(P1) `c784714`** persists `elapsed_ms` on **all six** hook-recall outcome sites (the early-bail
+sites never computed it at all) and adds `agentrec memories --stats`, which reads
+`memory-stats.jsonl` **directly** — never through `memories()`'s `load_effective` preconditions,
+so a corrupt `memory.jsonl` cannot poison a stats readout of a different file (verified
+empirically, not just read). Three buckets reported separately: measurable, parseable-pre-upgrade,
+and torn. **A plan premise turned out to be false and is corrected in-plan:** AC1.1's rationale
+says the two budget-bail sites "race under the forced-bail seam (either arm wins)". The reviewer
+instrumented both arms and measured **60/60 for the `recv_timeout` Err arm** (30 clean + 30 under
+6-way load) — std's `recv_timeout` does an optimistic `try_recv` before `recv_deadline(now+0)`, so
+the freshly-spawned worker has never sent. The AC still holds (its neuter removes the field from
+**both** sites) but **sites 3/4/5 carry `elapsed_ms` with no test asserting it**, site 3 being the
+one whose value crosses the `u128 as u64` cast. Recorded residual, deliberately not closed —
+widening an AC after the fact is tightening after the fact.
+**(P1 review) `051a9a4`** closed four real defects in that brand-new surface: the `capped` bucket
+could not answer the question it exists for (a capped *injection* landed in `injected` and never
+incremented `capped`, so 50 capped injections read as `capped=0` — now a mutually-exclusive bucket
+plus a cross-cutting `capped_total`); `memories --stats --json` printed prose under a `--json` flag
+(the exact class the honesty round fixed for `status --ack-degraded --json`, fixed the same way —
+clap **rejects** it, does not ignore it); `--stats` returned a confident measured zero in an
+**uninitialized** repo (PD1 class — an absent store must never read as a measured zero); and a doc
+comment that was false for 4 of the 6 sites.
+**(P1 AC1.3) `2bb3937` — the round's headline evidence, and the ledger row it closes.** Release
+build, **10,000-record `memory.jsonl`**, **360 real `agentrec hook` subprocess runs, 0 nonzero
+exits**, in a **throwaway root** — never `~/Projects/agentrec`, which production daemon pid 783
+watches and would have recorded the entire seeding pass into the live dogfood store. Three legs of
+120: **(A)** stale-heavy/capped **p99=16 ms**, **(B)** fresh-first/injecting **p99=13 ms** with
+120/120 real injections, **(C)** leg B under 8-way CPU load **p99=22 ms**. **Zero
+`budget_exceeded` across all 360** — the 50 ms envelope holds **on the merits**, not via the
+fail-open suppression the criterion would equally have accepted. Leg C was taken *beyond* the AC
+because an unloaded sequential run is the "reasoned safe, unobserved" margin class this repo keeps
+getting burned by; it carries its own **positive control** (the load shifted p50 10→16, p99 13→22,
+so it was demonstrably not a no-op). Honest bounds recorded in-row: synthetic corpus, macOS/APFS
+only, warm cache (small effect — the cold first probe was 17 ms against leg A's p99 of 16), and the
+figure scales with corpus size because the hook is a fresh process per prompt and caches nothing.
+**Process note kept because it is the recurring class here:** leg C's 8 spinners **leaked** —
+`kill $LOADPIDS` failed silently since the subshells had reparented to pid 1 — and were found at
+~100% CPU each and killed by pid. Legs A and B predate them and are unaffected. Same class as the
+3607 orphaned `tail` processes that once starved this machine to `posix_spawn failed`; caught only
+because the cleanup was *verified* rather than assumed.
+**(P3) `9cecf6c`** counts dedup hits + heal re-read bytes on the daemon snapshot path
+(`PutResult::Stored` gains `deduped`/`reread_bytes` — a deliberate breaking change to a
+workspace-internal `pub` enum), with **Decision 6** honored exactly: only a *clean* dedup hit
+reports its verification-read cost; the corrupt-fallthrough returns `deduped: false,
+reread_bytes: 0`, because that cost is a heal event and mixing the two would blur the very number
+the phase exists to produce. `drain_io_failures` → `drain_recorder_stats`, guard extended, so write
+cadence stays **≤1 `state.json` write per flush, never one per event**.
+**(P3 review) `33e7987` — the blocking finding, and it was a real one.** `stage` routes symlinks
+through `symlink_change` → `store.put`, which destructured `Stored { hash, .. }` and **discarded
+`deduped`/`reread_bytes`** — so a symlink dedup hit paid a full verification re-read and counted
+nothing. The plan's only two named exclusions (`daemon.rs:1584`, `:1759`) are **both prompt puts**
+in `persist`/`recover_orphan`; neither is a symlink, so this was an in-scope site silently missed —
+**and both the shipped source comment and the README asserted the opposite**, the false-claim-in-a-
+shipped-artifact class this repo has already taken a GATE FAIL for. Now counted, comments corrected.
+Same commit documents that the two counters are **epoch-scoped mirrors, not lifetime totals** (a
+restart renders the dead epoch's figure until the new epoch's first hit — the shape `9b1b09b` fixed
+for `epoch_ignore_rebuilds`), pinned by a test so a future switch to accumulate reds by name.
+**(P2a) `aac459b`** splits `enforce_budget` into pure `plan_eviction` + `execute`,
+behavior-identical, which is what lets `status` stay honest read-only. The three rules the plan
+burned two FAIL rounds converging on all held against real code: the A3(c) freshness guard lives in
+**both** halves; execute re-checks against **the plan's carried `pass_start`, never a fresh
+`now()`** (a fresh-now re-check is *strictly weaker* than the unsplit code in a hard-delete path);
+and protect-retain runs **before** the guard inside `plan`, so a candidate both protected and fresh
+is counted once. All **5 neuters** reproduced RED, and the implementer re-ran two of them against
+the **committed** source after `cargo fmt` reflowed the file rather than trusting the pre-fmt proof.
+AC2a.3's granularity precondition never fired (10/10 solo). **Two inherited constraints it
+surfaced and P2b then honored:** `execute` re-checks **mtime only**, so it is safe *only* when
+called immediately adjacent to its own `plan_eviction`; and `EvictionPlan.victims` order is
+**nondeterministic** (HashSet iteration), so nothing may render or assert on it.
+**(P2b) `98bd074`** moves eviction off the `status` read verb onto a daemon tick (Q1=(a),
+Decision 7): 10-min interval plus one pass at startup **after** `recover_orphan`, with
+`harvest → plan_eviction → execute` as one unbroken statement sequence in the single-threaded loop.
+`status` becomes a pure read verb that still prints the over-budget notice, the orphan clause and
+the protected-bytes honesty line — now from the plan, worded as what the daemon *will* do
+(`would free N B; M protected`), plus `daemon not running — nothing is evicting`. The live-daemon
+protect fixture uses a **newline-terminated torn `log.jsonl` line + a `memory.jsonl` pin** — never
+`open.json`, which `sync_journal`'s idle arm deletes within ~250 ms (the plan's B9 finding, which
+held up in practice).
+**(P2b gap) `009ecd0` — the disclosure that mattered most this round.** P2b's own implementer
+reported 10/10 clean and then volunteered that **its passing test never exercises the recurring
+tick**: the plan mandates a startup eviction pass, the test seeds the over-budget store *before*
+spawning the daemon, so the startup pass always evicts and a broken `EVICT_INTERVAL` would pass
+unnoticed while a long-running daemon silently never evicted. Same vacuity class the plan's own B10
+finding killed at plan time, reproduced in the delivered test. Closed by a test that pushes the
+store over budget **after** the daemon is confirmed live and its startup pass spent. **The proof it
+is non-vacuous is the headline:** under a neuter deleting *only* the periodic tick, the new test
+**fails while the pre-existing `daemon_eviction_keeps_protected_refs` still passes**. The tick
+itself was working — no real bug — but nothing had proven it.
+**Process debt, recorded not papered over.** claimd declare-first held for **every** phase this
+round (the residuals round managed it for only 2 of 5). But two `--stale-on` scopes were **my**
+error: P1's claims omitted `README.md`, and the P3-fix claim omitted `cli/src/state.rs` even though
+the brief itself named `state.rs:145-147` as a file to fix. Both were refused retroactive widening
+by the implementers, correctly — `amend` cannot widen `stale_on`, and a declare-record postdating
+the code makes the log lie about ordering, the one property claimd provides. **`README.md` was
+deliberately NOT added to `lint.ignore`:** it is the file that shipped this repo's false
+"text line resets on each daemon restart" claim and took a GATE FAIL for it, so it is the last doc
+that should be exempt from claim coverage. From P2a onward `--stale-on` was derived from the plan's
+own **Files** line and lint has been clean. Note `claimd lint --range <parent>..HEAD` reports a
+false coverage failure whenever the declares live in `<parent>` itself — the exclusive range omits
+them; `<parent>~1..HEAD` is the honest invocation, and implementers reported both rather than
+substituting the passing one. **Two implementer process failures worth keeping:** one **fabricated
+a sha256** (`45a3d2ff…`, matching no file at either commit — caught by the reviewer hashing all six
+touched files at both commits, and kept out of every receipt), and one ran `git checkout --` mid-
+neuter and **discarded two completed fixes** before redoing them (disclosed unprompted; the redone
+file hashed identically). Neither corrupted delivered code; both are why implementer-reported
+hashes are treated as claims, not evidence.
+**Still open, none blocking:** P1's sites 3/4/5 `elapsed_ms` coverage (above); a persistent
+eviction-history counter (P2b ships stderr + the status dry-run as the only observables); the
+epoch-scoping of the dedup counters (documented, not gated by a nonce); and AC1.3's figure is
+macOS-only, like every other timing margin in this repo. Gap 4 (Linux inotify watch pruning)
+remains deliberately deferred per the plan's rejected list — it reintroduces the new-dir arming
+race the residuals round closed, and there is still no `max_user_watches` exhaustion evidence.
+
+**Perf-evidence plan — PLAN-GATE PASS after 6 revisions (2026-07-28, `main`, docs-only, zero
+code changed):** `docs/superpowers/plans/2026-07-27-agentrec-perf-evidence-round.md` — 4 phases
+(recall `elapsed_ms` + `memories --stats` + the 10k ledger measurement; dedup-hit counters on the
+snapshot path; `retention` plan/execute split; eviction relocated from `status` to a daemon tick),
+~9.5–11.5 h wall estimated, gap 4 (inotify watch pruning) explicitly deferred with the race-class
+reason. **The plan itself was skeptic-gated to a PASS verdict as a hard finalisation condition
+(founder /goal), and it took 5 FAIL rounds — 12 blocking findings, every one real and
+refutation-argued against the actual code.** The instructive ones: (B8) the protected-bytes
+honesty line in `status` is *manufactured by the destructive pass* — `enforce_budget` had no
+dry-run, so a read-only `status` would silently kill a shipped honesty surface and red a test the
+plan never named; (B9) a live-daemon fixture seeding `open.json` is destroyed by the daemon's own
+`sync_journal` idle arm within ~250ms — protect-channel fixtures must use files the daemon only
+appends to; (B10) "freshly-staged blob survives the tick" is vacuous — staged blobs aren't in
+`log.jsonl` until the turn closes, so they are never candidates (the SR6 class, caught at plan
+time instead of shipped); (B11) after splitting plan/execute, the *reference timestamp* of
+execute's freshness re-check was unspecified — fresh-`now()` is strictly weaker than the unsplit
+code in a hard-delete path, and the AC's offered future-dated bump could not tell the designs
+apart; (B12) the both-halves guard fix then *masked its own plan-side neuter* from every
+deletion-observable test, requiring a plan-report-leg discriminator. **Net: three of the five
+FAIL rounds found defects in fixes to earlier findings — the loop converged inward, which is what
+distinguishes a gate from a rubber stamp.** Founder decisions recorded in-plan: Q1 = (a)
+(eviction moves to the daemon; `status` becomes a pure read verb; daemon-down + `undo` growth
+accepted as rare/bounded/self-announcing), Q2 = default (a breached 10k p99 leaves the ledger row
+OPEN-with-figure; no criterion loosened). Plan baseline 428/0/1 was re-verified by the gate's own
+suite run at `834f477`, and the gate's parting scope note is preserved in the plan header: two
+things only the code-level skeptic can settle (unbroken harvest→plan→execute call site; AC2b.2's
+timing-coupled ~2s-seam leg, solo + repeated runs required). Also this session, pre-plan: PR #7
+squash-merged (`5ea946b`) — both P5 ledger rows closed by its CI run (`834f477` records this; the
+"per-phase history kept" draft claim was corrected to squash-merge reality before commit); 2
+leaked test daemons killed; 7 remote + 2 local branches deleted (13 stale locals blocked by the
+git-guardrails hook, command handed to founder); read-verb latency measured on the live store
+(`log`/`blame` 10ms @ 2006 turns — the number that killed log-indexing as a gap). **Nothing
+implemented; next step is `/chunker` on the plan.**
+
 **Residuals round — GATE PASS (2026-07-27, branch `fix/residuals-round` cut from
 `fix/honesty-round`, `3477781..8f89775`, not pushed, no PR):** All 5 phases of
 `docs/superpowers/plans/2026-07-26-agentrec-residuals-round.md`. macOS **422 → 428, 0 failed,
@@ -131,7 +309,17 @@ VMs, two regimes" framing twice over (the 14 and 19 both fall entirely inside th
 this VM's observed span is 8–19, and the re-gate's own run added a **13** at the prior range's exact
 floor; spread uninstrumented, all inside `1..=45`); (F4)
 `e3d24d7`'s subject says "30 stale claims re-confirmed" — the true count is **44** (44 STALE →
-44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). P4's population-level flake claim closes only over CI history. P1's
+44 CONFIRMED, 0 refuted, no manual claim self-attested; message immutable, corrected here). After
+the re-gate PASS the branch was pushed and [PR #7](https://github.com/ravi1395/agentrec/pull/7)
+opened (65 commits, four stacked rounds) and **squash-merged** to `main` as `5ea946b` on 2026-07-27
+— per-phase history survives only in the PR, not on `main` (an earlier draft of this entry, written
+before the merge, claimed "per-phase history kept") — and its `pull_request` trigger
+closed **both** structurally-blocked P5 ledger rows the same evening: run
+[30309231117](https://github.com/ravi1395/agentrec/actions/runs/30309231117), all 5 jobs green,
+ubuntu legs 431/0/2 each, and the `--nocapture` step printed `rebuild_count observed: 11` on both
+ubuntu runners — the "AC1 is unclosable from a branch" analysis was true for `workflow_dispatch`
+but missed that a PR *is* the branch-reachable trigger; the rows closed by the route the round
+declined to take (a PR), taken later with founder approval. P4's population-level flake claim closes only over CI history. P1's
 verdict is bounded: the "aged" fixture is `rsync`-copied seconds before the watcher attaches, so it
 is aged in tree shape but **not** in per-path FSEvents journal history — weeks-old production
 directories remain unprobed and unprobeable by fixture; the dogfood daemon on this repo is the

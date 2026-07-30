@@ -212,6 +212,17 @@ enum Command {
         /// Emit the full effective records (+ freshness) as JSON.
         #[arg(long)]
         json: bool,
+        /// Summarize per-hook recall latency (elapsed_ms) from
+        /// memory-stats.jsonl instead of listing memories. Reads that file
+        /// directly — bypasses memory.jsonl entirely, so a corrupt store
+        /// never blocks this readout. Rejected together with
+        /// `--stale`/`--all`/`--json` (finding 4, review round; same
+        /// precedent as `status --ack-degraded --json`): those flags shape
+        /// the memory-listing branch this one bypasses entirely, and
+        /// silently ignoring them let a monitoring script ask for
+        /// `--stats --json` and get human prose instead of an error.
+        #[arg(long, conflicts_with_all = ["stale", "all", "json"])]
+        stats: bool,
     },
     /// Emit an agent-authored memory candidate (write path): appends a
     /// memory-candidate signal for the daemon to validate, hash, and
@@ -327,7 +338,18 @@ fn main() {
             json,
             for_hook,
         } => memorycmds::recall_cmd(&root, &query, k, json, for_hook),
-        Command::Memories { stale, all, json } => memorycmds::memories(&root, stale, all, json),
+        Command::Memories {
+            stale,
+            all,
+            json,
+            stats,
+        } => {
+            if stats {
+                memorycmds::memories_stats(&root)
+            } else {
+                memorycmds::memories(&root, stale, all, json)
+            }
+        }
         Command::Candidate { fact, from, tool } => {
             memorycmds::candidate(&root, &fact, &from, &tool)
         }
