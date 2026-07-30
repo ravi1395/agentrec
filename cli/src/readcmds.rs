@@ -283,6 +283,18 @@ fn print_entry(store: &BlobStore, entry: &FileEntry) {
         return;
     }
 
+    // D1 (P2 fix round): `after` here is a DERIVED value (an imported
+    // turn's oldString→newString substitution), not bytes anyone actually
+    // observed post-edit — the diff below must not be presented as
+    // recorded fact without saying so.
+    if entry.after_synthesized == Some(true) {
+        println!(
+            "  {}: (after-state DERIVED from imported oldString/newString substitution, \
+             not observed)",
+            entry.path
+        );
+    }
+
     let text = match entry.op.as_str() {
         "create" => diff::unified("", after_str, &entry.path),
         "delete" => diff::unified(before_str, "", &entry.path),
@@ -672,6 +684,35 @@ pub fn undo(
         }
     }
 
+    // AC3 (P2, clm_2GCNB5WPT0FKHH4NFBYB9Q2JJT): a turn imported from
+    // external history whose selected files include any provenance-only
+    // entry (`before: null` — NOT a `create` op, whose `before: null` is
+    // legitimate rather than a reconstruction failure) refuses the WHOLE
+    // undo BEFORE `build_plan`/`execute_revert` ever run — never a partial
+    // revert of the other, genuinely-revertible entries in the same turn.
+    // Distinct wording from `withheld` ("secret-pattern..."), `skipped`
+    // ("content not snapshotted...") and modified-since ("later agent
+    // turn"/"recording gap"/"human or external edit").
+    if target.imported == Some(true) {
+        let selected: Vec<&FileEntry> = target
+            .files
+            .iter()
+            .filter(|f| files.is_empty() || files.contains(&f.path))
+            .collect();
+        let unreconstructable = selected
+            .iter()
+            .filter(|f| f.op != "create" && f.before.is_none())
+            .count();
+        if unreconstructable > 0 {
+            return Err(format!(
+                "undo refused: turn {} was imported from external history and has no \
+                 recoverable pre-edit content for {unreconstructable} file(s) — \
+                 provenance-only, never fabricated; nothing was written",
+                fmt::short_id(&target.id)
+            ));
+        }
+    }
+
     let store = BlobStore::new(objects_dir(root));
     let plans = build_plan(
         root,
@@ -747,6 +788,8 @@ pub fn undo(
                     "undo of {short_target} (partial — aborted mid-revert)"
                 )),
                 merges: vec![],
+                imported: None,
+                files_complete: None,
                 files: inverse_entries,
             };
             let _ = crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(partial));
@@ -773,6 +816,8 @@ pub fn undo(
         prompt_ref: None,
         prompt_excerpt: Some(format!("undo of {short_target}")),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: inverse_entries,
     };
     let reverted_n = undo_record.files.len();
@@ -916,8 +961,17 @@ fn build_plan(
         let current = read_current_hash(root, &entry.path);
         let is_modified = current.as_deref() != entry.after.as_deref();
 
+        let after_synthesized = entry.after_synthesized == Some(true);
+
         if is_modified && !allow_modified {
-            let cause = modified_cause(target_idx, turns, records, target, &entry.path);
+            let cause = modified_cause(
+                target_idx,
+                turns,
+                records,
+                target,
+                &entry.path,
+                after_synthesized,
+            );
             plans.push(Plan {
                 entry: entry.clone(),
                 kind: PlanKind::Excluded { cause },
@@ -925,8 +979,16 @@ fn build_plan(
             continue;
         }
 
-        let warn =
-            is_modified.then(|| modified_cause(target_idx, turns, records, target, &entry.path));
+        let warn = is_modified.then(|| {
+            modified_cause(
+                target_idx,
+                turns,
+                records,
+                target,
+                &entry.path,
+                after_synthesized,
+            )
+        });
         plans.push(Plan {
             entry: entry.clone(),
             kind: PlanKind::Revert { warn },
@@ -952,7 +1014,18 @@ fn modified_cause(
     records: &[LogRecord],
     target: &TurnRecord,
     path: &str,
+    after_synthesized: bool,
 ) -> String {
+    // D1 (P2 fix round, founder decision 2): a synthesized `after` is a
+    // DERIVED value, not an observation of what the file actually looked
+    // like post-edit — comparing the real on-disk hash against it and
+    // reporting a mismatch as "human or external edit" would fabricate
+    // attribution nobody earned. This must win over both signals below: a
+    // later rich turn or a recording gap are real facts about *observed*
+    // history, but neither makes an unobserved comparison point trustworthy.
+    if after_synthesized {
+        return "imported turn's after-state was derived (not observed) — cannot attribute this difference".to_string();
+    }
     let later_touches = turns[target_idx + 1..]
         .iter()
         .any(|t| t.grade == "rich" && t.files.iter().any(|f| f.path == path));
@@ -1099,6 +1172,7 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     })
 }
 

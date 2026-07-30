@@ -1711,6 +1711,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -1749,6 +1751,7 @@ fn diff_text_modify_shows_unified() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "src/new.rs".into(),
@@ -1759,6 +1762,7 @@ fn diff_text_modify_shows_unified() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -1798,6 +1802,7 @@ fn diff_binary_file_message() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1836,6 +1841,7 @@ fn diff_skipped_file_notice() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1877,6 +1883,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::IO_FAILED.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "unreadable.rs".into(),
@@ -1887,6 +1894,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::UNREADABLE.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "legacy.rs".into(),
@@ -1897,6 +1905,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None, // pre-this-round log entry
+                after_synthesized: None,
             },
             FileEntry {
                 // hash recorded, but no such blob was ever put in the store —
@@ -1909,6 +1918,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -2000,6 +2010,7 @@ fn diff_reports_corrupt_blob_distinctly_from_missing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2080,6 +2091,7 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2100,6 +2112,7 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2577,6 +2590,8 @@ fn make_turn(
         prompt_ref: None,
         prompt_excerpt: prompt_excerpt.map(str::to_string),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -2621,6 +2636,7 @@ fn blame_file_reports_last_rich_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2640,6 +2656,7 @@ fn blame_file_reports_last_rich_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2707,6 +2724,7 @@ fn blame_bare_turn_no_fabrication() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2746,6 +2764,7 @@ fn blame_deleted_file_resolves() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     // z.rs is never written to disk — absent, as expected post-delete.
@@ -2786,6 +2805,7 @@ fn blame_line_level_added_and_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2836,6 +2856,7 @@ fn blame_gap_is_stale() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2888,6 +2909,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2917,6 +2939,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2978,6 +3001,7 @@ fn blame_line_create_turn_still_credited() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3028,6 +3052,7 @@ fn blame_line_unresolvable_after_not_false_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3086,6 +3111,7 @@ fn undo_clean_revert_byte_exact() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3135,6 +3161,7 @@ fn undo_preview_does_not_mutate() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3182,6 +3209,7 @@ fn undo_file_subset() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "b.rs".into(),
@@ -3192,6 +3220,7 @@ fn undo_file_subset() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -3234,6 +3263,7 @@ fn undo_modified_since_excluded_then_allowed() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3301,6 +3331,7 @@ fn undo_skipped_and_withheld_refused() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(agentrec_core::record::skip_reason::IO_FAILED.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "w.rs".into(),
@@ -3311,6 +3342,7 @@ fn undo_skipped_and_withheld_refused() {
                 withheld: true,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -3349,6 +3381,7 @@ fn undo_skipped_and_withheld_refused() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -3419,6 +3452,7 @@ fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3478,6 +3512,7 @@ fn undo_create_and_delete_inverse() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -3502,6 +3537,7 @@ fn undo_create_and_delete_inverse() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_b);
@@ -3540,6 +3576,7 @@ fn undo_is_a_turn_and_reversible() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3598,6 +3635,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn1);
@@ -3617,6 +3655,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn2);
@@ -3663,6 +3702,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn_rich);
@@ -3682,6 +3722,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn_bare);
@@ -4118,6 +4159,7 @@ fn panic_undo_skips_git_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_claude);
@@ -4140,6 +4182,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "checkout_b.rs".into(),
@@ -4150,6 +4193,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "checkout_c.rs".into(),
@@ -4160,6 +4204,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -4252,6 +4297,7 @@ fn purge_removes_expired_prompt_blob_keeps_shared() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     old_shared.started = days_ago_rfc3339(200);
@@ -4377,6 +4423,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_old1.started = "2024-01-01T00:00:00.000Z".into();
@@ -4394,6 +4441,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_old2.started = "2024-02-01T00:00:00.000Z".into();
@@ -4413,6 +4461,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_new.started = "2024-06-01T00:00:00.000Z".into();
@@ -5493,6 +5542,7 @@ fn noise_turn(id: &str) -> agentrec_core::record::TurnRecord {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     };
     base_turn(
         id,
@@ -5562,6 +5612,7 @@ fn nf_is_noise_does_not_panic_on_absolute_path() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5697,6 +5748,7 @@ fn nf5_blame_and_undo_unaffected_by_noise_globs() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5741,6 +5793,7 @@ fn nf6_all_noise_turn_still_appears_and_rich_rate_unaffected() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     };
     let all_noise_turn = base_turn(
         "t_NF6ALLNOISE00000000000001",
@@ -6768,6 +6821,7 @@ fn memories_stale_shows_drifted_pin_and_when() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -8831,6 +8885,7 @@ fn status_eviction_keeps_open_turn_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         ),
     );
@@ -8847,6 +8902,7 @@ fn status_eviction_keeps_open_turn_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         ),
     );

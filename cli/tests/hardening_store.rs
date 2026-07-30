@@ -64,6 +64,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -109,6 +111,7 @@ fn purge_snapshots_before_ignores_planted_malformed_hash() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     old_turn.started = "2020-01-01T00:00:00.000Z".into();
@@ -168,6 +171,7 @@ fn default_purge_keeps_prompt_blob_also_referenced_as_a_snapshot() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     snapshot_turn.started = days_ago_rfc3339(1);
@@ -208,6 +212,7 @@ fn purge_snapshots_before_keeps_snapshot_blob_also_referenced_as_a_prompt() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     old_snapshot_turn.started = "2020-01-01T00:00:00.000Z".into();

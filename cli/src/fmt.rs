@@ -233,6 +233,15 @@ pub fn turn_list_line(t: &TurnRecord, when: &str, files: &str, id_color: bool) -
     if t.truncated {
         line.push_str(&format!("{SEP}(truncated)"));
     }
+    // AC7 (P2): an imported turn's file list is known-partial (opaque tool
+    // calls and non-file activity from the source transcript are never
+    // captured) — `log` marks it explicitly rather than presenting it as a
+    // complete accounting. Gated on `files_complete == Some(false)`, which
+    // is never set on a live-recorded (bare or rich) turn, so a bare turn
+    // is never relabeled by this clause.
+    if t.files_complete == Some(false) {
+        line.push_str(&format!("{SEP}partial file list (imported)"));
+    }
     line
 }
 
@@ -392,6 +401,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: excerpt.map(String::from),
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![],
         }
     }

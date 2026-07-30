@@ -459,7 +459,13 @@ fn default_source_resolves_via_home_env_when_source_omitted() {
 // silent no-op. --------------------------------------------------------
 
 #[test]
-fn dry_run_false_is_a_loud_error_not_a_silent_noop() {
+fn dry_run_false_persists_instead_of_refusing_now_that_p2_has_landed() {
+    // Superseded by P2: P1's refusal existed only because persistence
+    // didn't exist yet ("not implemented until P2"). Now that it has,
+    // omitting `--dry-run` performs real persistence, scoped to `--root`.
+    // The "opaque" fixture's session has no file-producing entries at all
+    // (only an opaque Bash call), so nothing is in scope to persist
+    // regardless of root, and the command must still exit 0.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
         .args(["import", "claude", "--source"])
@@ -469,11 +475,15 @@ fn dry_run_false_is_a_loud_error_not_a_silent_noop() {
         .output()
         .expect("run agentrec import claude without --dry-run");
 
-    assert!(!out.status.success(), "must exit nonzero without --dry-run");
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--dry-run") && stderr.contains("P2"),
-        "stderr must name the reason, got: {stderr}"
+        out.status.success(),
+        "P2: omitting --dry-run must persist, not refuse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("appended: 0"),
+        "opaque-only fixture has nothing to persist, got: {stdout}"
     );
 }
 
@@ -501,6 +511,7 @@ fn text_report_contains_every_json_field_in_prose() {
         "t3=",
         "opaque_calls",
         "mean_opaque_share_pct",
+        "skipped_secret_path",
         "skipped_sidechain",
         "skipped_malformed_line",
         "skipped_non_utf8_line",
@@ -981,4 +992,816 @@ fn redundant_reannouncement_of_same_backup_name_does_not_clear_staleness() {
         "must NOT resolve T1.5 despite the redundant same-name re-announcement"
     );
     assert!(redundant_entries[1]["sha256"].is_null());
+}
+
+// =====================================================================
+// P2: persistence (`agentrec import claude`, no `--dry-run`)
+// =====================================================================
+//
+// P1's fixtures above use fake `cwd` values ("/fake/repo") since dry-run
+// classification never touches the filesystem at `cwd`. Persistence DOES
+// (root-scoping, T2 git resolution), so every test below builds its own
+// transcript dynamically, pointed at a real tempdir it controls — a static
+// fixture file can't know its own tempdir path at authoring time.
+
+mod persist {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_session(source: &Path, project: &str, session_id: &str, lines: &[String]) {
+        let dir = source.join("projects").join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{session_id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
+    fn run_persist(source: &Path, root: &Path) -> Output {
+        Command::new(bin())
+            .args(["import", "claude", "--source"])
+            .arg(source)
+            .arg("--root")
+            .arg(root)
+            .output()
+            .expect("run agentrec import claude (persist)")
+    }
+
+    fn run_persist_json(source: &Path, root: &Path) -> Output {
+        Command::new(bin())
+            .args(["import", "claude", "--json", "--source"])
+            .arg(source)
+            .arg("--root")
+            .arg(root)
+            .output()
+            .expect("run agentrec import claude --json (persist)")
+    }
+
+    fn init_repo(root: &Path) {
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.name", "test"])
+            .status()
+            .unwrap();
+    }
+
+    /// Commits `rel_path` with `content`, at an explicit author/committer
+    /// date, so a test can control exactly which commits `git log --before`
+    /// sees — real commit dates, not the arbitrary fictional-future
+    /// timestamps this fixture format otherwise uses.
+    fn git_commit_at(root: &Path, rel_path: &str, content: &str, date_no_tz: &str) {
+        // An explicit `+00:00` offset is load-bearing: the transcript
+        // timestamps this is compared against (`--before=...Z`) are UTC,
+        // and `GIT_AUTHOR_DATE` without an explicit offset is interpreted
+        // in the LOCAL timezone — on a machine east of UTC that silently
+        // shifts which side of `--before` a commit lands on.
+        let date_rfc3339 = format!("{date_no_tz}+00:00");
+        std::fs::write(root.join(rel_path), content).unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", rel_path])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env("GIT_AUTHOR_DATE", &date_rfc3339)
+            .env("GIT_COMMITTER_DATE", &date_rfc3339)
+            .args(["commit", "-q", "-m", "commit"])
+            .status()
+            .unwrap();
+    }
+
+    fn log_lines(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join(".agentrec/log.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn turn_lines(root: &Path) -> Vec<serde_json::Value> {
+        log_lines(root)
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("turn"))
+            .collect()
+    }
+
+    // ---- AC2 (clm_6NQ448DW5PD4X4XW5EKX9CVPKM): idempotent re-run appends
+    // 0; kill-9-then-resume is byte-identical (after sort) to an
+    // uninterrupted run. -----------------------------------------------
+
+    #[test]
+    fn ac2_rerun_appends_zero_new_records() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-10T09:00:00.000Z","sessionId":"s_ac2","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"please fix a.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-10T09:00:05.000Z","sessionId":"s_ac2","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/a.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac2", &lines);
+
+        let out1 = run_persist(source.path(), root.path());
+        assert!(out1.status.success(), "{out1:?}");
+        let stdout1 = String::from_utf8_lossy(&out1.stdout);
+        assert!(stdout1.contains("appended: 1"), "stdout: {stdout1}");
+
+        let after_first = log_lines(root.path());
+        assert_eq!(turn_lines(root.path()).len(), 1);
+
+        let out2 = run_persist(source.path(), root.path());
+        assert!(out2.status.success(), "{out2:?}");
+        let stdout2 = String::from_utf8_lossy(&out2.stdout);
+        assert!(
+            stdout2.contains("appended: 0"),
+            "AC2: re-run must append 0 new records, got: {stdout2}"
+        );
+        assert_eq!(
+            log_lines(root.path()),
+            after_first,
+            "AC2: re-run must not change log.jsonl at all"
+        );
+    }
+
+    // AC2's kill-9 half: a real mid-process SIGKILL is nondeterministic to
+    // time reliably in a unit test, so this proves the mechanism that makes
+    // resumability true — deterministic ids + idempotent skip — by
+    // constructing the "killed after session 1, before session 2" state
+    // directly (pre-seeding only session 1's already-appended turn) and
+    // asserting the resumed run's final log is byte-identical (after
+    // sorting lines, which sorts by `id` here since every line shares the
+    // same `v`/`type` prefix) to an uninterrupted two-session run.
+    #[test]
+    fn ac2_resume_after_simulated_interruption_matches_uninterrupted_run() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let cwd = root.path().to_string_lossy().to_string();
+
+        for sid in ["s1_ac2r", "s2_ac2r"] {
+            let lines = vec![
+                format!(
+                    r#"{{"type":"user","uuid":"u_{sid}","timestamp":"2026-06-11T09:00:00.000Z","sessionId":"{sid}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit {sid}.txt"}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"assistant","uuid":"a_{sid}","timestamp":"2026-06-11T09:00:05.000Z","sessionId":"{sid}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t_{sid}","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/{sid}.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+                ),
+            ];
+            write_session(source.path(), "proj", sid, &lines);
+        }
+
+        // Reference: one uninterrupted run over both sessions, same root.
+        let out_ref = run_persist(source.path(), root.path());
+        assert!(out_ref.status.success());
+        assert_eq!(turn_lines(root.path()).len(), 2);
+        let mut reference: Vec<String> = log_lines(root.path());
+        reference.sort();
+
+        // Simulate "killed after session 1, before session 2": wipe this
+        // SAME root back to empty (log + objects), then persist only
+        // session 1's file, then resume with both files present. Same
+        // root throughout means `root`/paths/hashes are directly
+        // comparable to `reference` — the earlier version of this test
+        // compared two different roots and never actually asserted byte
+        // equality; this version does.
+        std::fs::remove_file(root.path().join(".agentrec/log.jsonl")).unwrap();
+        let _ = std::fs::remove_dir_all(root.path().join(".agentrec/objects"));
+
+        let source_partial = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source_partial.path().join("projects/proj")).unwrap();
+        std::fs::copy(
+            source.path().join("projects/proj/s1_ac2r.jsonl"),
+            source_partial.path().join("projects/proj/s1_ac2r.jsonl"),
+        )
+        .unwrap();
+        let out_partial = run_persist(source_partial.path(), root.path());
+        assert!(out_partial.status.success());
+        assert_eq!(
+            turn_lines(root.path()).len(),
+            1,
+            "partial run should have appended exactly session 1's turn"
+        );
+
+        // Resume: same root, now with BOTH session files available (mirrors
+        // a process that crashed after session 1 and was restarted against
+        // the full, unchanged source corpus).
+        let out_resume = run_persist(source.path(), root.path());
+        assert!(out_resume.status.success());
+        let stdout_resume = String::from_utf8_lossy(&out_resume.stdout);
+        assert!(
+            stdout_resume.contains("appended: 1"),
+            "resume must append only the NEW session's turn, session 1 already present: {stdout_resume}"
+        );
+
+        let mut resumed: Vec<String> = log_lines(root.path());
+        resumed.sort();
+        assert_eq!(
+            resumed, reference,
+            "AC2: a kill-9'd-then-resumed run must be byte-identical (after \
+             sorting) to an uninterrupted run"
+        );
+    }
+
+    // ---- AC4 (clm_6TEDAJ0DE6S93FAQ7BYQPRE1WE): import-missing-`before`
+    // entries have `baseline_unknown == false`, asserted on the wire. ------
+
+    #[test]
+    fn ac4_import_missing_before_never_sets_baseline_unknown() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path()); // no commit at all — T2 has nothing to find
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-12T09:00:00.000Z","sessionId":"s_ac4","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit orphan.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-12T09:00:05.000Z","sessionId":"s_ac4","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/orphan.txt","oldString":"one","newString":"ONE"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac4", &lines);
+
+        let out = run_persist(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0]["before"].is_null(), "T3: before must be null");
+        assert!(
+            files[0].get("baseline_unknown").is_none(),
+            "AC4: baseline_unknown must be absent (false) on an import-missing-before \
+             entry, not reused from the live first-observation meaning; got: {:?}",
+            files[0]
+        );
+    }
+
+    // ---- AC5 (clm_6V537ZT8N3Z11MXVEWZE1P65SA): T2 resolution — the latest
+    // commit at-or-before the entry's own timestamp, byte-equal to
+    // known-good content; a candidate whose exact bytes were never
+    // committed falls through to T3 `before: null`, never a near-miss
+    // commit. -------------------------------------------------------------
+
+    #[test]
+    fn ac5_t2_candidate_resolves_exact_committed_blob() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        // Commit BEFORE the edit's own timestamp: this is the state T2 must
+        // resolve to.
+        git_commit_at(root.path(), "tracked.txt", "alpha\n", "2026-06-13T08:00:00");
+        // A LATER commit, after the edit — must never be preferred.
+        git_commit_at(
+            root.path(),
+            "tracked.txt",
+            "alpha-newer\n",
+            "2026-06-13T10:00:00",
+        );
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-13T09:00:00.000Z","sessionId":"s_ac5","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit tracked.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-13T09:00:05.000Z","sessionId":"s_ac5","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/tracked.txt","oldString":"alpha","newString":"beta"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac5", &lines);
+
+        let out = run_persist_json(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["t2_resolution"]["resolved"], 1, "report: {report}");
+
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let before_ref = files[0]["before"].as_str().expect("before must resolve");
+        // Byte-equal to the known-good pre-edit commit, not the later one.
+        assert_eq!(
+            before_ref,
+            agentrec_core::store::hash_bytes(b"alpha\n"),
+            "must resolve the commit at-or-before the edit's OWN timestamp, never a later one"
+        );
+    }
+
+    // Never a near-miss: bytes that were never committed at all (the edit's
+    // `oldString` doesn't match ANY committed state, e.g. a mid-session
+    // intermediate edit that never got its own commit) must fall through to
+    // T3 `before: null`, never fall back to whatever commit happens to exist.
+    #[test]
+    fn ac5_t2_never_falls_back_to_a_near_miss_commit() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        // The only commit's content does NOT contain the edit's `oldString`
+        // ("alpha") at all — this is not this edit's pre-state.
+        git_commit_at(
+            root.path(),
+            "tracked.txt",
+            "totally-unrelated-content\n",
+            "2026-06-14T08:00:00",
+        );
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-14T09:00:00.000Z","sessionId":"s_ac5b_neg","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit tracked.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-14T09:00:05.000Z","sessionId":"s_ac5b_neg","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/tracked.txt","oldString":"alpha","newString":"beta"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac5b_neg", &lines);
+
+        let out = run_persist_json(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["t2_resolution"]["resolved"], 0);
+        assert_eq!(report["t2_resolution"]["rejected_unverifiable"], 1);
+
+        let turns = turn_lines(root.path());
+        let files = turns[0]["files"].as_array().unwrap();
+        assert!(
+            files[0]["before"].is_null(),
+            "must fall through to T3 before:null, never the near-miss commit's bytes"
+        );
+    }
+
+    // ---- AC5b (added): fabrication-rate oracle. Two fixture legs
+    // (positive: git blob matches; negative: it doesn't) plus a real-corpus
+    // measurement (separate #[ignore]d test below, run manually and
+    // reported — never asserted against, since the corpus is this
+    // developer's real, uncommitted-to-the-repo data). --------------------
+
+    #[test]
+    fn ac5b_oracle_fixture_positive_git_blob_matches_true_before() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        git_commit_at(root.path(), "f.txt", "one\ntwo\n", "2026-06-15T08:00:00");
+
+        let cwd = root.path().to_string_lossy().to_string();
+        // originalFile ("one\ntwo\n") matches exactly what was committed —
+        // the oracle must find 0 mismatches over a denominator of 1.
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-15T09:00:00.000Z","sessionId":"s_oracle_pos","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit f.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-15T09:00:05.000Z","sessionId":"s_oracle_pos","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/f.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_oracle_pos", &lines);
+
+        let out = Command::new(bin())
+            .args(["import", "claude", "--json", "--source"])
+            .arg(source.path())
+            .arg("--root")
+            .arg(root.path())
+            .env("AGENTREC_IMPORT_T2_ORACLE", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["t2_oracle"]["denominator"], 1, "report: {report}");
+        assert_eq!(report["t2_oracle"]["mismatches"], 0);
+    }
+
+    #[test]
+    fn ac5b_oracle_fixture_negative_git_blob_disagrees_with_true_before() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        // Committed content DOES contain the edit's `oldString` ("one") —
+        // so the T1.5-style content guard `resolve_t2_before` applies would
+        // pass it — but the rest of the blob disagrees with the true
+        // `originalFile` below. This is the exact fabrication shape that
+        // survived an `oldString`-only guard once already (T1.5 round): a
+        // stale/wrong blob whose unrelated region happens to contain the
+        // needle.
+        git_commit_at(
+            root.path(),
+            "f.txt",
+            "one\nDIFFERENT-STALE-LINE\n",
+            "2026-06-16T08:00:00",
+        );
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-16T09:00:00.000Z","sessionId":"s_oracle_neg","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit f.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-16T09:00:05.000Z","sessionId":"s_oracle_neg","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/f.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_oracle_neg", &lines);
+
+        let out = Command::new(bin())
+            .args(["import", "claude", "--json", "--source"])
+            .arg(source.path())
+            .arg("--root")
+            .arg(root.path())
+            .env("AGENTREC_IMPORT_T2_ORACLE", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["t2_oracle"]["denominator"], 1, "report: {report}");
+        assert_eq!(
+            report["t2_oracle"]["mismatches"], 1,
+            "oracle must detect that the git blob does NOT match the true pre-edit bytes"
+        );
+    }
+
+    // The debug seam must not exist in a release binary (Pinned decision 9
+    // posture, extended to this new seam).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn ac5b_oracle_seam_disabled_in_release_even_with_env_set() {
+        std::env::set_var("AGENTREC_IMPORT_T2_ORACLE", "1");
+        // In a release build the seam is compiled out; nothing to assert
+        // beyond "this compiles and the env var is inert" — the release
+        // `strings` check (run manually, see report) is the real proof.
+        std::env::remove_var("AGENTREC_IMPORT_T2_ORACLE");
+    }
+
+    // ---- AC6 (unlabeled in P2.md's list, 5th bullet): a planted secret in
+    // a transcript prompt appears in neither the CAS prompt blob nor
+    // `prompt_excerpt`. Scrub runs INSIDE persistence (house invariant). ---
+
+    #[test]
+    fn ac6_planted_secret_in_prompt_never_appears_in_blob_or_excerpt() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        let cwd = root.path().to_string_lossy().to_string();
+        // D5 (P2 fix round): AC6 names THREE distinct secret classes, not
+        // one — an earlier version of this test planted only the `sk-...`
+        // shape. All three literals below are the exact ones
+        // `agentrec-core/src/scrub.rs`'s own test suite already proves
+        // redact (`known_secret_shapes_redacted`,
+        // `entropy_catches_hex_and_decimal_tokens`,
+        // `quoted_multiword_secret_fully_redacted`) — reused here rather
+        // than invented, so this test can't silently drift from what scrub
+        // actually catches.
+        let sk_secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let hex64_secret = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let quoted_secret = r#"password = "correct horse battery staple""#;
+        let prompt_text = format!(
+            "use this key {sk_secret} and blob {hex64_secret} and {quoted_secret} to fix a.txt"
+        );
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-17T09:00:00.000Z","sessionId":"s_ac6","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":{prompt_json}}}}}"#,
+                prompt_json = serde_json::to_string(&prompt_text).unwrap()
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T09:00:05.000Z","sessionId":"s_ac6","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/a.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac6", &lines);
+
+        let out = run_persist(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let excerpt = turns[0]["prompt_excerpt"].as_str().unwrap_or("");
+
+        let prompt_ref = turns[0]["prompt_ref"]
+            .as_str()
+            .expect("prompt must have been stored");
+        let hex = prompt_ref.strip_prefix("sha256:").unwrap();
+        let (fan, rest) = hex.split_at(2);
+        let blob_path = root.path().join(".agentrec/objects").join(fan).join(rest);
+        let blob = std::fs::read_to_string(&blob_path).unwrap();
+        assert!(
+            blob.contains("[redacted:"),
+            "blob must show a redaction marker: {blob}"
+        );
+
+        for (label, secret) in [
+            ("sk-...", sk_secret),
+            ("64-hex", hex64_secret),
+            ("quoted multi-word credential", quoted_secret),
+        ] {
+            assert!(
+                !excerpt.contains(secret),
+                "AC6: {label} secret leaked into prompt_excerpt: {excerpt}"
+            );
+            assert!(
+                !blob.contains(secret),
+                "AC6: {label} secret leaked into the CAS prompt blob: {blob}"
+            );
+        }
+        // The quoted credential's individual words must not leak either
+        // (mirrors scrub.rs's own `quoted_multiword_secret_fully_redacted`
+        // assertion) — containment-of-the-whole-string alone could miss a
+        // partial leak if scrub redacted only part of the quoted value.
+        for word in ["correct", "horse", "battery", "staple"] {
+            assert!(
+                !blob.contains(word),
+                "AC6: quoted secret word leaked: {word} in {blob}"
+            );
+        }
+    }
+
+    // ---- D7 (P2 fix round): dry-run and persist must agree on a secret
+    // file — dry-run counts it under `skipped_secret_path` (never
+    // tier-classified as if it were reconstructible), persist withholds it
+    // (never snapshotted). Same transcript, both modes, one shared fixture
+    // — exactly the cross-check the P1 fabrication defects show is needed
+    // whenever two paths measure "the same" thing independently.
+    #[test]
+    fn d7_secret_path_parity_between_dry_run_and_persist() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-19T09:00:00.000Z","sessionId":"s_d7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit .env"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-19T09:00:05.000Z","sessionId":"s_d7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/.env","oldString":"KEY=old","newString":"KEY=new","originalFile":"KEY=old\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_d7", &lines);
+
+        // Dry-run leg: the secret file must be counted under
+        // `skipped_secret_path`, NOT tier-classified.
+        let dry_out = Command::new(bin())
+            .args(["import", "claude", "--dry-run", "--json", "--source"])
+            .arg(source.path())
+            .arg("--root")
+            .arg(root.path())
+            .output()
+            .unwrap();
+        assert!(dry_out.status.success(), "{dry_out:?}");
+        let dry_report: Value = serde_json::from_slice(&dry_out.stdout).unwrap();
+        assert_eq!(dry_report["skipped_secret_path"], 1, "report: {dry_report}");
+        assert_eq!(dry_report["tier_counts"]["t1"], 0, "report: {dry_report}");
+
+        // Persist leg: withheld, never snapshotted, never stored as an
+        // over-cap/regular blob.
+        let persist_out = run_persist(source.path(), root.path());
+        assert!(persist_out.status.success(), "{persist_out:?}");
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["withheld"], true, "entry: {:?}", files[0]);
+        assert!(files[0]["before"].is_null());
+        assert!(files[0]["after"].is_null());
+    }
+
+    // ---- BLOCKER 1 (P2 integration-gate fix round): a file-producing
+    // entry whose `filePath` is NOT lexically under its session's `cwd`
+    // must be COUNTED (`skipped_out_of_cwd`), not silently vanish. Mirrors
+    // the skeptic's proven failure scenario exactly: `cwd = <root>/sub`,
+    // a fully-recoverable T1 entry (real `originalFile` bytes) sits at
+    // `<root>/outside-cwd-inside-root.txt` — outside cwd, but still inside
+    // root. Recovery is NOT authorized this round: the entry must still be
+    // refused, only now visibly.
+    #[test]
+    fn blocker1_out_of_cwd_entry_is_counted_not_silently_dropped() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+
+        let cwd = root.path().join("sub").to_string_lossy().to_string();
+        let outside_path = root.path().join("outside-cwd-inside-root.txt");
+        let outside_path_str = outside_path.to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-20T09:00:00.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"touch both files"}}}}"#
+            ),
+            // In-cwd entry: must persist normally (proves the fix doesn't
+            // over-refuse — only the genuinely out-of-cwd entry is dropped).
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-20T09:00:05.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/inside.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+            // Out-of-cwd (but in-root) entry: fully recoverable (real
+            // originalFile bytes) yet must be refused-and-counted, not
+            // silently dropped.
+            format!(
+                r#"{{"type":"assistant","uuid":"a2","timestamp":"2026-06-20T09:00:06.000Z","sessionId":"s_b1","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t2","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{outside_path_str}","oldString":"alpha","newString":"beta","originalFile":"alpha\nkeep\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_b1", &lines);
+
+        let out = run_persist_json(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["skipped_out_of_cwd"], 1,
+            "the out-of-cwd entry must be counted: report={report}"
+        );
+
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1);
+        let files = turns[0]["files"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "only the in-cwd entry persists — the out-of-cwd one is refused, not recovered: {files:?}"
+        );
+        assert_eq!(files[0]["path"], "sub/inside.txt");
+        assert!(
+            !files.iter().any(|f| f["path"]
+                .as_str()
+                .unwrap_or("")
+                .contains("outside-cwd-inside-root")),
+            "the out-of-cwd entry must never appear in files, even though its bytes were \
+             fully recoverable: {files:?}"
+        );
+    }
+
+    // ---- AC7 (last P2.md bullet): `log` renders imported turns with a
+    // "partial file list (imported)" marker; a bare turn is never relabeled.
+
+    #[test]
+    fn ac7_log_marks_imported_turns_partial_and_never_relabels_bare() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+
+        let cwd = root.path().to_string_lossy().to_string();
+        let lines = vec![
+            format!(
+                r#"{{"type":"user","uuid":"u1","timestamp":"2026-06-18T09:00:00.000Z","sessionId":"s_ac7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit a.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","timestamp":"2026-06-18T09:00:05.000Z","sessionId":"s_ac7","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/a.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ];
+        write_session(source.path(), "proj", "s_ac7", &lines);
+
+        let out = run_persist(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+
+        // Also seed a plain BARE turn directly (never imported, never
+        // rich) — the second half of this test's name ("never relabels
+        // bare") is unproven without one actually present in the log.
+        agentrec_core::record::append_log(
+            &root.path().join(".agentrec/log.jsonl"),
+            &agentrec_core::record::LogRecord::Turn(agentrec_core::record::TurnRecord {
+                v: 1,
+                id: "t_bareturn0000000000000001".into(),
+                grade: "bare".into(),
+                truncated: false,
+                started: "2026-06-18T10:00:00.000Z".into(),
+                ended: "2026-06-18T10:00:01.000Z".into(),
+                tool: None,
+                model: None,
+                session: None,
+                root: root.path().to_string_lossy().to_string(),
+                prompt_ref: None,
+                prompt_excerpt: None,
+                merges: vec![],
+                imported: None,
+                files_complete: None,
+                files: vec![agentrec_core::record::FileEntry {
+                    path: "bare.txt".into(),
+                    before: None,
+                    after: Some(agentrec_core::store::hash_bytes(b"x")),
+                    op: "create".into(),
+                    skipped: false,
+                    withheld: false,
+                    baseline_unknown: true,
+                    skipped_reason: None,
+                    after_synthesized: None,
+                }],
+            }),
+        )
+        .unwrap();
+
+        let log_out = Command::new(bin())
+            .args(["log"])
+            .arg("--root")
+            .arg(root.path())
+            .output()
+            .unwrap();
+        assert!(log_out.status.success(), "{log_out:?}");
+        let stdout = String::from_utf8_lossy(&log_out.stdout);
+
+        let imported_line = stdout
+            .lines()
+            .find(|l| l.contains("claude"))
+            .expect("imported turn's line must be present");
+        assert!(
+            imported_line.contains("partial file list (imported)"),
+            "log must mark the imported turn's partial file list, got: {imported_line}"
+        );
+
+        let bare_line = stdout
+            .lines()
+            .find(|l| l.contains("bare"))
+            .expect("bare turn's line must be present");
+        assert!(
+            !bare_line.contains("partial file list (imported)"),
+            "AC7: a bare (live, unattributed) turn must never be relabeled as imported, \
+             got: {bare_line}"
+        );
+    }
+
+    // ---- Real-corpus leg (AC5b requires this — a fixture alone cannot
+    // close the negative case). Runs `agentrec import claude` in
+    // --dry-run-equivalent oracle mode against THIS machine's real
+    // ~/.claude/projects corpus for measurement only; nothing from that
+    // corpus is committed to the repo. `#[ignore]`d because it depends on
+    // developer-machine state unavailable in CI — run manually and the
+    // measured rate is captured in the round's report.
+    #[test]
+    #[ignore]
+    fn ac5b_oracle_real_corpus_measurement() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let source = PathBuf::from(&home).join(".claude");
+        if !source.join("projects").is_dir() {
+            eprintln!("no ~/.claude/projects on this machine — skipping");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let out = Command::new(bin())
+            .args(["import", "claude", "--json", "--source"])
+            .arg(&source)
+            .arg("--root")
+            .arg(root.path())
+            .env("AGENTREC_IMPORT_T2_ORACLE", "1")
+            .output()
+            .expect("run real-corpus oracle pass");
+        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() - start;
+        assert!(out.status.success(), "{out:?}");
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+        let denominator = report["t2_oracle"]["denominator"].as_u64().unwrap_or(0);
+        let mismatches = report["t2_oracle"]["mismatches"].as_u64().unwrap_or(0);
+
+        // D2 (P2 fix round, founder-corrected bar): "PASSES <=1%" is not a
+        // claim this oracle can ever establish — the whole guard-admitted
+        // channel on this corpus is on the order of a few hundred cases at
+        // best, nowhere near the ~299 clean samples a genuine <=1% claim
+        // needs. The defensible claim is a one-sided Clopper-Pearson 95%
+        // upper bound on the observed rate, computed exactly (for 0
+        // observed mismatches the closed form is `1 - 0.05^(1/n)`).
+        let upper_bound_pct = if denominator > 0 && mismatches == 0 {
+            (1.0 - 0.05f64.powf(1.0 / denominator as f64)) * 100.0
+        } else {
+            f64::NAN
+        };
+        eprintln!(
+            "AC5b real-corpus report ({elapsed:?}): {report}\n\
+             {mismatches} fabrications in {denominator} guard-admitted real-corpus samples \
+             (95% upper bound {upper_bound_pct:.1}%). The <=1% bar is not establishable on \
+             this corpus by this oracle; the whole verifiable channel is on this order of \
+             magnitude, not thousands."
+        );
+
+        // The actual ratchet: mismatches must stay at 0 on whatever the
+        // guard admits. A regression to the pre-hardening ~37% fabrication
+        // rate (or any nonzero rate) must fail this test — an eprintln!
+        // with no assertion, which is what this test used to be, passes on
+        // a silent regression.
+        assert_eq!(
+            mismatches, 0,
+            "AC5b ratchet: 0 fabrications required on the guard-admitted channel \
+             (denominator={denominator}); a regression here is a correctness defect, \
+             not a recall trade-off"
+        );
+    }
 }
