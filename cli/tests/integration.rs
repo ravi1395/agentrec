@@ -10399,6 +10399,13 @@ mod service_leak_guard {
     // `service_exec_path()` with the real run, so the value asserted here is
     // the value that would be written.
     //
+    // Neutered BOTH ways, because the first attempt only proved the weaker
+    // thing. Restoring `.canonicalize()` *before* the dry-run print existed
+    // reds this test on an ABSENT LINE, which pins the print statement and
+    // not the behavior. Re-run with the print in place, the neuter reds on a
+    // WRONG VALUE: `[dry-run]   recording exec: …/target/debug/agentrec`, the
+    // resolved target, failing both asserts below.
+    //
     // **macOS only, and NOT an oversight.** Linux's `std::env::current_exe()`
     // reads `/proc/self/exe`, which the kernel resolves — the invocation path
     // is unrecoverable there by any means this binary has, so linuxbrew-style
