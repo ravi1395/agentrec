@@ -182,7 +182,7 @@ pub fn run(
             actions.push("skipped service install (--no-service)".to_string());
         }
         ServiceDecision::SkipTemp(prefix) => actions.push(temp_skip_line(&prefix)),
-        ServiceDecision::Install => match current_exe() {
+        ServiceDecision::Install => match service_exec_path() {
             Ok(exec) => match service::install(root, &exec) {
                 Ok(mut lines) => {
                     changed = changed || lines.iter().any(|l| l.starts_with("wrote service unit"));
@@ -228,7 +228,15 @@ fn print_dry_run(root: &Path, no_hook: bool, no_service: bool, force_service: bo
             println!("[dry-run] would {}", temp_skip_line(&prefix))
         }
         ServiceDecision::Install => {
-            println!("[dry-run] would write and load a per-repo service unit")
+            println!("[dry-run] would write and load a per-repo service unit");
+            // The exec path is a SNAPSHOT baked into the unit and never
+            // re-resolved at load time, so it is the one value a dry run most
+            // needs to show: a wrong exec here is a silently dead recorder
+            // months later, not a visible error now.
+            match service_exec_path() {
+                Ok(exec) => println!("[dry-run]   recording exec: {}", exec.display()),
+                Err(e) => println!("[dry-run]   service install would be skipped: {e}"),
+            }
         }
     }
     println!("[dry-run] nothing on disk was touched");
@@ -236,10 +244,35 @@ fn print_dry_run(root: &Path, no_hook: bool, no_service: bool, force_service: bo
 
 /// Absolute path to this running `agentrec` binary — the exec the generated
 /// service unit invokes.
-fn current_exe() -> Result<std::path::PathBuf, String> {
-    std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .map_err(|e| format!("cannot resolve agentrec's own executable path: {e}"))
+///
+/// **Deliberately NOT `canonicalize`d, and this is the whole point of the
+/// function.** Canonicalize fully resolves symlinks, and Homebrew installs
+/// `/opt/homebrew/bin/<tool>` as a symlink into a version-pinned Cellar
+/// directory (verified: `/opt/homebrew/bin/rg -> ../Cellar/ripgrep/15.2.0/
+/// bin/rg`). A unit that records the resolved target pins one Cellar version
+/// forever: after `brew upgrade` the service keeps running the OLD binary,
+/// and once the old version is reaped the unit becomes a permanent launchd
+/// status-78 respawn loop. The invocation path is stable across upgrades.
+///
+/// Canonicalizing is right for the **root** (`service::resolve_root` dedupes
+/// two spellings of one repo into one unit) and wrong for the **exec**.
+///
+/// Linux is not fixed by this and cannot be: `std::env::current_exe()` there
+/// reads `/proc/self/exe`, which the kernel has already resolved, so a
+/// symlinked install records the target no matter what this function does.
+/// Bounded residual, not an oversight.
+fn service_exec_path() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve agentrec's own executable path: {e}"))?;
+    // A unit's exec must be absolute — launchd/systemd run it with no useful
+    // cwd. `current_exe` is absolute on both supported platforms; joining cwd
+    // is a belt-and-braces fallback that still never resolves a symlink.
+    if exe.is_absolute() {
+        return Ok(exe);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("cannot resolve agentrec's own executable path: {e}"))?;
+    Ok(cwd.join(exe))
 }
 
 /// Lock down `.agentrec/` (D37): the dir and its subdirs to 0700, files

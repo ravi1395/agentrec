@@ -284,15 +284,29 @@ carries only current state, what's next, and standing debts.
   wrong for the **exec**. NOT BUILT — found 2026-07-31 while root-causing the 40 orphans. No brew
   formula exists in this repo (`find` for `*.rb` → none), so the tap was not inspected; the claim
   is about the documented install path plus the verified symlink layout.
-- **The 40 orphans' root cause was NOT what this file said this morning, and the correction
-  matters.** The recorded cause was "`init` in a temp dir without a matching uninstall". The
-  archived plists say otherwise: **39 of 40 pointed at a `target/debug` build directory** — 21
-  `~/.gate3`, 6 `~/.gate2`, 4 `agentrec-phase2`, 4 `~/.gate-linux`, plus scratchpad worktrees — i.e.
-  the dominant vector was **agents running `init` from throwaway build trees**, not temp roots. The
-  one surviving unit is the one installed from a stable path (`~/.local/bin`). Mechanism: `init`
-  bakes a SNAPSHOT OF TWO PATHS (root + `current_exe()`), neither validated at load time, and
-  `KeepAlive` turns a stale snapshot into permanent noise rather than one clean failure. launchd
-  status **78** is an exec failure, not the daemon refusing a missing root.
+- **The 40 orphans' root cause — this bullet was itself wrong once, and the correction of the
+  correction is the load-bearing part.** The original recorded cause was "`init` in a temp dir
+  without a matching uninstall". This bullet then "corrected" it to *build trees, **not** temp
+  roots*, on the strength of the archived plists' **exec** paths. That inference was false: it read
+  one of the unit's two baked paths and generalized to the other. Re-measured over all 40 archived
+  plists, parsing each unit's `--root` (not its exec):
+  - **39 of 40 recorded a `--root` under a temp prefix** — `/private/var/folders/…/T/tmp.*` or
+    `/private/tmp/claude-501/…/scratchpad/*`. **0 orphans had a non-temp root.**
+  - The 40th is `~/Projects/agentrec` on `~/.local/bin/agentrec` — both paths still present: the
+    **live dogfood daemon, never an orphan at all**. So the orphan population is 39, not 40, and it
+    is **100% temp-rooted**.
+  - The build-tree observation is true but describes the **exec** path (`~/.gate3`, `~/.gate2`,
+    `agentrec-phase2`, `~/.gate-linux` `target/debug`), which is why those units fail with launchd
+    status **78** (exec failure) rather than the daemon refusing a missing root.
+  - **Therefore D46's temp-root guard is the correct predicate and would have prevented 39 of 39.**
+    The preceding "not temp roots" wording undercut the guard this repo had just shipped.
+  Replay (archive is local and disk-only, so this is a manual claim, `clm_50SC7TBN4GC281S1F8PZF0XTNF`):
+  parse `ProgramArguments` in each `~/agentrec-launchagents-archive-20260731-152414/*.plist`, take
+  the argument after `--root`, and bucket on the `/private/var/folders`, `/private/tmp`, `/tmp`,
+  `/var/folders` prefixes → 39 temp / 1 other.
+  Mechanism, unchanged and still the general lesson: `init` bakes a SNAPSHOT OF TWO PATHS (root +
+  the running exec), neither validated at load time, and `KeepAlive` turns a stale snapshot into
+  permanent noise rather than one clean failure. Either path going stale is sufficient.
 - **Residual gap D46 does NOT close, and the one that matters for real users:** a unit whose
   recorded path — root **or** exec — vanishes on a **non-temp** path. Deleting, moving, or renaming
   an ordinary repo leaks an identical unit and the temp guard never fires. `doctor` reports it;

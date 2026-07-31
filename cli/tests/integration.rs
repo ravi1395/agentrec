@@ -10381,4 +10381,62 @@ mod service_leak_guard {
             "dry-run must not promise an install that won't happen: {stdout}"
         );
     }
+
+    // The exec path baked into a service unit must be the path agentrec was
+    // INVOKED through, never the symlink's resolved target.
+    //
+    // Homebrew installs `/opt/homebrew/bin/<tool>` as a symlink into a
+    // version-pinned Cellar directory (verified on this machine:
+    // `/opt/homebrew/bin/rg -> ../Cellar/ripgrep/15.2.0/bin/rg`). A unit that
+    // records the resolved target keeps running the OLD binary after `brew
+    // upgrade`, and becomes a permanent launchd status-78 respawn loop once
+    // the old Cellar version is reaped — the same failure mode as the 39
+    // orphans cleaned on 2026-07-31.
+    //
+    // Driven through `--dry-run` deliberately: `service::install` ends in a
+    // real `launchctl load -w`, so a non-dry end-to-end assertion would leak
+    // a live LaunchAgent from the test suite. `--dry-run` shares
+    // `service_exec_path()` with the real run, so the value asserted here is
+    // the value that would be written.
+    //
+    // **macOS only, and NOT an oversight.** Linux's `std::env::current_exe()`
+    // reads `/proc/self/exe`, which the kernel resolves — the invocation path
+    // is unrecoverable there by any means this binary has, so linuxbrew-style
+    // symlink installs keep the resolved path. Recorded as a bounded residual
+    // rather than asserted-and-skipped, since a `#[cfg]`-hidden assert reads
+    // as coverage that does not exist.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn service_exec_path_is_the_invocation_path_not_the_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let link = bin_dir.join("agentrec");
+        std::os::unix::fs::symlink(bin(), &link).unwrap();
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `--service` forces past the temp-root guard; `--dry-run` keeps the
+        // whole run side-effect-free.
+        let out = Command::new(&link)
+            .args(["init", "--no-hook", "--service", "--dry-run"])
+            .args(["--root", root.to_str().unwrap()])
+            .env("AGENTREC_TEST_SERVICE_DIR", empty_service_dir())
+            .output()
+            .expect("spawn via symlink");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            stdout.contains(link.to_str().unwrap()),
+            "the unit must record the invocation path {}: {stdout}",
+            link.display()
+        );
+        assert!(
+            !stdout.contains(bin()),
+            "the unit must not record the resolved target {}: {stdout}",
+            bin()
+        );
+    }
 }
