@@ -311,6 +311,20 @@ carries only current state, what's next, and standing debts.
     and false of D46 v1.** The `--service` bypass is ruled out, not assumed: `git show
     2c26fc5^:cli/src/main.rs` has no `--service` flag at all, so no historical `init` could have
     passed it. The preceding "not temp roots" wording undercut the guard this repo had just shipped.
+  - **Claim superseded at the founder's direction (2026-07-31):**
+    `clm_50SC7TBN4GC281S1F8PZF0XTNF` overstated this by saying "D46's temp-root guard" without
+    pinning the version. Replaced by `clm_4H1XM492AEQE4G2W9NTM822CER`, carrying the skeptic's
+    wording. The founder directed the re-declaration explicitly — an agent softening its own
+    reviewed claim unprompted would be indistinguishable from dodging, and is still forbidden.
+    Both claims rest DECLARED-unattested; neither was self-attested.
+  - **Fix design brainstormed, NOT built:**
+    `docs/superpowers/specs/2026-07-31-service-unit-staleness-design.md` (fable, fresh context).
+    Recommends declarative liveness conditions in the unit itself (launchd `KeepAlive`/`PathState`
+    dict; systemd `ConditionPathExists`) plus an exec-aware `scan_units`, and keeps `service prune`
+    deferred. Load-bearing finding: `daemon.rs::run` already exits cleanly on a vanished root, but
+    a vanished **exec** fails at spawn (status 78) before any agentrec code runs — so **a
+    daemon-side self-reap would have prevented none of the 39 measured leaks.** Three founder
+    decisions at the tail of that doc.
   - **Not establishable, stated as a gap:** the archive copy clobbered every plist mtime to
     2026-07-31 15:24:14, so **no unit can be dated** — how many of the 39 pre- or post-date
     `2c26fc5`/`58c517f` is unrecoverable, as are the original `init` command lines.
