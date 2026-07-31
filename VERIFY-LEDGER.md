@@ -16,7 +16,8 @@ allowing a "M3 shipped" claim. Each names the exact command/environment that clo
 | Memory: 10k/50ms hard perf envelope — **CLOSED 2026-07-28** | **Measured (perf-evidence round P1, AC1.3).** Release build at worktree `051a9a4` (`--stats` present, `strings \| grep -c AGENTREC_TEST` = **0**), macOS arm64, throwaway root under `scratchpad/ac13` — deliberately NOT the live dogfood store, whose 3-fact corpus cannot reach 10k, and NOT `~/Projects/agentrec`, which the production daemon (pid 783) watches and would have recorded the whole seeding pass into. 10,000 records seeded per `seed_capped_stale_heavy_corpus`'s schema (integration.rs:6196): 140 orphaned (`RECALL_VERIFY_CAP` 128 + 12, shared fact text, missing pins) + 60 fresh (real files, real sha256 pins) + 9800 filler; 2.8 MB `memory.jsonl`. **360 real `agentrec hook claude` subprocess runs, 0 nonzero exits**, in three legs of 120, each read out via `agentrec memories --stats`: **(A) stale-heavy / pathological** — orphans win the idx-ascending tiebreak so the verify walk caps out and injects nothing: **p50=11 p90=12 p99=16 max=16 ms**, `injected=0 budget_exceeded=0 failure=0 capped_empty=120 capped_total=120`. **(B) fresh-first** — fresh block inserted first so injection succeeds: **p50=10 p90=11 p99=13 max=16 ms**, `injected=120 budget_exceeded=0 capped_total=0`, and 0/120 empty stdout (every run emitted a real block, `n=5`). **(C) leg B under 8-way CPU load** — **p50=16 p90=18 p99=22 max=23 ms**, `injected=120 budget_exceeded=0`. **Criterion met with ~2.3× margin at worst (22 ms vs 50 ms), and zero `budget_exceeded` events across all 360 runs** — i.e. the envelope holds on the merits, never via the fail-open suppression the criterion's parenthetical would also have accepted. Leg C exists because an unloaded sequential run is the "reasoned safe, unobserved" margin class this repo has been burned by; it carries its own **positive control** — the load demonstrably shifted the distribution (p50 10→16, p99 13→22), so it was not a no-op. **Honest bounds on this figure:** synthetic corpus, not organic; macOS/APFS only (Linux unmeasured, same posture as every other timing margin in this repo); warm page cache, though the effect is small (the very first cold probe measured 17 ms against leg A's p99 of 16); a 10k `memory.jsonl` is fully re-parsed per hook process by design (the hook is a fresh process per prompt, so nothing caches — see the plan's rejected list), so this figure scales with corpus size and should be re-measured if a store materially exceeds 10k. **Process note:** leg C's 8 background spinners leaked — `kill $LOADPIDS` failed silently because the subshells had reparented to pid 1 — and were found still at ~100% CPU each and killed by pid. Legs A and B ran before the spinners existed and are unaffected; this is the same orphaned-process class that once starved this machine to `posix_spawn failed` and perturbed FSEvents timing, caught here only because the cleanup was verified rather than assumed. | Closed here — figure above satisfies the criterion verbatim (10k-record store, release build, p99 < 50 ms, on the dogfood machine). Seeding + measurement commands recorded verbatim below this table rather than as a committed script (the plan's rejected list forbids one: this repo shipped two defects in a never-executed script). |
 | Memory: 10k/50ms hard perf envelope — original gate text (superseded by the CLOSED row above) | F2 (2026-07-12) made `RECALL_BUDGET_MS`=50 a genuinely **hard** cooperative deadline — `cmds::inject_memory` threads `deadline: Instant` into `memory::recall_with_deadline`, which checks it at each `load_effective`/`bm25_rank`/verify loop boundary and bails to an empty, `budget_exceeded`-flagged result the instant it passes, instead of the old measure-after-the-fact suppression. This closes the *correctness* gap (a slow recall can no longer delay the prompt unboundedly — proven deterministically by `hook_recall_bails_at_injected_deadline` via a test-only already-expired-deadline injection, no runner-speed coupling) but the *10k-record p99 latency envelope itself* is still timing-dependent and still not CI-provable: CI proves exit-0 + (now, typically faster) bailout at 3000 records within a 500ms slack bound, not the true steady-state 50ms envelope at 10k records on a release build. | A dogfood-machine timing run: 10k-record store, `agentrec hook` p99 recall < 50ms (or block correctly suppressed past budget, now via the hard deadline rather than a race). Marked LADDERED in IMPLEMENTATION.md INV-M4, never claimed CI-proven. |
 | Memory: real Claude Code session shows injected block | The UserPromptSubmit hook injection is proven by integration tests (`hook_injects_fresh_memories_into_stdout`, concurrent-append, fail-open) driving `agentrec hook` directly; a live agent turn actually receiving the block in-context is env-gated. | A real Claude Code session in this repo with the memory hook installed: a prompt matching a remembered fact shows the `\`\`\`agentrec memory` block in the agent's context. |
-| Memory: 1-week dogfood + skill-driven candidate | `status` counters (`memory: N fresh, M stale, R rejects, I injections`) and the candidate emitter + `agentrec-memory` SKILL.md are code-complete + tested; real-world hit-rate, no-false-staleness, and ≥1 useful skill-emitted memory need live use over a week. **BASELINE PREPPED (2026-07-17):** store reclaimed 3.4 GiB→775 MiB (orphan-GC, under budget, `status` clean), `agentrec-memory` SKILL installed to `.claude/skills/` (candidate emission now enabled — was staged-only), memory store re-pinned + seeded to 3 fresh / 0 stale (recall verified), `doctor` all-pass incl. hook-presence. The 1-week clock can now start honestly. **CLOCK STARTED T0 = 2026-07-18** (PR #5 merged to `main` at `8079299`; run on this repo's canonical `main`). **T0 baseline:** daemon live (launchd `com.agentrec.bfa6bde6eaa4`, RunAtLoad+KeepAlive, boots at login), `store 793 MiB` (under budget), `gaps 0`, `memory: 3 fresh / 0 stale / 0 rejects / 13 injections / 0 failures`, `rich-rate 60% trailing-20` (recovering as build churn quiets — honest-bare, `doctor` hook-presence pass), 3 seeded facts re-pinned to canonical `main` content after the rebase drifted `purgecmd.rs`. **Window closes ~2026-07-25.** Check at close: hit-rate non-trivial, DEGRADED/staleness never falsely fired (distinguish real file-drift staleness from false), and ≥1 `agentrec candidate` (SKILL-emitted) became a genuinely useful recalled memory. | One week recording in this repo with the SKILL installed: `status` shows a non-trivial hit-rate, DEGRADED/staleness never falsely fires, and ≥1 agent-emitted candidate becomes a genuinely useful recalled memory. |
+| Memory: 1-week dogfood + skill-driven candidate — **CLOSED FAILED 2026-07-31** | **FAILED — the window expired without a clean run and the store decayed instead.** T0 = 2026-07-18, window closed ~2026-07-25; measured at close on **2026-07-31**, 6 days after the window closed and 13 days after T0 (exact commands + output: subsection *"Memory dogfood — measured at close (verbatim, 2026-07-31)"* below). Baseline at T0 was `3 fresh / 0 stale / 0 rejects / 13 injections / 0 failures`; the same counter now reads **`memory: 1 fresh, 2 stale, 0 rejects, 628 injections, 0 failures`**. The close condition is a **conjunction** of three criteria; each is adjudicated separately and none is flattened into the others. **(1) Non-trivial hit-rate — UNMEASURABLE, not merely "low".** `.agentrec/memory-stats.jsonl` appends one line per *successful* injection only (`{"n":k,"ts":…}`) and records nothing for a hook run that recalled zero, so the counter has **no denominator** and no hit-rate is derivable from this store at all. What it does show: **629** lines at the stats read (**628** at the `status` read ~1 minute earlier — the counter is live-monotonic and this very session is injecting; the red-team's earlier reading of 626 is the same counter, earlier), `n`=1 on 516 / `n`=2 on 61 / `n`=3 on 51, cumulative since 2026-07-12 — so **628 is not a window figure**: **4 pre-T0 / 131 in-window (07-18…07-25) / 494 post-window**, and **zero injections on 07-19 through 07-23** — five consecutive days inside the window with no recall at all. (Cumulative through 07-18 is 25, straddling the T0 baseline's 13 — baseline and stats file corroborate each other.) **(2) DEGRADED/staleness never falsely fires — MET; the one conjunct that passed.** Both stale facts are *genuine* drift, not false staleness: `agentrec-core/src/retention.rs` and `cli/src/purgecmd.rs` moved to new hashes inside real recorded turns (`t_01KYSR5958KXWRJ2WRHHRXDCJV`, `t_01KYJT06M1R4E2X6RAY8K8K6Y9`). This conjunct passing does **not** soften the row. **(3) ≥1 SKILL-emitted candidate becomes a genuinely useful recalled memory — DEFINITIVELY FAILED, and the emitter never fired at all.** All **6** records in `memory.jsonl` are `origin: "human"` (3 `assert` + 3 `reverify`); **0** agent-origin. This is not "emitted then dropped": across **all 1944** lines in `signal.jsonl` — **974 `start` / 970 `stop`** — **not one carries the `kind: "memory-candidate"` field** that `cli/src/memorycmds.rs:124` stamps on every candidate, and `rejects` is `0`, so no candidate signal was ever written to this store. `.claude/skills/agentrec-memory/SKILL.md` **is** installed, so the cause is that no agent session ever invoked it, not a missing install. | **Not closeable as PASS; closed FAILED, row retained — never counted as evidence for memory v1 real-world use.** A rerun requires all of: (a) a **fresh T0** and a fresh 7-day window; (b) a **clean baseline** — the 2 genuinely drifted facts re-pinned (`agentrec verify --confirm`) back to `3 fresh / 0 stale`; and (c) **first**, an end-to-end proof that the candidate path fires at all — one real agent session emitting `agentrec candidate` and the daemon ingesting it to an `origin: "agent"` record. Without (c), a rerun fails on conjunct 3 identically no matter how cleanly the clock runs. A hit-rate criterion also needs an instrument that records recall *attempts*, not only successes; as written it is unfalsifiable against this store. **Cascade / scope:** this failure does not close and does not alter the sibling memory rows — *"Memory: real Claude Code session shows injected block"* stays **OPEN** (independent env-gate) and the two perf-envelope rows stay CLOSED 2026-07-28. The `## Open (still gated …)` prose summary near the end of this file still lists "1-week memory dogfood + skill candidate" among the open rows and was **deliberately not amended here** — this task owns this row only. |
+| Memory: 1-week dogfood + skill-driven candidate — original gate text (superseded by the FAILED row above) | `status` counters (`memory: N fresh, M stale, R rejects, I injections`) and the candidate emitter + `agentrec-memory` SKILL.md are code-complete + tested; real-world hit-rate, no-false-staleness, and ≥1 useful skill-emitted memory need live use over a week. **BASELINE PREPPED (2026-07-17):** store reclaimed 3.4 GiB→775 MiB (orphan-GC, under budget, `status` clean), `agentrec-memory` SKILL installed to `.claude/skills/` (candidate emission now enabled — was staged-only), memory store re-pinned + seeded to 3 fresh / 0 stale (recall verified), `doctor` all-pass incl. hook-presence. The 1-week clock can now start honestly. **CLOCK STARTED T0 = 2026-07-18** (PR #5 merged to `main` at `8079299`; run on this repo's canonical `main`). **T0 baseline:** daemon live (launchd `com.agentrec.bfa6bde6eaa4`, RunAtLoad+KeepAlive, boots at login), `store 793 MiB` (under budget), `gaps 0`, `memory: 3 fresh / 0 stale / 0 rejects / 13 injections / 0 failures`, `rich-rate 60% trailing-20` (recovering as build churn quiets — honest-bare, `doctor` hook-presence pass), 3 seeded facts re-pinned to canonical `main` content after the rebase drifted `purgecmd.rs`. **Window closes ~2026-07-25.** Check at close: hit-rate non-trivial, DEGRADED/staleness never falsely fired (distinguish real file-drift staleness from false), and ≥1 `agentrec candidate` (SKILL-emitted) became a genuinely useful recalled memory. | One week recording in this repo with the SKILL installed: `status` shows a non-trivial hit-rate, DEGRADED/staleness never falsely fires, and ≥1 agent-emitted candidate becomes a genuinely useful recalled memory. |
 | Store bloat over budget with 0 B freed (D36 dogfood observation) — **RESOLVED 2026-07-17, not a bug** | Root-caused: budget eviction (`retention::enforce_budget`) walks only turn-referenced snapshot blobs (0.74 GiB, under budget → "0 freed" correct); the 2.55 GiB was ORPHANED superseded intermediate snapshots the daemon `put`s for crash recovery, which nothing reclaimed. Fixed by shipping `purge --orphans` (branch `fix/purge-orphans-gc`, `c881cfe`; skeptic GATE PASS; 343 tests). Proven live: reclaimed 5835 blobs / 2.6 GiB, store→775 MiB, over-budget notice gone. | Closed here — verified on the real dogfood store. Future weeks: re-run `purge --orphans` (daemon stopped) when `status` flags orphan bloat. |
 | D11 (service reload on re-init) | `service.rs`'s `install`/`uninstall`/`load`/`unload` shell out to real `launchctl`/`systemctl` and are, by this file's own long-standing design (see its module doc comment), deliberately never invoked from the automated suite — only `--no-service` paths are. The fix (launchd: `unload` best-effort then `load -w`; systemd: `daemon-reload` before `enable --now`) is implemented and reads correctly, but "re-`init` on an already-loaded service actually restarts it with the new unit content" needs a real macOS box with a previously-loaded `com.agentrec.<slug>` label, and a real Linux box with a previously-loaded `agentrec-<slug>.service`, to prove `launchctl load` no longer silently no-ops and `systemctl` actually re-reads the rewritten unit. | A manual run on both a macOS box and a Linux box: `agentrec init` twice in a row against a real (non-`--no-service`) repo, second run — confirm via `launchctl list \| grep com.agentrec` / `systemctl --user status agentrec-<slug>` that the service is loaded and its `ExecStart` matches the freshly written unit content. |
 | Residuals round P4 — `wait_for_live_daemon` race-closure at the population level | `watcher_arm_stamp_keys_on_current_epoch_nonce` (unit) and `live_daemon_reports_watcher_armed` (integration) prove the MECHANISM: the daemon stamps `watcher_armed_nonce == epoch_nonce` only after `.watch()` succeeds, keyed on the current epoch's nonce so a crashed prior epoch's stale value self-invalidates, and `wait_for_live_daemon` now blocks on that condition instead of a bare `pid != 0`. Neither test — nor any fixture — can directly observe "no live-daemon test loses an event emitted in the ~4.3ms window between `acquire_lock` writing the pid and `.watch()` returning `Ok`" going forward, because that is an absence-of-a-flake claim across the whole suite's history, not a single assertion. | Measured over CI/local-run history: after this fix lands, zero live-daemon integration test failures attributable to "event emitted before the watcher armed" (as opposed to genuine FSEvents/inotify coalescing flake, already documented separately) across N subsequent full-suite runs. Not closeable by a single run; track failures of any live-daemon test (`live_daemon_reports_watcher_armed`, `doctor_healthy_all_pass_exit_0`, `status_suppresses_reload_line_after_daemon_crash`, `daemon_counts_ignore_rebuilds`, etc.) going forward and attribute root cause before counting one against this claim. |
@@ -124,6 +125,142 @@ this store size. **Bound:** one store, one machine, macOS/APFS; the walk is over
 plus the object tree, so this figure grows with both and should be re-measured before assuming it
 stays negligible on a materially larger store.
 
+### Memory dogfood — measured at close (verbatim, 2026-07-31)
+
+Evidence for the **FAILED** 1-week dogfood row above. Read-only verbs only, run against the
+**live production dogfood store** (`~/Projects/agentrec`, daemon recording) — nothing was
+recorded, re-pinned, purged or undone to produce these numbers. Binary provenance:
+`./target/release/agentrec` → `agentrec 0.1.0`, mtime `2026-07-28T10:26:54`. There is no
+`agentrec memory status` verb on this build and `memories --stats` errors here
+(`unexpected argument '--stats'` — that surface postdates this binary), so the counters come
+from `status`, which is where this row's criterion locates them.
+
+```console
+$ ./target/release/agentrec status
+store:      83.9 MiB
+turns:      2243 (agent turns; git activity hidden)
+gaps:       0 recording gap(s)
+rich-rate:  100% over trailing 20 agent turn(s)
+memory:     1 fresh, 2 stale, 0 rejects, 628 injections, 0 failures
+
+$ ./target/release/agentrec memories
+01KXS4AE  stale     2026-07-17  store bloat is orphaned CAS blobs (superseded intermediate snapshots the daemon put()s every debounced batch for crash recovery); budget eviction only walks turn-referenced snapshots so 'over budget, 0 freed' is correct not a bug — purge --orphans is the only reclaim path  [pins: agentrec-core/src/retention.rs, cli/src/purgecmd.rs]
+    agentrec-core/src/retention.rs: pinned sha256:5c63bde37eeb4f4b925c33c7e84ba01803f7a69947ed96a4208aff0791a7dd68 -> now sha256:e00e601e29828c0de8b9e18ae88a7b386d42323b333c7099e85a8881acd16389  (drifted in turn t_01KYSR5958KXWRJ2WRHHRXDCJV at yesterday)
+    cli/src/purgecmd.rs: pinned sha256:3629b7e8760e73e6e299f1627bb5a267dc53e5a7dfcbcf22e2106df4bbf35023 -> now sha256:668fee2bed5890e3f898f17be038bad826c7d7606cfaf1a3c54b5850c02c4a48  (drifted in turn t_01KYJT06M1R4E2X6RAY8K8K6Y9 at 4d ago)
+01KXS4AE  stale     2026-07-17  deleting CAS blobs by absence requires a COMPLETE ref-set: referenced_hashes raw-scans sha256: refs from log.jsonl+open.json+memory.jsonl (never load_log, which drops torn lines) so a blob cited only by an unparseable line is never mistaken for an orphan  [pins: cli/src/purgecmd.rs]
+    cli/src/purgecmd.rs: pinned sha256:3629b7e8760e73e6e299f1627bb5a267dc53e5a7dfcbcf22e2106df4bbf35023 -> now sha256:668fee2bed5890e3f898f17be038bad826c7d7606cfaf1a3c54b5850c02c4a48  (drifted in turn t_01KYJT06M1R4E2X6RAY8K8K6Y9 at 4d ago)
+01KXAWQM  fresh     2026-07-17  nightly torture seed rotation is wall-clock-derived, see AGENTREC_TORTURE_SEED  [pins: cli/tests/torture.rs]
+```
+
+The three derived claims in the row come from these read-only passes over the store — commands
+verbatim and rerunnable, `cd`'d to the repo root:
+
+```console
+# conjunct 3, part 1 — origins. 0 agent-authored records, so no candidate exists to evaluate.
+$ python3 -c "
+import json,collections
+c=collections.Counter(); ops=collections.Counter()
+for l in open('.agentrec/memory.jsonl'):
+    l=l.strip()
+    if not l: continue
+    try: r=json.loads(l)
+    except: c['UNPARSEABLE']+=1; continue
+    c[r.get('origin')]+=1; ops[r.get('op')]+=1
+print('origin:',dict(c)); print('op:',dict(ops))
+"
+origin: {'human': 6}
+op: {'assert': 3, 'reverify': 3}
+
+# conjunct 3, part 2 — the emitter never fired. Every signal line has the same 7-key shape and
+# none carries the `kind` key that cli/src/memorycmds.rs:124 stamps on a memory-candidate.
+$ python3 -c "
+import json,collections
+k=collections.Counter()
+for l in open('.agentrec/signal.jsonl'):
+    l=l.strip()
+    if not l: continue
+    k[tuple(sorted(json.loads(l).keys()))]+=1
+for kk,v in k.items(): print(v,kk)
+"
+1944 ('event', 'prompt', 'session', 'tool', 'transcript', 'ts', 'v')
+
+$ python3 -c "
+import json,collections
+c=collections.Counter()
+for l in open('.agentrec/signal.jsonl'):
+    l=l.strip()
+    if l: c[json.loads(l)['event']]+=1
+print(dict(c))
+"
+{'stop': 970, 'start': 974}
+
+# conjunct 1 — injection counter shape: successes only, cumulative since 2026-07-12.
+$ python3 -c "
+import json,collections
+n=collections.Counter(); tot=0
+for l in open('.agentrec/memory-stats.jsonl'):
+    l=l.strip()
+    if not l: continue
+    n[json.loads(l).get('n')]+=1; tot+=1
+print('lines',tot,'n-dist',dict(n))
+"
+lines 628 n-dist {1: 516, 3: 51, 2: 61}
+
+$ python3 -c "
+import json,datetime as d
+T0=d.datetime(2026,7,18); TC=d.datetime(2026,7,26)
+pre=inw=post=0
+for l in open('.agentrec/memory-stats.jsonl'):
+    l=l.strip()
+    if not l: continue
+    ts=d.datetime.fromtimestamp(json.loads(l)['ts']/1000)
+    if ts<T0: pre+=1
+    elif ts<TC: inw+=1
+    else: post+=1
+print('pre-T0(<07-18):',pre,' in-window(07-18..07-25):',inw,' post-window(>=07-26):',post)
+"
+pre-T0(<07-18): 4  in-window(07-18..07-25): 131  post-window(>=07-26): 494
+
+$ python3 -c "
+import json,datetime as d,collections
+c=collections.Counter()
+for l in open('.agentrec/memory-stats.jsonl'):
+    l=l.strip()
+    if l:
+        ts=d.datetime.fromtimestamp(json.loads(l)['ts']/1000)
+        c[ts.date().isoformat()]+=1
+run=0
+for k in sorted(c):
+    run+=c[k]; print(k,c[k],'cum',run)
+"
+2026-07-12 1 cum 1
+2026-07-17 3 cum 4
+2026-07-18 21 cum 25
+2026-07-24 25 cum 50
+2026-07-25 85 cum 135
+2026-07-26 184 cum 319
+2026-07-27 45 cum 364
+2026-07-28 30 cum 394
+2026-07-29 37 cum 431
+2026-07-30 124 cum 555
+2026-07-31 74 cum 629
+
+$ ls -d .claude/skills/agentrec-memory && ls .claude/skills/agentrec-memory
+.claude/skills/agentrec-memory
+SKILL.md
+```
+
+Notes on the numbers above, in order: 07-19…07-23 are **absent** from the per-day table, i.e.
+five consecutive days inside the window with zero injections. The `lines 628` and the daily
+`cum 629` differ by one because the counter is **live-monotonic** — one more injection landed
+between the two reads, and both postdate the red-team's 626. The `n`-distribution and the
+`{'stop': 970, 'start': 974}` split are counts of records, not of turns. **Every count here is a
+snapshot of a store the daemon is still writing to and will read higher on a rerun** — re-running
+the two loops minutes later returned `1949` signal lines and `lines 631` — so the load-bearing
+claim is the *shape*, not the totals: the signal file still exhibits exactly one key-tuple and it
+does not contain `kind`, and the injection counter still has no failure/attempt column to divide
+by. Both hold at any snapshot; neither can be repaired by waiting.
+
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
 Verdict: **GATE PASS** (binding done-gate, opus skeptical-reviewer, round 2 after one loop-back). 269 tests, 0 failed; clippy `-D warnings` + fmt clean. Independent codex (gpt-5.6-terra) cross-review ran alongside and surfaced 2 real bugs the per-task reviews missed (equal-ts fold nondeterminism, crash-window dangling `source_turns`) — both fixed + re-verified before the gate.
@@ -173,7 +310,7 @@ Verdict: **SHIP** — all ACs verifiable on macOS PASS. 142 tests, 0 failed; cli
 | H++ (one run) | 1200 ops, INV1+INV2 asserted every undo, 0 violations, 0 orphans; deterministic via `AGENTREC_TORTURE_SEED`. |
 
 ## Open (still gated — environment/time absent here)
-_(see the Open table near the top.)_ **J3 (CI matrix), I++1 (Linux perms), Y++2 (inotify induced-low-watches), Y+1 (Ubuntu + macOS clean-box installer legs), Y+2 (brew tap), the README blame GIF, and — as of 2026-07-17 — the 7-night D36 streak all closed** — repo published at https://github.com/ravi1395/agentrec, v0.1.0 tagged and released, Actions matrices green. Every M3-era launch gate is now closed; the remaining open rows are the memory-v1 ladder (10k/50ms envelope, real-session injected block, 1-week memory dogfood + skill candidate) and D11 service-reload, all in the Open table above.
+_(see the Open table near the top.)_ **J3 (CI matrix), I++1 (Linux perms), Y++2 (inotify induced-low-watches), Y+1 (Ubuntu + macOS clean-box installer legs), Y+2 (brew tap), the README blame GIF, and — as of 2026-07-17 — the 7-night D36 streak all closed** — repo published at https://github.com/ravi1395/agentrec, v0.1.0 tagged and released, Actions matrices green. Every M3-era launch gate is now closed; the remaining open rows are the memory-v1 ladder (10k/50ms envelope CLOSED 2026-07-28; 1-week memory dogfood + skill candidate **CLOSED FAILED 2026-07-31** — see its row; real-session injected block still open) and D11 service-reload, in the tables above.
 
 ## Follow-ups from the final gate (accepted, non-blocking)
 - **CONCERN #2 — FIXED:** the torture default seed was a fixed constant, so a nightly D36 run with an unset seed would repeat one interleaving 7× and never broaden INV2 coverage. `env_seed()` now derives from the wall clock when `AGENTREC_TORTURE_SEED` is unset (explicit seed still honored + printed for reproducibility). Verified: two unset-seed runs print different seeds.
