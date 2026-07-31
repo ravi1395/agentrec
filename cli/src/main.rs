@@ -93,11 +93,19 @@ enum Command {
     Diff {
         /// Turn id, full or an unambiguous prefix.
         turn: String,
+        /// Emit `serde_json` of the exact `DiffResult` `RepositoryView::diff`
+        /// returned, instead of the unified-diff text.
+        #[arg(long)]
+        json: bool,
     },
     /// Which turn last touched a file or line.
     Blame {
         /// `<file>` or `<file>:<line>`.
         target: String,
+        /// Emit `serde_json` of the exact `BlameResult` `RepositoryView::blame`
+        /// returned, instead of the prose line.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a turn's header; the full prompt requires the explicit --prompt flag.
     Show {
@@ -327,8 +335,8 @@ fn main() {
             all_files,
         } => cmds::log(&root, all, json, limit, utc, explain, all_files),
         Command::Status { ack_degraded, json } => cmds::status(&root, ack_degraded, json),
-        Command::Diff { turn } => readcmds::diff(&root, &turn),
-        Command::Blame { target } => readcmds::blame(&root, &target),
+        Command::Diff { turn, json } => readcmds::diff(&root, &turn, json),
+        Command::Blame { target, json } => readcmds::blame(&root, &target, json),
         Command::Show {
             turn,
             prompt,

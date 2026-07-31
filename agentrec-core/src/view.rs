@@ -259,7 +259,13 @@ pub fn load_ledger(path: &std::path::Path) -> Ledger {
 /// A repository's read-only facts. Produced by [`RepositoryView::health`],
 /// which writes nothing — deciding to act on `over_budget` is the caller's,
 /// and is a separate, explicit call.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (P5): `status --json` flattens this in alongside its
+/// pre-existing `state.json`-derived operational fields (additive, not a
+/// replacement — see `cmds::StatusJson`'s doc comment). Every field here is
+/// unconditionally present; none is "usually absent" in the sense that would
+/// call for `skip_serializing_if`.
+#[derive(Debug, Clone, Serialize)]
 pub struct RepositoryHealth {
     pub store_bytes: u64,
     pub budget: u64,
@@ -273,7 +279,12 @@ pub struct RepositoryHealth {
 }
 
 /// One page of results plus the cursor that continues it.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (P5): `next` deliberately has NO `skip_serializing_if` — it is
+/// a pagination terminator, and its absence must never be confusable with a
+/// serializer that omits nulls (see `view.rs`'s module doc / P5.md's note on
+/// this exact asymmetry, raised by the P4b-5 gate).
+#[derive(Debug, Clone, Serialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
     /// `None` when this page reached the end of the ledger.
@@ -296,7 +307,7 @@ pub struct Page<T> {
 /// such a cursor by first match re-delivers every record between the two
 /// occurrences. `after_occurrence` disambiguates: it is the 0-based index of
 /// this id among the records sharing it, in ledger order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cursor {
     pub after_id: String,
     /// Which record bearing `after_id` this cursor sits after, counting from
@@ -392,10 +403,20 @@ impl DiffQuery {
 /// An envelope rather than a bare [`Page`] because the header
 /// (`turn <id> · <tool> · N files`) has no slot on `Page`, and a fileless
 /// turn's empty page would make those facts unproducible.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (P5): field declaration order IS the wire order (`serde_json`
+/// emits declaration order) — `turn_id`, `tool`, `total_files`, `files` —
+/// pinned by `diff --json`'s empty-case literal
+/// (`{"turn_id":"t_…","total_files":0,"files":{"items":[],"next":null}}`
+/// when `tool` is absent). `tool` follows the `TurnRecord::tool` /
+/// `MemoryHit::reason` convention: `skip_serializing_if = "Option::is_none"`
+/// so a genuinely bare (toolless) turn omits the key entirely rather than
+/// emitting `"tool":null`.
+#[derive(Debug, Clone, Serialize)]
 pub struct DiffResult {
     /// FULL id — `fmt::short_id` truncation is the adapter's.
     pub turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// The turn's OWN file count, deliberately distinct from
     /// `files.items.len()`: the page may be limited while the header still
@@ -406,7 +427,7 @@ pub struct DiffResult {
 
 /// One file entry with its content already resolved, so a renderer needs no
 /// blob store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileDiff {
     pub path: String,
     pub state: FileDiffState,
@@ -419,7 +440,16 @@ pub struct FileDiff {
 /// after-blob error → binary → baseline-unknown → text. `BaselineUnknown` is
 /// decided BEFORE the synthesized-after question, which is why
 /// `after_synthesized` rides only on [`FileDiffState::Text`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` (P5): internally tagged (`"type"`, `snake_case`) — the same
+/// shape `LogRecord` already uses for its turn/epoch discriminant
+/// (`record.rs`) — rather than serde's default externally-tagged
+/// `{"Withheld":null}` / `{"Text":{...}}`, which is both PascalCase and an
+/// extra wrapper layer a consumer would have to unwrap for every arm. No
+/// other precedent for a data-carrying multi-variant enum exists in this
+/// crate to follow instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum FileDiffState {
     /// Secret-pattern file: never snapshotted, nothing to show.
     Withheld,
@@ -489,7 +519,12 @@ pub struct BlameQuery {
 
 /// A blame answer, echoing the query it answers so a renderer that holds
 /// nothing else can still name the path and line.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (P5): plain field-for-field — `path`/`line` are always
+/// meaningful (unlike `DiffResult::tool`, `line: None` is a real "file-level
+/// query" answer, not an absent fact), so neither carries
+/// `skip_serializing_if`.
+#[derive(Debug, Clone, Serialize)]
 pub struct BlameResult {
     pub path: String,
     pub line: Option<usize>,
@@ -505,7 +540,18 @@ pub struct BlameResult {
 ///
 /// Not `PartialEq`: [`TurnRecord`] is not, and widening the record type's
 /// derives to make a test assertion shorter is not this task's business.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (P5): internally tagged (`"type"`, `snake_case`), the same
+/// convention as [`FileDiffState`]. This is what gives AC-3's "uncovered
+/// path → `recording_gap`, no attributor" its structural guarantee: the
+/// `NoTurnRecordingGap`/`LineRecordingGap`/`LineOriginGap` arms carry no
+/// `turn` field at all (the type system, not an adapter, makes a guessed
+/// attributor impossible), and their tag names say "recording_gap" — a
+/// hand-built extra `"recording_gap": true` boolean was deliberately NOT
+/// added on top: that would be exactly the second, adapter-owned
+/// interpretation AC-1 forbids on this path.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlameState {
     /// No turn touches the path AND the daemon crashed at least once — the
     /// turn that touched it may simply not have been recorded.

@@ -269,6 +269,48 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
     Ok(())
 }
 
+/// `status --json`'s payload (P5, AC-1): the pre-existing `state.json`
+/// operational fields, `#[serde(flatten)]`-joined with the exact
+/// [`agentrec_core::view::RepositoryHealth`] `RepositoryView::health`
+/// returned — no hand-built JSON, so a field added to `RepositoryHealth`
+/// (e.g. `unparsed_lines`, the tolerant-parse counter AC-6 needs) appears
+/// here with no edit to this struct.
+///
+/// Additive, not a replacement: `status --json` shipped in the
+/// ignore-rebuild round with a payload `RepositoryHealth` does not cover
+/// (`ignore_rebuilds`, `snapshot_failures`, dedup counters, …), and P5.md's
+/// "pre-existing overlap" note is explicit that the AC here is routing the
+/// EXISTING flag through the view's serializer, not narrowing it down to
+/// only what `RepositoryHealth` carries — every field the pre-P5 payload
+/// emitted stays exactly where it was, and `#[test] status_omits_stale_
+/// epoch_reload_line`'s `payload["ignore_rebuilds"]`-style indexing keeps
+/// compiling and passing unchanged (`serde_json::Value` indexing is
+/// unaffected by whether a sibling key arrived via `flatten` or a literal
+/// field).
+///
+/// Field order is flatten-then-literal: `RepositoryHealth`'s fields
+/// (`store_bytes`, `budget`, `over_budget`, `turn_count`, `crash_gaps`,
+/// `unknown_type_lines`, `unparsed_lines`) appear first, followed by the
+/// operational fields below in their declared order — nothing pins this
+/// order as a contract (unlike `DiffResult`'s empty-case literal), so this
+/// is a legible default, not a promise.
+#[derive(serde::Serialize)]
+struct StatusJson {
+    #[serde(flatten)]
+    health: agentrec_core::view::RepositoryHealth,
+    ignore_rebuilds: u64,
+    epoch_ignore_rebuilds: u64,
+    epoch_ignore_rebuilds_stale: bool,
+    last_ignore_rebuild_ms: Option<u64>,
+    snapshot_failures: u64,
+    io_failed: Vec<String>,
+    prompt_put_failures: u64,
+    state_parse_failures: u64,
+    last_bad_field: Option<String>,
+    dedup_hits: u64,
+    dedup_reread_bytes: u64,
+}
+
 /// Builds `status --json`'s payload (split out from [`status`] so it's
 /// unit-testable without capturing stdout). `state.json` is OPERATIONAL
 /// data, not the PROTOCOL wire format (PROTOCOL §5 deliberately keeps it off
@@ -302,26 +344,40 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 /// LIVE one. The new sibling `epoch_ignore_rebuilds_stale` carries that
 /// distinction instead, always present (never only-when-true) so a consumer
 /// can tell the two cases apart without inferring it from field absence.
+///
+/// P5 (AC-2): read-only, same as [`status_report`] — `read_state` never
+/// writes back (a corrupted field's healed default lives only in the
+/// returned `State`, persisted only by an explicit `write_state` call this
+/// function never makes) and `daemon_is_running`'s flock probe is a
+/// non-blocking check that creates nothing. `RepositoryView::health` is
+/// documented as a pure read. Nothing on this path writes to
+/// `.agentrec/objects/`, `log.jsonl`, or `state.json`.
 fn status_json(root: &Path) -> Result<serde_json::Value, String> {
     let state = read_state(root);
     let daemon_live = crate::daemon::daemon_is_running(root);
-    Ok(serde_json::json!({
-        "ignore_rebuilds": state.ignore_rebuilds,
-        "epoch_ignore_rebuilds": current_epoch_reloads(&state),
-        "epoch_ignore_rebuilds_stale": !daemon_live,
-        "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
+    let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let health = view
+        .health(effective_store_budget())
+        .map_err(|e| e.to_string())?;
+    let payload = StatusJson {
+        health,
+        ignore_rebuilds: state.ignore_rebuilds,
+        epoch_ignore_rebuilds: current_epoch_reloads(&state),
+        epoch_ignore_rebuilds_stale: !daemon_live,
+        last_ignore_rebuild_ms: if state.ignore_rebuilds > 0 {
             Some(state.last_ignore_rebuild_ms)
         } else {
             None
         },
-        "snapshot_failures": state.snapshot_failures,
-        "io_failed": state.io_failed,
-        "prompt_put_failures": state.prompt_put_failures,
-        "state_parse_failures": state.state_parse_failures,
-        "last_bad_field": state.last_bad_field,
-        "dedup_hits": state.dedup_hits,
-        "dedup_reread_bytes": state.dedup_reread_bytes,
-    }))
+        snapshot_failures: state.snapshot_failures,
+        io_failed: state.io_failed,
+        prompt_put_failures: state.prompt_put_failures,
+        state_parse_failures: state.state_parse_failures,
+        last_bad_field: state.last_bad_field,
+        dedup_hits: state.dedup_hits,
+        dedup_reread_bytes: state.dedup_reread_bytes,
+    };
+    serde_json::to_value(&payload).map_err(|e| e.to_string())
 }
 
 /// Builds `status`'s full output as a string (split out from [`status`] so

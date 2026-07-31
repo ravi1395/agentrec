@@ -13,17 +13,31 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-/// `diff <turn>`: resolve `turn` (full id or unambiguous prefix, K+) and print
-/// a unified diff per changed file. Binary files get a byte-count summary
-/// instead of a textual diff (F2); skipped/withheld files get a notice (F3)
-/// instead of content that was never snapshotted.
-pub fn diff(root: &Path, turn_ref: &str) -> Result<(), String> {
+/// `diff <turn> [--json]`: resolve `turn` (full id or unambiguous prefix, K+)
+/// and print a unified diff per changed file. Binary files get a byte-count
+/// summary instead of a textual diff (F2); skipped/withheld files get a
+/// notice (F3) instead of content that was never snapshotted.
+///
+/// `--json` (P5, AC-1): `serde_json::to_string` of the exact [`view::DiffResult`]
+/// `RepositoryView::diff` returned — no adapter-owned field naming, so a
+/// field added to `DiffResult` appears here with no edit. A lookup/cursor
+/// failure is unaffected by the flag: still prose on stderr via
+/// [`diff_error_text`], exit 1 — the plan does not ask for (and P5.md does
+/// not pin) a JSON error envelope, so none is invented here.
+pub fn diff(root: &Path, turn_ref: &str, json: bool) -> Result<(), String> {
     let view = view::RepositoryView::open(root).map_err(|e| e.to_string())?;
     let q = view::DiffQuery {
         turn: turn_ref.to_string(),
         ..Default::default()
     };
     let result = view.diff(&q).map_err(|e| diff_error_text(turn_ref, &e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     print!("{}", render_diff(&result));
     Ok(())
 }
@@ -307,7 +321,14 @@ fn hhmm(rfc: &str) -> String {
 /// `blame <file>` or `blame <file>:<line>` (PROTOCOL §5, AC G1–G6): which
 /// turn last touched a file, or introduced one of its current lines. Read-only
 /// — never needs the daemon running.
-pub fn blame(root: &Path, target: &str) -> Result<(), String> {
+///
+/// `--json` (P5, AC-1): `serde_json::to_string` of the exact
+/// [`view::BlameResult`] `RepositoryView::blame` returned. An uncovered path
+/// serializes with a `state.type` tag naming the recording-gap arm and no
+/// `turn` field at all (AC-3) — see [`view::BlameState`]'s doc for why no
+/// separate `recording_gap` boolean is hand-built on top. Error path
+/// unaffected by the flag, same rationale as [`diff`].
+pub fn blame(root: &Path, target: &str, json: bool) -> Result<(), String> {
     let (file, line_no) = parse_target(target);
     let view = view::RepositoryView::open(root).map_err(|e| e.to_string())?;
     let q = view::BlameQuery {
@@ -315,6 +336,13 @@ pub fn blame(root: &Path, target: &str) -> Result<(), String> {
         line: line_no,
     };
     let result = view.blame(&q).map_err(|e| blame_error_text(&q.path, &e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     print!("{}", render_blame(&result));
     Ok(())
 }

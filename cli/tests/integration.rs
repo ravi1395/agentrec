@@ -9686,3 +9686,610 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
         "expected one stderr eviction line from the daemon: {stderr_text}"
     );
 }
+
+// ---- P5: `--json` read contracts for `diff`, `blame`, `status` -----------
+//
+// AC references below are P5.md's (as corrected by the founder's two
+// P5.md corrections and the launching agent's claimd claim list):
+//   AC-1 typed-value mirror, no hand-built JSON
+//   AC-2 (substituted) status --json is read-only, matches bare status's
+//        zero-write invariant
+//   AC-3 empty cases are data (diff fileless; blame uncovered path)
+//   AC-4 bare turns carry no tool/model keys, never labeled human/agent
+//   AC-6 malformed/torn log line's counter surfaces in status --json, exit 0
+// (AC-5, golden bytes, is verified by `cargo test --test golden` directly,
+// not here.)
+mod json_contracts {
+    use super::*;
+
+    /// Like [`agentrec`], but with extra environment variables set on the
+    /// child — needed for the CLI's debug-only budget-override seam
+    /// (`AGENTREC_TEST_STORE_BUDGET_BYTES`), which is how a test drives a
+    /// real over-budget `status` path without a multi-GiB store.
+    fn agentrec_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        Command::new(bin())
+            .args(args)
+            .args(["--root", root.to_str().unwrap()])
+            .envs(envs.iter().copied())
+            .output()
+            .expect("run agentrec")
+    }
+
+    fn json(out: &Output) -> serde_json::Value {
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("not valid JSON: {e}: {out:?}"))
+    }
+
+    fn keys(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        v.as_object()
+            .unwrap_or_else(|| panic!("not a JSON object: {v}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn set(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Recursively collects every JSON string leaf value in `v` — used to
+    /// prove a bare turn's rendering never labels it "human" or "agent"
+    /// anywhere in the tree (AC-4), not just at one expected field.
+    fn all_string_leaves(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => {
+                for i in items {
+                    all_string_leaves(i, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for i in map.values() {
+                    all_string_leaves(i, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn total_store_bytes(root: &Path) -> u64 {
+        fn walk(dir: &Path, total: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, total);
+                } else if let Ok(meta) = entry.metadata() {
+                    *total += meta.len();
+                }
+            }
+        }
+        let mut total = 0u64;
+        walk(&root.join(".agentrec/objects"), &mut total);
+        total
+    }
+
+    fn log_bytes(root: &Path) -> u64 {
+        std::fs::metadata(root.join(".agentrec/log.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    // ---- AC-1: typed-value mirror, no adapter-owned field naming ---------
+
+    /// `diff --json`'s top-level object has EXACTLY `DiffResult`'s declared
+    /// fields, and `files` has exactly `Page<T>`'s — proof by key set rather
+    /// than a literal, per-field body (a field added to either struct would
+    /// change this set with no edit here needed). The `Text` file state is
+    /// checked the same way, one level down.
+    #[test]
+    fn diff_json_key_set_matches_diff_result_and_page() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let before = store.put(b"a\n").unwrap();
+        let after = store.put(b"b\n").unwrap();
+
+        let turn = base_turn(
+            "t_JSONDIFFTEXT000000000000001",
+            vec![FileEntry {
+                path: "x.rs".into(),
+                before: Some(before),
+                after: Some(after),
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", &turn.id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            keys(&v),
+            set(&["turn_id", "tool", "total_files", "files"]),
+            "diff --json top level: {v}"
+        );
+        assert_eq!(v["turn_id"], turn.id);
+        assert_eq!(v["tool"], "claude");
+        assert_eq!(v["total_files"], 1);
+        let files = &v["files"];
+        assert_eq!(keys(files), set(&["items", "next"]));
+        assert!(files["next"].is_null());
+        let items = files["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(keys(&items[0]), set(&["path", "state"]));
+        assert_eq!(items[0]["path"], "x.rs");
+        assert_eq!(
+            keys(&items[0]["state"]),
+            set(&["type", "before", "after", "op", "after_synthesized"]),
+            "FileDiffState::Text shape: {}",
+            items[0]["state"]
+        );
+        assert_eq!(items[0]["state"]["type"], "text");
+        assert_eq!(items[0]["state"]["before"], "a\n");
+        assert_eq!(items[0]["state"]["after"], "b\n");
+        assert_eq!(items[0]["state"]["op"], "modify");
+        assert_eq!(items[0]["state"]["after_synthesized"], false);
+    }
+
+    /// AC-3's pinned empty-case literal, byte-for-byte
+    /// (P5.md's 2026-07-30 amendment): a fileless-but-tooled turn's
+    /// `diff --json` is exactly
+    /// `{"turn_id":"t_…","tool":"claude","total_files":0,"files":{"items":[],"next":null}}`
+    /// — exit 0, empty is data, not an error.
+    #[test]
+    fn diff_json_fileless_turn_matches_pinned_empty_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let turn = base_turn("t_JSONFILELESS000000000000001", vec![]);
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", &turn.id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "{{\"turn_id\":\"{}\",\"tool\":\"claude\",\"total_files\":0,\"files\":{{\"items\":[],\"next\":null}}}}\n",
+                turn.id
+            ),
+            "diff --json fileless-turn literal, byte for byte"
+        );
+        assert!(out.stderr.is_empty(), "stderr: {out:?}");
+    }
+
+    /// `blame --json`'s top-level object has EXACTLY `BlameResult`'s
+    /// declared fields (same key-set proof as diff's, above).
+    #[test]
+    fn blame_json_key_set_matches_blame_result() {
+        use agentrec_core::record::FileEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let turn = make_turn(
+            "t_JSONBLAMEFILE00000000000001",
+            "rich",
+            Some("claude"),
+            "2026-07-05T09:00:00.000Z",
+            Some("write w.rs"),
+            vec![FileEntry {
+                path: "w.rs".into(),
+                before: None,
+                after: Some(agentrec_core::store::hash_bytes(b"content\n")),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        std::fs::write(root.join("w.rs"), b"content\n").unwrap();
+
+        let out = agentrec(root, &["blame", "w.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            keys(&v),
+            set(&["path", "line", "state"]),
+            "blame --json: {v}"
+        );
+        assert_eq!(v["path"], "w.rs");
+        assert!(v["line"].is_null());
+        assert_eq!(v["state"]["type"], "file");
+        assert_eq!(v["state"]["turn"]["id"], turn.id);
+        assert_eq!(v["state"]["deleted"], false);
+        assert_eq!(v["state"]["modified"], false);
+    }
+
+    /// The grep AC's weaker half — kept alongside the key-set proofs above,
+    /// which are the real instrument (a hand-built `json!({...})` would
+    /// still pass this particular grep since it doesn't use `format!`).
+    #[test]
+    fn no_hand_built_json_braces_on_diff_blame_status_paths() {
+        for rel in ["src/readcmds.rs", "src/cmds.rs"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("format!(\"{{"),
+                "{rel} contains a hand-built JSON brace literal (format!(\"{{...\"))"
+            );
+        }
+    }
+
+    // ---- AC-3 (blame half): uncovered path → recording_gap, no attributor -
+
+    /// File-level blame on a path no turn ever touched, with a crash gap in
+    /// the ledger: `state.type` names the recording-gap arm and the object
+    /// carries no `turn` field at all — not a guess, structurally.
+    #[test]
+    fn blame_json_no_turn_recording_gap_carries_no_turn_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        // Two `start` epochs with no `stop` between them: a crash gap, no
+        // turn seeded at all.
+        seed_epoch(root, "start", "2026-07-05T00:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T00:05:00.000Z");
+
+        let out = agentrec(root, &["blame", "never-touched.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["state"]["type"], "no_turn_recording_gap");
+        assert_eq!(
+            keys(&v["state"]),
+            set(&["type"]),
+            "no_turn_recording_gap must carry no other field (never a guessed \
+             attributor): {}",
+            v["state"]
+        );
+    }
+
+    /// Line-level blame on a touched-but-gap-stale file: `LineRecordingGap`,
+    /// same no-attributor guarantee as the file-level arm above.
+    #[test]
+    fn blame_json_line_recording_gap_carries_no_turn_field() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+
+        let after = store.put(b"original\n").unwrap();
+        let turn = make_turn(
+            "t_JSONLINEGAP00000000000001",
+            "rich",
+            Some("claude"),
+            "2026-07-05T09:00:00.000Z",
+            Some("write g.rs"),
+            vec![FileEntry {
+                path: "g.rs".into(),
+                before: None,
+                after: Some(after),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        seed_epoch(root, "start", "2026-07-05T09:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T09:05:00.000Z");
+        // Diverges from the turn's recorded `after` — the gap could be
+        // hiding the real cause, so a line query must not guess either.
+        std::fs::write(root.join("g.rs"), b"changed-during-the-gap\n").unwrap();
+
+        let out = agentrec(root, &["blame", "g.rs:1", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["state"]["type"], "line_recording_gap");
+        assert_eq!(keys(&v["state"]), set(&["type"]), "{}", v["state"]);
+    }
+
+    // ---- AC-4: bare turns carry no tool/model keys, no human/agent label --
+
+    /// `diff --json` on a bare (toolless) turn omits the `tool` key
+    /// entirely (never `"tool":null`) — the `TurnRecord::tool` /
+    /// `MemoryHit::reason` convention.
+    #[test]
+    fn diff_json_bare_turn_omits_tool_key() {
+        let turn_id = "t_JSONBARETOOL00000000000001";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let turn = make_turn(
+            turn_id,
+            "bare",
+            None,
+            "2026-07-05T09:00:00.000Z",
+            None,
+            vec![],
+        );
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", turn_id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert!(
+            v.as_object().unwrap().get("tool").is_none(),
+            "a bare turn must omit `tool` entirely, not emit null: {v}"
+        );
+        assert_eq!(keys(&v), set(&["turn_id", "total_files", "files"]));
+    }
+
+    /// `blame --json` on a bare turn: the nested `turn` carries no
+    /// `tool`/`model` keys, and no string anywhere in the whole tree is the
+    /// literal "human" or "agent" — a bare turn must never be labeled
+    /// either way (plan decision 6).
+    #[test]
+    fn blame_json_bare_turn_has_no_tool_model_or_human_agent_label() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let after = store.put(b"content\n").unwrap();
+
+        let turn = make_turn(
+            "t_JSONBAREBLAME0000000000001",
+            "bare",
+            None,
+            "2026-07-05T09:00:00.000Z",
+            None,
+            vec![FileEntry {
+                path: "y.rs".into(),
+                before: None,
+                after: Some(after),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        std::fs::write(root.join("y.rs"), b"content\n").unwrap();
+
+        let out = agentrec(root, &["blame", "y.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        let nested_turn = v["state"]["turn"].as_object().unwrap();
+        assert!(nested_turn.get("tool").is_none(), "{v}");
+        assert!(nested_turn.get("model").is_none(), "{v}");
+
+        let mut leaves = Vec::new();
+        all_string_leaves(&v, &mut leaves);
+        assert!(
+            !leaves.iter().any(|s| s == "human" || s == "agent"),
+            "a bare turn must never be labeled human or agent anywhere: {v}"
+        );
+    }
+
+    // ---- error path: unaffected by --json, no invented JSON envelope ------
+
+    #[test]
+    fn diff_json_unknown_turn_still_prose_on_stderr_exit_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        seed_turn(root, &base_turn("t_JSONREALTURN00000000000001", vec![]));
+
+        let out = agentrec(root, &["diff", "t_DOESNOTEXIST", "--json"]);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+        assert!(out.stdout.is_empty(), "no JSON envelope on error: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unknown turn id"),
+            "stderr: {out:?}"
+        );
+    }
+
+    #[test]
+    fn blame_json_unknown_path_still_prose_on_stderr_exit_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = agentrec(root, &["blame", "nope.rs:1", "--json"]);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+        assert!(out.stdout.is_empty(), "no JSON envelope on error: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "agentrec: nope.rs: not found\n"
+        );
+    }
+
+    // ---- AC-2 (substituted): status --json is read-only, same zero-write --
+    // invariant as bare `status` -------------------------------------------
+
+    /// Both `status` and `status --json` on an over-budget store: neither
+    /// writes to `.agentrec/objects/`, appends to `log.jsonl`, or touches
+    /// `state.json` — matching `cmds::status_performs_zero_store_writes`'s
+    /// existing invariant for bare `status`, asserted here for BOTH
+    /// invocations (the corrected AC-2: not a paired "one evicts, one
+    /// doesn't" assertion — `status` no longer evicts anything at all,
+    /// eviction moved to the daemon's own tick in the perf-evidence round).
+    #[test]
+    fn status_and_status_json_are_both_zero_write_on_over_budget_store() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+
+        let victim = store.put(&[0xABu8; 200]).unwrap();
+        let turn = base_turn(
+            "t_JSONZEROWRITE00000000000001",
+            vec![FileEntry {
+                path: "big.bin".into(),
+                before: None,
+                after: Some(victim.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+
+        // A state.json that predates either call, so its mtime is a
+        // meaningful "did anything touch this" signal rather than an
+        // artifact of the file not existing yet.
+        let state_path = root.join(".agentrec/state.json");
+        std::fs::write(&state_path, "{}").unwrap();
+        let state_before = std::fs::read_to_string(&state_path).unwrap();
+        let mtime_before = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        let store_before = total_store_bytes(root);
+        let log_before = log_bytes(root);
+
+        // Budget of 5 bytes: `big.bin`'s 200-byte snapshot is a genuine,
+        // structurally over-budget eviction candidate — a real eviction
+        // pass (the daemon's tick) would delete it. Neither `status` nor
+        // `status --json` may.
+        let envs = [("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")];
+        let out = agentrec_env(root, &["status"], &envs);
+        assert!(out.status.success(), "status failed: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("over"),
+            "expected the over-budget notice: {out:?}"
+        );
+
+        let out = agentrec_env(root, &["status", "--json"], &envs);
+        assert_eq!(out.status.code(), Some(0), "status --json failed: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["over_budget"], true, "status --json: {v}");
+
+        assert_eq!(
+            total_store_bytes(root),
+            store_before,
+            "neither status nor status --json may write to .agentrec/objects/"
+        );
+        assert_eq!(
+            log_bytes(root),
+            log_before,
+            "neither status nor status --json may append to log.jsonl"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            state_before,
+            "neither status nor status --json may rewrite state.json"
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            mtime_before,
+            "neither status nor status --json may touch state.json's mtime"
+        );
+        assert!(store.contains(&victim), "victim must survive both calls");
+    }
+
+    // ---- AC-6: malformed/torn log line's counter surfaces, exit 0 --------
+
+    #[test]
+    fn status_json_surfaces_unparsed_lines_counter_and_exits_0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        seed_turn(root, &base_turn("t_JSONTORNTURN00000000000001", vec![]));
+        // A non-empty, non-JSON tail line — the torn-line-after-a-crash shape
+        // `Ledger::unparsed_lines` exists to count.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.join(".agentrec/log.jsonl"))
+                .unwrap();
+            writeln!(f, "not json at all — a torn tail line").unwrap();
+        }
+
+        let out = agentrec(root, &["status", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            v["unparsed_lines"], 1,
+            "status --json must surface the tolerant-parse counter: {v}"
+        );
+    }
+
+    // ---- status --json: exact typed value, not a reshaped subset ---------
+
+    /// `status --json`'s health-derived fields are the SAME facts the human
+    /// `status` report renders off the same `RepositoryView::health` call —
+    /// not an independently reshaped subset (AC-1's substance, applied to
+    /// `status`).
+    #[test]
+    fn status_json_health_fields_match_what_status_report_renders() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let blob = store.put(b"hello\n").unwrap();
+
+        let turn = base_turn(
+            "t_JSONHEALTHFIELDS000000001",
+            vec![FileEntry {
+                path: "h.rs".into(),
+                before: None,
+                after: Some(blob),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        // A crash gap: a `start` following a still-open `start` (see
+        // `view::recording_gaps` — a single trailing, never-closed `start`
+        // alone is not yet a gap; it is the SECOND `start` that proves the
+        // first was never terminated).
+        seed_epoch(root, "start", "2026-07-05T00:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T00:05:00.000Z");
+
+        let out = agentrec(root, &["status", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["turn_count"], 1, "{v}");
+        assert_eq!(v["crash_gaps"], 1, "{v}");
+        assert_eq!(v["over_budget"], false, "{v}");
+        assert!(v["store_bytes"].as_u64().unwrap() > 0, "{v}");
+
+        let text_out = agentrec(root, &["status"]);
+        let text = String::from_utf8_lossy(&text_out.stdout);
+        assert!(
+            text.contains("1 recording gap(s)"),
+            "human status must report the same crash-gap fact: {text}"
+        );
+    }
+}
