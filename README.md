@@ -83,6 +83,22 @@ Run it yourself:
 AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 ```
 
+## Known limitations
+
+**A human edit made while an agent's turn is open is attributed to the agent.** The recorder
+keeps one open turn per root (decision D6 in `IMPLEMENTATION.md`), so any file mutation landing
+between the agent's start signal and its stop signal is folded into that turn — including your
+own save from another editor window. The turn is rich, so `blame` will name the agent's turn,
+tool and prompt for those lines. The documented remedy is separation by root: put concurrent
+work in a separate worktree.
+
+**`undo` of such a turn discards those human edits with no modified-since warning.** The edit
+happened inside the turn, so it is part of what the turn recorded as its `after` state. The
+modified-since rail (D30) compares the file's current hash against that `after` hash — it is
+built to catch edits made *after* the turn closed, and there is nothing for it to detect here.
+`undo` therefore restores the file to its pre-turn `before` content, dropping the human edit,
+and reports it as an ordinary clean revert. Nothing in the tool flags this today.
+
 ## Commands
 
 | Command | Does |
