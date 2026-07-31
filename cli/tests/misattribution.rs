@@ -33,6 +33,17 @@ const CAUTION_SUBSTR: &str =
     "cannot distinguish the recorded tool's own writes from concurrent human edits made in the \
      same window";
 
+/// The caution's *scope* clause. Deliberately a SECOND constant rather than an
+/// extension of `CAUTION_SUBSTR`: the negatives below assert
+/// `!contains(CAUTION_SUBSTR)`, and folding the two together would let a
+/// regression that prints only the first clause slip past them.
+const CAUTION_SCOPE_SUBSTR: &str =
+    "every file marked `revert` above is reverted regardless of who wrote it";
+
+/// The pre-fix wording, which claimed the revert covers every *listed* file.
+/// False on any plan carrying an `EXCLUDE` or `REFUSE` line; pinned absent.
+const CAUTION_OVERCLAIM_SUBSTR: &str = "every file listed above is reverted";
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
 }
@@ -244,6 +255,14 @@ fn intra_bracket_human_edit_folds_into_agent_turn_and_undo_reverts_it() {
         preview.contains(CAUTION_SUBSTR),
         "preview must carry the intra-window caution: {preview}"
     );
+    // This plan is all-Revert — the one shape on which the pre-fix "every file
+    // listed above" wording happened to be true. Pin the corrected clause here
+    // too, so the reword is asserted on both the pure-revert and the mixed
+    // shape (`mixed_plan_caution_scopes_itself_to_reverted_files_only`).
+    assert!(
+        preview.contains(CAUTION_SCOPE_SUBSTR),
+        "the caution must scope its revert claim to files marked `revert`: {preview}"
+    );
     assert!(
         preview.contains("preview only"),
         "preview must still require --confirm: {preview}"
@@ -342,5 +361,162 @@ fn agentrec_own_turn_carries_no_window_caution() {
     assert!(
         !stdout.contains(CAUTION_SUBSTR),
         "agentrec's own turn is not a watch window — no caution: {stdout}"
+    );
+}
+
+// ---- the caution must be true for every plan shape it is printed on --------
+
+/// A `modify` entry whose `before`/`after` are both real blobs, so the
+/// integrity gate (`store.get`) above modified-since never fires and the entry
+/// reaches the revert/exclude fork this file is about.
+fn modify_entry(
+    store: &agentrec_core::store::BlobStore,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+) -> agentrec_core::record::FileEntry {
+    agentrec_core::record::FileEntry {
+        path: path.into(),
+        op: "modify".into(),
+        before: Some(store.put(before).expect("snapshot before")),
+        after: Some(store.put(after).expect("snapshot after")),
+        skipped: false,
+        skipped_reason: None,
+        withheld: false,
+        baseline_unknown: false,
+    }
+}
+
+fn seed_turn(
+    root: &Path,
+    id: &str,
+    grade: &str,
+    tool: Option<&str>,
+    files: Vec<agentrec_core::record::FileEntry>,
+) {
+    use agentrec_core::record::{LogRecord, TurnRecord};
+    let turn = TurnRecord {
+        v: 1,
+        id: id.to_string(),
+        grade: grade.into(),
+        truncated: false,
+        started: "2026-07-30T00:00:00.000Z".into(),
+        ended: "2026-07-30T00:00:01.000Z".into(),
+        tool: tool.map(str::to_string),
+        model: None,
+        session: None,
+        root: root.to_string_lossy().to_string(),
+        prompt_ref: None,
+        prompt_excerpt: None,
+        merges: vec![],
+        files,
+    };
+    agentrec_core::record::append_log(&root.join(".agentrec/log.jsonl"), &LogRecord::Turn(turn))
+        .expect("seed turn");
+}
+
+/// D2: on a MIXED plan — one `revert`, one `EXCLUDE` — the caution must not
+/// claim the revert covers everything printed. The excluded file IS "listed
+/// above" and is NOT reverted, so the pre-fix sentence was false exactly where
+/// a user is most likely to be reading it. The guard's own stated rationale is
+/// "a warning that is always true beats a detector that is sometimes a lie";
+/// this test is what makes "always true" checkable.
+#[test]
+fn mixed_plan_caution_scopes_itself_to_reverted_files_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+
+    // a.txt: on-disk content == the turn's `after` -> not modified -> revert.
+    // b.txt: a post-turn edit to a THIRD value -> modified-since -> EXCLUDE.
+    // (Same fixture shape as integration.rs's `undo_modified_since_*` tests.)
+    let files = vec![
+        modify_entry(&store, "a.txt", b"a-v1\n", b"a-v2\n"),
+        modify_entry(&store, "b.txt", b"b-v1\n", b"b-v2\n"),
+    ];
+    seed_turn(
+        root,
+        "t_MIXEDPLANCAUTION0000000001",
+        "rich",
+        Some("claude"),
+        files,
+    );
+    std::fs::write(root.join("a.txt"), b"a-v2\n").unwrap();
+    std::fs::write(root.join("b.txt"), b"b-v3-human\n").unwrap();
+
+    let out = agentrec(root, &["undo", "t_MIXEDPLANCAUTION0000000001"]);
+    assert!(out.status.success(), "undo preview failed: {out:?}");
+    let preview = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // The plan really is mixed — otherwise the assertions below are vacuous.
+    assert!(
+        preview.contains("revert  a.txt"),
+        "fixture must produce a revert: {preview}"
+    );
+    assert!(
+        preview.contains("EXCLUDE b.txt"),
+        "fixture must produce an exclusion: {preview}"
+    );
+
+    assert!(
+        preview.contains(CAUTION_SUBSTR),
+        "a rich non-agentrec turn still gets the caution: {preview}"
+    );
+    // D2 proper, asserted first so a regression reds on the overclaim itself.
+    assert!(
+        !preview.contains(CAUTION_OVERCLAIM_SUBSTR),
+        "OVERCLAIM: b.txt is listed above and is NOT reverted, so the caution \
+         must not say every listed file is reverted: {preview}"
+    );
+    assert!(
+        preview.contains(CAUTION_SCOPE_SUBSTR),
+        "the caution must scope its revert claim to the files actually marked \
+         `revert`: {preview}"
+    );
+
+    assert_eq!(
+        std::fs::read(root.join("b.txt")).unwrap(),
+        b"b-v3-human\n",
+        "preview must not mutate the worktree"
+    );
+}
+
+/// D7 (minor, recorded): bare turns are excluded from the caution by the
+/// `grade != "rich"` arm of the gate, and nothing pinned that. Whether a bare
+/// turn's undo *should* carry a window caution is a founder call (the residual
+/// is escalated, not decided here) — this test pins only the CURRENT behavior
+/// so a change to it is visible in a diff rather than silent.
+///
+/// Non-vacuity matters: the gate has two suppression paths, so the fixture
+/// deliberately yields a plan with a real `revert` line. Without that, the test
+/// would pass because nothing was revertible, pinning nothing about `grade`.
+#[test]
+fn bare_turn_undo_carries_no_window_caution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = agentrec_core::store::BlobStore::new(root.join(".agentrec/objects"));
+
+    let files = vec![modify_entry(&store, "c.txt", b"c-v1\n", b"c-v2\n")];
+    seed_turn(root, "t_BARETURNNOCAUTION000000001", "bare", None, files);
+    std::fs::write(root.join("c.txt"), b"c-v2\n").unwrap();
+
+    let out = agentrec(root, &["undo", "t_BARETURNNOCAUTION000000001"]);
+    assert!(out.status.success(), "undo preview failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    assert!(
+        stdout.contains("revert  c.txt"),
+        "the plan must contain a revert, or the caution gate is not even \
+         reached and this test pins nothing: {stdout}"
+    );
+    assert!(
+        !stdout.contains(CAUTION_SUBSTR),
+        "PINNED (residual, not endorsed): bare turns get no window caution: {stdout}"
+    );
+    assert!(
+        !stdout.contains(CAUTION_SCOPE_SUBSTR),
+        "no partial caution either: {stdout}"
     );
 }

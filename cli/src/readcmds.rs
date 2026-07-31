@@ -1051,6 +1051,11 @@ fn print_plan(target: &TurnRecord, plans: &[Plan]) {
 /// is not modified-since, it is *mis-attributed*, and no post-hoc heuristic
 /// can separate the two. So undo states the limitation rather than guessing:
 /// a warning that is always true beats a detector that is sometimes a lie.
+/// "Always true" is load-bearing and was once violated: the sentence claimed
+/// "every file listed above is reverted", which is false on a MIXED plan where
+/// an `EXCLUDE`/`REFUSE` line is also listed. It now names only the files
+/// marked `revert`, the one set that is reverted under every flag combination
+/// (`--allow-modified` moves a file INTO that set, never out of it).
 ///
 /// Deliberately NOT prefixed `WARNING:` — that token is already the per-file
 /// modified-since marker above, and conflating the two would make each one
@@ -1062,6 +1067,13 @@ fn print_plan(target: &TurnRecord, plans: &[Plan]) {
 /// rather than "the agent's": the sentence has to stay true for every turn
 /// class the gate admits.
 fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
+    // Bare turns are excluded here deliberately, and that exclusion is pinned
+    // by `bare_turn_undo_carries_no_window_caution` (cli/tests/misattribution.rs)
+    // — a bare turn is already rendered as an unattributed window everywhere,
+    // so the line would restate its grade rather than add anything. Whether it
+    // should nonetheless be printed is an open founder call (escalated as a
+    // residual, not decided here); the test exists so changing it shows in a
+    // diff instead of silently.
     if target.grade != "rich" || target.tool.as_deref() == Some("agentrec") {
         return None;
     }
@@ -1074,8 +1086,8 @@ fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
     Some(
         "  CAUTION: this turn's file list is an activity window, not an authorship record — \
          agentrec cannot distinguish the recorded tool's own writes from concurrent human \
-         edits made in the same window (D6), and every file listed above is reverted \
-         regardless of who wrote it. Review the list before confirming."
+         edits made in the same window (D6), and every file marked `revert` above is \
+         reverted regardless of who wrote it. Review the list before confirming."
             .to_string(),
     )
 }
