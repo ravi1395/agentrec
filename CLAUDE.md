@@ -14,6 +14,43 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **PHASE 2.0 PLAN EXIT REACHED (2026-07-31) on `feat/phase-2-0-view-completion` at `88c7e9b`
+  + this commit. P5 GATE-PASSED; all 9 plan-exit checkboxes verified. Pushed, no PR.**
+  P5 shipped `--json` read contracts for `diff`/`blame`/`status` as adapters over P4b's typed
+  values — `Serialize` on `RepositoryHealth`/`Page<T>`/`Cursor`/`DiffResult`/`FileDiff`/
+  `FileDiffState`/`BlameResult`/`BlameState`; `status --json` now flattens the pre-existing
+  operational payload with the exact `RepositoryHealth` the view returned. Test baseline
+  **615 / 0 / 2** (was 602/0/2 at P4b), 13 new `json_contracts::` integration tests, **33
+  goldens**. Fable skeptic in an isolated worktree: **GATE PASS, 12/12**. Plan-exit checklist
+  verified by the orchestrator independently: hard gate retired at the final commit (99.6%
+  importable, denominator re-measured to 1937), zero-bytes dry-run re-verified, gap logic
+  proven unified (one `view.rs::has_gap_after`, zero copies in `cli/src`), suite/clippy/fmt
+  green on debug **and** release, no test seam in release `strings`, scope honesty clean
+  (`PROTOCOL.md` untouched, zero MCP/Sutra paths). Full evidence:
+  `VERIFY-LEDGER.md` § "Phase 2.0 plan exit" and the plan's own Final-acceptance section,
+  each checkbox now carrying its verdict inline.
+  - **Two plan-exit ACs were founder-ratified substitutions, not passes-as-written. Both are
+    recorded in the plan rather than quietly satisfied:**
+    1. **Item 4 (and P5's own AC-2) named an impossible event.** "...while bare `status` in
+       the same fixture **still evicts**" cannot hold — the perf-evidence round moved eviction
+       to the daemon tick; `status` is read-only now and a test pins that. Substituted with a
+       **parity** assertion: *both* `status` and `status --json` must be zero-write. Stronger,
+       not weaker — a write reintroduced on either path still reds. Re-adding eviction to
+       `status` to satisfy the original text is forbidden.
+    2. **Item 2 collided with P5's AC-1.** "Every P3 golden byte-identical" could not coexist
+       with "route `status --json` through `RepositoryHealth`", which necessarily adds that
+       struct's fields. Scoped to **human-form** goldens (absolute), with `--json` goldens
+       permitted to change **additively only**. Verified: exactly one modified golden
+       (`status_json.golden`, a `--json` golden), all 11 pre-existing keys byte-identical,
+       **+7 keys, 0 removed**; six recall goldens *added*, none modified.
+  - **Open questions 1–3 are carried forward UNANSWERED, explicitly** (founder ruling: invent
+    no answers). Q1 wave-2 cut, Q2 the memory plan's 12 unchecked boxes vs memory v1 recorded
+    merged, Q3 store reclaim. Disposition table in the plan. All three founder-owned.
+  - **Residual closed by P5:** `cli/src/readcmds.rs` was in P5's edit scope, but the `load_log`
+    direct-call residual below was **not** part of P5's ACs and is **not** closed — it stands.
+  - **Sequenced next (unchanged by this exit):** Codex 2.1 → Protocol 1.0 freeze → MCP read
+    2.2, which mirrors these exact serializers. No MCP code exists in this plan by design.
+
 - **P4b EXECUTED and GATE-PASSED (2026-07-30) on `feat/phase-2-0-view-completion`.** Closes
   `RepositoryView` against the parent spec's six-method list (`open`/`list`/`diff`/`blame`/
   `recall`/`health`) — P4 had left `diff`/`blame`/`recall` unimplemented by design; P4b lands
@@ -171,13 +208,18 @@ carries only current state, what's next, and standing debts.
 
 ### Now / next (in order)
 
-1. ~~**P4**~~ done → ~~**P4b**~~ done (gate-passed, see above; `diff`/`blame`/`recall` now
-   implemented in the seam) → **P5** (`--json`), now executable: dependency satisfied, empty-case
-   literal corrected → the plan's 9-checkbox "Final acceptance — plan exit" section. **P4/P4b
-   must not weaken or regenerate P3's goldens to make extraction pass** — they are the
-   byte-equivalence instrument for the whole plan, and that is the ratchet.
-   Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1.
-2. **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
+1. ~~**P4**~~ → ~~**P4b**~~ → ~~**P5**~~ → ~~**plan-exit checklist**~~ **all done and gated
+   (2026-07-31).** Phase 2.0 is at plan exit; see Current state. The goldens were never
+   weakened or regenerated to make extraction pass — every human-form golden is byte-identical
+   from `10d235d` to exit, which was the whole ratchet.
+   **Remaining on this branch: open a PR.** Nothing is merged to `main` yet.
+   Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1,
+   which is still unanswered.
+2. **NOT DONE — plan exit was reached without it, deliberately and on the record.** It was
+   never a plan-exit checkbox, so doing it would have been scope the exit did not authorize;
+   saying so beats letting a "recommended before plan exit" line rot into a false implication
+   that it happened. Still owed, still cheap. Original note follows verbatim.
+   **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
    `existing_ids` never gains ids appended during the current run, so two session files sharing a
    `sessionId` in one run would append two turns with the same id and different `files`, making
    `diff`/`show`/`undo <id>` error "ambiguous". The shape is real, not hypothetical — the corpus

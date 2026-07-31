@@ -279,6 +279,67 @@ this store size. **Bound:** one store, one machine, macOS/APFS; the walk is over
 plus the object tree, so this figure grows with both and should be re-measured before assuming it
 stays negligible on a materially larger store.
 
+## Phase 2.0 plan exit — hard-gate re-verification at the final commit (2026-07-31, `88c7e9b`)
+
+Plan-exit item 1 requires the hard gate retired **at the plan's final commit**, not only at P1's,
+with the denominator re-measured at run time (the corpus is a rolling ≤30-day window). Item 6
+requires P1's zero-bytes dir-digest AC re-verified against that same real-corpus run. Both were
+re-run here; the P1 row above is the earlier measurement and is **not** superseded — it is the
+same instrument at a different point on a moving corpus, and the drift between them is the point.
+
+Release build at `88c7e9b`. Command: `agentrec import claude --dry-run` (`--source` defaulted to
+`~/.claude`). Full output: `docs/verify/plan-exit-gate-run.txt`. Importability predicate is
+unchanged from the P1 row above (P1.md pinned decision 3) and is not restated here, so it cannot
+drift between the two rows.
+
+| Figure | P1 gate run (2026-07-29) | Plan exit (2026-07-31) |
+|---|---|---|
+| sessions_total (denominator, re-measured) | 1631 | **1937** |
+| sessions_importable | 1625 — 99.6% | **1930 — 99.6%** (bar is ≥90%) |
+| tier: T1 | 856 | **839** |
+| tier: T1.5 | 90 | **87** (1 structurally-inferred) |
+| tier: T2-candidate | — | **881** |
+| tier: T3 | — | **416** |
+| opaque_calls | — | **9558** |
+| mean_opaque_share_pct (per-session) | — | **10.91** |
+| T1.5 rejected — blob stale by intervening edit | 170 | **170** |
+| T1.5 rejected — unverifiable / blob missing / unsafe path | 3 / 0 / 0 | **3 / 1 / 0** |
+| skipped_sidechain | — | **1320** |
+| skipped malformed / non-UTF8 / io-error | — | **0 / 0 / 0** |
+| skipped_missing_field: cwd | — | **7** (schema drift, loud on stderr; those sessions are *not* counted importable) |
+| peak_rss_mb | — | **16.56** |
+
+**Verdict: the hard gate is RETIRED.** 99.6% ≥ the 90% bar, against a denominator re-measured at
+run time, with per-tier and per-session opaque-share fidelity figures recorded — which is what
+spec decision 8 requires and what a parse-only pass would not have satisfied.
+
+**Zero-bytes (item 6): PASS.** Recursive digest over `.agentrec/` was byte-identical across the
+run — `e682de84…` before and after.
+
+### Honesty notes on these numbers — read before citing them
+
+1. **The corpus moved *during this session*.** Two dry runs minutes apart measured
+   `opaque_calls` 9554 then 9558, and `peak_rss_mb` 16.66 then 16.56. The source is this
+   machine's live `~/.claude`, which the very session doing the verification is writing to. Every
+   figure here is a **timestamped sample of a moving corpus**, not a repeatable constant; a re-run
+   will differ and that is not a regression. Only the *ratio* (99.6%) is stable across the two
+   runs and the two dates.
+2. **T1 fell 856 → 839 and T1.5 fell 90 → 87 while the denominator rose 1631 → 1937.** This is
+   the rolling ≤30-day window doing exactly what the spec says it does: old sessions with
+   reconstructible pre-edit bytes aged out while newer sessions aged in. It is **not** a
+   classifier regression, but nothing in this run *proves* that — the two runs share no pinned
+   session set. Corpus decay is the reason "durable archive" stays embargoed.
+3. **The first attempt at the zero-bytes check was confounded and would have read as a FAIL.**
+   The scratch repo was created with `agentrec init`, which installs and starts a **live
+   daemon**; the daemon then snapshotted the run's own redirected output file into `.agentrec`,
+   changing the digest. The importer wrote nothing — the recorder did. The valid measurement uses
+   a repo with a hand-written `.agentrec/config.toml` and no daemon. **Any future
+   re-verification of this row must not run under a live recorder.** (The stray LaunchAgent from
+   that first attempt was uninstalled; the production daemon on `~/Projects/agentrec` was never
+   touched.)
+4. **`sessions_in_root: 0`** — no session was attributed to a bare `~/.claude/projects` root, so
+   the depth-1 denominator rule was not silently widened.
+
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
 Verdict: **GATE PASS** (binding done-gate, opus skeptical-reviewer, round 2 after one loop-back). 269 tests, 0 failed; clippy `-D warnings` + fmt clean. Independent codex (gpt-5.6-terra) cross-review ran alongside and surfaced 2 real bugs the per-task reviews missed (equal-ts fold nondeterminism, crash-window dangling `source_turns`) — both fixed + re-verified before the gate.

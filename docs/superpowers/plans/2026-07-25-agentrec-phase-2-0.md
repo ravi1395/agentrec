@@ -280,43 +280,113 @@ measurement.
 2. **`docs/superpowers/plans/2026-07-12-agentrec-memory.md` shows 12 unchecked tasks**, but CLAUDE.md records memory v1 as merged to `main` (PR #2, `7a83628`) with the dogfood clock started 2026-07-18. Are those checkboxes stale bookkeeping (close the plan), or genuinely open work that belongs in Phase 2 scope?
 3. **Store reclaim decision, adjacent to P1's corpus work.** The retained archives `.agentrec/objects.archived.1784328469` (2.6 GiB) + `.1784934498` (15 MiB) need only an `rm`, and 767.7 MiB of referenced `.remember`/`.code-review-graph` churn has no precise tool (only date-scoped `purge --snapshots-before`, which hard-deletes). Does this plan carry a phase for it, or is it a separate founder-called cleanup?
 
+**Disposition at plan exit (2026-07-31, founder-ratified).** All three are **carried forward
+unanswered** — explicitly, per plan-exit item 9's "never silently dropped". No answer was
+invented for any of them; each remains founder-owned:
+
+| # | Carried-forward state | Owner |
+|---|---|---|
+| 1 | Wave-2 cut (`import aider`, trailers + shim, npm/mise): parallel-now vs separate-plan-after still undecided. Nothing in wave 2 was started, so no fact on the ground pre-empts the ruling. | founder |
+| 2 | `2026-07-12-agentrec-memory.md`'s 12 unchecked tasks vs CLAUDE.md recording memory v1 merged: still unreconciled. **Stale-bookkeeping vs genuinely-open is exactly what must not be guessed** — an agent closing those boxes on inference is the failure this row exists to prevent. | founder |
+| 3 | Store reclaim: the two retained archives still need an `rm` (reversible-until-deleted, disk-only, agent may not run it); the referenced-churn class still has no precise tool and deliberately did not get one. | founder |
+
 ## Final acceptance — plan exit (added 2026-07-28, founder-directed; the "done" bar for the whole plan)
 
 Per-phase ACs above gate each commit; **this section is the bar for calling the plan itself
 complete.** Verified by the orchestrator independently of every implementer, then a binding
 skeptical-reviewer round in an isolated worktree. No item may be weakened to pass (ratchet).
 
-- [ ] **The Phase 2.0 hard gate is retired with evidence:** `agentrec import claude --dry-run`
+- [x] **The Phase 2.0 hard gate is retired with evidence:** `agentrec import claude --dry-run`
       over the real corpus (denominator re-measured at run time — rolling ≤30-day window)
       reports ≥90% of top-level sessions importable, **and** the fidelity figures (per-tier
       T1/T1.5/T2-candidate/T3 %, per-session opaque-call share) are recorded in a
       VERIFY-LEDGER row (spec decision 8). A parse-only pass without the fidelity row does
       **not** retire the gate.
-- [ ] **Byte-equivalence holds at exit, not just at P4:** every P3 golden is byte-identical at
-      the plan's final commit (stdout, stderr, exit code).
-- [ ] **Suite green at the re-based ladder** (absolute counts in this plan are stale — see the
+      → **PASS.** Plan-exit re-run at `88c7e9b` (release build): 1930/1937 = **99.6%**
+      importable against a re-measured denominator (1937, up from P1's 1631 — the rolling
+      window moved). Per-tier and opaque-share figures recorded in the plan-exit
+      VERIFY-LEDGER row; output at `docs/verify/plan-exit-gate-run.txt`.
+- [x] **Byte-equivalence holds at exit, not just at P4:** every P3 **human-form** golden is
+      byte-identical at the plan's final commit (stdout, stderr, exit code). **`--json`
+      goldens may change, additively only** — every pre-existing key and value byte-identical,
+      zero keys removed, new keys permitted.
+      → **AMENDED 2026-07-31, founder-ratified. Not a weakening — a conflict resolution.**
+      As originally written this item and **P5's AC-1 could not both hold**: AC-1 mandates
+      that `status --json` route through `RepositoryView`'s typed `RepositoryHealth`
+      serializer, which necessarily adds that struct's fields to the output. The two ratified
+      ACs collided at exit. The extraction's actual invariant — that refactoring behind the
+      seam never perturbs what a human reads — is preserved absolutely; the machine-readable
+      surface is where AC-1 deliberately *does* add fields. The additive-only bar is the
+      standing replacement, and it is checkable, not a waiver.
+      → **PASS under the amended scope.** `git diff --diff-filter=M --name-only
+      10d235d..HEAD -- cli/tests/fixtures/golden/` → exactly one file,
+      `status_json.golden` (a `--json` golden). Zero human-form goldens modified. Six recall
+      goldens are **added**, not modified. Additive-only verified key-by-key: all 11
+      pre-existing keys byte-identical, +7 new (`store_bytes`, `budget`, `over_budget`,
+      `turn_count`, `crash_gaps`, `unknown_type_lines`, `unparsed_lines`), **0 removed**.
+- [x] **Suite green at the re-based ladder** (absolute counts in this plan are stale — see the
       warning in the header): `cargo test --workspace -- --test-threads=3` → 0 failed on the
       cut-point branch; clippy `-D warnings` + fmt clean on debug **and** release; release
       `strings` carries no test seam.
-- [ ] **The pure-read split is proven both ways:** `status --json` / `health()` perform zero
-      writes on an over-budget store while bare `status` in the same fixture still evicts
-      (paired assertion, P4/P5 ACs).
-- [ ] **Import honesty is enforced at the undo boundary:** `undo` on a provenance-only
+      → **PASS.** 615 passed / 0 failed / 2 ignored. Debug and release clippy `-D warnings`
+      both exit 0; `cargo fmt --all -- --check` exit 0. Release `strings` carries no
+      `AGENTREC_TEST_PAUSE_*` seam (the two pause seams are `#[cfg(debug_assertions)]`-gated
+      and absent from the release binary; `AGENTREC_CLAUDE_PROJECTS_DIR` is present and is a
+      documented source override, not a test seam).
+- [x] **The pure-read split is proven both ways:** `status --json` / `health()` perform zero
+      writes on an over-budget store — **and so does bare `status` in the same fixture**
+      (parity assertion, P4/P5 ACs).
+      → **SUBSTITUTED 2026-07-31, founder-ratified — same substitution as P5's AC-2.** The
+      original clause ("...while bare `status` in the same fixture **still evicts**") is
+      **unsatisfiable against shipped code**: the perf-evidence round moved eviction to the
+      daemon's own tick (`daemon::run_eviction_pass`); `status_report` now calls only
+      `plan_eviction`, a read-only dry run, and `cmds.rs::tests::
+      status_performs_zero_store_writes` pins exactly the opposite invariant. The AC named an
+      event that can no longer occur. Re-adding eviction to `status` to satisfy it is
+      **forbidden**. The substituted bar is stronger, not weaker: *both* forms must be
+      zero-write, so a regression that reintroduced a write on either path still reds.
+      → **PASS.** `status_and_status_json_are_both_zero_write_on_over_budget_store` asserts
+      store bytes, log length, and `state.json` content **and** mtime unchanged after both
+      invocations on a genuinely over-budget fixture (`budget: 5`, 200-byte victim,
+      `over_budget: true` asserted).
+- [x] **Import honesty is enforced at the undo boundary:** `undo` on a provenance-only
       imported turn refuses before any working-tree write, with a message textually distinct
       from `withheld` / `skipped` / modified-since (P2 AC).
-- [ ] **`--dry-run` wrote zero bytes under `.agentrec/`** — P1's recursive dir-digest AC
+      → **PASS.** `hardening_cli::ac3_imported_turn_with_provenance_only_entry_refuses_before
+      _any_write` — asserts nonzero exit, stderr naming imported history, textual distinctness
+      from all three other refusal classes, and the load-bearing part: a sibling file in the
+      same turn that *would* have been revertible is byte-unchanged, so the refusal lands
+      before `build_plan`/`execute_revert`, and no `agentrec` undo turn is appended.
+- [x] **`--dry-run` wrote zero bytes under `.agentrec/`** — P1's recursive dir-digest AC
       re-verified at plan exit against the real corpus run, not only the fixture run (the
       import path's sole destructive-safety check; the one most likely to be satisfied
       loosely).
-- [ ] **Gap logic was unified, not relocated:** the three former implementations
+      → **PASS.** Recursive digest over `.agentrec/` byte-identical across the real-corpus
+      dry run (`e682de84…` before and after).
+      **Recorded trap, because the first attempt at this check was confounded and would have
+      read as a FAIL:** the first run used an `agentrec init`'d scratch repo, which starts a
+      **live daemon** — the daemon then snapshotted the very output file the run redirected
+      into the repo, changing the digest. The importer wrote nothing; the recorder did. The
+      valid measurement uses a repo with a hand-written `.agentrec/config.toml` and **no
+      daemon**. Any future re-verification of this item must not run under a live recorder.
+- [x] **Gap logic was unified, not relocated:** the three former implementations
       (`has_recording_gap` / `has_gap_after` / `count_gaps`) resolve through ONE `view.rs`
       primitive — `rg` finds zero copies in `cli/src` (P4 AC), asserted at plan exit because
       byte-identical goldens pass either way and the spec names relocation as the
       extraction's failure mode.
-- [ ] **Scope honesty:** no protocol-freeze artifacts (decision 8 / spec D5 — changelog only),
+      → **PASS.** Exactly one definition repo-wide: `agentrec-core/src/view.rs:102
+      pub fn has_gap_after`. `has_recording_gap` and `count_gaps` no longer exist in any form.
+      `cli/src` holds one call site (`readcmds.rs:839 view::has_gap_after`) and two prose
+      comments naming it — zero definitions.
+- [x] **Scope honesty:** no protocol-freeze artifacts (decision 8 / spec D5 — changelog only),
       no Sutra-repo touches (decision 12 / spec D9), no MCP code in this plan (2.2 is
       unconditional Phase 2 scope per spec D10 but sequenced **after** P4/P5 as its own
       round), no founder decision re-litigated.
-- [ ] **Closing bookkeeping (house rule):** CLAUDE.md Status entry + VERIFY-LEDGER updated in
+      → **PASS.** 29 files changed across `10d235d..88c7e9b`; `PROTOCOL.md` untouched, zero
+      paths matching `mcp` or `sutra`, no Sutra-repo path in the diff.
+- [x] **Closing bookkeeping (house rule):** CLAUDE.md Status entry + VERIFY-LEDGER updated in
       the closing commit; open questions 1–3 above either answered or explicitly carried
       forward — never silently dropped.
+      → **PASS.** This commit. Open questions 1–3 are **explicitly carried forward, not
+      answered** (founder ruling 2026-07-31: invent no answers) — see "Disposition" under
+      Open questions above and the CLAUDE.md Status entry.
