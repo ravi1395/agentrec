@@ -295,11 +295,25 @@ carries only current state, what's next, and standing debts.
   - The 40th is `~/Projects/agentrec` on `~/.local/bin/agentrec` — both paths still present: the
     **live dogfood daemon, never an orphan at all**. So the orphan population is 39, not 40, and it
     is **100% temp-rooted**.
-  - The build-tree observation is true but describes the **exec** path (`~/.gate3`, `~/.gate2`,
-    `agentrec-phase2`, `~/.gate-linux` `target/debug`), which is why those units fail with launchd
-    status **78** (exec failure) rather than the daemon refusing a missing root.
-  - **Therefore D46's temp-root guard is the correct predicate and would have prevented 39 of 39.**
-    The preceding "not temp roots" wording undercut the guard this repo had just shipped.
+  - The build-tree observation is **substantively correct** and describes the **exec** path
+    (`~/.gate3` 21, `~/.gate2` 6, `agentrec-phase2` 4, `~/.gate-linux` 4, plus scratchpad
+    worktrees) — which is why those units fail with launchd status **78** (exec failure) rather
+    than the daemon refusing a missing root. Only its *inference* ("not temp roots") was false.
+    Exact split, since the round's own first count was off by one: **38 `target/debug` + 1
+    `target/release`** (`com.agentrec.decf56034f2e`, `Projects/agentrec/target/release/agentrec`)
+    + 1 `~/.local/bin` — so "39 `target/debug`" is wrong, "39 build-tree execs" is right.
+  - **Therefore the temp-root guard is the correct predicate and would have prevented 39 of 39 —
+    but only in its post-`58c517f` form, and that distinction is the point.** D46 **as first
+    shipped** (`2c26fc5`) keyed on reading `$TMPDIR`, and demonstrably leaked a real launchd unit
+    for a tempdir root when a test scrubbed the variable (`58c517f`: "the `$TMPDIR` read let the
+    guard leak a unit"; `initcmd.rs:54-65`). TMPDIR-scrubbing harnesses are exactly the population
+    that created these 39, so **"D46 would have prevented 39 of 39" is true of the current code
+    and false of D46 v1.** The `--service` bypass is ruled out, not assumed: `git show
+    2c26fc5^:cli/src/main.rs` has no `--service` flag at all, so no historical `init` could have
+    passed it. The preceding "not temp roots" wording undercut the guard this repo had just shipped.
+  - **Not establishable, stated as a gap:** the archive copy clobbered every plist mtime to
+    2026-07-31 15:24:14, so **no unit can be dated** — how many of the 39 pre- or post-date
+    `2c26fc5`/`58c517f` is unrecoverable, as are the original `init` command lines.
   Replay (archive is local and disk-only, so this is a manual claim, `clm_50SC7TBN4GC281S1F8PZF0XTNF`):
   parse `ProgramArguments` in each `~/agentrec-launchagents-archive-20260731-152414/*.plist`, take
   the argument after `--root`, and bucket on the `/private/var/folders`, `/private/tmp`, `/tmp`,
