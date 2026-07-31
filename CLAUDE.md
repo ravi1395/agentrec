@@ -269,6 +269,37 @@ carries only current state, what's next, and standing debts.
     from which labels disappeared, not proof, and it is recorded as inference.
   - **The product defect that produced all 40 is fixed (D46)** — see Current state. `init` under a
     temp root installs no unit, so this cannot silently re-accumulate; `doctor` reports any that do.
+- **BLOCKS/AFFECTS A PUBLIC PHASE 2: `init` bakes a CANONICALIZED exec path, which breaks every
+  Homebrew user on upgrade.** `initcmd::current_exe()` does `current_exe().canonicalize()`;
+  canonicalize fully resolves symlinks, and Homebrew installs binaries as symlinks into
+  version-pinned Cellar paths (verified on this machine: `/opt/homebrew/bin/rg ->
+  ../Cellar/ripgrep/15.2.0/bin/rg`). README.md:51 documents `brew install
+  ravi1395/agentrec/agentrec` as a supported path, so a brew user's unit records
+  `…/Cellar/agentrec/<version>/bin/agentrec`. Two consequences — **(1) certain: after `brew
+  upgrade` the service keeps running the OLD binary forever** (user upgrades, recorder doesn't);
+  (2) once the old Cellar version is cleaned up, the unit becomes a launchd status-78 respawn loop
+  on the user's machine — exactly the failure this repo just cleaned 39 of. Fix is small and does
+  not need canonicalize: record the INVOCATION path (`/opt/homebrew/bin/agentrec`), which is stable
+  across upgrades. Canonicalizing is correct for the **root** (dedupes `.` vs absolute, D5) and
+  wrong for the **exec**. NOT BUILT — found 2026-07-31 while root-causing the 40 orphans. No brew
+  formula exists in this repo (`find` for `*.rb` → none), so the tap was not inspected; the claim
+  is about the documented install path plus the verified symlink layout.
+- **The 40 orphans' root cause was NOT what this file said this morning, and the correction
+  matters.** The recorded cause was "`init` in a temp dir without a matching uninstall". The
+  archived plists say otherwise: **39 of 40 pointed at a `target/debug` build directory** — 21
+  `~/.gate3`, 6 `~/.gate2`, 4 `agentrec-phase2`, 4 `~/.gate-linux`, plus scratchpad worktrees — i.e.
+  the dominant vector was **agents running `init` from throwaway build trees**, not temp roots. The
+  one surviving unit is the one installed from a stable path (`~/.local/bin`). Mechanism: `init`
+  bakes a SNAPSHOT OF TWO PATHS (root + `current_exe()`), neither validated at load time, and
+  `KeepAlive` turns a stale snapshot into permanent noise rather than one clean failure. launchd
+  status **78** is an exec failure, not the daemon refusing a missing root.
+- **Residual gap D46 does NOT close, and the one that matters for real users:** a unit whose
+  recorded path — root **or** exec — vanishes on a **non-temp** path. Deleting, moving, or renaming
+  an ordinary repo leaks an identical unit and the temp guard never fires. `doctor` reports it;
+  nothing prevents or reaps it. This is also the new evidence bearing on **`service prune`**, whose
+  deferral rationale (only piece that shells `launchctl`; destructive; founder-reserved) still
+  holds — but whose stated mitigation was "the user reaps by hand", and the leak source is now
+  known to be systemic rather than agent-only. Founder decision, not an agent reversal.
 - **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
   agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
   indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the
