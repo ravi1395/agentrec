@@ -223,6 +223,22 @@ pub struct InstalledUnit {
     pub label: String,
     pub path: PathBuf,
     pub state: UnitState,
+    /// The recorded exec, when it was recoverable AND no longer exists on
+    /// disk. `None` covers three DIFFERENT situations on purpose — exec
+    /// present, exec unrecoverable, unit unreadable — because none of them is
+    /// evidence the exec is missing.
+    ///
+    /// Deliberately a separate field rather than a `UnitState` variant: the
+    /// two paths a unit bakes go stale INDEPENDENTLY. A vanished root with a
+    /// live exec and a live root with a vanished exec are both real, and the
+    /// second is the shape a `brew upgrade` produces — invisible to a
+    /// root-only classification, and invisible to the daemon too, since a
+    /// missing exec fails at spawn before any of this code runs.
+    ///
+    /// `Unparseable` must never carry `Some`: a unit we could not read tells
+    /// us nothing about its exec, and reporting one would be a fabricated
+    /// finding — the same rule that keeps `Unparseable` out of `VanishedRoot`.
+    pub missing_exec: Option<PathBuf>,
 }
 
 /// Does `name` look like a unit file this tool installed? Both platforms'
@@ -255,23 +271,68 @@ pub fn scan_units(dir: &Path) -> Vec<InstalledUnit> {
             if !is_agentrec_unit_name(&name) {
                 return None;
             }
-            let state = match std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| parse_unit_root(&text))
-            {
+            let content = std::fs::read_to_string(&path).ok();
+            let state = match content.as_deref().and_then(parse_unit_root) {
                 Some(root) if root.is_dir() => UnitState::Live(root),
                 Some(root) => UnitState::VanishedRoot(root),
                 None => UnitState::Unparseable,
             };
+            // Read from the same `content`, so an unreadable file yields
+            // `None` here for the same reason it yields `Unparseable` above,
+            // rather than by a second independent read that could disagree.
+            let missing_exec = content
+                .as_deref()
+                .and_then(parse_unit_exec)
+                .filter(|exec| !exec.exists());
             Some(InstalledUnit {
                 label: unit_label(&name),
                 path,
                 state,
+                missing_exec,
             })
         })
         .collect();
     units.sort_by(|a, b| a.path.cmp(&b.path));
     units
+}
+
+/// Recover the exec a unit file records — `ProgramArguments[0]` on launchd,
+/// the first `ExecStart=` token on systemd. Dispatches on CONTENT like
+/// `parse_unit_root`, so both writers' output is parseable from either host.
+pub fn parse_unit_exec(content: &str) -> Option<PathBuf> {
+    if content.trim_start().starts_with('<') {
+        parse_launchd_exec(content)
+    } else {
+        parse_systemd_exec(content)
+    }
+}
+
+fn parse_launchd_exec(content: &str) -> Option<PathBuf> {
+    let after_key = content.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key
+        .split("<array>")
+        .nth(1)?
+        .split("</array>")
+        .next()?;
+    array
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()
+        .map(|v| xml_unescape(v.trim()))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_systemd_exec(content: &str) -> Option<PathBuf> {
+    let line = content
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("ExecStart="))?;
+    split_exec_start(line)
+        .into_iter()
+        .next()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Recover the `--root` a unit file records. Dispatches on CONTENT, not on the
@@ -821,6 +882,45 @@ mod tests {
         "/repo/<angle>&amp;lt;",
         "/repo/it's mine",
     ];
+
+    // The exec is the unit's OTHER baked path, and it needs the same
+    // round-trip guarantee as the root: a mangled exec would make the scan
+    // stat a path the unit never named and report a healthy install as
+    // stranded. Reuses TRICKY_ROOTS as exec paths — the escaping rules are
+    // per-writer, not per-field, so the same corpus stresses both.
+    #[test]
+    fn parse_unit_exec_round_trips_both_unit_forms() {
+        let root = Path::new("/repo/plain");
+        for raw in TRICKY_ROOTS {
+            let exec = Path::new(raw);
+            let plist = launchd_plist(exec, root);
+            assert_eq!(
+                parse_unit_exec(&plist).as_deref(),
+                Some(exec),
+                "launchd exec round-trip failed for {raw}: {plist}"
+            );
+            let unit = systemd_unit(exec, root);
+            assert_eq!(
+                parse_unit_exec(&unit).as_deref(),
+                Some(exec),
+                "systemd exec round-trip failed for {raw}: {unit}"
+            );
+        }
+    }
+
+    // The two parsers must not cross-talk: an exec and a root that differ have
+    // to come back distinct from the SAME document. A `nth(0)`/`nth(1)` slip
+    // in either direction would return the exec as the root, which the scan
+    // would then stat as a repo.
+    #[test]
+    fn exec_and_root_are_recovered_independently() {
+        let exec = Path::new("/opt/homebrew/bin/agentrec");
+        let root = Path::new("/Users/x/repo with space");
+        for doc in [launchd_plist(exec, root), systemd_unit(exec, root)] {
+            assert_eq!(parse_unit_exec(&doc).as_deref(), Some(exec), "{doc}");
+            assert_eq!(parse_unit_root(&doc).as_deref(), Some(root), "{doc}");
+        }
+    }
 
     // AC-S5: parsing must invert BOTH writers exactly. A root that survives
     // `xml_escape`/`systemd_escape` but comes back mangled would make the
