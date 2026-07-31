@@ -14,6 +14,20 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **Redteam remediation round (delivered 2026-08-01, GATE PASS after 5 skeptic rounds) — branch
+  `fix/redteam-immediate-actions`, 10 commits, unmerged.** External redteam (technical +
+  product) drove 4 immediate actions: (T1) README discloses D6 intra-bracket misattribution +
+  silent-undo consequence; (T2) E2E test pins the D6 data-loss chain against the real daemon,
+  `undo` gains a CAUTION activity-window line scoped to revert-marked files (mixed-plan-true,
+  bare-turn exclusion pinned); (T3) `purge --signals-consumed` — third sanctioned rewrite class
+  (D46), inbox was 13.4 MB unbounded — plus `status` inbox accounting; (T4) memory 1-week
+  dogfood ledger row **CLOSED FAILED** with per-conjunct evidence (candidate emitter never
+  fired; hit-rate unfalsifiable as written). Gate found and fixed 2 REAL daemon defects: startup
+  never detected a shrunk/missing inbox against a stale persisted offset (silent tail loss, now
+  resync+persist+DEGRADED at both startup sites) — and 3 successive rounds of normative-text
+  falsity around state.json deletion, killed only by probe-first writing (deletion mints NO
+  duplicate turns — D7 drops start/stop in the gap; real loss is silent as-if-consumed drop).
+  Test baseline **465 / 0 / 1** on the branch (443 on `main`).
 - **`main`** — carries the perf-evidence round: [PR #8](https://github.com/ravi1395/agentrec/pull/8)
   **squash-merged** to `main` as `4e04438` on 2026-07-30 (per-phase history survives only in the
   PR, not on `main`), then reconciled here with the local docs-only chain (`204ff04`..`2ade38a`)
@@ -69,6 +83,17 @@ carries only current state, what's next, and standing debts.
   in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
+- **PROTOCOL.md §3 amendment (D46 loose end):** `signal.jsonl` still annotated bare
+  "append-only"; the sanctioned consumed-prefix truncation makes that imprecise, and conflict
+  order (PROTOCOL > register) means the precise wording must land there, not only in D46.
+- **CAUTION feature + bare-turn decision (re-gate N4):** the undo activity-window CAUTION
+  shipped with no IMPLEMENTATION.md AC row (against "new features add their AC there first")
+  and the bare-turn exclusion is pinned only in code comments; founder decides whether bare
+  turns also get the caution, then both need register/ledger rows.
+- Merge decision for `fix/redteam-immediate-actions` (10 commits, gate PASS, 465/0/1) —
+  branch vs PR #10's in-flight `feat/phase-2-0-view-completion` ordering; both touch
+  IMPLEMENTATION.md (D46 number reused by both branches for different decisions — collision
+  must be resolved at merge, whichever lands second renumbers).
 - Demand/launch gate (Show HN etc.) never run — ROADMAP Phase 0's 30-day kill criterion has
   no data; 2.2's post-ship evaluation row needs a probe repo picked + `agentrec init` there.
 - Plan open questions 2–3: memory-plan stale checkboxes; store-churn reclaim.
@@ -92,8 +117,17 @@ carries only current state, what's next, and standing debts.
   runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
   block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
   spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
-- Memory dogfood ladder effectively not started (store prepped 2026-07-17; clock never ran
-  clean).
+- Memory dogfood ladder: 1-week row **CLOSED FAILED 2026-07-31** (window expired dirty; 0
+  agent-origin candidates in 1944 signal lines — the SKILL emitter never fired once; hit-rate
+  unfalsifiable, stats log has no denominator). Rerun requires fresh T0, re-pinned baseline,
+  and FIRST an end-to-end proof the candidate path fires at all.
+- DEGRADED channel wording (re-gate N3): a signal-inbox shrink is counted via
+  `record_io_failure`, so the banner reads "snapshot write(s) failed … undo on affected files
+  has no snapshot" about a file that is neither a snapshot nor undoable. Pre-existing channel,
+  deliberately deferred.
+- `daemon.rs` resync helper doc: "len is the only offset that can't replay consumed signals as
+  duplicate turns" is true at the `poll` site, over-general at the startup site (startup replay
+  never feeds start/stop to the engine at any offset). Safe direction, text-only.
 
 ## Working method
 
