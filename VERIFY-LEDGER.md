@@ -868,17 +868,30 @@ left, `~/Library/LaunchAgents` back to exactly 1 agentrec unit (the live dogfood
 
 | Probe | `KeepAlive` config | Result | Reading |
 |---|---|---|---|
-| 1 | `PathState {existing: true, missing: true}` | `runs = 3` in 30s, `state = spawn scheduled` | **`PathState` ORs its entries** |
+| 1 | `PathState {existing: true, missing: true}` | `runs = 3` in 30s, `state = spawn scheduled` | a present co-key defeats the gate (see the mechanism caveat below) |
 | 2 | `PathState {missing: true}`, no explicit `RunAtLoad` | `runs = 0`, `state = not running` | single failing key suppresses the job entirely |
 | 3 | `PathState {missing: true}` + explicit `RunAtLoad` | `runs = 1`, `state = not running` | `RunAtLoad` fires **once**, then every restart is blocked |
 
 **Probe 1 refuted the design this round started from.** The plan specified
-`PathState {root, exec}` on the assumption it ANDs. It does not — `launchd.plist(5)` says "If
-multiple keys are provided, launchd ORs them", and probe 1 confirms that extends inside
-`PathState`. A `{root, exec}` pair would keep the job alive whenever **either** path exists, so
-the exec gate would have been **inert in exactly the case that motivates it** (root present,
-binary upgraded away) while reading as fixed. There is no AND available: `false` values invert
-individual conditions, they cannot negate the OR across them.
+`PathState {root, exec}` on the assumption it ANDs. It does not: a `{root, exec}` pair would keep
+the job alive whenever **either** path exists, so the exec gate would have been **inert in exactly
+the case that motivates it** (root present, binary upgraded away) while reading as fixed. No AND
+is reachable — `false` values invert individual conditions, they cannot negate whatever combines
+them.
+
+**Mechanism caveat, added by the D47 gate round (2026-07-31) after this section overstated it.**
+`launchd.plist(5)`'s "If multiple keys are provided, launchd ORs them" is stated at the
+`KeepAlive`-**dict** level, not inside `PathState`. Probe 1 does NOT uniquely establish
+"`PathState` ORs its entries": it is equally consistent with "an absent path is disregarded while
+a present co-key is satisfied". The two are operationally identical for this decision — under
+either, a co-listed exec adds no gate — so root-only is correctly supported. **The OR label is
+inference; the consequence is what was measured.** Do not quote "PathState ORs" as measured fact.
+
+**Probe 3's observation window went unrecorded**, so "blocks every restart / one attempt per
+login" is an extrapolation from ONE load cycle. It is supported by a real discriminating
+observable — `state = not running` versus probe 1's `state = spawn scheduled`, which is how a
+throttled pending respawn reads — but "every" is not established. To close: reload the probe-3
+plist, wait ≥30s (3× the 10s default `ThrottleInterval`), confirm `runs` stays 1.
 
 **Shipped:** `PathState` on the **root only**. Probe 3 is the shipped configuration's behavior —
 one attempt per login, no loop. `launchd_pathstate_lists_only_the_root_never_the_exec` exists so a
@@ -898,6 +911,22 @@ purpose is not missing activity.
 upgrade to a proven claim without running it on Linux. Needed: load a new-posture unit, delete
 the root, confirm the start job is skipped (unit inactive, not failed) and no restart churn
 appears in `systemctl --user status`.
+
+### Gate outcome (2026-07-31)
+
+Binding fable skeptic in an isolated worktree (`~/.gate-d47`, detached at `4c58b07`):
+**GATE PASS, 8/8 ACs.** It re-ran the full suite itself (644/0/3), executed 5 neuter/restore
+cycles rather than trusting the round's reported ones, confirmed each redded on a WRONG VALUE
+rather than absent output, and independently replayed the archive classification (39 temp-rooted
+/ 1 live daemon). It verified the edited fixture `no_orphans_is_a_silent_pass` was a genuine
+de-ambient-ing, not a weakening — the old fixture named an exec absent on this machine and would
+fail under correct new code. Its two wording findings are folded in above; both were this
+document's own overstatements.
+
+**Residual risk it named, carried deliberately:** no generator-emitted `PathState` plist has ever
+been loaded end-to-end — every probe plist was hand-written, and the hermetic-tests rule keeps
+`install` out of the suite. The first `agentrec init` after merge (the dogfood rewrite below) IS
+that end-to-end test; check `launchctl print gui/$(id -u)/com.agentrec.bfa6bde6eaa4` afterwards.
 
 ### Founder decision pending
 

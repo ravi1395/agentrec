@@ -69,18 +69,29 @@ fn xml_escape(s: &str) -> String {
 /// it.
 ///
 /// **Only the ROOT is listed, and that is a measured constraint, not an
-/// omission.** launchd ORs the conditions in a `KeepAlive` dict, and probing
-/// confirmed the OR extends INSIDE `PathState`: a two-key dict with one path
-/// absent still produced 3 spawns in 30s. So listing `{root, exec}` would
-/// keep the job alive whenever EITHER exists, making the exec gate inert in
-/// exactly the case that motivates it (root present, binary upgraded away).
-/// There is no AND: `PathState`'s `false` values invert individual
-/// conditions, they cannot negate the OR across them. A vanished exec is
-/// therefore DETECTED (`doctorcmd::check_orphan_services`), not prevented.
+/// omission.** A probed two-key `PathState` with one path absent still
+/// produced 3 spawns in 30s (macOS, 2026-07-31), so a co-listed path that
+/// still exists defeats the gate: `{root, exec}` would keep the job alive
+/// whenever EITHER exists, making the exec gate inert in exactly the case
+/// that motivates it (root present, binary upgraded away).
 ///
-/// Measured behavior with a missing root, macOS 2026-07-31: `RunAtLoad`
-/// fires exactly once, then `PathState` blocks every restart — `runs = 1`,
-/// `state = not running`. One attempt per login, no loop.
+/// Precise about the mechanism, because the gate round caught this doc
+/// overstating it: the man page's "launchd ORs them" is stated at the
+/// `KeepAlive`-dict level, and the probe does not uniquely distinguish
+/// "`PathState` ORs its entries" from "an absent path is disregarded while a
+/// present co-key is satisfied". Both hypotheses give the same consequence
+/// for this decision, which is why root-only is right either way — but the
+/// OR label itself is inference, not measurement. No AND is reachable in
+/// either reading: `false` values invert individual conditions, they cannot
+/// negate whatever combines them. A vanished exec is therefore DETECTED
+/// (`doctorcmd::check_orphan_services`), not prevented.
+///
+/// Measured with a missing root, macOS 2026-07-31: `RunAtLoad` fires once
+/// and the job then reads `runs = 1`, `state = not running` — versus
+/// `state = spawn scheduled` for a job launchd is still respawning, which is
+/// what makes the two distinguishable. Read as "no respawn observed in that
+/// window", not "every restart blocked forever": it is ONE load cycle whose
+/// duration went unrecorded.
 pub fn launchd_plist(exec: &Path, root: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
