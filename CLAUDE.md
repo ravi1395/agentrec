@@ -238,6 +238,23 @@ carries only current state, what's next, and standing debts.
 
 ### Founder-pending (agent cannot or may not do these)
 
+- **40 orphaned `com.agentrec.*` LaunchAgents in `~/Library/LaunchAgents` (found 2026-07-31).**
+  41 plists exist; **exactly one** (`com.agentrec.bfa6bde6eaa4`, the real dogfood daemon on
+  `~/Projects/agentrec`) points at a directory that still exists. The other 40 point at deleted
+  scratch roots — 37 under `/var/folders/.../tmp.*` and 3 under prior sessions' scratchpads —
+  and every one carries `RunAtLoad` + `KeepAlive`. Agent will not mass-delete plists (modifying
+  the user's launchd config is the founder's call). Enumerate with the read-only loop recorded
+  in this round's transcript; remove with `launchctl bootout gui/$(id -u)/<label>` then `rm` the
+  plist.
+  - **This is a product defect, not just machine cruft, and it is ours.** `agentrec init` in a
+    temp dir installs a **permanent, user-scoped, KeepAlive** service; when the dir is deleted —
+    which is what temp dirs are for — nothing reaps the unit. Every scratch `init` across every
+    round has leaked one. `uninstall` does remove it correctly (verified this round: the stray
+    `com.agentrec.5e36ca4f5c82` from the plan-exit corpus run is gone), so the leak is entirely
+    "init without a matching uninstall", which is the normal outcome of a crashed or abandoned
+    test run. Candidate fixes, none built: `init --no-service` as the default under `TMPDIR`;
+    a `doctor` check that lists units whose `--root` no longer exists; a `service prune` verb.
+    Not started — recorded so the next round does not rediscover it.
 - **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
   agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
   indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the
