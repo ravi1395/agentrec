@@ -76,7 +76,7 @@ carries only current state, what's next, and standing debts.
 ### Standing debts & residuals (recorded, not blocking)
 
 - `log.jsonl` churn history (9602 `.remember` entries) still renders as churn blasts in
-  `log`/`show`; not byte-reclaimable without a third sanctioned rewrite class — deliberately
+  `log`/`show`; not byte-reclaimable without a fourth sanctioned rewrite class — deliberately
   not built.
 - claimd coverage debt rows: `cli/src/cmds.rs` (P3 residuals round) and `cli/src/purgecmd.rs`
   (honesty round) — touched-uncovered, retroactive declaration refused by design.
