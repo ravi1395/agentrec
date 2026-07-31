@@ -813,12 +813,42 @@ all. `$TMPDIR` is still consulted for non-default and non-macOS values. Pinned b
 the static prefix reds it), and confirmed by counting plists across **four** subsequent full runs —
 41 held, then 42 held with zero further growth.
 
-**The 42nd plist was NOT removed.** It is this round's own mess rather than one of the founder's
-40, but plist removal is founder-reserved and that reservation was not scoped to "units you didn't
-create". It is listed in CLAUDE.md § Founder-pending with its removal command, alongside the 40.
+**The 42nd plist was not removed by the agent when this was written.** It was subsequently reaped
+along with the other orphans on 2026-07-31, on the founder's explicit instruction — see
+"Orphans reaped" below.
 
 ### Residual — the guard is preventive only, and only for future inits
 
 `doctor`'s check is user-global, but the temp guard changes only what THIS binary installs from now
 on. Any `agentrec` build predating this change still leaks a unit per temp-dir `init`. Nothing
 detects or blocks that, and nothing here reaps what already exists.
+
+### Orphans reaped (2026-07-31, founder-instructed) — and the detection half self-confirmed
+
+The founder instructed removal, so the 40 were reaped. **39 by the agent in one pass; 2 had already
+gone** (`com.agentrec.039364bb7dfe`, `com.agentrec.c0bf764acce7`) — inferred, not proven, to be the
+founder running the two removal commands this session had printed, since those are exactly the two
+labels that appeared in runnable form.
+
+Method, in the order it ran, because a destructive pass with no rails is not evidence of care:
+
+1. **Archive first** — all 40 plists copied to `ARCHIVE` (below) before anything was touched. Fully
+   reversible, consistent with the repo's never-delete house rule.
+2. **Removal list built from agentrec's own classifier**, not an ad-hoc `plistlib` script: the
+   `VanishedRoot` bucket of `service::scan_units`, i.e. the code D46 shipped.
+3. **Independently re-checked** — each listed root re-tested absent at removal time (a root that
+   reappeared, e.g. a remounted volume, would have aborted the pass).
+4. **Live unit asserted OUT of the list** (`grep -c bfa6bde6eaa4` = 0) and **every entry asserted
+   present in the archive** before any `rm`.
+5. `launchctl bootout gui/$(id -u)/<label>` then `rm` — **39 removed, 0 failures**.
+
+Verified after: exactly one plist remains (`com.agentrec.bfa6bde6eaa4`), `launchctl list` shows one
+agentrec job at **status 0** (before: 23 loaded orphans at status **78** — launchd respawning
+recorders whose roots were gone), and the real dogfood daemon is untouched and still running as
+pid 865 against `~/Projects/agentrec`.
+
+**`doctor`'s orphaned-services check now prints a silent `pass` with no note** — the D46 detection
+half confirming its own fix end-to-end against the real machine, having previously reported all 40.
+
+- **ARCHIVE:** `/Users/ravichandrasekhar/agentrec-launchagents-archive-20260731-152414` (40 plists). Safe to delete once the founder is satisfied; nothing
+  references it.

@@ -249,50 +249,26 @@ carries only current state, what's next, and standing debts.
 
 ### Founder-pending (agent cannot or may not do these)
 
-- **40 orphaned `com.agentrec.*` LaunchAgents in `~/Library/LaunchAgents` (found 2026-07-31).**
-  41 plists exist; **exactly one** (`com.agentrec.bfa6bde6eaa4`, the real dogfood daemon on
-  `~/Projects/agentrec`) points at a directory that still exists. The other 40 point at deleted
-  scratch roots — 37 under `/var/folders/.../tmp.*` and 3 under prior sessions' scratchpads —
-  and every one carries `RunAtLoad` + `KeepAlive`. Agent will not mass-delete plists (modifying
-  the user's launchd config is the founder's call). Enumerate with the read-only loop recorded
-  in this round's transcript; remove with `launchctl bootout gui/$(id -u)/<label>` then `rm` the
-  plist.
-  - **This is a product defect, not just machine cruft, and it is ours.** `agentrec init` in a
-    temp dir installs a **permanent, user-scoped, KeepAlive** service; when the dir is deleted —
-    which is what temp dirs are for — nothing reaps the unit. Every scratch `init` across every
-    round has leaked one. `uninstall` does remove it correctly (verified this round: the stray
-    `com.agentrec.5e36ca4f5c82` from the plan-exit corpus run is gone), so the leak is entirely
-    "init without a matching uninstall", which is the normal outcome of a crashed or abandoned
-    test run.
-  - **The PRODUCT DEFECT half is FIXED (D46, 2026-07-31) — the 40 plists are NOT, and remain
-    entirely yours.** Two of the three candidate fixes were built, the third deliberately not:
-    (1) **prevent** — `init` under a canonicalized temp prefix (`$TMPDIR`, `/tmp`, `/private/tmp`)
-    now skips **only** the service install and prints why, with `--service` to force it
-    (`--service` + `--no-service` is a clap conflict error). Canonicalizing both sides is
-    load-bearing, not tidiness: `$TMPDIR` reads `/var/folders/…` while `resolve_root` stores
-    `/private/var/folders/…`, and the raw compare was proven by neuter to make the guard silently
-    never fire. `$TMPDIR` alone would have covered only 37 of the 40 — the other 3 are under
-    `/private/tmp/claude-501/…`. (2) **detect** — `doctor` gains an `orphaned services` check
-    that parses installed units (necessary: `slug()` is a one-way hash, so orphans cannot be found
-    by inverting filenames) and reports vanished roots as **advisory `pass`, never `fail`** — the
-    unit directory is machine-global, so failing would break every unrelated repo's exit-0 gate.
-    It prints the exact `launchctl bootout … && rm` pair. (3) **NOT built: `service prune`** — the
-    only piece that would shell `launchctl` (forbidden automated coverage by `service.rs`'s module
-    contract), destructive, and plist removal is yours. Evidence, including a **real-corpus run
-    (41/41 parsed, 40 vanished, 1 live, 0 unparseable)** that independently reproduces the 40/41
-    above, and three discriminating-neuter proofs: `VERIFY-LEDGER.md` § "D46". Suite 634/0/3
-    (from 615/0/2). **`agentrec uninstall --root <deleted path>` is NOT a usable remedy for these
-    40** — `resolve_root` canonicalized at install time, a vanished path cannot canonicalize, so
-    the recomputed slug misses. Use the printed `bootout`+`rm` pair.
-- **A 42nd orphaned plist exists, created by D46's OWN test suite on 2026-07-31 at 10:57** —
-  `com.agentrec.c0bf764acce7` → `/private/var/folders/m5/…/T/.tmpdW8v92` (deleted). The guard's
-  first version recognized macOS per-user temp dirs only via `$TMPDIR`, and a concurrent
-  `set_var` in the same test binary made one read miss, so `init` installed a real unit. Fixed
-  (static `/var/folders` prefix; also closes the launchd/cron case where `$TMPDIR` is unset),
-  neuter-proven, and 42 has held across four subsequent full suite runs. **Not removed** — plist
-  removal is yours, and that reservation was not scoped to units the agent created. Same removal
-  path as the other 40:
-  `launchctl bootout gui/$(id -u)/com.agentrec.c0bf764acce7 && rm ~/Library/LaunchAgents/com.agentrec.c0bf764acce7.plist`
+- ~~**40 orphaned `com.agentrec.*` LaunchAgents**~~ — **REAPED 2026-07-31 at the founder's explicit
+  instruction.** The machine now carries **exactly one** agentrec unit,
+  `com.agentrec.bfa6bde6eaa4` → `~/Projects/agentrec`, loaded and healthy (pid 865, launchd status
+  **0**; before the reap 23 orphans were loaded and failing with status **78**, i.e. launchd was
+  repeatedly respawning recorders whose `--root` was gone). Method: every plist archived first to
+  `AGENTREC_LAUNCHAGENT_ARCHIVE` (below) — reversible, per the house never-delete rule — then the
+  removal list built from agentrec's OWN classifier (`service::scan_units` `VanishedRoot` bucket),
+  each root independently re-checked absent, the live unit asserted out of the list, and every
+  entry asserted present in the archive before a single `rm`. Then `launchctl bootout
+  gui/$(id -u)/<label>` followed by `rm` — 39 removed, 0 failures. `doctor`'s orphaned-services
+  check is now a silent `pass` with no note, which is the D46 detection half confirming its own
+  fix end-to-end on the real machine.
+  - **Archive (delete when satisfied; nothing else references it):** `/Users/ravichandrasekhar/agentrec-launchagents-archive-20260731-152414` — 40 plists.
+  - **Two of the 42 were removed before this pass and NOT by the agent.** `com.agentrec.039364bb7dfe`
+    (the label `doctor` happened to print as its example) and `com.agentrec.c0bf764acce7` (the unit
+    D46's own suite leaked, whose removal command was surfaced in a runnable block) both vanished
+    between checks. Almost certainly the founder ran the two printed commands; that is inference
+    from which labels disappeared, not proof, and it is recorded as inference.
+  - **The product defect that produced all 40 is fixed (D46)** — see Current state. `init` under a
+    temp root installs no unit, so this cannot silently re-accumulate; `doctor` reports any that do.
 - **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
   agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
   indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the
