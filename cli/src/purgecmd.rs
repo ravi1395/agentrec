@@ -815,10 +815,15 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 ///     hands to `parse_signals`. The tail is copied verbatim.
 /// (b) It refuses rather than guesses on any inconsistency: a missing
 ///     `state.json` (the only record of what was consumed), an offset past
-///     EOF, or an offset that does not land just after a `\n`. A consumed
-///     offset is always a line boundary by construction (both readers advance
-///     only to `rposition(b'\n') + 1`), so a mid-line offset means something
-///     already went wrong — truncating there would decapitate a signal line.
+///     EOF, or an offset that does not land just after a `\n`. Ordinary
+///     consumption always leaves a line-boundary offset (both readers advance
+///     only to `rposition(b'\n') + 1`) — but the shrink resync in (c) is a
+///     legitimate producer of a mid-line offset: it lands at the file's real
+///     EOF, which sits mid-line whenever the last line was torn mid-write.
+///     That state self-resolves after the next hook fire (hooks append whole
+///     lines, so consumption advances back onto a boundary). The refusal is
+///     still right either way — truncating there would decapitate a signal
+///     line — but it is a wait-and-retry, not proof of corruption.
 /// (c) Ordering is rename-THEN-rebase, and that direction is load-bearing.
 ///     A crash between them leaves a large `signal_offset` against a short
 ///     file, which the daemon detects AT STARTUP OR MID-RUN and reconciles
@@ -916,8 +921,13 @@ fn purge_signals_consumed_inner(
     if bytes[offset as usize - 1] != b'\n' {
         return Err(format!(
             "state.json's signal_offset ({offset}) does not land on a line boundary \
-             — refusing to truncate through a partial signal line (a consumed offset \
-             is always a line boundary by construction; this state.json is corrupt)"
+             — refusing to truncate through a partial signal line. Ordinary \
+             consumption always leaves a line-boundary offset; the usual cause here \
+             is a detected inbox shrink whose resync landed on a torn final line — \
+             that resolves itself after the next hook fire and one `agentrec record` \
+             cycle, then retry. Do NOT delete state.json (purge refuses permanently \
+             without it); only an offset that stays mid-line across new hook \
+             activity indicates a hand-edited or corrupt state.json"
         ));
     }
     let (consumed, tail) = bytes.split_at(offset as usize);
@@ -1687,10 +1697,12 @@ mod tests {
         drop(lock);
     }
 
-    // AC3.1: an offset that does not land just after a newline can only come
-    // from a corrupt state.json (both readers advance to `rposition('\n')+1`).
-    // Truncating there would decapitate a signal line, so it refuses and
-    // changes nothing. Neuter: drop the boundary check → RED.
+    // AC3.1: an offset that does not land just after a newline is refused —
+    // truncating there would decapitate a signal line. It is NOT proof of
+    // corruption: ordinary consumption always lands on `rposition('\n')+1`,
+    // but a shrink resync legitimately lands mid-line when the last line was
+    // torn (self-resolves on the next hook fire). Refuses and changes
+    // nothing either way. Neuter: drop the boundary check → RED.
     #[test]
     fn signals_consumed_refuses_a_mid_line_offset() {
         let (tmp, original, offset) = signal_fixture(3);
