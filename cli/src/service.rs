@@ -56,7 +56,31 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// macOS launchd plist: runs `record --root <root>` at load and on crash.
+/// macOS launchd plist: runs `record --root <root>` at load and on crash,
+/// but ONLY while the root still exists.
+///
+/// `KeepAlive` is a dict carrying `PathState`, not a bare `<true/>`. A bare
+/// `KeepAlive` is what turned a stale path snapshot into permanent noise: the
+/// unit records the root at `init` time, nothing re-validates it at load
+/// time, and when the root is deleted launchd respawns the doomed job forever
+/// (39 such units accumulated on the author's machine by 2026-07-31).
+/// `PathState` makes the precondition declarative, so the init system —
+/// which is the only thing still running once a path goes stale — enforces
+/// it.
+///
+/// **Only the ROOT is listed, and that is a measured constraint, not an
+/// omission.** launchd ORs the conditions in a `KeepAlive` dict, and probing
+/// confirmed the OR extends INSIDE `PathState`: a two-key dict with one path
+/// absent still produced 3 spawns in 30s. So listing `{root, exec}` would
+/// keep the job alive whenever EITHER exists, making the exec gate inert in
+/// exactly the case that motivates it (root present, binary upgraded away).
+/// There is no AND: `PathState`'s `false` values invert individual
+/// conditions, they cannot negate the OR across them. A vanished exec is
+/// therefore DETECTED (`doctorcmd::check_orphan_services`), not prevented.
+///
+/// Measured behavior with a missing root, macOS 2026-07-31: `RunAtLoad`
+/// fires exactly once, then `PathState` blocks every restart — `runs = 1`,
+/// `state = not running`. One attempt per login, no loop.
 pub fn launchd_plist(exec: &Path, root: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -75,7 +99,13 @@ pub fn launchd_plist(exec: &Path, root: &Path) -> String {
 \t<key>RunAtLoad</key>\n\
 \t<true/>\n\
 \t<key>KeepAlive</key>\n\
-\t<true/>\n\
+\t<dict>\n\
+\t\t<key>PathState</key>\n\
+\t\t<dict>\n\
+\t\t\t<key>{root}</key>\n\
+\t\t\t<true/>\n\
+\t\t</dict>\n\
+\t</dict>\n\
 </dict>\n\
 </plist>\n",
         slug = slug(root),
@@ -113,11 +143,35 @@ fn systemd_escape(s: &str) -> String {
     out
 }
 
+/// Escape a path for a systemd setting that takes ONE value rather than a
+/// command line (`ConditionPathIsDirectory=`, …). Only `%` needs doubling: a
+/// literal `%` would otherwise start a specifier expansion. Deliberately does
+/// NOT reuse `systemd_escape`, whose whitespace quoting exists to stop a path
+/// splitting into extra `ExecStart=` argv entries — there is no argv to split
+/// here, and a quoted value would likely be taken with its quotes.
+fn systemd_value_escape(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
 /// Linux systemd user unit: same exec; `Restart=always` mirrors `KeepAlive`.
+///
+/// `ConditionPathIsDirectory` is systemd's counterpart to launchd's
+/// `PathState` — a start job whose condition is false is skipped, leaving the
+/// unit inactive rather than failed, so a deleted root stops producing restart
+/// churn. Kept to the ROOT alone for parity with the launchd side, where
+/// listing the exec too was measured to be actively wrong (see
+/// `launchd_plist`); the exec is DETECTED by `doctor`, not gated here.
+///
+/// **Honesty note:** unlike the launchd behavior above, this one is NOT
+/// measured. It was written on a macOS host with no systemd to probe, so the
+/// generator is unit-tested but the runtime effect rests on documentation and
+/// carries a VERIFY-LEDGER row. Do not upgrade this to a proven claim without
+/// running it on Linux.
 pub fn systemd_unit(exec: &Path, root: &Path) -> String {
     format!(
         "[Unit]\n\
 Description=agentrec recorder for {root}\n\
+ConditionPathIsDirectory={root_cond}\n\
 \n\
 [Service]\n\
 ExecStart={exec} record --root {root_q}\n\
@@ -128,6 +182,7 @@ WantedBy=default.target\n",
         root = root.display(),
         exec = systemd_escape(&exec.display().to_string()),
         root_q = systemd_escape(&root.display().to_string()),
+        root_cond = systemd_value_escape(&root.display().to_string()),
     )
 }
 
@@ -882,6 +937,82 @@ mod tests {
         "/repo/<angle>&amp;lt;",
         "/repo/it's mine",
     ];
+
+    // The unit must gate its own restarts on the root still existing, or a
+    // deleted repo respawns a doomed job forever — the mechanism behind 39
+    // leaked units. A bare `KeepAlive <true/>` is exactly that defect.
+    #[test]
+    fn launchd_plist_gates_keepalive_on_the_root_path() {
+        let plist = launchd_plist(Path::new("/usr/local/bin/agentrec"), Path::new("/repo"));
+        assert!(
+            plist.contains("<key>PathState</key>"),
+            "KeepAlive must be conditional: {plist}"
+        );
+        // The gated path must be the ROOT.
+        let path_state = plist
+            .split("<key>PathState</key>")
+            .nth(1)
+            .expect("PathState section");
+        assert!(
+            path_state.contains("<key>/repo</key>"),
+            "PathState must name the root: {plist}"
+        );
+        assert!(
+            !plist.contains("<key>KeepAlive</key>\n\t<true/>"),
+            "a bare KeepAlive is the defect this replaces: {plist}"
+        );
+    }
+
+    // MEASURED CONSTRAINT, not a style choice: launchd ORs the entries in a
+    // KeepAlive dict, and the OR extends inside PathState — a probe with two
+    // keys, one absent, still produced 3 spawns in 30s. Listing the exec
+    // alongside the root would therefore keep a job alive whenever EITHER
+    // exists, silently making the gate useless in the very case it is meant
+    // for (root present, binary upgraded away). This test exists so a future
+    // reader who thinks "why isn't the exec gated too?" adds it and reds
+    // here instead of shipping an inert condition.
+    #[test]
+    fn launchd_pathstate_lists_only_the_root_never_the_exec() {
+        let exec = Path::new("/opt/homebrew/bin/agentrec");
+        let plist = launchd_plist(exec, Path::new("/repo"));
+        let path_state = plist
+            .split("<key>PathState</key>")
+            .nth(1)
+            .expect("PathState section");
+        assert!(
+            !path_state.contains(exec.to_str().unwrap()),
+            "PathState ORs its entries — adding the exec makes the gate inert: {plist}"
+        );
+    }
+
+    // systemd counterpart. NOT measured (no systemd host available when this
+    // was written) — the generator is pinned here, the runtime effect carries
+    // a VERIFY-LEDGER row.
+    #[test]
+    fn systemd_unit_gates_start_on_the_root_directory() {
+        let unit = systemd_unit(Path::new("/usr/local/bin/agentrec"), Path::new("/repo"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo"),
+            "start must be conditional on the root: {unit}"
+        );
+    }
+
+    // A `%` in the root would start a systemd specifier expansion. The
+    // Condition value takes ONE value, so it must be `%`-doubled but NOT
+    // shell-quoted the way an ExecStart token is.
+    #[test]
+    fn condition_value_escapes_percent_without_quoting() {
+        let unit = systemd_unit(Path::new("/bin/agentrec"), Path::new("/repo/100%done"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo/100%%done"),
+            "% must be doubled: {unit}"
+        );
+        let unit = systemd_unit(Path::new("/bin/agentrec"), Path::new("/repo with space"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo with space\n"),
+            "a single-value setting must not gain argv quoting: {unit}"
+        );
+    }
 
     // The exec is the unit's OTHER baked path, and it needs the same
     // round-trip guarantee as the root: a mangled exec would make the scan

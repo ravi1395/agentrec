@@ -852,3 +852,55 @@ half confirming its own fix end-to-end against the real machine, having previous
 
 - **ARCHIVE:** `/Users/ravichandrasekhar/agentrec-launchagents-archive-20260731-152414` (40 plists). Safe to delete once the founder is satisfied; nothing
   references it.
+
+## D47 — declarative liveness: stop the respawn loop at the unit (2026-07-31)
+
+Follows D46. D46 stopped `init` from *creating* units under temp roots; D47 stops a unit that
+already exists from **respawn-looping once its baked path goes stale**. The two baked paths (root,
+exec) are never re-validated at load time, and `KeepAlive true` turns one clean failure into
+permanent noise.
+
+### Measured on macOS 26.5 (Darwin 25.5.0), 2026-07-31 — three launchd probes
+
+Run with throwaway labels (`local.pathstateprobe*`, deliberately NOT `com.agentrec.*`), plists in
+a scratch dir, `launchctl bootout` in an EXIT trap. Residue re-checked after each: 0 probe jobs
+left, `~/Library/LaunchAgents` back to exactly 1 agentrec unit (the live dogfood daemon).
+
+| Probe | `KeepAlive` config | Result | Reading |
+|---|---|---|---|
+| 1 | `PathState {existing: true, missing: true}` | `runs = 3` in 30s, `state = spawn scheduled` | **`PathState` ORs its entries** |
+| 2 | `PathState {missing: true}`, no explicit `RunAtLoad` | `runs = 0`, `state = not running` | single failing key suppresses the job entirely |
+| 3 | `PathState {missing: true}` + explicit `RunAtLoad` | `runs = 1`, `state = not running` | `RunAtLoad` fires **once**, then every restart is blocked |
+
+**Probe 1 refuted the design this round started from.** The plan specified
+`PathState {root, exec}` on the assumption it ANDs. It does not — `launchd.plist(5)` says "If
+multiple keys are provided, launchd ORs them", and probe 1 confirms that extends inside
+`PathState`. A `{root, exec}` pair would keep the job alive whenever **either** path exists, so
+the exec gate would have been **inert in exactly the case that motivates it** (root present,
+binary upgraded away) while reading as fixed. There is no AND available: `false` values invert
+individual conditions, they cannot negate the OR across them.
+
+**Shipped:** `PathState` on the **root only**. Probe 3 is the shipped configuration's behavior —
+one attempt per login, no loop. `launchd_pathstate_lists_only_the_root_never_the_exec` exists so a
+later reader who "fixes" the omission reds instead of shipping an inert condition.
+
+**Exec staleness is DETECTED, not prevented** — `doctor`'s second advisory clause (this round),
+naming the exec and the re-init remedy. Mitigating context: `eeef849` already made the recorded
+exec stable across `brew upgrade`, which was the motivating case. `ThrottleInterval` was
+considered to bound exec-failure noise and **rejected**: it would equally delay legitimate crash
+restarts, and a multi-minute recording gap is a worse defect than log noise in a tool whose
+purpose is not missing activity.
+
+### Open row — Linux, NOT measured
+
+`systemd_unit` emits `ConditionPathIsDirectory=<root>`. The generator is unit-tested; the
+**runtime effect is unverified** — written on a macOS host with no systemd to probe. Do not
+upgrade to a proven claim without running it on Linux. Needed: load a new-posture unit, delete
+the root, confirm the start job is skipped (unit inactive, not failed) and no restart churn
+appears in `systemctl --user status`.
+
+### Founder decision pending
+
+The posture change means the **next `agentrec init` in `~/Projects/agentrec` rewrites and
+reloads the live dogfood unit** (`service::install` rewrites on content difference). Harmless in
+principle; flagged because that daemon is production evidence infrastructure.
