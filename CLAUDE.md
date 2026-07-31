@@ -14,6 +14,17 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **D46 SERVICE-LEAK FIX delivered (2026-07-31) on `feat/phase-2-0-view-completion`, after the
+  Phase 2.0 plan exit. Not gated by a skeptic yet; not pushed; no PR.** Closes the *product-defect*
+  half of the 40-orphaned-LaunchAgents founder-pending entry: `init` no longer installs a
+  `RunAtLoad`+`KeepAlive` unit under a temp root (with `--service` to force), and `doctor` reports
+  units whose `--root` vanished as advisory-`pass`. `service prune` deliberately NOT built (only
+  piece that shells `launchctl`; destructive; plist removal is founder-reserved). ACs S1–S9 added
+  to `IMPLEMENTATION.md` §4 block **S** + register row **D46**; 9 claimd claims (8 EVIDENCED, S9
+  DECLARED-manual by design — it pins a moving corpus). Suite **634 / 0 / 3** (from 615/0/2);
+  clippy+fmt clean debug **and** release; new `AGENTREC_TEST_SERVICE_DIR` seam absent from release
+  `strings`. **The 40 existing plists are untouched** — still 41 installed, re-counted after the
+  full test run. Evidence incl. real-corpus run and three neuter proofs: `VERIFY-LEDGER.md` § "D46".
 - **PHASE 2.0 PLAN EXIT REACHED (2026-07-31) on `feat/phase-2-0-view-completion` at `88c7e9b`
   + this commit. P5 GATE-PASSED; all 9 plan-exit checkboxes verified. Pushed, no PR.**
   P5 shipped `--json` read contracts for `diff`/`blame`/`status` as adapters over P4b's typed
@@ -252,9 +263,27 @@ carries only current state, what's next, and standing debts.
     round has leaked one. `uninstall` does remove it correctly (verified this round: the stray
     `com.agentrec.5e36ca4f5c82` from the plan-exit corpus run is gone), so the leak is entirely
     "init without a matching uninstall", which is the normal outcome of a crashed or abandoned
-    test run. Candidate fixes, none built: `init --no-service` as the default under `TMPDIR`;
-    a `doctor` check that lists units whose `--root` no longer exists; a `service prune` verb.
-    Not started — recorded so the next round does not rediscover it.
+    test run.
+  - **The PRODUCT DEFECT half is FIXED (D46, 2026-07-31) — the 40 plists are NOT, and remain
+    entirely yours.** Two of the three candidate fixes were built, the third deliberately not:
+    (1) **prevent** — `init` under a canonicalized temp prefix (`$TMPDIR`, `/tmp`, `/private/tmp`)
+    now skips **only** the service install and prints why, with `--service` to force it
+    (`--service` + `--no-service` is a clap conflict error). Canonicalizing both sides is
+    load-bearing, not tidiness: `$TMPDIR` reads `/var/folders/…` while `resolve_root` stores
+    `/private/var/folders/…`, and the raw compare was proven by neuter to make the guard silently
+    never fire. `$TMPDIR` alone would have covered only 37 of the 40 — the other 3 are under
+    `/private/tmp/claude-501/…`. (2) **detect** — `doctor` gains an `orphaned services` check
+    that parses installed units (necessary: `slug()` is a one-way hash, so orphans cannot be found
+    by inverting filenames) and reports vanished roots as **advisory `pass`, never `fail`** — the
+    unit directory is machine-global, so failing would break every unrelated repo's exit-0 gate.
+    It prints the exact `launchctl bootout … && rm` pair. (3) **NOT built: `service prune`** — the
+    only piece that would shell `launchctl` (forbidden automated coverage by `service.rs`'s module
+    contract), destructive, and plist removal is yours. Evidence, including a **real-corpus run
+    (41/41 parsed, 40 vanished, 1 live, 0 unparseable)** that independently reproduces the 40/41
+    above, and three discriminating-neuter proofs: `VERIFY-LEDGER.md` § "D46". Suite 634/0/3
+    (from 615/0/2). **`agentrec uninstall --root <deleted path>` is NOT a usable remedy for these
+    40** — `resolve_root` canonicalized at install time, a vanished path cannot canonicalize, so
+    the recomputed slug misses. Use the printed `bootout`+`rm` pair.
 - **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
   agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
   indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the

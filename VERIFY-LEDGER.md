@@ -684,3 +684,78 @@ by construction over five tag shapes, including that the legacy no-`type` C6 fal
   **Revisit if MCP 2.2 ever pages a ledger exposed to hand edits.**
 - The gate hit and corrected a multi-filter `cargo test` invocation that silently runs nothing —
   the same malformed-replay shape that permanently REFUTED two P1 claims. One TESTNAME per replay.
+
+## D46 — service-unit leak: temp-root guard + orphan detection (2026-07-31)
+
+Closes the founder-pending "40 orphaned `com.agentrec.*` LaunchAgents" entry's **product-defect**
+half. It does **not** remove any plist from this machine — that stays founder-reserved, and the
+40 units are all still installed and untouched (re-counted at 41 before and after this round's
+full test run, including the run that exercises `init` under temp roots).
+
+### What is automated, and what is not — stated narrowly
+
+The honest scope line is **not** "`service.rs` is untested". This change adds no code to the
+`launchctl`/`systemctl`-spawning path and calls none of it:
+
+| Surface | Coverage |
+|---|---|
+| `parse_unit_root`, `scan_units`, `manual_remove_command` (D46 discovery half) | **Fully automated.** Filesystem + text only, spawns nothing. 8 unit tests in `service.rs`, both unit-file forms, on every platform (the parser dispatches on content, not host OS). |
+| `service_decision`, `temp_prefixes`, `temp_skip_line` (D46 prevention half) | **Fully automated.** Pure; full flag×path matrix asserted in `initcmd.rs`, plus a real-binary leg in `integration.rs::service_leak_guard`. |
+| `check_orphan_services` (`doctor`) | **Fully automated** against an injected fixture directory via the debug-only `AGENTREC_TEST_SERVICE_DIR` seam. Verified absent from the release binary: `strings target/release/agentrec \| grep -c AGENTREC_TEST_SERVICE_DIR` = **0** (debug = 1). |
+| Production resolution of the REAL service directory | Not directly asserted (it reads `$HOME`/`$XDG_CONFIG_HOME`). Covered indirectly by the pre-existing `unit_path`/`config_home` tests, which now route through the same `service_dir` resolver, **and** by the real-corpus run below, which resolved and scanned the real directory. |
+| `install`/`unload`/`load` (spawn `launchctl`/`systemctl`) | **Unchanged and still never invoked from an automated test** — see the existing "D11 (service reload on re-init)" open row above, which this round neither closes nor widens. |
+
+### Real-corpus evidence (AC-S9) — not a fixture round-trip
+
+A round-trip test proves the parser inverts *our own writer*; it cannot prove it reads the plists
+actually installed here. This repo has been bitten four times by fixture-only evidence for a
+corpus-shape claim, so the parser was run read-only over the real directory before the ACs were
+declared met. `cargo test --bin agentrec real_corpus_unit_scan -- --ignored --nocapture`
+(`#[ignore]`d by design — environment-coupled, never part of the hermetic suite), output archived
+at `docs/verify/d46-real-corpus-unit-scan.txt`:
+
+> `real-corpus scan of /Users/ravichandrasekhar/Library/LaunchAgents: 41 agentrec unit(s) — 41 parsed (1 live, 40 vanished-root), 0 unparseable`
+
+**41/41 parsed, 40 vanished, 1 live, 0 unparseable** — independently reproducing the 40-of-41 figure
+recorded in CLAUDE.md from a separate `plistlib` enumeration. The one live unit is
+`com.agentrec.bfa6bde6eaa4` → `/Users/ravichandrasekhar/Projects/agentrec`, the real dogfood daemon.
+
+**This claim pins a moving target and is declared `manual`, not `deterministic`** (`clm_5JMKH9FFCNA4T0EDSVD5M8B2C0`,
+DECLARED — never self-attested). The corpus is *expected* to shrink to 1 once the founder reaps
+the orphans; a deterministic replay asserting 40 would then go REFUTED for the right thing
+happening. The probe itself asserts only the invariant that survives reaping: **zero unparseable
+units**.
+
+### Discriminating-neuter proofs (a green test is not evidence until the broken version reds)
+
+| Neuter | Test that must red | Result |
+|---|---|---|
+| `service_decision` stops canonicalizing the root | `service_decision_skips_under_a_real_temp_dir` | **FAILED** (correct). This is the load-bearing one: on macOS `$TMPDIR` reads `/var/folders/…` while `resolve_root` stores `/private/var/folders/…`, so an uncanonicalized compare makes the guard silently never fire — it would have shipped looking correct. |
+| `scan_units` folds `Unparseable` into `VanishedRoot` | `scan_units_classifies_live_vanished_and_unparseable_disjointly` | **FAILED** (correct) — a unit we could not read must never be reported as an orphan. |
+| `check_orphan_services` returns `Check::fail` instead of `Check::advisory` | `orphaned_unit_is_advisory_not_fail` | **FAILED** (correct) — the exit-0 gate rail holds. |
+
+The full-init leg (`init_under_temp_root_still_does_everything_but_the_service`) was **deliberately
+not neutered**: removing the guard makes that test install a real launchd unit, i.e. leak exactly
+the thing being fixed. Only the pure decision function was neutered, and only the pure tests were
+run under it.
+
+### Suite
+
+`cargo test --workspace -- --test-threads=3` → **634 passed / 0 failed / 3 ignored**
+(baseline at the Phase 2.0 plan exit: 615 / 0 / 2 — **+19 tests, +1 ignored**, the new ignored one
+being the real-corpus probe). clippy `-D warnings` + `fmt --check` clean on **debug and release**.
+
+### Deliberately NOT built, with reasons
+
+- **`service prune`** — the third candidate fix. Three facts, not a preference: it is the only
+  piece here that would shell out to `launchctl`/`systemctl` (which `service.rs`'s module contract
+  forbids the automated suite from exercising), it is destructive, and plist removal on this
+  machine is an explicitly founder-reserved item. `doctor` prints the exact command pair instead,
+  which closes the user-facing problem with zero untestable code.
+- **Reaping the existing 40 units.** Founder's, unchanged. `doctor` now finds and prints them.
+
+### Residual — the guard is preventive only, and only for future inits
+
+`doctor`'s check is user-global, but the temp guard changes only what THIS binary installs from now
+on. Any `agentrec` build predating this change still leaks a unit per temp-dir `init`. Nothing
+detects or blocks that, and nothing here reaps what already exists.

@@ -22,9 +22,92 @@ memory_inject_max = 5      # max facts injected per hook call
 # noise_globs = [\".remember/**\"]  # fold matching file entries out of log/show (see README); --all-files to reveal
 ";
 
-pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Result<(), String> {
+/// D46: whether `init` should install the per-repo service unit, and if not,
+/// why. Split out as a PURE function so the whole flag×path matrix is
+/// assertable without executing `service::install`, which shells out to the
+/// real `launchctl`/`systemctl` and is therefore off-limits to the automated
+/// suite.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ServiceDecision {
+    Install,
+    /// `--no-service` was passed.
+    SkipFlag,
+    /// The root lives under a temp prefix (the carried path is the prefix that
+    /// matched, so the printed reason can name it).
+    SkipTemp(std::path::PathBuf),
+}
+
+/// Directories whose contents exist to be deleted. A repo root under any of
+/// them gets no service unit by default: `init` installs a user-scoped unit
+/// with `RunAtLoad` + `KeepAlive`, and when the root is deleted nothing reaps
+/// the unit — every crashed or abandoned test run leaks one permanently.
+///
+/// Canonicalized on BOTH sides, which is load-bearing rather than tidiness: on
+/// macOS `$TMPDIR` reads `/var/folders/…/T/` while `service::resolve_root`
+/// stores the canonical `/private/var/folders/…/T/`, so a raw prefix compare
+/// would never match and this guard would silently never fire.
+///
+/// `$TMPDIR` alone is not enough: of the 40 leaked units measured 2026-07-31,
+/// 37 were under `$TMPDIR` and 3 under `/private/tmp/claude-501/…` (agent
+/// session scratchpads), which is not `$TMPDIR` on any of these runs.
+fn temp_prefixes() -> Vec<std::path::PathBuf> {
+    let mut prefixes: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        let canonical = p.canonicalize().unwrap_or(p);
+        if !prefixes.contains(&canonical) {
+            prefixes.push(canonical);
+        }
+    };
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        if !tmpdir.is_empty() {
+            push(std::path::PathBuf::from(tmpdir));
+        }
+    }
+    push(std::path::PathBuf::from("/tmp"));
+    push(std::path::PathBuf::from("/private/tmp"));
+    prefixes
+}
+
+pub(crate) fn service_decision(
+    root: &Path,
+    no_service: bool,
+    force_service: bool,
+) -> ServiceDecision {
+    if no_service {
+        return ServiceDecision::SkipFlag;
+    }
+    if force_service {
+        return ServiceDecision::Install;
+    }
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    match temp_prefixes()
+        .into_iter()
+        .find(|prefix| canonical.starts_with(prefix))
+    {
+        Some(prefix) => ServiceDecision::SkipTemp(prefix),
+        None => ServiceDecision::Install,
+    }
+}
+
+/// The line `init` prints when it declines to install a service unit under a
+/// temp root. Shared by the real run and `--dry-run` so the two can't drift.
+fn temp_skip_line(prefix: &Path) -> String {
+    format!(
+        "skipped service install: root is under a temporary directory ({}) — \
+         a service installed here outlives the directory; pass --service to install anyway",
+        prefix.display()
+    )
+}
+
+pub fn run(
+    root: &Path,
+    no_hook: bool,
+    no_service: bool,
+    force_service: bool,
+    dry_run: bool,
+) -> Result<(), String> {
     if dry_run {
-        print_dry_run(root, no_hook, no_service);
+        print_dry_run(root, no_hook, no_service, force_service);
         return Ok(());
     }
 
@@ -78,10 +161,12 @@ pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Resul
         ));
     }
 
-    if no_service {
-        actions.push("skipped service install (--no-service)".to_string());
-    } else {
-        match current_exe() {
+    match service_decision(root, no_service, force_service) {
+        ServiceDecision::SkipFlag => {
+            actions.push("skipped service install (--no-service)".to_string());
+        }
+        ServiceDecision::SkipTemp(prefix) => actions.push(temp_skip_line(&prefix)),
+        ServiceDecision::Install => match current_exe() {
             Ok(exec) => match service::install(root, &exec) {
                 Ok(mut lines) => {
                     changed = changed || lines.iter().any(|l| l.starts_with("wrote service unit"));
@@ -90,7 +175,7 @@ pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Resul
                 Err(e) => actions.push(format!("service install skipped: {e}")),
             },
             Err(e) => actions.push(format!("service install skipped: {e}")),
-        }
+        },
     }
 
     if dir_already_existed && !changed {
@@ -105,7 +190,7 @@ pub fn run(root: &Path, no_hook: bool, no_service: bool, dry_run: bool) -> Resul
 
 /// Print every action `run` would take, without creating/writing/loading
 /// anything (AC-Y+5).
-fn print_dry_run(root: &Path, no_hook: bool, no_service: bool) {
+fn print_dry_run(root: &Path, no_hook: bool, no_service: bool, force_service: bool) {
     println!("[dry-run] would scaffold {}", agentrec_dir(root).display());
     println!("[dry-run] would write default config.toml (if missing)");
     println!("[dry-run] would ensure .gitignore entry (git repos only)");
@@ -117,10 +202,18 @@ fn print_dry_run(root: &Path, no_hook: bool, no_service: bool) {
     } else {
         println!("[dry-run] would install Claude Code hooks (UserPromptSubmit + Stop)");
     }
-    if no_service {
-        println!("[dry-run] would skip service install (--no-service)");
-    } else {
-        println!("[dry-run] would write and load a per-repo service unit");
+    // Same decision function as the real run, so `--dry-run` can never claim
+    // an install the real run would skip.
+    match service_decision(root, no_service, force_service) {
+        ServiceDecision::SkipFlag => {
+            println!("[dry-run] would skip service install (--no-service)")
+        }
+        ServiceDecision::SkipTemp(prefix) => {
+            println!("[dry-run] would {}", temp_skip_line(&prefix))
+        }
+        ServiceDecision::Install => {
+            println!("[dry-run] would write and load a per-repo service unit")
+        }
     }
     println!("[dry-run] nothing on disk was touched");
 }
@@ -371,7 +464,7 @@ mod tests {
         fs::write(&settings_path, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
         let before = fs::read(&settings_path).unwrap();
 
-        let err = run(root, false, true, false).unwrap_err();
+        let err = run(root, false, true, false, false).unwrap_err();
         assert!(
             err.contains("settings.local.json"),
             "error should name the file: {err}"
@@ -386,8 +479,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git")).unwrap();
-        run(root, true, true, false).unwrap();
-        run(root, true, true, false).unwrap(); // second run: no error, no duplicates
+        run(root, true, true, false, false).unwrap();
+        run(root, true, true, false, false).unwrap(); // second run: no error, no duplicates
         assert!(root.join(".agentrec/config.toml").exists());
         assert!(root.join(".agentrec/objects").exists());
         let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
@@ -397,7 +490,7 @@ mod tests {
     #[test]
     fn init_without_git_skips_gitignore() {
         let tmp = tempfile::tempdir().unwrap();
-        run(tmp.path(), true, true, false).unwrap();
+        run(tmp.path(), true, true, false, false).unwrap();
         assert!(!tmp.path().join(".gitignore").exists());
     }
 
@@ -407,7 +500,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let before = walk(root);
-        run(root, true, true, true).unwrap();
+        run(root, true, true, false, true).unwrap();
         let after = walk(root);
         assert_eq!(before, after, "dry-run must not create or modify anything");
     }
@@ -420,12 +513,12 @@ mod tests {
     fn init_no_service_rerun_is_byte_for_byte_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        run(root, false, true, false).unwrap();
+        run(root, false, true, false, false).unwrap();
         let settings_path = root.join(".claude/settings.local.json");
         let first = fs::read_to_string(&settings_path).unwrap();
         let config_first = fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
 
-        run(root, false, true, false).unwrap();
+        run(root, false, true, false, false).unwrap();
         let second = fs::read_to_string(&settings_path).unwrap();
         let config_second = fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
 
@@ -445,7 +538,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        run(root, true, true, false).unwrap();
+        run(root, true, true, false, false).unwrap();
 
         let dir_mode = fs::metadata(agentrec_dir(root))
             .unwrap()
@@ -458,6 +551,123 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(file_mode & 0o777, 0o600);
+    }
+
+    // ---- D46 AC-S1..S4: temp-root service guard -------------------------
+
+    // AC-S1/S2: the guard must actually FIRE on a real temp directory. This is
+    // the trap the whole design turns on: `tempfile::tempdir()` hands back
+    // `/var/folders/…` on macOS while `$TMPDIR` also reads `/var/folders/…`,
+    // but `service::resolve_root` stores the canonicalized `/private/var/…` —
+    // compare either side raw and this guard silently never fires. Uses a real
+    // tempdir rather than a hand-written "/tmp/x" string for exactly that
+    // reason.
+    #[test]
+    fn service_decision_skips_under_a_real_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decision = service_decision(tmp.path(), false, false);
+        assert!(
+            matches!(decision, ServiceDecision::SkipTemp(_)),
+            "a real tempdir must be recognized as temp, got {decision:?}"
+        );
+    }
+
+    // The three leaked scratchpad units of 2026-07-31 sat under /private/tmp,
+    // which is NOT $TMPDIR on this machine — $TMPDIR alone covers only 37 of
+    // the 40. Asserted against the prefix list directly since a test can't
+    // create a directory under /private/tmp without polluting the machine.
+    #[test]
+    fn temp_prefixes_cover_tmp_as_well_as_tmpdir() {
+        let prefixes = temp_prefixes();
+        let has = |p: &str| {
+            let canonical = std::path::Path::new(p)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(p));
+            prefixes.contains(&canonical)
+        };
+        assert!(has("/tmp"), "{prefixes:?}");
+        assert!(has("/private/tmp"), "{prefixes:?}");
+        if let Ok(t) = std::env::var("TMPDIR") {
+            if !t.is_empty() {
+                assert!(has(&t), "$TMPDIR must be covered too: {prefixes:?}");
+            }
+        }
+    }
+
+    // AC-S4: an ordinary repo path must still install — the rail against an
+    // over-broad predicate that would disable the service for everyone.
+    #[test]
+    fn service_decision_installs_for_an_ordinary_root() {
+        // The repo this test is compiled from: a real, non-temp path.
+        let ordinary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            service_decision(ordinary, false, false),
+            ServiceDecision::Install
+        );
+    }
+
+    // AC-S2/S3: the whole matrix in one place. `--no-service` wins outright;
+    // `--service` forces an install that the temp guard would otherwise skip.
+    // (`--no-service` + `--service` together never reaches here — clap rejects
+    // it; see the CLI-level conflict test in the integration suite.)
+    #[test]
+    fn service_decision_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_root = tmp.path();
+        let ordinary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        assert_eq!(
+            service_decision(temp_root, true, false),
+            ServiceDecision::SkipFlag
+        );
+        assert_eq!(
+            service_decision(ordinary, true, false),
+            ServiceDecision::SkipFlag
+        );
+        assert_eq!(
+            service_decision(temp_root, false, true),
+            ServiceDecision::Install,
+            "--service must override the temp-root skip"
+        );
+        assert_eq!(
+            service_decision(ordinary, false, false),
+            ServiceDecision::Install
+        );
+        assert!(matches!(
+            service_decision(temp_root, false, false),
+            ServiceDecision::SkipTemp(_)
+        ));
+    }
+
+    // AC-S1: the guard must skip ONLY the service. Every other init step still
+    // runs, and the printed reason names both the cause and the override — a
+    // silent skip would just move the confusion instead of removing it.
+    #[test]
+    fn init_under_temp_root_still_does_everything_but_the_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+
+        // `no_service: false` — the guard, not the flag, is what must skip it.
+        run(root, false, false, false, false).unwrap();
+
+        assert!(root.join(".agentrec/config.toml").exists());
+        assert!(root.join(".agentrec/objects").exists());
+        assert!(root.join(".claude/settings.local.json").exists());
+        assert!(fs::read_to_string(root.join(".gitignore"))
+            .unwrap()
+            .contains(".agentrec/"));
+        // No unit file was written for this root.
+        let unit = service::unit_path(root).unwrap();
+        assert!(
+            !unit.exists(),
+            "a temp-root init must not install a service unit: {}",
+            unit.display()
+        );
+        // And the reason names the override.
+        let line = temp_skip_line(tmp.path());
+        assert!(line.contains("--service"), "{line}");
+        assert!(line.contains("temporary directory"), "{line}");
     }
 
     fn walk(root: &Path) -> Vec<std::path::PathBuf> {

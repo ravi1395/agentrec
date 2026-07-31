@@ -46,6 +46,10 @@ enum Command {
         /// Skip writing/loading the per-repo service unit (launchd/systemd).
         #[arg(long)]
         no_service: bool,
+        /// Install the service unit even under a temporary directory, where
+        /// it is skipped by default (D46: the unit outlives the directory).
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
         /// Print the actions init would take without touching disk.
         #[arg(long)]
         dry_run: bool,
@@ -323,8 +327,9 @@ fn main() {
         Command::Init {
             no_hook,
             no_service,
+            service,
             dry_run,
-        } => initcmd::run(&root, no_hook, no_service, dry_run),
+        } => initcmd::run(&root, no_hook, no_service, service, dry_run),
         Command::Record => daemon::run(&root),
         Command::Log {
             all,

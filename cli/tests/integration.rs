@@ -10293,3 +10293,74 @@ mod json_contracts {
         );
     }
 }
+
+// ---- D46: service-unit leak guard (AC-S1/S3) --------------------------------
+//
+// End-to-end legs that must go through the real binary: clap's flag conflict,
+// and the fact that a temp-root `init` writes no unit. Every other AC of D46 is
+// covered by the hermetic unit tests in `initcmd.rs`/`service.rs`/`doctorcmd.rs`
+// — and nothing here (or anywhere in the suite) executes `service::install`,
+// which shells out to the real `launchctl`/`systemctl`.
+mod service_leak_guard {
+    use super::*;
+
+    // AC-S3: `--no-service` and `--service` together must be a hard CLI error,
+    // not a silent precedence rule. A user who passes both has contradicted
+    // themselves about a side effect that outlives the directory; guessing
+    // which they meant is exactly the wrong call.
+    #[test]
+    fn init_rejects_no_service_together_with_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = agentrec(tmp.path(), &["init", "--no-service", "--service"]);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "conflicting flags must not succeed: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--no-service") && stderr.contains("--service"),
+            "the error must name both flags: {stderr}"
+        );
+    }
+
+    // AC-S1, through the real binary: a `tempfile::tempdir()` root gets the
+    // full init MINUS the service unit, and says why. The unit-file assertion
+    // is the load-bearing one — this test failing means the suite itself is
+    // leaking launchd units, which is the defect D46 exists to stop.
+    #[test]
+    fn init_under_temp_root_installs_no_unit_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let out = agentrec(root, &["init", "--no-hook"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("temporary directory") && stdout.contains("--service"),
+            "init must name the reason and the override: {stdout}"
+        );
+        assert!(
+            !stdout.contains("wrote service unit"),
+            "no unit may be written under a temp root: {stdout}"
+        );
+        assert!(root.join(".agentrec/config.toml").exists(), "{stdout}");
+    }
+
+    // AC-S1: `--dry-run` shares the decision function, so it can never promise
+    // an install the real run would skip.
+    #[test]
+    fn dry_run_reports_the_same_temp_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = agentrec(tmp.path(), &["init", "--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("temporary directory"),
+            "dry-run must predict the skip: {stdout}"
+        );
+        assert!(
+            !stdout.contains("would write and load a per-repo service unit"),
+            "dry-run must not promise an install that won't happen: {stdout}"
+        );
+    }
+}

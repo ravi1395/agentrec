@@ -127,6 +127,7 @@ pub(crate) fn diagnose(root: &Path) -> Report {
                 "state parse",
                 "store permissions",
                 "inotify headroom",
+                "orphaned services",
             ]
             .iter()
             .map(|name| Check::na(name)),
@@ -143,6 +144,7 @@ pub(crate) fn diagnose(root: &Path) -> Report {
         check_state_parse(root),
         check_permissions(root),
         check_inotify(root),
+        check_orphan_services(),
     ];
     let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
     Report { checks, ok }
@@ -414,6 +416,59 @@ fn first_blob(objects_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---- orphaned service units (D46) -------------------------------------------
+
+/// Reports installed service units whose recorded `--root` is not present on
+/// disk. `init` installs a user-scoped unit with `RunAtLoad` + `KeepAlive`;
+/// when the root is later deleted — the normal fate of a temp dir, and of any
+/// crashed or abandoned test run — nothing reaps the unit, so they accumulate
+/// silently (measured on the author's machine 2026-07-31: 40 of 41 installed
+/// units pointed at deleted roots).
+///
+/// ADVISORY ONLY, always rendered as `pass`, for a structural reason and not
+/// as a softening: the unit directory is USER-GLOBAL, so a `Fail` here would
+/// make one stale unit from some unrelated scratch repo break `doctor`'s
+/// all-pass exit-0 deploy gate in every other repo on the machine. The
+/// condition also isn't a property of the repo being diagnosed at all.
+///
+/// The note reports what was observed — a root that is not present — and
+/// deliberately does NOT assert the unit is abandoned: an unmounted external
+/// volume or a detached network mount reads exactly the same from here.
+/// Removal is left to the user (see D46 on why `service prune` isn't built);
+/// the exact command pair is printed instead.
+fn check_orphan_services() -> Check {
+    const NAME: &str = "orphaned services";
+    let Ok(dir) = crate::service::service_dir() else {
+        // No HOME: nothing locatable to scan, so nothing to report.
+        return Check::pass(NAME);
+    };
+    let units = crate::service::scan_units(&dir);
+    let vanished: Vec<_> = units
+        .iter()
+        .filter_map(|u| match &u.state {
+            crate::service::UnitState::VanishedRoot(root) => Some((u, root)),
+            _ => None,
+        })
+        .collect();
+    let Some((first, first_root)) = vanished.first() else {
+        return Check::pass(NAME);
+    };
+    let plural = if vanished.len() == 1 { "" } else { "s" };
+    Check::advisory(
+        NAME,
+        format!(
+            "{} installed service unit{plural} record a --root that is not present \
+             (e.g. {} -> {}) — usually a leftover `agentrec init` in a directory since \
+             deleted, though an unmounted volume looks the same from here. If the root \
+             is genuinely gone, remove each with: {}",
+            vanished.len(),
+            first.label,
+            first_root.display(),
+            crate::service::manual_remove_command(&first.label, &first.path),
+        ),
+    )
 }
 
 // ---- inotify headroom (Linux only) ------------------------------------------
@@ -732,6 +787,138 @@ mod tests {
             est <= 4,
             "cannot exceed the true directory count, got {est}"
         );
+    }
+
+    // ---- D46 AC-S7/S8: orphaned service units ---------------------------
+
+    // Env vars are process-global; every test below drives the debug-only
+    // AGENTREC_TEST_SERVICE_DIR seam, so they must serialize against each
+    // other or the mutations race across cargo's parallel test threads.
+    static SERVICE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_service_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = SERVICE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AGENTREC_TEST_SERVICE_DIR").ok();
+        std::env::set_var("AGENTREC_TEST_SERVICE_DIR", dir);
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("AGENTREC_TEST_SERVICE_DIR", v),
+            None => std::env::remove_var("AGENTREC_TEST_SERVICE_DIR"),
+        }
+        out
+    }
+
+    // AC-S7: a vanished root is reported, but as ADVISORY — `status` stays
+    // `pass` so a stale unit from an unrelated scratch repo cannot break this
+    // repo's all-pass exit-0 gate, while the note still carries the count and
+    // the runnable removal command.
+    #[test]
+    fn orphaned_unit_is_advisory_not_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let gone = tmp.path().join("deleted-repo"); // deliberately never created
+        std::fs::write(
+            units.join("com.agentrec.0123456789ab.plist"),
+            crate::service::launchd_plist(Path::new("/usr/local/bin/agentrec"), &gone),
+        )
+        .unwrap();
+
+        let check = with_service_dir(&units, check_orphan_services);
+        assert_eq!(
+            check.status,
+            CheckStatus::Pass,
+            "a user-global condition must never fail this repo's gate"
+        );
+        let remedy = check.remedy.expect("advisory must carry a note");
+        assert!(remedy.starts_with("1 installed service unit "), "{remedy}");
+        assert!(remedy.contains("com.agentrec.0123456789ab"), "{remedy}");
+        assert!(remedy.contains(&gone.display().to_string()), "{remedy}");
+        // The note must not assert abandonment — an unmounted volume reads
+        // identically from here, and this repo has failed four gate rounds on
+        // confidently-worded claims about real-world state.
+        assert!(
+            remedy.contains("unmounted volume"),
+            "note must state the false-positive class: {remedy}"
+        );
+    }
+
+    // The whole-report leg: `diagnose` on an otherwise-healthy-shaped repo
+    // must carry the check, and an orphan must not flip `report.ok`.
+    #[test]
+    fn orphaned_unit_does_not_flip_report_ok_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let gone = tmp.path().join("deleted-repo");
+        std::fs::write(
+            units.join("com.agentrec.0123456789ab.plist"),
+            crate::service::launchd_plist(Path::new("/usr/local/bin/agentrec"), &gone),
+        )
+        .unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(agentrec_dir(&root)).unwrap();
+
+        let report = with_service_dir(&units, || diagnose(&root));
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "orphaned services")
+            .expect("diagnose must include the orphaned-services check");
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    // No orphan -> a plain pass with NO note, so a healthy machine's `doctor`
+    // output gains no noise.
+    #[test]
+    fn no_orphans_is_a_silent_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let live = tmp.path().join("live-repo");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(
+            units.join("com.agentrec.0123456789ab.plist"),
+            crate::service::launchd_plist(Path::new("/usr/local/bin/agentrec"), &live),
+        )
+        .unwrap();
+        // An unreadable unit must not be reported either — we know nothing
+        // about its root, and a fabricated orphan is worse than a missed one.
+        std::fs::write(units.join("com.agentrec.deadbeef0000.plist"), "<plist/>").unwrap();
+
+        let check = with_service_dir(&units, check_orphan_services);
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.remedy, None, "healthy machine must print no note");
+    }
+
+    // AC-S8: the uninitialized-repo short-circuit returns a HARDCODED list of
+    // check names; a new check missing from it makes the report shape differ
+    // between the two paths. Asserted as set equality, not by name, so any
+    // future check that forgets the list also reds here.
+    #[test]
+    fn uninitialized_report_has_the_same_check_set_as_an_initialized_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let units = tmp.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let uninitialized = tmp.path().join("bare"); // no .agentrec/
+        std::fs::create_dir_all(&uninitialized).unwrap();
+        let initialized = tmp.path().join("repo");
+        std::fs::create_dir_all(agentrec_dir(&initialized)).unwrap();
+
+        let (bare, real) = with_service_dir(&units, || {
+            (diagnose(&uninitialized), diagnose(&initialized))
+        });
+        let names = |r: &Report| {
+            let mut n: Vec<String> = r.checks.iter().map(|c| c.name.clone()).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(
+            names(&bare),
+            names(&real),
+            "uninitialized short-circuit must cover every check"
+        );
+        assert!(names(&bare).contains(&"orphaned services".to_string()));
     }
 
     // notify walks with `follow_links(true)`, so it arms watches on the targets
