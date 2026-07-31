@@ -17,10 +17,28 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
 }
 
+/// D46: an empty fixture directory, shared by every spawned binary in this
+/// suite, standing in for the user-global service directory.
+///
+/// `doctor`'s orphaned-services check scans `service::service_dir()`, which in
+/// production is the developer's real `~/Library/LaunchAgents`. Left unset,
+/// every `doctor` invocation in this suite would read whatever units happen to
+/// be installed on the machine running the tests — 41 on the author's box, 0
+/// on a fresh CI runner. The check is advisory so no assertion would flip, but
+/// a test whose behavior depends on ambient user state is precisely the defect
+/// class this repo keeps charging. Pinned to an empty tempdir instead, leaked
+/// for the process lifetime so it outlives every spawn.
+fn empty_service_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("service-dir fixture"))
+        .path()
+}
+
 fn agentrec(root: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .args(["--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_SERVICE_DIR", empty_service_dir())
         .output()
         .expect("run agentrec")
 }

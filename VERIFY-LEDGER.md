@@ -733,11 +733,25 @@ units**.
 | `service_decision` stops canonicalizing the root | `service_decision_skips_under_a_real_temp_dir` | **FAILED** (correct). This is the load-bearing one: on macOS `$TMPDIR` reads `/var/folders/…` while `resolve_root` stores `/private/var/folders/…`, so an uncanonicalized compare makes the guard silently never fire — it would have shipped looking correct. |
 | `scan_units` folds `Unparseable` into `VanishedRoot` | `scan_units_classifies_live_vanished_and_unparseable_disjointly` | **FAILED** (correct) — a unit we could not read must never be reported as an orphan. |
 | `check_orphan_services` returns `Check::fail` instead of `Check::advisory` | `orphaned_unit_is_advisory_not_fail` | **FAILED** (correct) — the exit-0 gate rail holds. |
+| `"orphaned services"` dropped from `diagnose`'s hardcoded uninitialized-repo `n/a` list | `uninitialized_report_has_the_same_check_set_as_an_initialized_one` | **FAILED** (correct), diffing the two name sets — so the rail catches any FUTURE check that forgets the list too, not just this one. |
 
 The full-init leg (`init_under_temp_root_still_does_everything_but_the_service`) was **deliberately
 not neutered**: removing the guard makes that test install a real launchd unit, i.e. leak exactly
 the thing being fixed. Only the pure decision function was neutered, and only the pure tests were
 run under it.
+
+### Suite hermeticity — fixed, not waived
+
+`check_orphan_services` scans the user-global service directory, so every `doctor` invocation in
+the integration suite would otherwise read whatever units happen to be installed on the machine
+running the tests (41 here, 0 on a fresh runner). The check is advisory, so no assertion would have
+flipped — but a test whose behavior depends on ambient user state is the exact defect class this
+repo keeps charging, so it was pinned rather than reasoned away: `integration.rs`'s `agentrec()`
+helper now sets `AGENTREC_TEST_SERVICE_DIR` to one process-wide empty tempdir. Verified both
+directions against the real binary: with the fixture, `doctor` prints `orphaned services  pass`
+with **no note**; without it, the same binary prints the 40-unit note and a runnable
+`launchctl bootout … && rm` pair — which is also this round's end-to-end production evidence that
+the check works on the real corpus, not only through unit tests.
 
 ### Suite
 
