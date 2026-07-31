@@ -835,10 +835,14 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 ///     found only the mid-run site (`SignalTailer::poll`, `len < self.offset`)
 ///     existed, so a crash in this window was never reconciled by restarting
 ///     the daemon and this command refused forever with no escape.
-///     The reverse order (rebase first) would leave offset 0
-///     against the full file and REPLAY every consumed start/stop signal as
-///     duplicate turns, corrupting the ledger. Losing an unprocessed signal is
-///     recoverable by re-prompting; a fabricated turn is not.
+///     The reverse order (rebase first) would leave offset 0 against the
+///     full file — NOT duplicate turns (D7's replay discipline drops
+///     start/stop in the gap at any offset; probe-validated 2026-08-01):
+///     the daemon would silently advance the offset to EOF across the
+///     UNCONSUMED tail, and the next run of this command would archive-and-
+///     drop those never-processed signals as if consumed. Rename-first makes
+///     a crash announce itself (DEGRADED); rebase-first makes the same
+///     crash lose the tail silently. Announced loss over silent loss.
 fn purge_signals_consumed(root: &Path) -> Result<(), String> {
     purge_signals_consumed_inner(root, None)
 }
@@ -926,9 +930,12 @@ fn purge_signals_consumed_inner(
              is a detected inbox shrink whose resync landed on a torn final line — \
              that resolves itself after the next hook fire and one `agentrec record` \
              cycle, then retry. Do NOT delete state.json — it is the only record \
-             of what was consumed, and without it the next record cycle replays \
-             already-consumed signals as duplicate turns; only an offset that \
-             stays mid-line across new hook activity indicates a hand-edited or \
+             of what was consumed. A daemon starting without it mints no turns \
+             from the backlog (start/stop signals in the gap are dropped by \
+             design) and silently advances the offset to end-of-file, after \
+             which this command archives and drops signals that were never \
+             processed as if they had been consumed. Only an offset that stays \
+             mid-line across new hook activity indicates a hand-edited or \
              corrupt state.json"
         ));
     }
@@ -1757,8 +1764,11 @@ mod tests {
     }
 
     // AC3.1: `state.json` is the only record of what was consumed. Missing
-    // means any offset would be a guess — guessing low replays consumed
-    // signals as duplicate turns, guessing high destroys unconsumed ones.
+    // means any offset would be a guess — a daemon rebuilding it starts at 0
+    // and silently advances to EOF over never-processed signals (D7 drops
+    // start/stop in the gap; probe-validated 2026-08-01), after which this
+    // command would archive-and-drop them as if consumed; guessing high
+    // destroys unconsumed ones directly.
     #[test]
     fn signals_consumed_refuses_without_state_json() {
         let (tmp, original, _offset) = signal_fixture(3);
