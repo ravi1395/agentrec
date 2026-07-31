@@ -21,7 +21,15 @@ carries only current state, what's next, and standing debts.
   `FileDiffState`/`BlameResult`/`BlameState`; `status --json` now flattens the pre-existing
   operational payload with the exact `RepositoryHealth` the view returned. Test baseline
   **615 / 0 / 2** (was 602/0/2 at P4b), 13 new `json_contracts::` integration tests, **33
-  goldens**. Fable skeptic in an isolated worktree: **GATE PASS, 12/12**. Plan-exit checklist
+  goldens**. Fable skeptic in an isolated worktree: **GATE PASS, 12/12**. The **plan exit
+  itself** then took its own binding Fable-skeptic round in an isolated worktree at `46e5bf0`
+  — **GATE PASS, 9/9**, both substitutions judged defensible only after the skeptic verified
+  their premises in source (not on the orchestrator's word), and the moving-corpus honesty
+  note reproduced independently: its own real-corpus re-run measured 1937/1944 = 99.6%
+  against this round's 1930/1937 = 99.6% — same ratio, different absolutes, hours apart.
+  Its five findings are in the ledger; three were corrections to this repo's own record and
+  are fixed, two are carried as debts (a claim whose replay is narrower than its text; three
+  replays hardcoded to this worktree path). Plan-exit checklist
   verified by the orchestrator independently: hard gate retired at the final commit (99.6%
   importable, denominator re-measured to 1937), zero-bytes dry-run re-verified, gap logic
   proven unified (one `view.rs::has_gap_after`, zero copies in `cli/src`), suite/clippy/fmt

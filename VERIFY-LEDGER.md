@@ -292,22 +292,27 @@ Release build at `88c7e9b`. Command: `agentrec import claude --dry-run` (`--sour
 unchanged from the P1 row above (P1.md pinned decision 3) and is not restated here, so it cannot
 drift between the two rows.
 
-| Figure | P1 gate run (2026-07-29) | Plan exit (2026-07-31) |
-|---|---|---|
-| sessions_total (denominator, re-measured) | 1631 | **1937** |
-| sessions_importable | 1625 — 99.6% | **1930 — 99.6%** (bar is ≥90%) |
-| tier: T1 | 856 | **839** |
-| tier: T1.5 | 90 | **87** (1 structurally-inferred) |
-| tier: T2-candidate | — | **881** |
-| tier: T3 | — | **416** |
-| opaque_calls | — | **9558** |
-| mean_opaque_share_pct (per-session) | — | **10.91** |
-| T1.5 rejected — blob stale by intervening edit | 170 | **170** |
-| T1.5 rejected — unverifiable / blob missing / unsafe path | 3 / 0 / 0 | **3 / 1 / 0** |
-| skipped_sidechain | — | **1320** |
-| skipped malformed / non-UTF8 / io-error | — | **0 / 0 / 0** |
-| skipped_missing_field: cwd | — | **7** (schema drift, loud on stderr; those sessions are *not* counted importable) |
-| peak_rss_mb | — | **16.56** |
+**Units differ by row and the table mixes them — read the Unit column before dividing anything.**
+(Flagged by the plan-exit gate: the tier counts do **not** sum to the session denominator —
+839+87+881+416 = 2223 file entries against 1937 sessions — because they count different things.
+The tool's own output has the same shape; this column is the fix.)
+
+| Figure | Unit | P1 gate run (2026-07-29) | Plan exit (2026-07-31) |
+|---|---|---|---|
+| sessions_total (denominator, re-measured) | sessions | 1631 | **1937** |
+| sessions_importable | sessions | 1625 — 99.6% | **1930 — 99.6%** (bar is ≥90%) |
+| tier: T1 | file entries | 856 | **839** |
+| tier: T1.5 | file entries | 90 | **87** (of which `t15_unverified=1` — the tool's own field name; "structurally-inferred" elsewhere in this ledger is a gloss on that same field, not a second figure) |
+| tier: T2-candidate | file entries | — | **881** |
+| tier: T3 | file entries | — | **416** |
+| opaque_calls | tool calls | — | **9558** |
+| mean_opaque_share_pct | % per session, averaged | — | **10.91** |
+| T1.5 rejected — blob stale by intervening edit | file entries | 170 | **170** |
+| T1.5 rejected — unverifiable / blob missing / unsafe path | file entries | 3 / 0 / 0 | **3 / 1 / 0** |
+| skipped_sidechain | sessions | — | **1320** |
+| skipped malformed / non-UTF8 / io-error | lines | — | **0 / 0 / 0** |
+| skipped_missing_field: cwd | lines | — | **7** (schema drift, loud on stderr; the affected sessions are *not* counted importable) |
+| peak_rss_mb | MB | — | **16.56** |
 
 **Verdict: the hard gate is RETIRED.** 99.6% ≥ the 90% bar, against a denominator re-measured at
 run time, with per-tier and per-session opaque-share fidelity figures recorded — which is what
@@ -339,6 +344,41 @@ run — `e682de84…` before and after.
    touched.)
 4. **`sessions_in_root: 0`** — no session was attributed to a bare `~/.claude/projects` root, so
    the depth-1 denominator rule was not silently widened.
+
+### Binding plan-exit gate — Fable skeptic, isolated worktree at `46e5bf0`: **GATE PASS (9/9)**
+
+The plan mandates this round after the orchestrator's own verification. The skeptic re-derived
+every checkbox independently rather than reading the verdicts, including **re-running the
+importer against the real corpus itself** (daemon-free scratch repo, per the item-6 trap):
+**1937/1944 = 99.6%** on its run vs this row's 1930/1937 = 99.6% — *different absolutes, same
+ratio, hours apart*, which is honesty note 1 reproduced by an independent party rather than
+merely asserted by the party that benefits from it. It also independently confirmed 615/0/2,
+both clippy profiles + fmt clean, release-seam count 0 vs debug 6, the zero-write digest, the
+single `has_gap_after` definition, and that the two manual founder-judgment claims carry **zero
+attest events** — not self-attested.
+
+Both substitutions were judged **defensible on their premises, verified in source, not accepted
+on the orchestrator's word**: item 4's impossibility confirmed (every `enforce_budget` caller in
+`cli/src` is inside `mod tests`; real eviction exists only at `daemon.rs:92 run_eviction_pass`),
+and item 2's seven added keys confirmed to be **exactly** `RepositoryHealth`'s fields
+(`view.rs:269-279`) — nothing smuggled in alongside the change AC-1 forces.
+
+**Five findings, all non-blocking; three are corrections to this repo's own record and are fixed
+in the commit that carries this paragraph** (an overstated "no longer exist in any form"
+sentence, a too-generous characterization of `AGENTREC_CLAUDE_PROJECTS_DIR`, and this table's
+unlabeled units). The two carried forward as debts:
+
+- **`clm_75W2H9NC0YF3Q2GMHG6V2Q98NT`'s replay is weaker than its claim text.** It automates only
+  the "exactly one modified golden" half; the **additive-only key property was verified by hand,
+  and has no standing replay**. A future `status_json` key *removal* is caught only implicitly,
+  by the golden test re-rendering. Adequate, not airtight — and stated here rather than left for
+  a reader to assume the replay covers the whole sentence.
+- **The three deterministic replays hardcode `/Users/ravichandrasekhar/Projects/agentrec-phase2`**,
+  so they are checkout-coupled and will not replay from another clone or worktree.
+
+Also noted, not fixed: `clm_16WKRQZSM5K8YV72EAJN0FHT7S`'s neuter *discriminates* (the skeptic
+duplicated the fn on a scratch copy and the replay failed), but it counts *files* rather than
+*definitions* — a second definition added inside `view.rs` itself would slip past it.
 
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 

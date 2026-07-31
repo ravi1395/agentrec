@@ -330,9 +330,19 @@ skeptical-reviewer round in an isolated worktree. No item may be weakened to pas
       `strings` carries no test seam.
       → **PASS.** 615 passed / 0 failed / 2 ignored. Debug and release clippy `-D warnings`
       both exit 0; `cargo fmt --all -- --check` exit 0. Release `strings` carries no
-      `AGENTREC_TEST_PAUSE_*` seam (the two pause seams are `#[cfg(debug_assertions)]`-gated
-      and absent from the release binary; `AGENTREC_CLAUDE_PROJECTS_DIR` is present and is a
-      documented source override, not a test seam).
+      `AGENTREC_TEST_PAUSE_*` seam: `grep -c AGENTREC_TEST` → **0** on release, **6** on
+      debug, so the check is non-vacuous.
+      **Honest qualification, forced by the plan-exit gate — the first phrasing of this
+      verdict was too generous to itself.** `AGENTREC_CLAUDE_PROJECTS_DIR` IS present in the
+      release binary and IS honored at runtime (`doctorcmd.rs:206-217`), and its own doc
+      comment says it exists "so this check is hermetically testable" — i.e. its stated
+      purpose is testing. Calling it "a documented source override, not a test seam" rounded
+      in the convenient direction: it is documented only in a source doc-comment, with no
+      README row. It is pre-existing (untouched in this range) and non-destructive (it
+      redirects a read-only `doctor` freshness check), so this item still passes on the ACs
+      it actually states — but **if "no test seam in release" is ever cited normatively,
+      this env var must first be either `cfg`-gated or promoted to a README-documented
+      override.** Carried forward as a debt, not waved off.
 - [x] **The pure-read split is proven both ways:** `status --json` / `health()` perform zero
       writes on an over-budget store — **and so does bare `status` in the same fixture**
       (parity assertion, P4/P5 ACs).
@@ -375,7 +385,11 @@ skeptical-reviewer round in an isolated worktree. No item may be weakened to pas
       byte-identical goldens pass either way and the spec names relocation as the
       extraction's failure mode.
       → **PASS.** Exactly one definition repo-wide: `agentrec-core/src/view.rs:102
-      pub fn has_gap_after`. `has_recording_gap` and `count_gaps` no longer exist in any form.
+      pub fn has_gap_after`. `has_recording_gap` and `count_gaps` have **zero definitions**
+      anywhere — which is what the AC asks. (Corrected by the plan-exit gate: an earlier
+      revision of this line said they "no longer exist in any form", which was loose —
+      `has_recording_gap` survives as prose in `cli/tests/golden.rs:474,1083`. The AC holds;
+      the sentence overstated it.)
       `cli/src` holds one call site (`readcmds.rs:839 view::has_gap_after`) and two prose
       comments naming it — zero definitions.
 - [x] **Scope honesty:** no protocol-freeze artifacts (decision 8 / spec D5 — changelog only),
