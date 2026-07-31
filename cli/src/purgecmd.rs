@@ -925,9 +925,11 @@ fn purge_signals_consumed_inner(
              consumption always leaves a line-boundary offset; the usual cause here \
              is a detected inbox shrink whose resync landed on a torn final line — \
              that resolves itself after the next hook fire and one `agentrec record` \
-             cycle, then retry. Do NOT delete state.json (purge refuses permanently \
-             without it); only an offset that stays mid-line across new hook \
-             activity indicates a hand-edited or corrupt state.json"
+             cycle, then retry. Do NOT delete state.json — it is the only record \
+             of what was consumed, and without it the next record cycle replays \
+             already-consumed signals as duplicate turns; only an offset that \
+             stays mid-line across new hook activity indicates a hand-edited or \
+             corrupt state.json"
         ));
     }
     let (consumed, tail) = bytes.split_at(offset as usize);
