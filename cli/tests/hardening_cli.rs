@@ -49,6 +49,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -75,6 +77,8 @@ fn make_turn(
         prompt_ref: None,
         prompt_excerpt: prompt_excerpt.map(str::to_string),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -130,6 +134,164 @@ fn wall_now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// ---- P2 AC3 (clm_2GCNB5WPT0FKHH4NFBYB9Q2JJT): undo of an imported turn
+// with a provenance-only (`before: null`) entry refuses the WHOLE turn,
+// before any working-tree write — even when another entry in the same turn
+// has real, revertible content. ---------------------------------------------
+
+#[test]
+fn ac3_imported_turn_with_provenance_only_entry_refuses_before_any_write() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let before = store.put(b"BEFORE\n").unwrap();
+    let after = store.put(b"AFTER\n").unwrap();
+    // The on-disk file matches the turn's recorded `after` exactly, so this
+    // entry is NOT modified-since — if the AC3 preflight were absent, this
+    // entry alone would be perfectly revertible.
+    std::fs::write(root.join("known.rs"), b"AFTER\n").unwrap();
+
+    let mut turn = base_turn(
+        "t_imp_AC3TEST00000000000000001",
+        vec![
+            FileEntry {
+                path: "known.rs".into(),
+                before: Some(before),
+                after: Some(after),
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            },
+            FileEntry {
+                path: "unknown.rs".into(),
+                before: None, // provenance-only: import could not reconstruct this
+                after: None,
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false, // AC4: import-missing-before is NOT baseline_unknown
+                skipped_reason: None,
+                after_synthesized: None,
+            },
+        ],
+    );
+    turn.imported = Some(true);
+    turn.files_complete = Some(false);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+
+    assert!(
+        !out.status.success(),
+        "AC3: undo of an imported turn with a provenance-only entry must exit nonzero: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("imported"),
+        "AC3: refusal must name imported history, got: {stderr}"
+    );
+    // Textually distinct from the other three refusal classes.
+    assert!(!stderr.contains("secret-pattern"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("content not snapshotted"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("later agent turn")
+            && !stderr.contains("recording gap")
+            && !stderr.contains("human or external edit"),
+        "stderr: {stderr}"
+    );
+
+    // The load-bearing assertion: `known.rs` — which WOULD have been
+    // revertible on its own — must be byte-unchanged. The refusal must land
+    // before build_plan/execute_revert ever runs, not just before the
+    // *other* file.
+    assert_eq!(
+        std::fs::read(root.join("known.rs")).unwrap(),
+        b"AFTER\n",
+        "AC3: refusal must happen before ANY working-tree write, even to an \
+         otherwise-revertible file in the same turn"
+    );
+    // No undo turn was appended either (nothing was reverted, so nothing to record).
+    assert!(
+        agentrec_turns(root).is_empty(),
+        "AC3: a refused undo must not append an agentrec undo turn"
+    );
+}
+
+// ---- D1 (P2 fix round, founder decision 2): a synthesized `after` must
+// never be reported as "human or external edit" when it disagrees with the
+// real on-disk file — the disagreement is the synthesis being approximate,
+// not a human touching the file. -----------------------------------------
+
+#[test]
+fn d1_synthesized_after_mismatch_is_never_attributed_to_a_human_edit() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // `before` is real (e.g. a T2 git blob); `after` is a DERIVED
+    // oldString->newString substitution that was never independently
+    // observed. The file on disk is genuinely untouched since import —
+    // still exactly the `before` content — so it disagrees with the
+    // synthesized `after`, but NOT because anyone edited it.
+    let before = store.put(b"alpha\nkeep\n").unwrap();
+    let after = store.put(b"beta\nkeep\n").unwrap(); // synthesized, never real
+    std::fs::write(root.join("tracked.txt"), b"alpha\nkeep\n").unwrap(); // untouched
+
+    let mut turn = base_turn(
+        "t_imp_D1TEST0000000000000000001",
+        vec![FileEntry {
+            path: "tracked.txt".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: Some(true),
+        }],
+    );
+    turn.imported = Some(true);
+    turn.files_complete = Some(false);
+    seed_turn(root, &turn);
+
+    // Preview only (no --confirm) is enough to exercise build_plan's
+    // modified-since cause without mutating anything.
+    let out = agentrec(root, &["undo", &turn.id]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !stdout.contains("human or external edit"),
+        "D1: a synthesized-after mismatch must never be blamed on a human edit, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("derived") || stdout.contains("not observed"),
+        "D1: the cause must name the bytes as derived/not-observed, got: {stdout}"
+    );
+
+    // File genuinely untouched — belt-and-braces given this was preview-only.
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).unwrap(),
+        b"alpha\nkeep\n"
+    );
+}
+
 // ---- E1: pre-flight integrity read + idempotent create-inverse ------------
 
 #[test]
@@ -161,6 +323,7 @@ fn e1_corrupt_before_blob_refuses_and_mutates_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -215,6 +378,7 @@ fn e1_create_inverse_with_already_deleted_file_succeeds() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -258,6 +422,7 @@ fn e2_clean_stop_start_gap_after_turn_marks_blame_stale() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -309,6 +474,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -338,6 +504,7 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_c);
@@ -350,13 +517,67 @@ fn e3_line_added_during_gap_is_reported_stale_not_predating() {
     let out = agentrec(root, &["blame", "f.rs:3"]);
     assert!(out.status.success(), "blame failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("attribution stale — recording gap"),
-        "stdout: {stdout}"
+    // EXACT, and the `f.rs:3: ` prefix is the load-bearing half. This is the
+    // POST-WALK gap answer — the walk ran, found no turn introducing the
+    // line, and refused to call it predating. A `contains` assertion here
+    // passes even with the post-walk and PRE-WALK arms wired backwards,
+    // because the two differ only by this prefix; see
+    // `e2_line_level_gap_before_the_walk_answers_without_a_line_prefix`.
+    assert_eq!(
+        stdout, "f.rs:3: attribution stale — recording gap\n",
+        "the post-walk gap answer is about a LINE, so it carries the prefix"
     );
-    assert!(
-        !stdout.contains("before recording began"),
-        "a gap-hidden origin must not be reported as predating all recording: {stdout}"
+}
+
+// The PRE-WALK sibling of the test above, and the only case that reaches it
+// at line level: `blame_line` short-circuits before ever reading the file
+// when the last touching turn is both modified-since and followed by an
+// uncovered interval. That answer is about recording COVERAGE, not about a
+// line, so it renders with NO `<path>:<line>: ` prefix — the byte
+// difference that makes the two states distinct rather than one state.
+#[test]
+fn e2_line_level_gap_before_the_walk_answers_without_a_line_prefix() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    let after = store.put(b"a\nb\n").unwrap();
+    let turn = make_turn(
+        "t_E2LINETURN0000000000000001",
+        "2026-07-06T09:00:00.000Z",
+        "2026-07-06T09:00:00.000Z",
+        Some("create g.rs"),
+        vec![FileEntry {
+            path: "g.rs".into(),
+            before: None,
+            after: Some(after),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    // An uncovered interval AFTER the turn ended...
+    seed_epoch(root, "stop", "2026-07-06T09:01:00.000Z");
+    seed_epoch(root, "start", "2026-07-06T09:02:00.000Z");
+    // ...and on-disk content that diverges from the turn's recorded `after`.
+    // Both are required: either alone leaves the walk to run normally.
+    std::fs::write(root.join("g.rs"), b"a\nchanged\n").unwrap();
+
+    let out = agentrec(root, &["blame", "g.rs:2"]);
+    assert!(out.status.success(), "blame failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "attribution stale — recording gap\n",
+        "the pre-walk answer carries no line prefix"
     );
 }
 
@@ -385,6 +606,7 @@ fn e6_undo_files_unmatched_path_refuses_and_mutates_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -430,6 +652,7 @@ fn e7_prompt_escape_sequence_never_reaches_stdout_raw() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -501,6 +724,7 @@ fn e8_live_guard_refuses_concurrent_undo() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -546,6 +770,7 @@ fn e8_expired_guard_does_not_block_undo() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1286,6 +1511,7 @@ fn undo_collapses_orphan_recovery_duplicate_same_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     // The steady `persist` close of a bracket turn carries an attributed model
@@ -1350,6 +1576,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     let b = base_turn(
@@ -1365,6 +1592,7 @@ fn undo_still_errors_on_distinct_turns_sharing_id() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &a);
@@ -1431,6 +1659,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let mut turn1 = base_turn(dup_id, dup_files);
     turn1.model = Some("claude-opus-4".into());
@@ -1459,6 +1688,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     let turn_c2 = base_turn(
@@ -1474,6 +1704,7 @@ fn purge_log_duplicates_collapses_dedup_preserves_ambiguous_and_other_lines() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_c1);
@@ -1598,6 +1829,7 @@ fn purge_log_duplicates_refuses_while_daemon_running() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let turn = base_turn(dup_id, files);
     // Exact identical dup — WOULD be removed if the daemon-liveness guard
@@ -1681,6 +1913,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     }];
     let turn = base_turn(dup_id, files);
     seed_turn(root, &turn);
@@ -1723,6 +1956,7 @@ fn purge_log_duplicates_aborts_on_concurrent_growth() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &extra_turn);
@@ -1794,6 +2028,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &dup);
@@ -1815,6 +2050,7 @@ fn purge_log_duplicates_and_concurrent_undo_lose_nothing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &target);
@@ -1898,6 +2134,7 @@ fn purge_orphans_archives_unreferenced_and_keeps_referenced() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);

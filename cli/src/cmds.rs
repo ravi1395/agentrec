@@ -54,18 +54,21 @@ pub fn log(
     explain: bool,
     all_files: bool,
 ) -> Result<(), String> {
-    let records = agentrec_core::record::load_log(&log_path(root));
-    let superseded = merged_ids(&records);
-
-    let turns: Vec<&TurnRecord> = records
-        .iter()
-        .filter_map(|r| match r {
-            LogRecord::Turn(t) => Some(t),
-            LogRecord::Epoch(_) => None,
+    // G5: both `log` forms read through the seam. `TurnQuery.limit` stays
+    // `None` on purpose — the view limits from the FIRST n oldest-first,
+    // while `log` renders newest-first, so `--limit` is applied by the
+    // adapter's `.rev().take(limit)` below (design R18). Pushing it into the
+    // query would also turn `--limit 0` into `CursorError::ZeroLimit`, a
+    // behavior change.
+    let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let page = view
+        .list_records(&agentrec_core::view::TurnQuery {
+            include_all: all,
+            limit: None,
+            after: None,
         })
-        .filter(|t| all || !superseded.contains(&t.id))
-        .filter(|t| all || t.tool.as_deref() != Some("git"))
-        .collect();
+        .map_err(|e| cursor_error_text(&e))?;
+    let turns = &page.items;
 
     if turns.is_empty() {
         if json {
@@ -76,11 +79,23 @@ pub fn log(
         return Ok(());
     }
 
-    let now_ms = wall_now_ms();
-    let color = fmt::should_color(
-        std::io::stdout().is_terminal(),
-        std::env::var_os("NO_COLOR").is_some(),
-    );
+    // Design R18 — the adapter's ONLY sanctioned reshaping: the view returns
+    // oldest-first and limits from the FIRST n, while `log` renders
+    // newest-first, so the slice happens here, before the renderer, and the
+    // glossary is applied after it. That is why `limit` and `explain` are
+    // not render opts.
+    let selected: Vec<&TurnRecord> = turns.iter().rev().take(limit).collect();
+
+    if json {
+        // AC3/AC4: one `serde_json::to_string` line per selected item, of the
+        // view's own record. The adapter names no field, so a field added to
+        // `TurnRecord` appears here with no edit.
+        for turn in &selected {
+            let line = serde_json::to_string(turn).map_err(|e| e.to_string())?;
+            println!("{line}");
+        }
+        return Ok(());
+    }
 
     // NF1: absent/empty `noise_globs` yields `None` here, so every branch
     // below that consults `noise_matcher` behaves exactly as it did before
@@ -89,44 +104,24 @@ pub fn log(
     let noise_globs = crate::noise::read_noise_globs(root);
     let noise_matcher = crate::noise::NoiseMatcher::build(root, &noise_globs);
 
-    // Rendered lines (non-JSON only) are accumulated so `--explain` can scan
-    // exactly what this invocation printed, not every term that ever exists.
-    let mut rendered = String::new();
+    let rendered = render_log(
+        &selected,
+        LogOpts {
+            now_ms: wall_now_ms(),
+            utc,
+            color: fmt::should_color(
+                std::io::stdout().is_terminal(),
+                std::env::var_os("NO_COLOR").is_some(),
+            ),
+            all_files,
+            noise: noise_matcher.as_ref(),
+        },
+    );
+    print!("{rendered}");
 
-    // Newest first; the log is append-order (oldest first).
-    for turn in turns.iter().rev().take(limit) {
-        if json {
-            let line = serde_json::to_string(turn).map_err(|e| e.to_string())?;
-            println!("{line}");
-        } else {
-            // NF-B/NF-D.4: fold counts a matched entry out of the visible
-            // count regardless of the turn's grade/tool — a turn whose
-            // entries are ALL noise still prints its own list line (turn
-            // selection above is untouched) plus this fold line, never
-            // silently disappears.
-            let noise_n = if all_files {
-                0
-            } else {
-                noise_matcher
-                    .as_ref()
-                    .map(|m| turn.files.iter().filter(|f| m.is_noise(&f.path)).count())
-                    .unwrap_or(0)
-            };
-            let visible_files = turn.files.len() - noise_n;
-            let line = format_turn(turn, now_ms, utc, color, visible_files);
-            println!("{line}");
-            rendered.push_str(&line);
-            rendered.push('\n');
-            if noise_n > 0 {
-                let fold_line = format!("+{noise_n} noise files (--all-files to show)");
-                println!("{fold_line}");
-                rendered.push_str(&fold_line);
-                rendered.push('\n');
-            }
-        }
-    }
-
-    if explain && !json {
+    if explain {
+        // D43: the glossary scans exactly what THIS invocation rendered, so
+        // it is applied to the renderer's output rather than passed into it.
         let entries = fmt::glossary_for(&rendered);
         if !entries.is_empty() {
             println!();
@@ -137,6 +132,76 @@ pub fn log(
         }
     }
     Ok(())
+}
+
+/// Sanctioned human-`log` render opts (design R17/AC17), complete:
+/// `now_ms`/`utc`/`color` for [`fmt::turn_list_line`], `all_files` and a
+/// PREBUILT [`crate::noise::NoiseMatcher`] for the NF-B fold. The matcher is
+/// root-derived at BUILD time and pure at render time, which is why it is
+/// admissible where a `&Path` is not. Nothing else — no root, no store, no
+/// ledger handle, and no closure over any of them, is reachable from here.
+struct LogOpts<'a> {
+    now_ms: u64,
+    utc: bool,
+    color: bool,
+    all_files: bool,
+    noise: Option<&'a crate::noise::NoiseMatcher>,
+}
+
+/// Human `log`'s whole stdout, built purely from the view's typed records
+/// plus [`LogOpts`] — the same wiring gate as `readcmds::render_diff`/
+/// `render_blame` and `memorycmds::render_recall`: the signature admits no
+/// `&Path`, no [`BlobStore`], no records-from-disk handle, so this cannot
+/// render from a direct read even if someone wanted it to.
+///
+/// `items` arrives already reversed and limited by the adapter (R18).
+fn render_log(items: &[&TurnRecord], opts: LogOpts) -> String {
+    let mut out = String::new();
+    for turn in items {
+        // NF-B/NF-D.4: fold counts a matched entry out of the visible count
+        // regardless of the turn's grade/tool — a turn whose entries are ALL
+        // noise still prints its own list line (turn selection is untouched)
+        // plus this fold line, never silently disappears.
+        let noise_n = if opts.all_files {
+            0
+        } else {
+            opts.noise
+                .map(|m| turn.files.iter().filter(|f| m.is_noise(&f.path)).count())
+                .unwrap_or(0)
+        };
+        let visible_files = turn.files.len() - noise_n;
+        out.push_str(&format_turn(
+            turn,
+            opts.now_ms,
+            opts.utc,
+            opts.color,
+            visible_files,
+        ));
+        out.push('\n');
+        if noise_n > 0 {
+            out.push_str(&format!("+{noise_n} noise files (--all-files to show)"));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Human prose for a [`agentrec_core::view::CursorError`]. Unreachable from
+/// `log` today (it sets neither `after` nor `limit`), but stated rather than
+/// unwrapped, and owned by the adapter — no prose crosses into
+/// `agentrec-core`.
+fn cursor_error_text(e: &agentrec_core::view::CursorError) -> String {
+    match e {
+        agentrec_core::view::CursorError::Stale => {
+            "the log was rewritten since this cursor — restart the query".to_string()
+        }
+        agentrec_core::view::CursorError::QueryMismatch => {
+            "cursor came from a different query — restart the query".to_string()
+        }
+        agentrec_core::view::CursorError::ZeroLimit => {
+            "a limit of 0 has no honest page".to_string()
+        }
+    }
 }
 
 /// Thin wrapper: computes `log`'s caller-owned fields (relative/UTC time,
@@ -204,6 +269,48 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
     Ok(())
 }
 
+/// `status --json`'s payload (P5, AC-1): the pre-existing `state.json`
+/// operational fields, `#[serde(flatten)]`-joined with the exact
+/// [`agentrec_core::view::RepositoryHealth`] `RepositoryView::health`
+/// returned — no hand-built JSON, so a field added to `RepositoryHealth`
+/// (e.g. `unparsed_lines`, the tolerant-parse counter AC-6 needs) appears
+/// here with no edit to this struct.
+///
+/// Additive, not a replacement: `status --json` shipped in the
+/// ignore-rebuild round with a payload `RepositoryHealth` does not cover
+/// (`ignore_rebuilds`, `snapshot_failures`, dedup counters, …), and P5.md's
+/// "pre-existing overlap" note is explicit that the AC here is routing the
+/// EXISTING flag through the view's serializer, not narrowing it down to
+/// only what `RepositoryHealth` carries — every field the pre-P5 payload
+/// emitted stays exactly where it was, and `#[test] status_omits_stale_
+/// epoch_reload_line`'s `payload["ignore_rebuilds"]`-style indexing keeps
+/// compiling and passing unchanged (`serde_json::Value` indexing is
+/// unaffected by whether a sibling key arrived via `flatten` or a literal
+/// field).
+///
+/// Field order is flatten-then-literal: `RepositoryHealth`'s fields
+/// (`store_bytes`, `budget`, `over_budget`, `turn_count`, `crash_gaps`,
+/// `unknown_type_lines`, `unparsed_lines`) appear first, followed by the
+/// operational fields below in their declared order — nothing pins this
+/// order as a contract (unlike `DiffResult`'s empty-case literal), so this
+/// is a legible default, not a promise.
+#[derive(serde::Serialize)]
+struct StatusJson {
+    #[serde(flatten)]
+    health: agentrec_core::view::RepositoryHealth,
+    ignore_rebuilds: u64,
+    epoch_ignore_rebuilds: u64,
+    epoch_ignore_rebuilds_stale: bool,
+    last_ignore_rebuild_ms: Option<u64>,
+    snapshot_failures: u64,
+    io_failed: Vec<String>,
+    prompt_put_failures: u64,
+    state_parse_failures: u64,
+    last_bad_field: Option<String>,
+    dedup_hits: u64,
+    dedup_reread_bytes: u64,
+}
+
 /// Builds `status --json`'s payload (split out from [`status`] so it's
 /// unit-testable without capturing stdout). `state.json` is OPERATIONAL
 /// data, not the PROTOCOL wire format (PROTOCOL §5 deliberately keeps it off
@@ -237,51 +344,76 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 /// LIVE one. The new sibling `epoch_ignore_rebuilds_stale` carries that
 /// distinction instead, always present (never only-when-true) so a consumer
 /// can tell the two cases apart without inferring it from field absence.
+///
+/// P5 (AC-2): read-only, same as [`status_report`] — `read_state` never
+/// writes back (a corrupted field's healed default lives only in the
+/// returned `State`, persisted only by an explicit `write_state` call this
+/// function never makes) and `daemon_is_running`'s flock probe is a
+/// non-blocking check that creates nothing. `RepositoryView::health` is
+/// documented as a pure read. Nothing on this path writes to
+/// `.agentrec/objects/`, `log.jsonl`, or `state.json`.
 fn status_json(root: &Path) -> Result<serde_json::Value, String> {
     let state = read_state(root);
     let daemon_live = crate::daemon::daemon_is_running(root);
-    Ok(serde_json::json!({
-        "ignore_rebuilds": state.ignore_rebuilds,
-        "epoch_ignore_rebuilds": current_epoch_reloads(&state),
-        "epoch_ignore_rebuilds_stale": !daemon_live,
-        "last_ignore_rebuild_ms": if state.ignore_rebuilds > 0 {
+    let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let health = view
+        .health(effective_store_budget())
+        .map_err(|e| e.to_string())?;
+    let payload = StatusJson {
+        health,
+        ignore_rebuilds: state.ignore_rebuilds,
+        epoch_ignore_rebuilds: current_epoch_reloads(&state),
+        epoch_ignore_rebuilds_stale: !daemon_live,
+        last_ignore_rebuild_ms: if state.ignore_rebuilds > 0 {
             Some(state.last_ignore_rebuild_ms)
         } else {
             None
         },
-        "snapshot_failures": state.snapshot_failures,
-        "io_failed": state.io_failed,
-        "prompt_put_failures": state.prompt_put_failures,
-        "state_parse_failures": state.state_parse_failures,
-        "last_bad_field": state.last_bad_field,
-        "dedup_hits": state.dedup_hits,
-        "dedup_reread_bytes": state.dedup_reread_bytes,
-    }))
+        snapshot_failures: state.snapshot_failures,
+        io_failed: state.io_failed,
+        prompt_put_failures: state.prompt_put_failures,
+        state_parse_failures: state.state_parse_failures,
+        last_bad_field: state.last_bad_field,
+        dedup_hits: state.dedup_hits,
+        dedup_reread_bytes: state.dedup_reread_bytes,
+    };
+    serde_json::to_value(&payload).map_err(|e| e.to_string())
 }
 
 /// Builds `status`'s full output as a string (split out from [`status`] so
 /// the over-budget eviction path is unit-testable with a tiny injected
 /// `budget`, instead of requiring a real 2 GiB store — AC I+).
 fn status_report(root: &Path, budget: u64) -> Result<String, String> {
-    let records = agentrec_core::record::load_log(&log_path(root));
     let store = BlobStore::new(objects_dir(root));
-    let size = store.total_bytes();
+    // P4: the read is the view's; the eviction below is this adapter's own
+    // explicit call. `status` keeps today's user-visible behavior by making
+    // both — but a caller that only wants the facts now has one that writes
+    // nothing. One ledger read feeds both this function's record walks and
+    // the health figures.
+    let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
+    let ledger = view.ledger();
+    let health = view.health_of(&ledger, budget).map_err(|e| e.to_string())?;
+    let size = health.store_bytes;
 
-    let superseded = merged_ids(&records);
-    let all_turns: Vec<&TurnRecord> = records
-        .iter()
-        .filter_map(|r| match r {
-            LogRecord::Turn(t) => Some(t),
-            LogRecord::Epoch(_) => None,
-        })
-        .collect();
-    let turns: Vec<&TurnRecord> = all_turns
-        .iter()
-        .copied()
-        .filter(|t| !superseded.contains(&t.id) && t.tool.as_deref() != Some("git"))
-        .collect();
+    // G4: the counting surface — turn count, rich-rate window, git-hidden
+    // accounting — IS `TurnQuery { include_all: false }`, so it comes from
+    // the summary projection rather than from a filter re-derived here.
+    // Every field it needs (`grade`, `tool`, `imported`, `.len()`) is on
+    // `TurnSummary`; no widening. The eviction protect-set below is a
+    // DIFFERENT set with a different type — see `eviction_plan`.
+    let turns = view
+        .list_of(
+            &ledger,
+            &agentrec_core::view::TurnQuery {
+                include_all: false,
+                limit: None,
+                after: None,
+            },
+        )
+        .map_err(|e| cursor_error_text(&e))?
+        .items;
 
-    let gaps = count_gaps(&records);
+    let gaps = health.crash_gaps;
 
     // Read once, reused below for the ignore-reload line and (further down)
     // the memory/DEGRADED sections — same single-read pattern those already
@@ -291,7 +423,21 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
-    let trailing: Vec<&&TurnRecord> = turns.iter().rev().take(20).collect();
+    //
+    // FOUNDER DECISION (P2 integration-gate fix round, Fix 4): imported
+    // turns are excluded from this window, same shape as the git-tool
+    // exclusion above — an imported turn carries `grade: "rich"` without
+    // any hook ever having fired, so a bulk import could otherwise flood
+    // the trailing-20 window and make a genuinely broken hook read as
+    // 100% healthy (the metric exists specifically to warn "your hooks may
+    // be broken", cmds.rs:342-353 below). Deliberately a SEPARATE list
+    // from `turns` (not a further narrowing reused elsewhere): `turns:`
+    // above still reports the total including imported ones — only the
+    // rich-rate window's membership changes.
+    let rich_rate_turns: Vec<&agentrec_core::view::TurnSummary> =
+        turns.iter().filter(|t| !t.imported).collect();
+    let trailing: Vec<&&agentrec_core::view::TurnSummary> =
+        rich_rate_turns.iter().rev().take(20).collect();
 
     let mut out = String::new();
     out.push_str(&format!("store:      {}\n", human_bytes(size)));
@@ -422,16 +568,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // and deletes nothing. This is what makes AC2b.1 ("status performs zero
     // store writes") true by construction rather than by discipline.
     if size > budget {
-        let owned_turns: Vec<TurnRecord> = all_turns.iter().map(|t| (*t).clone()).collect();
-        // SAFETY (Phase 1 honesty fix, still load-bearing for the dry-run
-        // report): harvest the protect-set as late as possible, immediately
-        // before planning, to narrow the window a live daemon (running
-        // continuously under launchd — Decisions log #2, no liveness
-        // refusal here) could append a new in-flight blob after we've read
-        // log.jsonl/open.json but before the plan is built.
-        let extra_protected = extra_protected_refs(root);
-        let plan =
-            agentrec_core::retention::plan_eviction(&store, &owned_turns, budget, &extra_protected);
+        let plan = eviction_plan(root, &store, &view, &ledger, budget)?;
         // Honesty (B): budget enforcement here only evicts turn-referenced
         // snapshot blobs. Most store bloat is usually ORPHANED blobs —
         // superseded intermediate snapshots the daemon `put` for crash
@@ -530,6 +667,66 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// The read-only eviction dry-run `status` renders, and the phase's only
+/// data-loss path (AC16).
+///
+/// **The protect-set's turn source is the UNFILTERED turn set** —
+/// `TurnQuery { include_all: true }`, never `status`'s filtered counting
+/// page. `plan_eviction` protects `prompt_ref` from ANY turn ("protect any
+/// blob referenced as a prompt by ANY turn, not just kept ones") and builds
+/// its keep-set from every turn's `files[]` hashes. Because the CAS is
+/// content-addressed, a superseded or git turn routinely shares a blob with
+/// a surviving turn; dropping those turns removes the blob from
+/// `protected_prompts` and from `keep`, and eviction then deletes a blob
+/// still referenced by recorded history — breaking `undo` of merged turns.
+/// `cmds::tests::eviction_protect_set_comes_from_the_unfiltered_turn_set`
+/// proves both loss classes.
+///
+/// Do NOT repair a failure here by widening [`extra_protected_refs`]: its
+/// "already reachable through `owned_turns`" premise is true only while
+/// `owned_turns` is unfiltered, so widening masks the bug and breaks that
+/// deliberate boundary.
+///
+/// Takes the already-read `ledger` rather than reading its own: `status`
+/// makes exactly ONE parse of `log.jsonl`, feeding `health_of`, `list_of`,
+/// and this function from it. A second parse would let a daemon append
+/// desync the printed turn count from the health and eviction figures.
+///
+/// Read-only by construction — planning deletes nothing (`execute` is the
+/// daemon tick's, never a read verb's).
+fn eviction_plan(
+    root: &Path,
+    store: &BlobStore,
+    view: &agentrec_core::view::RepositoryView,
+    ledger: &agentrec_core::view::Ledger,
+    budget: u64,
+) -> Result<agentrec_core::retention::EvictionPlan, String> {
+    let owned_turns: Vec<TurnRecord> = view
+        .list_records_of(
+            ledger,
+            &agentrec_core::view::TurnQuery {
+                include_all: true,
+                limit: None,
+                after: None,
+            },
+        )
+        .map_err(|e| cursor_error_text(&e))?
+        .items;
+    // SAFETY (Phase 1 honesty fix, still load-bearing for the dry-run
+    // report): harvest the protect-set as late as possible, immediately
+    // before planning, to narrow the window a live daemon (running
+    // continuously under launchd — Decisions log #2, no liveness refusal
+    // here) could append a new in-flight blob after we've read
+    // log.jsonl/open.json but before the plan is built.
+    let extra_protected = extra_protected_refs(root);
+    Ok(agentrec_core::retention::plan_eviction(
+        store,
+        &owned_turns,
+        budget,
+        &extra_protected,
+    ))
 }
 
 /// Phase 1 honesty fix: hashes `enforce_budget`'s own structured walk over
@@ -904,28 +1101,6 @@ pub(crate) fn merged_ids(records: &[LogRecord]) -> HashSet<String> {
     out
 }
 
-/// A recording gap is any `start` epoch that follows a prior `start` with no
-/// intervening `stop` (kill -9 left the first unterminated).
-fn count_gaps(records: &[LogRecord]) -> usize {
-    let mut gaps = 0;
-    let mut open = false;
-    for r in records {
-        if let LogRecord::Epoch(e) = r {
-            match e.event.as_str() {
-                "start" => {
-                    if open {
-                        gaps += 1; // previous session never cleanly stopped
-                    }
-                    open = true;
-                }
-                "stop" => open = false,
-                _ => {}
-            }
-        }
-    }
-    gaps
-}
-
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -1042,6 +1217,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![FileEntry {
                 path: path.into(),
                 before: None,
@@ -1051,6 +1228,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         }
     }
@@ -1081,6 +1259,89 @@ mod tests {
         assert!(
             store.contains(&hash),
             "status must never delete a blob — it only reports what a daemon tick would do"
+        );
+    }
+
+    // P4 AC4: reading a repository's health is a pure read. An over-budget
+    // store is the case where that is falsifiable — the pre-P4 read path
+    // evicted from inside `status_report`, so a caller that only wanted to
+    // ask "how is this repo doing?" silently deleted blobs. Asserted on all
+    // three write surfaces at once (store bytes, log length, state.json
+    // mtime) because eviction touches the first and any accidental
+    // re-introduction of a write would most likely land on one of the other
+    // two.
+    #[test]
+    fn health_performs_no_writes_on_an_over_budget_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let hash = store.put(&[0u8; 5_000]).unwrap();
+        let turn = turn_with_snapshot("t_PUREHEALTH00000000000001", "big.bin", &hash);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        crate::state::write_state(root, &crate::state::State::default()).unwrap();
+
+        let state_path = crate::state_path(root);
+        let before_bytes = store.total_bytes();
+        let before_log = std::fs::metadata(log_path(root)).unwrap().len();
+        let before_mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        let view = agentrec_core::view::RepositoryView::open(root).unwrap();
+        let health = view.health(1_000).unwrap();
+
+        assert!(health.over_budget, "fixture must actually be over budget");
+        assert_eq!(
+            store.total_bytes(),
+            before_bytes,
+            "health() evicted from the store"
+        );
+        assert_eq!(
+            std::fs::metadata(log_path(root)).unwrap().len(),
+            before_log,
+            "health() appended to log.jsonl"
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            before_mtime,
+            "health() rewrote state.json"
+        );
+        assert!(store.contains(&hash), "the blob must survive a pure read");
+    }
+
+    // P4 AC7, second half: tolerating an unknown record `type` must not
+    // drop the blobs that record references out of the protect-set. A future
+    // producer's record kind is unreadable to this binary — which is exactly
+    // why its refs must be harvested from the raw line rather than inferred
+    // from a parse that did not happen.
+    #[test]
+    fn an_unknown_record_type_still_contributes_to_the_protected_ref_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let referenced = store.put(&[0xCCu8; 4_000]).unwrap();
+
+        let line = serde_json::json!({
+            "type": "future_thing",
+            "v": 1,
+            "files": [{"path": "x.bin", "before": null, "after": referenced, "op": "modify"}]
+        })
+        .to_string();
+        let log = log_path(root);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, format!("{line}\n")).unwrap();
+
+        assert!(
+            extra_protected_refs(root).contains(&referenced),
+            "a blob referenced only by an unknown-type record must stay protected"
+        );
+
+        // And it survives the real over-budget path, not just the harvest.
+        let out = status_report(root, 100).unwrap();
+        assert!(out.contains("over"), "fixture must be over budget: {out}");
+        assert!(
+            store.contains(&referenced),
+            "eviction dropped a blob referenced by a record it could not parse"
         );
     }
 
@@ -1225,6 +1486,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![],
         }
     }
@@ -1252,6 +1515,70 @@ mod tests {
         assert!(
             !out.contains("check `agentrec init`"),
             "remedy must no longer point at `agentrec init`: {out}"
+        );
+    }
+
+    // FOUNDER DECISION (P2 integration-gate fix round, Fix 4): an imported
+    // turn (`grade: "rich"`, but no hook ever fired) must not count toward
+    // the rich-rate window at all — not just "not count as rich", but not
+    // even occupy a window SLOT, since the whole failure mode is a bulk
+    // import diluting a genuinely broken hook's signal. All 10 turns here
+    // are imported; the window must have nothing to compute a rate over.
+    #[test]
+    fn status_rich_rate_excludes_imported_turns_entirely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        for i in 0..10 {
+            let mut turn = turn_with_grade(&format!("t_imp_{i:021}"), "rich");
+            turn.imported = Some(true);
+            turn.files_complete = Some(false);
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("rich-rate:  n/a (no agent turns yet)"),
+            "an all-imported log must report n/a — nothing live to rate: {out}"
+        );
+    }
+
+    // The property actually worth protecting: a genuinely broken hook
+    // (bare turns) must still drive the rate down and trip the warning,
+    // even when imported turns are ALSO present in the same log — a bulk
+    // import must never mask a real regression by diluting the window with
+    // turns no hook ever produced.
+    #[test]
+    fn status_rich_rate_still_reflects_broken_hooks_alongside_imported_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        // 20 imported turns first (would fill the entire trailing-20
+        // window under the old, unfixed behavior).
+        for i in 0..20 {
+            let mut turn = turn_with_grade(&format!("t_imp_{i:021}"), "rich");
+            turn.imported = Some(true);
+            turn.files_complete = Some(false);
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+        // Then 10 bare (live, hook-not-firing) turns — the real signal.
+        for i in 0..10 {
+            let turn = turn_with_grade(&format!("t_BARE{i:021}"), "bare");
+            append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("rich-rate:  0% over trailing 10 agent turn(s)"),
+            "the window must be the 10 live bare turns only, not diluted by \
+             the 20 imported ones ahead of them: {out}"
+        );
+        assert!(
+            out.contains("hooks may be broken"),
+            "a genuinely broken-hook signal must still trip the warning \
+             even with imported turns present in the log: {out}"
         );
     }
 
@@ -2088,6 +2415,309 @@ mod tests {
              eviction pass would have deleted `old`, changing this snapshot"
         );
         assert!(store.contains(&old), "old must survive a `status` call");
+    }
+
+    // ---- P4b-4 -----------------------------------------------------------
+
+    /// A turn with an arbitrary file list — `turn_with_snapshot`'s
+    /// general form, needed here for the fileless git turn and for the
+    /// `merges`/`prompt_ref` fields the AC16 fixture turns on.
+    fn turn_full(id: &str, snapshot: Option<&str>) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            id: id.to_string(),
+            grade: "rich".into(),
+            truncated: false,
+            started: "2026-01-01T00:00:00.000Z".into(),
+            ended: "2026-01-01T00:00:01.000Z".into(),
+            tool: Some("claude".into()),
+            model: None,
+            session: None,
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: None,
+            files_complete: None,
+            files: snapshot
+                .map(|h| {
+                    vec![FileEntry {
+                        path: format!("{id}.bin"),
+                        before: None,
+                        after: Some(h.into()),
+                        op: "create".into(),
+                        skipped: false,
+                        withheld: false,
+                        baseline_unknown: false,
+                        skipped_reason: None,
+                        after_synthesized: None,
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    // AC16 — THE DATA-LOSS GATE. `status`'s eviction protect-set must be
+    // built from the UNFILTERED turn set. `plan_eviction` derives its
+    // eviction `candidates` EXCLUSIVELY from the turns it is passed, so a
+    // blob referenced only by an excluded turn is invisible to eviction and
+    // survives under both implementations — a fixture like that would
+    // discriminate nothing. This one therefore SHARES HASHES across the
+    // filter boundary, in both loss classes:
+    //
+    //   (a) prompt-protection loss — A is both the oldest surviving turn's
+    //       snapshot AND the excluded GIT turn's `prompt_ref`. Unfiltered,
+    //       `protected_prompts` saves it; filtered, the git turn is gone,
+    //       its `prompt_ref` never enters `protected_prompts`, and A is
+    //       evicted.
+    //   (b) keep-set loss — B is shared between the excluded SUPERSEDED
+    //       turn near the tail (inside the keep window when included) and an
+    //       older candidate turn. Unfiltered, `keep` holds it via the tail
+    //       turn so the candidate walk skips it; filtered, it is absent from
+    //       `keep` and is evicted.
+    //
+    // Every blob is backdated well past `pass_start` so `plan_eviction`'s
+    // A3(c) same-pass freshness guard cannot rescue any of them vacuously
+    // and mask the difference.
+    //
+    // Neuter (verified both directions): flip `eviction_plan`'s
+    // `include_all: true` to `false` -> A and B become victims,
+    // `freed_bytes_projected` jumps 20 -> 70, `status`'s "would free" line
+    // changes with it, and `execute` deletes two blobs recorded history
+    // still references. Do NOT repair that by widening
+    // `extra_protected_refs` — the fix is the unfiltered turn set.
+    #[test]
+    fn eviction_protect_set_comes_from_the_unfiltered_turn_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let a = store.put(&[0xAAu8; 40]).unwrap(); // loss class (a)
+        let b = store.put(&[0xBBu8; 30]).unwrap(); // loss class (b)
+        let c = store.put(&[0xCCu8; 20]).unwrap(); // the genuine victim
+        let n = store.put(&[0xEEu8; 5]).unwrap(); // newest, kept by budget
+        for h in [&a, &b, &c, &n] {
+            backdate(&objects_dir(root), h, 3600);
+        }
+
+        // Oldest first, matching `load_log`/ledger order.
+        let t1 = turn_full("t_P4B4OLDA0000000000000001", Some(&a));
+        let t2 = turn_full("t_P4B4OLDB0000000000000001", Some(&b));
+        let t3 = turn_full("t_P4B4OLDC0000000000000001", Some(&c));
+        // The excluded GIT turn: no files of its own, but its prompt hashes
+        // to the same content as T1's snapshot.
+        let mut git = turn_full("t_P4B4GIT00000000000000001", None);
+        git.tool = Some("git".into());
+        git.prompt_ref = Some(a.clone());
+        // The excluded SUPERSEDED turn, near the tail, re-referencing B.
+        let superseded = turn_full("t_P4B4SUPERSEDED0000000001", Some(&b));
+        let mut newest = turn_full("t_P4B4NEWEST000000000001", Some(&n));
+        newest.merges = vec![superseded.id.clone()];
+
+        for t in [t1, t2, t3, git, superseded, newest] {
+            append_log(&log_path(root), &LogRecord::Turn(t)).unwrap();
+        }
+
+        // 95 bytes of store against a 45-byte budget. Unfiltered walk:
+        // NEW(5) then SUPERSEDED(+30 = 35, still under) fill `keep`; T3 trips
+        // the boundary at 55 > 45, so C and A become candidates and B does
+        // not. Filtered walk: NEW(5) then T3(+20 = 25) fill `keep`; T2 trips
+        // at 55 > 45, so B and A become candidates and C does not.
+        let budget = 45;
+        let view = agentrec_core::view::RepositoryView::open(root).unwrap();
+        let ledger = view.ledger();
+        let plan = eviction_plan(root, &store, &view, &ledger, budget).unwrap();
+
+        assert_eq!(
+            plan.victims,
+            vec![(c.clone(), 20)],
+            "only C — the blob no excluded turn protects — may be planned \
+             for eviction; A is prompt-protected by the git turn and B is \
+             held by the superseded tail turn's keep-set entry"
+        );
+        assert_eq!(plan.freed_bytes_projected, 20);
+
+        // The production wiring: `status` renders THIS plan's figure.
+        let out = status_report(root, budget).unwrap();
+        assert!(
+            out.contains(&format!("would free {}", human_bytes(20))),
+            "status must render the unfiltered plan's projection \
+             (filtered would read {}): {out}",
+            human_bytes(70)
+        );
+
+        // Deletion-level proof. `status` itself never evicts
+        // (`status_performs_zero_store_writes`); the daemon tick executes
+        // the same plan, so the loss class is observable only by executing
+        // it — here, in the test only.
+        let evicted = agentrec_core::retention::execute(&store, plan);
+        assert_eq!(evicted.count, 1);
+        assert_eq!(evicted.bytes, 20);
+        assert!(
+            store.contains(&a),
+            "loss class (a): a blob shared with an excluded git turn's \
+             prompt_ref must survive"
+        );
+        assert!(
+            store.contains(&b),
+            "loss class (b): a blob shared with an excluded superseded \
+             turn's keep-set entry must survive"
+        );
+        assert!(store.contains(&n));
+        assert!(!store.contains(&c), "C is the only genuine victim");
+    }
+
+    /// The body text of one top-level `fn` in this file, from its signature
+    /// to its closing brace at column 0.
+    fn fn_body(name: &str) -> &'static str {
+        let src = include_str!("cmds.rs");
+        let needle = format!("\nfn {name}(");
+        let start = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no `fn {name}(` in cmds.rs"));
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").expect("unterminated fn");
+        &rest[..end]
+    }
+
+    // AC5 + the single-parse decision, as a body-text tripwire.
+    //
+    // AC5's condition is function-scoped ("RED if `status_report` still
+    // calls `merged_ids` itself"; `undo`'s surviving caller is out of
+    // scope), and the single-ledger-parse decision is likewise a property
+    // of these two bodies, not of any output — two parses print the same
+    // bytes on a quiescent repo and differ only against a concurrent daemon
+    // append, which is not reproducible in a unit test. After the P4b-4
+    // rewiring both follow structurally from the signatures: `health_of`,
+    // `list_of`, and `list_records_of` all take an already-read `&Ledger`
+    // and cannot re-read. This test pins that the bodies keep using those
+    // forms.
+    //
+    // Scoped to LEDGER parses. Two RAW-BYTE re-reads of `log.jsonl` remain
+    // in the over-budget path: `eviction_plan` -> `extra_protected_refs`,
+    // which harvests hashes off torn lines a structured parse cannot see,
+    // and `status_report` -> `purgecmd::orphan_bytes` ->
+    // `purgecmd::referenced_hashes`. Both are pre-existing, deliberately
+    // late-bound (each narrows the window a live daemon can append an
+    // in-flight blob in), and neither is a second interpretation of the
+    // ledger, so both are outside what this pins.
+    //
+    // Honest limitation: a text scan, not a runtime parse counter. It
+    // cannot see a re-derivation written with different words. It is a
+    // tripwire on the exact regression shapes this task removed — the
+    // behavioral cross-check below is what pins the counting itself.
+    #[test]
+    fn status_derives_its_counts_from_the_seam_and_parses_the_ledger_once() {
+        let report = fn_body("status_report");
+        let plan = fn_body("eviction_plan");
+
+        for (name, body) in [("status_report", report), ("eviction_plan", plan)] {
+            assert!(
+                !body.contains("merged_ids("),
+                "{name} must not re-derive the superseded filter — that IS \
+                 `TurnQuery {{ include_all: false }}`"
+            );
+            assert!(
+                !body.contains(r#"Some("git")"#),
+                "{name} must not re-derive the git-hidden filter"
+            );
+            assert!(
+                !body.contains("load_log("),
+                "{name} must read through the view, not the record loader"
+            );
+            // The ledger-taking forms only; the `&self`-reading twins
+            // (`health`, `list`, `list_records`) would each add a parse.
+            for reader in [".health(", ".list(", ".list_records("] {
+                assert!(
+                    !body.contains(reader),
+                    "{name} must not call `{reader}` — it re-parses the ledger"
+                );
+            }
+        }
+        assert_eq!(
+            report.matches(".ledger()").count(),
+            1,
+            "status_report must parse the LEDGER exactly once"
+        );
+        assert_eq!(
+            plan.matches(".ledger()").count(),
+            0,
+            "eviction_plan must consume status_report's ledger, not read its own"
+        );
+    }
+
+    // AC5's behavioral half: the counting surface's three figures come from
+    // the summary projection. Fixture carries one of every class the filter
+    // decides on — a plain rich turn, a bare turn, an IMPORTED rich turn
+    // (counted in `turns:` but excluded from the rich-rate window), a GIT
+    // turn (hidden), and a SUPERSEDED turn (hidden) — so a re-derived
+    // filter that disagreed with `TurnQuery { include_all: false }` on any
+    // one of them would show up here.
+    #[test]
+    fn status_counting_surface_matches_the_summary_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let mut rich = turn_full("t_P4B4COUNTRICH0000000001", None);
+        rich.grade = "rich".into();
+        let mut bare = turn_full("t_P4B4COUNTBARE0000000001", None);
+        bare.grade = "bare".into();
+        bare.tool = None;
+        let mut imported = turn_full("t_P4B4COUNTIMPORTED000001", None);
+        imported.imported = Some(true);
+        let mut git = turn_full("t_P4B4COUNTGIT00000000001", None);
+        git.tool = Some("git".into());
+        let superseded = turn_full("t_P4B4COUNTSUPERSEDED0001", None);
+        let mut newest = turn_full("t_P4B4COUNTNEWEST00000001", None);
+        newest.merges = vec![superseded.id.clone()];
+
+        for t in [rich, bare, imported, git, superseded, newest] {
+            append_log(&log_path(root), &LogRecord::Turn(t)).unwrap();
+        }
+
+        let view = agentrec_core::view::RepositoryView::open(root).unwrap();
+        let page = view
+            .list_of(
+                &view.ledger(),
+                &agentrec_core::view::TurnQuery {
+                    include_all: false,
+                    limit: None,
+                    after: None,
+                },
+            )
+            .unwrap();
+        // 6 turns recorded, 2 hidden (git + superseded).
+        assert_eq!(page.items.len(), 4, "fixture precondition");
+
+        let out = status_report(root, 1_000_000).unwrap();
+        assert!(
+            out.contains(&format!(
+                "turns:      {} (agent turns; git activity hidden)",
+                page.items.len()
+            )),
+            "turn count must be the projection's page length: {out}"
+        );
+        let non_imported = page.items.iter().filter(|t| !t.imported).count();
+        assert_eq!(non_imported, 3, "fixture precondition");
+        assert!(
+            out.contains(&format!("over trailing {non_imported} agent turn(s)")),
+            "the rich-rate window must be the projection's non-imported \
+             members: {out}"
+        );
+        let rich_n = page
+            .items
+            .iter()
+            .filter(|t| !t.imported && t.grade == "rich")
+            .count();
+        assert!(
+            out.contains(&format!(
+                "rich-rate:  {:.0}%",
+                rich_n as f64 / non_imported as f64 * 100.0
+            )),
+            "rich-rate numerator must come from the projection's grades: {out}"
+        );
     }
 
     // AC2b.3: with no daemon running (the common `hold_daemon_lock` probe

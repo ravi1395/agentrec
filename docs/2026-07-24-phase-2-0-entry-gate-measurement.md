@@ -27,6 +27,22 @@ Parse robustness: **0 unparseable lines out of 106,311.** 37 MB peak RSS over th
 
 ## 2. Before-bytes ladder — the spec's 3 tiers are missing a source
 
+> **Superseded 2026-07-29 — corrected twice.** This section's T1.5 figure (25.3%) counted
+> files with a *same-session backup reference available*, not file entries the ladder's
+> first-hit-wins logic would actually resolve via T1.5 — most of those referenced files were
+> already covered by T1 and never reached the T1.5 check. The built importer's first
+> real-corpus run (task P1) measured T1.5's marginal contribution at **0.5%** — but that
+> reading itself had a bug (T1.5 lookup compared an absolute path against `cwd`-relative
+> keys, so it almost never matched) and, once fixed, a second bug (file-history blobs are
+> written at snapshot time, not per edit, so ~30% of the fixed reading's resolved bytes were
+> fabricated pre-*snapshot*, not pre-edit, states). The corrected, twice-re-measured honest
+> figures are **43.8%** (T1 856 + T1.5 90 = 946 of 2159, counting `create` ops as
+> reconstructible) or **31.7%** (595 + 90 = 685 of 2159, counting only entries yielding actual
+> pre-edit bytes) — not 67.9%, and not the intermediate 40.4% either. See
+> `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and `docs/verify/p1-gate-run-t15fix2.txt` for
+> the full correction history. The table and narrative below are left unchanged as a record
+> of what was predicted on this date.
+
 | tier | source | entries | share |
 |---|---|---|---|
 | T1 | transcript `originalFile` or `create` op | 869 | 42.5% |
@@ -35,6 +51,13 @@ Parse robustness: **0 unparseable lines out of 106,311.** 37 MB peak RSS over th
 | T3 | provenance-only, honest `null` | 157 | 7.7% |
 
 **Reconstructible without touching git: 67.9%.** With the git upper bound: 92.3%.
+
+> **Superseded 2026-07-29 — see callout above; corrected twice.** The honest measured figure
+> went through 40.4% (T1 39.9% + T1.5 0.5%, itself later found wrong) and now stands at
+> **43.8%** (or **31.7%** counting only entries yielding actual bytes). The "do not quote
+> 92.3%" rule below is unaffected and stronger, and now extends to a **~85% ceiling**
+> (43.8 + 41.5 T2-candidate) by the identical upper-bound argument: T2-candidate measured
+> 41.5%, still an unresolved upper bound, and P2 will not resolve every candidate.
 
 ### T1.5 is a real, undocumented source
 `~/.claude/file-history/<sessionId>/<hash>@<version>` holds **verbatim pre-edit
@@ -55,6 +78,14 @@ at all. The true T2 rate is below 24.5%; measuring it requires replaying each
 turn's timestamp against `git log --until`, which was out of scope here.
 **Do not quote 92.3% as the reconstructible rate.** Quote 67.9% + "git recovers
 some unknown share of the remaining 24.5%".
+
+> **Retraction, 2026-07-29 — do not follow the imperative above.** "Quote 67.9%" is stale
+> instruction; 67.9% was the prediction and has since been measured wrong twice. Quote
+> **43.8%** (T1 856 + T1.5 90 = 946 of 2159, counting `create` ops as reconstructible) or
+> **31.7%** (595 + 90 = 685, actual-bytes only) instead, each with its definition, and pair
+> either with "git recovers some unknown share of the remaining 41.5% T2-candidate" — never
+> collapse that into a bare ~85%, which carries the identical upper-bound ban as 92.3%. See
+> `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section.
 
 ## 3. Structural incompleteness — confirmed, slightly worse than spec
 

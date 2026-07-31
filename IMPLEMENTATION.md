@@ -59,6 +59,7 @@ Every call that could have been an open question, resolved. Renegotiable, but th
 | D43 | *(accessibility review 2026-07-09)* Comprehension defaults: `log` prints human-relative times ("14 min ago"; absolute under `--utc` and always in `--json`); grades are color-coded in TTYs (off under `NO_COLOR` or non-TTY); `--explain` on read verbs appends a short glossary of exactly the terms present in that output. The README leads with the disaster-recovery story in its first ten lines; architecture comes after. |
 | D44 | *(accessibility review 2026-07-09)* Claude Code plugin (v2): marketplace packaging that bundles the hook config and MCP registration into a one-step install for Claude Code users, fetching the binary via the D39 installer (with explicit user consent) when absent. Packaging only — the plugin and `agentrec init` must produce identical configuration from a single source of truth; no logic forks. |
 | D45 | *(pre-1.0-freeze honesty fix, 2026-07-25)* **Corrects D35's "wire format is unchanged" claim, which was only ever a two-way split** (I/O-failure vs. everything-else, and only distinguished via `state.json`'s operational `io_failed` path list — not per-entry, and blind to a third real cause, an unreadable file at record time, which always rendered as "over size cap"). `FileEntry` gains `skipped_reason: Option<String>` (PROTOCOL §5, additive open enum: `over_cap` \| `io_failed` \| `unreadable`, `policy` reserved with no producer yet) as permanent per-entry wire truth, landed now specifically because it is materially cheaper before the protocol 1.0 freeze (N1) than after. `state.json`'s `io_failed`/`snapshot_failures` are UNCHANGED and keep their D35 job (operational, aggregate, drive the DEGRADED banner via `--ack-degraded`) — the two channels are deliberately independent (neither is derived from the other) and `build_plan`'s per-entry refusal message now reads only the wire field, never `state.json`. Companion honesty gain: when the recorder actually read the bytes (`over_cap`, `io_failed`) but didn't durably store them, `after` is now set to the real content hash instead of `null` — fixes a permanent modified-since false positive on any never-touched-again skipped file (`unreadable` has no bytes, so `after` correctly stays `null`, never fabricated). The `skipped` gate in `undo`'s `build_plan` is unconditionally checked, and refuses, ABOVE the modified-since comparison — the previously-inert case where a skipped entry's `after` equals the live file's hash is now reachable (thanks to the honesty gain above) and must never fall through to a revert attempt against a blob that was never stored. `D35`'s undo message text ("no snapshot exists (write failed at record time)") is superseded by the shared `fmt::skip_reason_text` vocabulary: `over_cap` → "over size cap", `io_failed` → "write failed at record time", `unreadable` → "file unreadable at record time", absent/unknown → "reason unrecorded". |
+| D46 | *(service-leak fix, 2026-07-31)* **Qualifies D40's "init registers and starts the service unit" default, which is wrong under a temp root.** `init` installs a user-scoped, `RunAtLoad`+`KeepAlive` unit; when the root is a temp directory — which exists to be deleted — nothing reaps the unit afterwards, and the machine accumulates one permanently-loaded service per crashed or abandoned test run (measured 2026-07-31: 40 of 41 installed units pointed at deleted roots). Two changes, deliberately asymmetric in risk: (1) PREVENT — under a canonicalized temp prefix (`$TMPDIR`, `/tmp`, `/private/tmp`) `init` skips **only** the service install, prints why, and offers `--service` to force it; canonicalization on both sides is load-bearing on macOS, where `resolve_root` stores `/private/var/folders/…` while `$TMPDIR` reads `/var/folders/…` and a raw prefix compare would never fire. (2) DETECT — `doctor` parses installed unit files (necessary because `slug()` is a one-way hash, so orphans cannot be found by inverting filenames) and reports units whose `--root` has vanished as **advisory**, never `fail`: the unit directory is machine-global and a `fail` would break the exit-0 gate of unrelated repos. Reaping is NOT automated: `service prune` is deferred because it is the only piece that shells out to `launchctl`/`systemctl` (which `service.rs` forbids the automated suite from exercising), it is destructive, and plist removal on this machine is founder-reserved. Doctor prints the exact removal commands instead. A vanished root is reported as vanished, never asserted to be abandoned — an unmounted volume reads identically. |
 
 ## 3. v1 — Extraction (target: ~8 weekend-equivalents, milestones M1–M3 per D33)
 
@@ -239,6 +240,63 @@ Every call that could have been an open question, resolved. Renegotiable, but th
 1. `npx agentrec@latest log` works on macOS and Linux with no Rust toolchain present: postinstall fetches the platform binary, checksum-verified; unsupported platforms fail with a clear message naming the supported matrix, never a cryptic build error.
 2. The npm package version is locked one-to-one to the binary release version; publishing is a CI step of the release workflow, not a manual action.
 3. The mise/asdf plugin installs and pins versions; the README install matrix documents all five paths (installer script, brew, npm, mise, cargo) with one-line commands.
+
+**S. Service-unit leak: temp-root guard + orphan detection (D46)**
+
+Measured trigger (2026-07-31, this machine): 41 `com.agentrec.*` launchd units
+installed, **40 of them pointing at a root that no longer exists** — 37 under the
+canonicalized `$TMPDIR` (`/private/var/folders/…/T/`), 3 under session scratchpads
+(`/private/tmp/claude-501/…`). Every one carries `RunAtLoad` + `KeepAlive`.
+`uninstall` reverses `init` correctly; the leak is entirely *init without a
+matching uninstall*, i.e. any crashed or abandoned test run.
+
+1. **Temp-root default.** `init` on a root whose canonicalized path is under a
+   temp prefix (canonicalized `$TMPDIR`, `/tmp`, `/private/tmp`) skips the service
+   install by default and prints a line naming both the reason and the `--service`
+   override. Every other init step (scaffold, config, gitignore, perms, hooks) is
+   unaffected.
+2. **The decision is a pure function, separately testable.** `init`'s service
+   branch consults one `service_decision(root, no_service, force)` returning
+   `Install` | `SkipFlag` | `SkipTemp`; the effectful `service::install` is called
+   only on `Install`. The full flag×path matrix is asserted against that function,
+   never by executing a real `launchctl`/`systemctl` install.
+3. **`--service` forces install** under a temp root; `--no-service` and `--service`
+   together is a CLI-level conflict error, not a silent precedence rule.
+4. **Non-temp roots are unaffected**: an ordinary repo path with no override yields
+   `Install`. (Regression rail against an over-broad temp predicate.)
+5. **Unit roots are recoverable.** `service::parse_unit_root` returns the exact
+   `--root` from both generated unit forms, inverting `xml_escape` (launchd) and
+   `systemd_escape` (systemd) — including roots containing `&`, spaces, `%`, and
+   quotes. Required because `slug()` is a one-way hash: orphans cannot be found by
+   inverting filenames, only by parsing unit contents.
+6. **Scanning classifies into three disjoint buckets.** `service::scan_units(dir)`
+   matches only agentrec-named units (`com.agentrec.*.plist` / `agentrec-*.service`),
+   ignores unrelated files in the same directory, and reports each as *live*,
+   *vanished-root*, or *unparseable*. An unparseable unit is never counted as an
+   orphan.
+7. **`doctor` reports vanished-root units as ADVISORY, never `fail`.** The check
+   ("orphaned services") renders `pass` and carries a note with the count, one
+   example unit, and the exact two-command removal pair. `fail` is forbidden here:
+   `~/Library/LaunchAgents` is machine-global, so failing would break the exit-0
+   deploy gate of every unrelated repo on the same machine. With no vanished-root
+   units the check is a plain `pass` with no note. The note must not assert the
+   directory was abandoned — an unmounted volume reads identically.
+8. **Report shape is path-independent**: the new check name appears in
+   `diagnose`'s uninitialized-repo `n/a` short-circuit list, so an uninitialized
+   repo yields the same check set as an initialized one.
+9. **Real-corpus evidence, not fixture-only** (ledger row, not a unit test): the
+   parser is run read-only over this machine's 41 installed plists and must report
+   41/41 parsed and 40 vanished — matching the independently recorded 40/41. A
+   round-trip test against our own writer cannot establish this.
+
+**Deferred deliberately — `service prune` is NOT built here**, for three facts,
+not a preference: (a) it is the only piece of this work that would shell out to
+`launchctl`/`systemctl`, which `cli/src/service.rs`'s module contract forbids
+exercising from the automated suite; (b) it is destructive; (c) removing plists
+from this machine is an open founder-pending item explicitly reserved to the
+founder. `doctor`'s remedy string therefore prints the exact runnable pair
+(`launchctl bootout gui/$(id -u)/<label>` then `rm <plist>`), closing the
+user-facing problem with zero untestable code.
 
 ### Memory (v1)
 

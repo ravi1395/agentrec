@@ -1,0 +1,11 @@
+stdout:
+
+--stderr--
+error: the argument '--ack-degraded' cannot be used with '--json'
+
+Usage: agentrec status --ack-degraded --root <ROOT>
+
+For more information, try '--help'.
+
+--exit--
+2
