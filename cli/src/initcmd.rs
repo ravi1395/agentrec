@@ -594,16 +594,35 @@ mod tests {
         }
     }
 
+    /// A non-temp root that stays non-temp no matter where this repo is
+    /// checked out.
+    ///
+    /// This used to be `env!("CARGO_MANIFEST_DIR")` — "the repo this test is
+    /// compiled from: a real, non-temp path" — which is only true when the
+    /// checkout itself isn't under a temp prefix. A `claimd verify` run
+    /// against a checkout under `$TMPDIR` REFUTED the claim these tests back
+    /// (`clm_4AFDDT3XCSFHKDZ06D926XJVNY`, exit 101), and it was right to: the
+    /// tests were environment-coupled, asserting `Install` for a path that
+    /// genuinely IS temp there. Reproduced by cloning to `$TMPDIR` and
+    /// re-running. Anyone building in a temp workdir — CI included — hit it.
+    ///
+    /// Both branches of the predicate are covered deliberately: `/usr` exists
+    /// (canonicalization succeeds) and the second path does not
+    /// (canonicalization fails and `service_decision` falls back to the path
+    /// as given), so neither branch can silently start reporting temp.
+    const ORDINARY_ROOTS: &[&str] = &["/usr", "/definitely-not-a-temp-dir/repo"];
+
     // AC-S4: an ordinary repo path must still install — the rail against an
     // over-broad predicate that would disable the service for everyone.
     #[test]
     fn service_decision_installs_for_an_ordinary_root() {
-        // The repo this test is compiled from: a real, non-temp path.
-        let ordinary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert_eq!(
-            service_decision(ordinary, false, false),
-            ServiceDecision::Install
-        );
+        for raw in ORDINARY_ROOTS {
+            assert_eq!(
+                service_decision(std::path::Path::new(raw), false, false),
+                ServiceDecision::Install,
+                "{raw} is not a temp path and must still install"
+            );
+        }
     }
 
     // AC-S2/S3: the whole matrix in one place. `--no-service` wins outright;
@@ -614,7 +633,9 @@ mod tests {
     fn service_decision_matrix() {
         let tmp = tempfile::tempdir().unwrap();
         let temp_root = tmp.path();
-        let ordinary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // NOT `CARGO_MANIFEST_DIR` — see ORDINARY_ROOTS: a checkout under
+        // $TMPDIR made that assertion false and refuted this test's claim.
+        let ordinary = std::path::Path::new(ORDINARY_ROOTS[0]);
 
         assert_eq!(
             service_decision(temp_root, true, false),
