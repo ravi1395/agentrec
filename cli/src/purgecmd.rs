@@ -319,7 +319,8 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
 
     test_pause_before_memory_rewrite();
 
-    // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site.
+    // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site
+    // for THIS file (the other two classes rewrite log.jsonl/signal.jsonl).
     rewrite_memory_atomic(&mem_path, &survivor_lines)?;
     agentrec_core::perms::lock_file(&mem_path);
 
@@ -487,8 +488,10 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
 // rewrite it dropping only lines that are exact `same_revert` duplicates of
 // an earlier same-id record.
 
-/// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape (the
-/// only other sanctioned rewrite in this codebase) — daemon-liveness
+/// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape — one
+/// of the three sanctioned rewrite classes in this codebase, in the order they
+/// landed: `--memories-retracted` (first), `--log-duplicates` (second, here),
+/// `--signals-consumed` (third, D46) — daemon-liveness
 /// refusal, archive-before-touch, atomic tmp+fsync+rename+dir-fsync. Two
 /// differences, both load-bearing:
 ///
@@ -765,10 +768,16 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 // the two durable surfaces (`log.jsonl` + `objects/`) that every read verb
 // actually reads. Nothing in the codebase re-reads the inbox below
 // `signal_offset` — `SignalTailer::poll` and `replay_pending_candidates` both
-// start AT that offset and only ever move forward.
+// start AT that offset and never read behind it. The offset itself moves
+// forward on every consumption; the ONE exception is a detected shrink, where
+// both sites resync it DOWN to the file's real EOF
+// (`daemon::resync_shrunk_signal_offset`). That is not a re-read of consumed
+// bytes — the bytes below it are gone from the file — so the redundancy
+// argument above is unaffected.
 //
-// This is the SECOND sanctioned rewrite class (D46), after
-// `purge --log-duplicates`. What survives of "append-only": emitters only ever
+// This is the THIRD sanctioned rewrite class (D46). The full set, in landing
+// order: `purge --memories-retracted`, `purge --log-duplicates`, and this one.
+// What survives of "append-only": emitters only ever
 // append, no line is ever mutated, reordered, or rewritten in place, and only
 // WHOLE already-consumed lines leave the file. What changes: the file's byte
 // offsets are rebased, so `signal_offset` must be rebased in the same
@@ -812,10 +821,16 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 ///     already went wrong — truncating there would decapitate a signal line.
 /// (c) Ordering is rename-THEN-rebase, and that direction is load-bearing.
 ///     A crash between them leaves a large `signal_offset` against a short
-///     file, which `SignalTailer::poll` ALREADY detects (`len < self.offset`):
-///     it resyncs to the new EOF, logs loudly, and counts a DEGRADED I/O
-///     failure — the unconsumed tail's bytes survive on disk, they are just
-///     never processed. The reverse order (rebase first) would leave offset 0
+///     file, which the daemon detects AT STARTUP OR MID-RUN and reconciles
+///     identically via `daemon::resync_shrunk_signal_offset`: it logs loudly,
+///     counts a DEGRADED I/O failure, and resyncs the offset to the new EOF
+///     *and persists it* — the unconsumed tail's bytes survive on disk, they
+///     are just never processed. Both sites matter here and the startup one
+///     is the one this command's own refusal text sends users to: red-team D1
+///     found only the mid-run site (`SignalTailer::poll`, `len < self.offset`)
+///     existed, so a crash in this window was never reconciled by restarting
+///     the daemon and this command refused forever with no escape.
+///     The reverse order (rebase first) would leave offset 0
 ///     against the full file and REPLAY every consumed start/stop signal as
 ///     duplicate turns, corrupting the ledger. Losing an unprocessed signal is
 ///     recoverable by re-prompting; a fabricated turn is not.
@@ -889,7 +904,11 @@ fn purge_signals_consumed_inner(
             "state.json's signal_offset ({offset}) is past the end of signal.jsonl \
              ({len} B) — the inbox was already truncated or rewritten externally; \
              refusing to truncate against an inconsistent offset (start `agentrec \
-             record` once: the daemon detects the shrink and resyncs, then retry)"
+             record` once: the daemon detects the shrink at startup, resyncs the \
+             offset to the file's end and reports DEGRADED — any signals in the \
+             gap are already lost — then retry; if the file's last line is torn \
+             mid-write the retry refuses once more on the line boundary until one \
+             more hook fire completes that line)"
         ));
     }
     // `offset` is a COUNT of consumed bytes, so `offset - 1` is the last
@@ -953,8 +972,8 @@ fn purge_signals_consumed_inner(
     crate::state::write_state(root, &state).map_err(|e| {
         format!(
             "signal.jsonl was truncated but rebasing signal_offset failed: {e} — \
-             start `agentrec record` to resync (the daemon detects the shrink, \
-             resumes at the new end, and reports DEGRADED); the {} unconsumed \
+             start `agentrec record` to resync (the daemon detects the shrink at \
+             startup, resumes at the new end, and reports DEGRADED); the {} unconsumed \
              byte(s) still in the inbox will be skipped",
             tail.len()
         )
@@ -1537,6 +1556,71 @@ mod tests {
         assert_eq!(
             state.state_parse_failures, 0,
             "the rebase must not corrupt state.json"
+        );
+    }
+
+    // Red-team D8: `signal_archive_path` stamps a WHOLE-SECOND timestamp, so
+    // two archives created inside the same second would collide on one name
+    // and the second would clobber the first — a silent loss of the very
+    // bytes the archive exists to preserve. The collision is argued
+    // unreachable (a second back-to-back run rebases to offset 0 first, and
+    // offset 0 short-circuits to the no-op BEFORE any archive is written),
+    // but "reasoned unreachable" was untested. This pins the reasoning.
+    //
+    // Asserts the archive COUNT, not just the first archive's bytes: a
+    // content-only check would pass even if a second archive file appeared
+    // alongside the first.
+    #[test]
+    fn signals_consumed_run_twice_in_one_second_no_ops_without_clobbering_the_archive() {
+        let (tmp, original, offset) = signal_fixture(3);
+        let root = tmp.path();
+        let expected_archive = original[..offset as usize].to_vec();
+        let expected_tail = original[offset as usize..].to_vec();
+
+        let archives = |root: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(agentrec_dir(root))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("signal.archived."))
+                        .unwrap_or(false)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        purge_signals_consumed(root).unwrap();
+        let first = archives(root);
+        assert_eq!(first.len(), 1, "first run archives once: {first:?}");
+
+        // Immediately again — same wall-clock second by construction (no
+        // sleep between them), which is exactly the collision window.
+        purge_signals_consumed(root).unwrap();
+
+        let second = archives(root);
+        assert_eq!(
+            second, first,
+            "the second run must not create, rename, or replace any archive — \
+             it short-circuits on offset 0 before reaching the archive step"
+        );
+        assert_eq!(
+            std::fs::read(&first[0]).unwrap(),
+            expected_archive,
+            "the first run's archive bytes must survive the second run untouched \
+             (a same-second name collision would have clobbered them)"
+        );
+        assert_eq!(
+            std::fs::read(signal_path(root)).unwrap(),
+            expected_tail,
+            "the second run is a no-op: the tail is unchanged and never re-truncated"
+        );
+        assert_eq!(
+            crate::state::read_state(root).signal_offset,
+            0,
+            "offset stays rebased at 0 after the no-op"
         );
     }
 
