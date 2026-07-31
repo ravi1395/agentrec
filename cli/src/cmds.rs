@@ -240,6 +240,9 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 fn status_json(root: &Path) -> Result<serde_json::Value, String> {
     let state = read_state(root);
     let daemon_live = crate::daemon::daemon_is_running(root);
+    let signal_bytes = std::fs::metadata(signal_path(root))
+        .map(|m| m.len())
+        .unwrap_or(0);
     Ok(serde_json::json!({
         "ignore_rebuilds": state.ignore_rebuilds,
         "epoch_ignore_rebuilds": current_epoch_reloads(&state),
@@ -256,6 +259,16 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         "last_bad_field": state.last_bad_field,
         "dedup_hits": state.dedup_hits,
         "dedup_reread_bytes": state.dedup_reread_bytes,
+        // T3/D46: the same inbox accounting the text report renders, so a
+        // monitoring script watching store growth sees the file that actually
+        // grew (13.4 MB on the dogfood store vs. 2.5 MB of log.jsonl). Both
+        // fields are ALWAYS present — never only-when-nonzero — the same
+        // posture `epoch_ignore_rebuilds_stale` argues for above: absence must
+        // never be the encoding of "zero", or a consumer cannot distinguish it
+        // from an older binary that had no such field. `signal_consumed_bytes`
+        // is clamped to the file size for the same reason the text line is.
+        "signal_bytes": signal_bytes,
+        "signal_consumed_bytes": state.signal_offset.min(signal_bytes),
     }))
 }
 
@@ -293,8 +306,37 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
     let trailing: Vec<&&TurnRecord> = turns.iter().rev().take(20).collect();
 
+    // T3/D46: the hook inbox is store accounting `status` never showed. On the
+    // dogfood store it reached 13.4 MB against a 2.5 MB `log.jsonl` — bigger
+    // than anything else this report renders — because nothing ever removed a
+    // signal line. Unconditional (like `store:`/`gaps:`, unlike the derived
+    // `rich-rate` and the activity-implying `ignore:` line): a size of 0 B is
+    // a fact about accounting, not a vacuous derived figure, and a consumer
+    // watching inbox growth needs the line to exist at 0 too. The consumed
+    // clause is the same honest-attribution shape as the over-budget notice's
+    // orphan clause — it names the bytes AND the only command that reclaims
+    // them. `signal_offset` is clamped to the file size before rendering: a
+    // stale/corrupt offset must never make this line claim more consumed bytes
+    // than the file contains (that inconsistency is `purge`'s to refuse on,
+    // not `status`' to render as fact).
+    let signal_bytes = std::fs::metadata(signal_path(root))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let signal_consumed = state.signal_offset.min(signal_bytes);
+
     let mut out = String::new();
     out.push_str(&format!("store:      {}\n", human_bytes(size)));
+    out.push_str(&format!(
+        "inbox:      {} signal.jsonl",
+        human_bytes(signal_bytes)
+    ));
+    if signal_consumed > 0 {
+        out.push_str(&format!(
+            " ({} consumed — reclaim with `agentrec purge --signals-consumed`)",
+            human_bytes(signal_consumed)
+        ));
+    }
+    out.push('\n');
     out.push_str(&format!(
         "turns:      {} (agent turns; git activity hidden)\n",
         turns.len()
@@ -1709,12 +1751,99 @@ mod tests {
         assert_eq!(
             out,
             "store:      0 B\n\
+             inbox:      0 B signal.jsonl\n\
              turns:      0 (agent turns; git activity hidden)\n\
              gaps:       0 recording gap(s)\n\
              rich-rate:  n/a (no agent turns yet)\n\
              memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures\n",
             "healthy-store status output must be unchanged: {out}"
         );
+    }
+
+    // AC3.2 (T3/D46): the hook inbox is the file that actually grew on the
+    // dogfood store (13.4 MB vs. 2.5 MB of log.jsonl) and `status` never
+    // accounted for it. The line must report the real byte size AND attribute
+    // the already-consumed share to its reclaim command — the same honest
+    // attribution shape the over-budget orphan clause uses. Neuter: drop the
+    // inbox line → RED here and in the pinned test above.
+    #[test]
+    fn status_reports_signal_inbox_size_and_consumed_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let body = vec![b'x'; 4096];
+        std::fs::write(signal_path(root), &body).unwrap();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: 3072,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("inbox:      4.0 KiB signal.jsonl (3.0 KiB consumed — reclaim with `agentrec purge --signals-consumed`)\n"),
+            "inbox line must carry size + consumed share + remedy: {out}"
+        );
+    }
+
+    // A stale/corrupt `signal_offset` past EOF must never make `status` claim
+    // more consumed bytes than the file holds — that inconsistency is
+    // `purge --signals-consumed`'s to refuse on, not `status`' to render as
+    // fact. Neuter: drop the `.min(signal_bytes)` clamp → RED (renders
+    // "9.8 KiB consumed" of a 100 B file).
+    #[test]
+    fn status_clamps_a_signal_offset_past_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        std::fs::write(signal_path(root), vec![b'x'; 100]).unwrap();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("inbox:      100 B signal.jsonl (100 B consumed"),
+            "consumed must be clamped to the real file size: {out}"
+        );
+        let json = status_json(root).unwrap();
+        assert_eq!(json["signal_bytes"], 100);
+        assert_eq!(json["signal_consumed_bytes"], 100);
+    }
+
+    // AC3.2, `--json` leg: both fields are always present (never
+    // only-when-nonzero), so a monitoring script can tell "zero" from "older
+    // binary without the field".
+    #[test]
+    fn status_json_carries_signal_inbox_fields_even_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let json = status_json(root).unwrap();
+        assert_eq!(json["signal_bytes"], 0, "field present at zero");
+        assert_eq!(json["signal_consumed_bytes"], 0, "field present at zero");
+
+        std::fs::write(signal_path(root), vec![b'x'; 2048]).unwrap();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json = status_json(root).unwrap();
+        assert_eq!(json["signal_bytes"], 2048);
+        assert_eq!(json["signal_consumed_bytes"], 1024);
     }
 
     // ---- Phase 1: enforce_budget's extra_protected wiring -----------------
