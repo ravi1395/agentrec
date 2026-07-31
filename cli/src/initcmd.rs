@@ -50,6 +50,19 @@ pub(crate) enum ServiceDecision {
 /// `$TMPDIR` alone is not enough: of the 40 leaked units measured 2026-07-31,
 /// 37 were under `$TMPDIR` and 3 under `/private/tmp/claude-501/…` (agent
 /// session scratchpads), which is not `$TMPDIR` on any of these runs.
+///
+/// **`$TMPDIR` is also not sufficient for the ones it does cover, and this
+/// suite proved it by leaking a 42nd unit.** macOS's per-user temp dir is
+/// `/var/folders/<x>/<y>/T/`, reachable ONLY via `$TMPDIR` unless matched
+/// structurally — and that env read is not reliable: (a) `$TMPDIR` is simply
+/// unset in launchd/cron contexts, and (b) `std::env::set_var` mutating the
+/// environment on another thread can make a concurrent `var()` miss (the data
+/// race that made `set_var` unsafe in edition 2024) — this test binary does
+/// exactly that in `service.rs`/`doctorcmd.rs`, and one such miss let the
+/// guard fall through to `Install` and write a real launchd unit for a
+/// tempdir root. `/var/folders` is therefore matched as a STATIC prefix, so
+/// the common case never depends on reading an env var at all. `$TMPDIR` is
+/// still consulted for non-default and non-macOS values.
 fn temp_prefixes() -> Vec<std::path::PathBuf> {
     let mut prefixes: Vec<std::path::PathBuf> = Vec::new();
     let mut push = |p: std::path::PathBuf| {
@@ -65,6 +78,9 @@ fn temp_prefixes() -> Vec<std::path::PathBuf> {
     }
     push(std::path::PathBuf::from("/tmp"));
     push(std::path::PathBuf::from("/private/tmp"));
+    // macOS per-user temp/cache root. Exclusively OS-managed scratch space —
+    // no one keeps a repo here on purpose, and `--service` overrides anyway.
+    push(std::path::PathBuf::from("/var/folders"));
     prefixes
 }
 
@@ -611,6 +627,44 @@ mod tests {
     /// (canonicalization fails and `service_decision` falls back to the path
     /// as given), so neither branch can silently start reporting temp.
     const ORDINARY_ROOTS: &[&str] = &["/usr", "/definitely-not-a-temp-dir/repo"];
+
+    // REGRESSION, and not a hypothetical: this suite leaked a real launchd
+    // unit (`com.agentrec.c0bf764acce7` → `…/T/.tmpdW8v92`, 2026-07-31 10:57)
+    // because `temp_prefixes` read `$TMPDIR` to recognize macOS's per-user
+    // temp dir, and the read can miss — `set_var` on another test thread
+    // races `var()`, and launchd/cron contexts have no `$TMPDIR` at all. When
+    // it missed, `/private/var/folders/…` matched no prefix and `init`
+    // installed a permanent KeepAlive unit for a directory about to be
+    // deleted: the exact defect D46 exists to stop, reproduced by D46's own
+    // tests. `/var/folders` is now a static prefix, so this holds with no
+    // environment at all.
+    //
+    // Deliberately does NOT mutate `$TMPDIR` to prove it — that would add
+    // another env-mutating test to the binary whose races caused this.
+    // Asserts the property directly instead: the macOS per-user temp shape is
+    // recognized without consulting the environment.
+    #[test]
+    fn macos_per_user_temp_is_recognized_without_reading_tmpdir() {
+        let prefixes = temp_prefixes();
+        let var_folders = std::path::Path::new("/var/folders")
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/var/folders"));
+        assert!(
+            prefixes.contains(&var_folders),
+            "the macOS per-user temp root must be a STATIC prefix, not one \
+             reachable only through $TMPDIR: {prefixes:?}"
+        );
+        // And a concrete path of that shape must decide SkipTemp.
+        let shaped = var_folders.join("m5/somethinglong/T/.tmpABCDEF");
+        assert!(
+            matches!(
+                service_decision(&shaped, false, false),
+                ServiceDecision::SkipTemp(_)
+            ),
+            "{} must be recognized as temp",
+            shaped.display()
+        );
+    }
 
     // AC-S4: an ordinary repo path must still install — the rail against an
     // over-broad predicate that would disable the service for everyone.

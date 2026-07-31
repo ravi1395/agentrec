@@ -20,11 +20,11 @@ carries only current state, what's next, and standing debts.
   `RunAtLoad`+`KeepAlive` unit under a temp root (with `--service` to force), and `doctor` reports
   units whose `--root` vanished as advisory-`pass`. `service prune` deliberately NOT built (only
   piece that shells `launchctl`; destructive; plist removal is founder-reserved). ACs S1–S9 added
-  to `IMPLEMENTATION.md` §4 block **S** + register row **D46**; 9 claimd claims (8 EVIDENCED, S9
-  DECLARED-manual by design — it pins a moving corpus). Suite **634 / 0 / 3** (from 615/0/2);
+  to `IMPLEMENTATION.md` §4 block **S** + register row **D46**; 9 claimd claims (7 CONFIRMED, 1 REFUTED-and-fixed, S9
+  DECLARED-manual by design — it pins a moving corpus; see Founder-pending for the refutation). Suite **635 / 0 / 3** (from 615/0/2);
   clippy+fmt clean debug **and** release; new `AGENTREC_TEST_SERVICE_DIR` seam absent from release
   `strings`. **The 40 existing plists are untouched** — still 41 installed, re-counted after the
-  full test run. Evidence incl. real-corpus run and three neuter proofs: `VERIFY-LEDGER.md` § "D46".
+  full test run. Evidence incl. real-corpus run and five neuter proofs: `VERIFY-LEDGER.md` § "D46".
 - **PHASE 2.0 PLAN EXIT REACHED (2026-07-31) on `feat/phase-2-0-view-completion` at `88c7e9b`
   + this commit. P5 GATE-PASSED; all 9 plan-exit checkboxes verified. Pushed, no PR.**
   P5 shipped `--json` read contracts for `diff`/`blame`/`status` as adapters over P4b's typed
@@ -284,6 +284,15 @@ carries only current state, what's next, and standing debts.
     (from 615/0/2). **`agentrec uninstall --root <deleted path>` is NOT a usable remedy for these
     40** — `resolve_root` canonicalized at install time, a vanished path cannot canonicalize, so
     the recomputed slug misses. Use the printed `bootout`+`rm` pair.
+- **A 42nd orphaned plist exists, created by D46's OWN test suite on 2026-07-31 at 10:57** —
+  `com.agentrec.c0bf764acce7` → `/private/var/folders/m5/…/T/.tmpdW8v92` (deleted). The guard's
+  first version recognized macOS per-user temp dirs only via `$TMPDIR`, and a concurrent
+  `set_var` in the same test binary made one read miss, so `init` installed a real unit. Fixed
+  (static `/var/folders` prefix; also closes the launchd/cron case where `$TMPDIR` is unset),
+  neuter-proven, and 42 has held across four subsequent full suite runs. **Not removed** — plist
+  removal is yours, and that reservation was not scoped to units the agent created. Same removal
+  path as the other 40:
+  `launchctl bootout gui/$(id -u)/com.agentrec.c0bf764acce7 && rm ~/Library/LaunchAgents/com.agentrec.c0bf764acce7.plist`
 - **Re-declare AC5b's claim with honest wording** (founder decided the approach 2026-07-30; the
   agent must not run it — an agent re-declaring its own unmeetable claim with weaker text is
   indistinguishable from dodging a refutation). Text to use: *0 observed fabrications on the
@@ -295,6 +304,19 @@ carries only current state, what's next, and standing debts.
   against the `cwd` in effect at its own snapshot line finds ~271 T1.5 candidates vs the current
   rule's 210-before-staleness-gating, at marginally *better* precision. Deliberately NOT changed —
   a pinned decision is not an executor's to overturn. Founder decides whether to amend it.
+- **D46 AC-S2's claim REFUTED, correctly, and NOT re-declared** (`clm_4AFDDT3XCSFHKDZ06D926XJVNY`,
+  exit 101). `claimd verify` replays committed state from a checkout under `$TMPDIR`; the test
+  backing it used `env!("CARGO_MANIFEST_DIR")` as its non-temp control, beside a comment asserting
+  that is "a real, non-temp path" — false in exactly that checkout, where the path IS temp and
+  `Install` is the wrong expectation. Reproduced by cloning to `$TMPDIR`. **Production code was
+  never wrong; the test's control path was.** Fixed (fixed non-temp paths covering both the
+  canonicalize-succeeds and canonicalize-fails branches) and re-verified green from a `$TMPDIR`
+  checkout — but REFUTED is not amendable and re-declaring an equivalent is forbidden as dodging,
+  so AC-S2 now carries a passing test and no live claim. Founder decides whether a re-declaration
+  is warranted. Same disposition as the two P1 claims below. Worth keeping: this is the
+  fifth instance of this repo's signature defect — a confidently-worded comment asserting an
+  environment fact nobody measured — and the first one caught by the claim protocol itself rather
+  than by a skeptic.
 - 2 claimd claims REFUTED on malformed replay commands (`clm_2DDM03JPR1N9JT4QHYHBTZC1SM`,
   `clm_07FVVKJGHZS8ZFSR2998HE7QRP`) — multi-filter `cargo test`. Underlying tests pass under a
   corrected invocation, but REFUTED is not amendable and re-declaring an equivalent is forbidden

@@ -755,7 +755,7 @@ the check works on the real corpus, not only through unit tests.
 
 ### Suite
 
-`cargo test --workspace -- --test-threads=3` → **634 passed / 0 failed / 3 ignored**
+`cargo test --workspace -- --test-threads=3` → **635 passed / 0 failed / 3 ignored**
 (baseline at the Phase 2.0 plan exit: 615 / 0 / 2 — **+19 tests, +1 ignored**, the new ignored one
 being the real-corpus probe). clippy `-D warnings` + `fmt --check` clean on **debug and release**.
 
@@ -767,6 +767,55 @@ being the real-corpus probe). clippy `-D warnings` + `fmt --check` clean on **de
   machine is an explicitly founder-reserved item. `doctor` prints the exact command pair instead,
   which closes the user-facing problem with zero untestable code.
 - **Reaping the existing 40 units.** Founder's, unchanged. `doctor` now finds and prints them.
+
+### The claim protocol caught a defect the four neuters did not
+
+`claimd verify` REFUTED AC-S2's claim (`clm_4AFDDT3XCSFHKDZ06D926XJVNY`, exit 101) after the first
+commit. It was right. `service_decision_matrix` and `service_decision_installs_for_an_ordinary_root`
+used `env!("CARGO_MANIFEST_DIR")` as their non-temp control — carrying a comment calling it "a real,
+non-temp path" — which holds only while the checkout is not itself under a temp prefix. `verify`
+replays committed state from a checkout under `$TMPDIR`, where that path genuinely is temp, so
+asserting `Install` was wrong there. Reproduced directly by `git clone` into `$TMPDIR`
+(`SkipTemp("/private/var/folders/…/T")` vs expected `Install`), fixed with fixed non-temp paths
+covering both predicate branches (`/usr` — canonicalization succeeds; a nonexistent absolute path —
+canonicalization fails and falls back), and re-verified green from a fresh `$TMPDIR` checkout.
+
+Two things worth recording. **Production code was never wrong** — the defect was entirely the tests'
+choice of control path, and it would have bitten any CI runner building in a temp workdir. And
+**AC-S4's test carried the identical defect while its claim verified CONFIRMED** — it happened to
+run somewhere non-temp. A green verify is not evidence the test is environment-independent.
+
+Per house rule the refuted claim is **not amended and no equivalent is re-declared**; AC-S2 now has
+a passing, fixed test and no live claim. Recorded in CLAUDE.md § Founder-pending for a ruling,
+same disposition as the two P1 claims refuted on malformed replays.
+
+### The guard leaked a 42nd unit before it was tight enough — recorded, not buried
+
+**This round's own test suite installed a real launchd unit** (`com.agentrec.c0bf764acce7` →
+`/private/var/folders/…/T/.tmpdW8v92`, mtime 2026-07-31 10:57:05), i.e. the guard failed at exactly
+the thing it exists to prevent. Caught by re-counting the plists after each suite run rather than
+assuming; the count went 41 → 42.
+
+Cause: the first version of `temp_prefixes` recognized macOS's per-user temp dir
+(`/var/folders/<x>/<y>/T/`) **only** by reading `$TMPDIR`. That read is not reliable —
+`std::env::set_var` on another thread races a concurrent `var()` (the data race that made
+`set_var` unsafe in edition 2024), and this very test binary mutates env in `service.rs`'s
+`ENV_LOCK` tests and `doctorcmd.rs`'s `with_service_dir`. One missed read left
+`/private/var/folders/…` matching no prefix, so `service_decision` returned `Install` and `init`
+wrote a permanent `KeepAlive` unit for a directory about to be deleted. The same miss also produced
+one transient assertion failure (199/1) that passed on re-run — a flake that was a real signal.
+
+The env-read was the wrong mechanism, not just unlucky: `$TMPDIR` is simply **unset** under
+launchd and cron, so the guard would have silently no-opped there in production too. Fixed by
+matching `/var/folders` as a STATIC prefix, so the common macOS case never reads an env var at
+all. `$TMPDIR` is still consulted for non-default and non-macOS values. Pinned by
+`macos_per_user_temp_is_recognized_without_reading_tmpdir`, neuter-proven (fifth neuter: dropping
+the static prefix reds it), and confirmed by counting plists across **four** subsequent full runs —
+41 held, then 42 held with zero further growth.
+
+**The 42nd plist was NOT removed.** It is this round's own mess rather than one of the founder's
+40, but plist removal is founder-reserved and that reservation was not scoped to "units you didn't
+create". It is listed in CLAUDE.md § Founder-pending with its removal command, alongside the 40.
 
 ### Residual — the guard is preventive only, and only for future inits
 
