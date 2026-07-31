@@ -1,0 +1,12 @@
+stdout:
+turn t_DUPA…TUR8 · claude · 1 file
+--- a/src/dup.rs
++++ b/src/dup.rs
+@@ -1 +1 @@
+-dup before
++dup after
+
+--stderr--
+
+--exit--
+0

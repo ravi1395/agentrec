@@ -18,6 +18,7 @@ pub mod retention;
 pub mod scrub;
 pub mod store;
 pub mod time;
+pub mod view;
 
 /// Per-file snapshot cap (PROTOCOL §6).
 pub const MAX_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;

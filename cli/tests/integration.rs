@@ -17,10 +17,28 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
 }
 
+/// D46: an empty fixture directory, shared by every spawned binary in this
+/// suite, standing in for the user-global service directory.
+///
+/// `doctor`'s orphaned-services check scans `service::service_dir()`, which in
+/// production is the developer's real `~/Library/LaunchAgents`. Left unset,
+/// every `doctor` invocation in this suite would read whatever units happen to
+/// be installed on the machine running the tests — 41 on the author's box, 0
+/// on a fresh CI runner. The check is advisory so no assertion would flip, but
+/// a test whose behavior depends on ambient user state is precisely the defect
+/// class this repo keeps charging. Pinned to an empty tempdir instead, leaked
+/// for the process lifetime so it outlives every spawn.
+fn empty_service_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("service-dir fixture"))
+        .path()
+}
+
 fn agentrec(root: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .args(["--root", root.to_str().unwrap()])
+        .env("AGENTREC_TEST_SERVICE_DIR", empty_service_dir())
         .output()
         .expect("run agentrec")
 }
@@ -1711,6 +1729,8 @@ fn base_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -1749,6 +1769,7 @@ fn diff_text_modify_shows_unified() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "src/new.rs".into(),
@@ -1759,6 +1780,7 @@ fn diff_text_modify_shows_unified() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -1798,6 +1820,7 @@ fn diff_binary_file_message() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1836,6 +1859,7 @@ fn diff_skipped_file_notice() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1877,6 +1901,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::IO_FAILED.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "unreadable.rs".into(),
@@ -1887,6 +1912,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::UNREADABLE.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "legacy.rs".into(),
@@ -1897,6 +1923,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None, // pre-this-round log entry
+                after_synthesized: None,
             },
             FileEntry {
                 // hash recorded, but no such blob was ever put in the store —
@@ -1909,6 +1936,7 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -2000,6 +2028,7 @@ fn diff_reports_corrupt_blob_distinctly_from_missing() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2080,6 +2109,7 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2100,6 +2130,7 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2230,6 +2261,55 @@ fn diff_prefix_match() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("turn "), "stdout: {stdout}");
     assert!(stdout.contains("0 file"), "stdout: {stdout}");
+}
+
+// P4b-2 AC8: a fileless turn is DATA, not an error — `diff` renders the
+// header alone, exit 0. `diff_prefix_match` above only asserts a substring
+// of stdout, so an empty page that also dropped the header (or gained a
+// stray line) would have regressed silently; this pins the whole stream.
+#[test]
+fn diff_fileless_turn_prints_the_header_alone_exit_0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let turn = base_turn("t_FILELESSTURN00000000000001", vec![]);
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["diff", &turn.id]);
+    assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("turn {} · claude · 0 files\n", short_id_of(&turn.id)),
+        "a fileless turn renders its header and nothing else"
+    );
+    assert!(out.stderr.is_empty(), "stderr: {out:?}");
+}
+
+// P4b-2 AC19 (the arm nothing pinned): `blame <missing>:<n>` is a user
+// error, not an attribution — stderr `agentrec: <path>: not found`, exit 1.
+// The fixture is deliberately gap-free (no epoch records at all), because a
+// crash gap would short-circuit into the recording-gap state and never reach
+// the error.
+#[test]
+fn blame_line_on_a_missing_file_reports_not_found_exit_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A ledger with a turn, but none touching the queried path.
+    seed_turn(root, &base_turn("t_UNRELATEDTURN0000000000001", vec![]));
+
+    let out = agentrec(root, &["blame", "nope.rs:1"]);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "agentrec: nope.rs: not found\n"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a refusal must not also print an attribution: {out:?}"
+    );
 }
 
 // --- AC PD2: `agentrec show <turn> [--prompt]` (SPEC §Prompt posture item
@@ -2577,6 +2657,8 @@ fn make_turn(
         prompt_ref: None,
         prompt_excerpt: prompt_excerpt.map(str::to_string),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     }
 }
@@ -2621,6 +2703,7 @@ fn blame_file_reports_last_rich_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2640,6 +2723,7 @@ fn blame_file_reports_last_rich_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2707,6 +2791,7 @@ fn blame_bare_turn_no_fabrication() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2746,6 +2831,7 @@ fn blame_deleted_file_resolves() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     // z.rs is never written to disk — absent, as expected post-delete.
@@ -2786,6 +2872,7 @@ fn blame_line_level_added_and_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2836,6 +2923,7 @@ fn blame_gap_is_stale() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2888,6 +2976,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2917,6 +3006,7 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2978,6 +3068,7 @@ fn blame_line_create_turn_still_credited() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3028,6 +3119,7 @@ fn blame_line_unresolvable_after_not_false_predating() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3086,6 +3178,7 @@ fn undo_clean_revert_byte_exact() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3135,6 +3228,7 @@ fn undo_preview_does_not_mutate() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3182,6 +3276,7 @@ fn undo_file_subset() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "b.rs".into(),
@@ -3192,6 +3287,7 @@ fn undo_file_subset() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -3234,6 +3330,7 @@ fn undo_modified_since_excluded_then_allowed() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3301,6 +3398,7 @@ fn undo_skipped_and_withheld_refused() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: Some(agentrec_core::record::skip_reason::IO_FAILED.to_string()),
+                after_synthesized: None,
             },
             FileEntry {
                 path: "w.rs".into(),
@@ -3311,6 +3409,7 @@ fn undo_skipped_and_withheld_refused() {
                 withheld: true,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -3349,6 +3448,7 @@ fn undo_skipped_and_withheld_refused() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -3419,6 +3519,7 @@ fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3478,6 +3579,7 @@ fn undo_create_and_delete_inverse() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -3502,6 +3604,7 @@ fn undo_create_and_delete_inverse() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_b);
@@ -3540,6 +3643,7 @@ fn undo_is_a_turn_and_reversible() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3598,6 +3702,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn1);
@@ -3617,6 +3722,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn2);
@@ -3663,6 +3769,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn_rich);
@@ -3682,6 +3789,7 @@ fn panic_undo_targets_last_rich() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         );
         seed_turn(root, &turn_bare);
@@ -4118,6 +4226,7 @@ fn panic_undo_skips_git_turn() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn_claude);
@@ -4140,6 +4249,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "checkout_b.rs".into(),
@@ -4150,6 +4260,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
             FileEntry {
                 path: "checkout_c.rs".into(),
@@ -4160,6 +4271,7 @@ fn panic_undo_skips_git_turn() {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             },
         ],
     );
@@ -4252,6 +4364,7 @@ fn purge_removes_expired_prompt_blob_keeps_shared() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     old_shared.started = days_ago_rfc3339(200);
@@ -4377,6 +4490,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_old1.started = "2024-01-01T00:00:00.000Z".into();
@@ -4394,6 +4508,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_old2.started = "2024-02-01T00:00:00.000Z".into();
@@ -4413,6 +4528,7 @@ fn purge_snapshots_before_date_respects_keepset() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     turn_new.started = "2024-06-01T00:00:00.000Z".into();
@@ -5352,6 +5468,75 @@ fn log_json_zero_turns_prints_empty_array() {
     assert_eq!(stdout.trim(), "[]", "stdout: {stdout:?}");
 }
 
+// AC3 (log half) + AC4 (log half): on a NON-EMPTY fixture, `log --json`
+// stdout is exactly `page.items.iter().rev().take(limit)` with one
+// `serde_json::to_string` line each. The `.rev().take(limit)` reordering is
+// the adapter's only sanctioned transformation — the expected value here is
+// computed by calling the seam itself, so any field construction, reshaping,
+// or re-derived filter in the adapter reds this.
+//
+// That equality is also AC4's real content: the adapter serializes the
+// view's own `TurnRecord` and names no field, so a field added to
+// `TurnRecord` appears in `log --json` with no adapter edit. The fixture
+// deliberately includes a git turn and a superseded turn so a filter drift
+// between the adapter and `TurnQuery { include_all: false }` also reds.
+#[test]
+fn log_json_is_serde_of_the_views_items_reversed_and_limited() {
+    use agentrec_core::view::{RepositoryView, TurnQuery};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    for i in 0..4 {
+        seed_turn(
+            root,
+            &base_turn(&format!("t_JSONSEAM000000000000000{i}"), vec![]),
+        );
+    }
+    let mut git = base_turn("t_JSONSEAMGIT00000000000001", vec![]);
+    git.tool = Some("git".into());
+    seed_turn(root, &git);
+    let dropped = base_turn("t_JSONSEAMSUPERSEDED0000001", vec![]);
+    seed_turn(root, &dropped);
+    let mut newest = base_turn("t_JSONSEAMNEWEST00000000001", vec![]);
+    newest.merges = vec![dropped.id.clone()];
+    seed_turn(root, &newest);
+
+    let view = RepositoryView::open(root).unwrap();
+    let page = view
+        .list_records(&TurnQuery {
+            include_all: false,
+            limit: None,
+            after: None,
+        })
+        .unwrap();
+    assert_eq!(
+        page.items.len(),
+        5,
+        "fixture precondition: 7 seeded, 2 hidden"
+    );
+
+    // A limit strictly below the page length, so `.take(limit)` is load-bearing
+    // rather than a no-op.
+    let limit = 3usize;
+    let expected: String = page
+        .items
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|t| format!("{}\n", serde_json::to_string(t).unwrap()))
+        .collect();
+
+    let out = agentrec(root, &["log", "--json", "--limit", &limit.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "log --json failed: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        expected,
+        "log --json must be serde of the view's items and nothing else"
+    );
+}
+
 #[test]
 fn log_default_is_relative_utc_is_absolute() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5493,6 +5678,7 @@ fn noise_turn(id: &str) -> agentrec_core::record::TurnRecord {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     };
     base_turn(
         id,
@@ -5562,6 +5748,7 @@ fn nf_is_noise_does_not_panic_on_absolute_path() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5697,6 +5884,7 @@ fn nf5_blame_and_undo_unaffected_by_noise_globs() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5741,6 +5929,7 @@ fn nf6_all_noise_turn_still_appears_and_rich_rate_unaffected() {
         withheld: false,
         baseline_unknown: false,
         skipped_reason: None,
+        after_synthesized: None,
     };
     let all_noise_turn = base_turn(
         "t_NF6ALLNOISE00000000000001",
@@ -6181,6 +6370,54 @@ fn recall_cli_fresh_only_and_json() {
     assert!(
         stdout.contains("src/a.rs") && stdout.contains("src/b.rs"),
         "memories --all must show both: {stdout}"
+    );
+}
+
+/// P4b-3: the human `recall` HITS line has no golden pin (`golden.rs`'s own
+/// module doc says only the two empty states are captured) — this is the
+/// one recall-rendering surface P4b-3's `format_memory_hit_line` extraction
+/// touches with no byte-exact test guarding it. Not a byte-exact assertion
+/// (the line embeds a relative timestamp, which goldens avoid for exactly
+/// this reason), but a substantive one: every field a hit line is supposed
+/// to show (freshness label, fact text, pin path) must actually appear, on
+/// stdout, in the plain (non-JSON, non-for-hook) form.
+#[test]
+fn recall_human_hit_line_shows_freshness_fact_and_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), b"fn a() {}").unwrap();
+    let out = agentrec(
+        root,
+        &[
+            "remember",
+            "nightly seed rotation keeps torture runs reproducible",
+            "--from",
+            "src/a.rs",
+        ],
+    );
+    assert!(out.status.success(), "remember failed: {out:?}");
+    seed_filler_memories(root, 8);
+
+    let out = agentrec(root, &["recall", "nightly seed rotation"]);
+    assert!(out.status.success(), "recall failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("fresh"),
+        "expected the fresh freshness label: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("nightly seed rotation keeps torture runs reproducible"),
+        "expected the fact text: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("src/a.rs"),
+        "expected the pin path: stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("[pins:"),
+        "expected the pins bracket: stdout={stdout}"
     );
 }
 
@@ -6768,6 +7005,7 @@ fn memories_stale_shows_drifted_pin_and_when() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }],
     );
     seed_turn(root, &turn);
@@ -9193,6 +9431,7 @@ fn daemon_eviction_keeps_protected_refs() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }
     }
 
@@ -9337,6 +9576,7 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }
     }
 
@@ -9463,4 +9703,747 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
         stderr_text.contains("evicted") && stderr_text.contains("blob"),
         "expected one stderr eviction line from the daemon: {stderr_text}"
     );
+}
+
+// ---- P5: `--json` read contracts for `diff`, `blame`, `status` -----------
+//
+// AC references below are P5.md's (as corrected by the founder's two
+// P5.md corrections and the launching agent's claimd claim list):
+//   AC-1 typed-value mirror, no hand-built JSON
+//   AC-2 (substituted) status --json is read-only, matches bare status's
+//        zero-write invariant
+//   AC-3 empty cases are data (diff fileless; blame uncovered path)
+//   AC-4 bare turns carry no tool/model keys, never labeled human/agent
+//   AC-6 malformed/torn log line's counter surfaces in status --json, exit 0
+// (AC-5, golden bytes, is verified by `cargo test --test golden` directly,
+// not here.)
+mod json_contracts {
+    use super::*;
+
+    /// Like [`agentrec`], but with extra environment variables set on the
+    /// child — needed for the CLI's debug-only budget-override seam
+    /// (`AGENTREC_TEST_STORE_BUDGET_BYTES`), which is how a test drives a
+    /// real over-budget `status` path without a multi-GiB store.
+    fn agentrec_env(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        Command::new(bin())
+            .args(args)
+            .args(["--root", root.to_str().unwrap()])
+            .envs(envs.iter().copied())
+            .output()
+            .expect("run agentrec")
+    }
+
+    fn json(out: &Output) -> serde_json::Value {
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("not valid JSON: {e}: {out:?}"))
+    }
+
+    fn keys(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        v.as_object()
+            .unwrap_or_else(|| panic!("not a JSON object: {v}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn set(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Recursively collects every JSON string leaf value in `v` — used to
+    /// prove a bare turn's rendering never labels it "human" or "agent"
+    /// anywhere in the tree (AC-4), not just at one expected field.
+    fn all_string_leaves(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => {
+                for i in items {
+                    all_string_leaves(i, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for i in map.values() {
+                    all_string_leaves(i, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn total_store_bytes(root: &Path) -> u64 {
+        fn walk(dir: &Path, total: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, total);
+                } else if let Ok(meta) = entry.metadata() {
+                    *total += meta.len();
+                }
+            }
+        }
+        let mut total = 0u64;
+        walk(&root.join(".agentrec/objects"), &mut total);
+        total
+    }
+
+    fn log_bytes(root: &Path) -> u64 {
+        std::fs::metadata(root.join(".agentrec/log.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    // ---- AC-1: typed-value mirror, no adapter-owned field naming ---------
+
+    /// `diff --json`'s top-level object has EXACTLY `DiffResult`'s declared
+    /// fields, and `files` has exactly `Page<T>`'s — proof by key set rather
+    /// than a literal, per-field body (a field added to either struct would
+    /// change this set with no edit here needed). The `Text` file state is
+    /// checked the same way, one level down.
+    #[test]
+    fn diff_json_key_set_matches_diff_result_and_page() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let before = store.put(b"a\n").unwrap();
+        let after = store.put(b"b\n").unwrap();
+
+        let turn = base_turn(
+            "t_JSONDIFFTEXT000000000000001",
+            vec![FileEntry {
+                path: "x.rs".into(),
+                before: Some(before),
+                after: Some(after),
+                op: "modify".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", &turn.id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            keys(&v),
+            set(&["turn_id", "tool", "total_files", "files"]),
+            "diff --json top level: {v}"
+        );
+        assert_eq!(v["turn_id"], turn.id);
+        assert_eq!(v["tool"], "claude");
+        assert_eq!(v["total_files"], 1);
+        let files = &v["files"];
+        assert_eq!(keys(files), set(&["items", "next"]));
+        assert!(files["next"].is_null());
+        let items = files["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(keys(&items[0]), set(&["path", "state"]));
+        assert_eq!(items[0]["path"], "x.rs");
+        assert_eq!(
+            keys(&items[0]["state"]),
+            set(&["type", "before", "after", "op", "after_synthesized"]),
+            "FileDiffState::Text shape: {}",
+            items[0]["state"]
+        );
+        assert_eq!(items[0]["state"]["type"], "text");
+        assert_eq!(items[0]["state"]["before"], "a\n");
+        assert_eq!(items[0]["state"]["after"], "b\n");
+        assert_eq!(items[0]["state"]["op"], "modify");
+        assert_eq!(items[0]["state"]["after_synthesized"], false);
+    }
+
+    /// AC-3's pinned empty-case literal, byte-for-byte
+    /// (P5.md's 2026-07-30 amendment): a fileless-but-tooled turn's
+    /// `diff --json` is exactly
+    /// `{"turn_id":"t_…","tool":"claude","total_files":0,"files":{"items":[],"next":null}}`
+    /// — exit 0, empty is data, not an error.
+    #[test]
+    fn diff_json_fileless_turn_matches_pinned_empty_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let turn = base_turn("t_JSONFILELESS000000000000001", vec![]);
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", &turn.id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "{{\"turn_id\":\"{}\",\"tool\":\"claude\",\"total_files\":0,\"files\":{{\"items\":[],\"next\":null}}}}\n",
+                turn.id
+            ),
+            "diff --json fileless-turn literal, byte for byte"
+        );
+        assert!(out.stderr.is_empty(), "stderr: {out:?}");
+    }
+
+    /// `blame --json`'s top-level object has EXACTLY `BlameResult`'s
+    /// declared fields (same key-set proof as diff's, above).
+    #[test]
+    fn blame_json_key_set_matches_blame_result() {
+        use agentrec_core::record::FileEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let turn = make_turn(
+            "t_JSONBLAMEFILE00000000000001",
+            "rich",
+            Some("claude"),
+            "2026-07-05T09:00:00.000Z",
+            Some("write w.rs"),
+            vec![FileEntry {
+                path: "w.rs".into(),
+                before: None,
+                after: Some(agentrec_core::store::hash_bytes(b"content\n")),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        std::fs::write(root.join("w.rs"), b"content\n").unwrap();
+
+        let out = agentrec(root, &["blame", "w.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            keys(&v),
+            set(&["path", "line", "state"]),
+            "blame --json: {v}"
+        );
+        assert_eq!(v["path"], "w.rs");
+        assert!(v["line"].is_null());
+        assert_eq!(v["state"]["type"], "file");
+        assert_eq!(v["state"]["turn"]["id"], turn.id);
+        assert_eq!(v["state"]["deleted"], false);
+        assert_eq!(v["state"]["modified"], false);
+    }
+
+    /// The grep AC's weaker half — kept alongside the key-set proofs above,
+    /// which are the real instrument (a hand-built `json!({...})` would
+    /// still pass this particular grep since it doesn't use `format!`).
+    #[test]
+    fn no_hand_built_json_braces_on_diff_blame_status_paths() {
+        for rel in ["src/readcmds.rs", "src/cmds.rs"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("format!(\"{{"),
+                "{rel} contains a hand-built JSON brace literal (format!(\"{{...\"))"
+            );
+        }
+    }
+
+    // ---- AC-3 (blame half): uncovered path → recording_gap, no attributor -
+
+    /// File-level blame on a path no turn ever touched, with a crash gap in
+    /// the ledger: `state.type` names the recording-gap arm and the object
+    /// carries no `turn` field at all — not a guess, structurally.
+    #[test]
+    fn blame_json_no_turn_recording_gap_carries_no_turn_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        // Two `start` epochs with no `stop` between them: a crash gap, no
+        // turn seeded at all.
+        seed_epoch(root, "start", "2026-07-05T00:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T00:05:00.000Z");
+
+        let out = agentrec(root, &["blame", "never-touched.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["state"]["type"], "no_turn_recording_gap");
+        assert_eq!(
+            keys(&v["state"]),
+            set(&["type"]),
+            "no_turn_recording_gap must carry no other field (never a guessed \
+             attributor): {}",
+            v["state"]
+        );
+    }
+
+    /// Line-level blame on a touched-but-gap-stale file: `LineRecordingGap`,
+    /// same no-attributor guarantee as the file-level arm above.
+    #[test]
+    fn blame_json_line_recording_gap_carries_no_turn_field() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+
+        let after = store.put(b"original\n").unwrap();
+        let turn = make_turn(
+            "t_JSONLINEGAP00000000000001",
+            "rich",
+            Some("claude"),
+            "2026-07-05T09:00:00.000Z",
+            Some("write g.rs"),
+            vec![FileEntry {
+                path: "g.rs".into(),
+                before: None,
+                after: Some(after),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        seed_epoch(root, "start", "2026-07-05T09:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T09:05:00.000Z");
+        // Diverges from the turn's recorded `after` — the gap could be
+        // hiding the real cause, so a line query must not guess either.
+        std::fs::write(root.join("g.rs"), b"changed-during-the-gap\n").unwrap();
+
+        let out = agentrec(root, &["blame", "g.rs:1", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["state"]["type"], "line_recording_gap");
+        assert_eq!(keys(&v["state"]), set(&["type"]), "{}", v["state"]);
+    }
+
+    // ---- AC-4: bare turns carry no tool/model keys, no human/agent label --
+
+    /// `diff --json` on a bare (toolless) turn omits the `tool` key
+    /// entirely (never `"tool":null`) — the `TurnRecord::tool` /
+    /// `MemoryHit::reason` convention.
+    #[test]
+    fn diff_json_bare_turn_omits_tool_key() {
+        let turn_id = "t_JSONBARETOOL00000000000001";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let turn = make_turn(
+            turn_id,
+            "bare",
+            None,
+            "2026-07-05T09:00:00.000Z",
+            None,
+            vec![],
+        );
+        seed_turn(root, &turn);
+
+        let out = agentrec(root, &["diff", turn_id, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert!(
+            v.as_object().unwrap().get("tool").is_none(),
+            "a bare turn must omit `tool` entirely, not emit null: {v}"
+        );
+        assert_eq!(keys(&v), set(&["turn_id", "total_files", "files"]));
+    }
+
+    /// `blame --json` on a bare turn: the nested `turn` carries no
+    /// `tool`/`model` keys, and no string anywhere in the whole tree is the
+    /// literal "human" or "agent" — a bare turn must never be labeled
+    /// either way (plan decision 6).
+    #[test]
+    fn blame_json_bare_turn_has_no_tool_model_or_human_agent_label() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let after = store.put(b"content\n").unwrap();
+
+        let turn = make_turn(
+            "t_JSONBAREBLAME0000000000001",
+            "bare",
+            None,
+            "2026-07-05T09:00:00.000Z",
+            None,
+            vec![FileEntry {
+                path: "y.rs".into(),
+                before: None,
+                after: Some(after),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        std::fs::write(root.join("y.rs"), b"content\n").unwrap();
+
+        let out = agentrec(root, &["blame", "y.rs", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        let nested_turn = v["state"]["turn"].as_object().unwrap();
+        assert!(nested_turn.get("tool").is_none(), "{v}");
+        assert!(nested_turn.get("model").is_none(), "{v}");
+
+        let mut leaves = Vec::new();
+        all_string_leaves(&v, &mut leaves);
+        assert!(
+            !leaves.iter().any(|s| s == "human" || s == "agent"),
+            "a bare turn must never be labeled human or agent anywhere: {v}"
+        );
+    }
+
+    // ---- error path: unaffected by --json, no invented JSON envelope ------
+
+    #[test]
+    fn diff_json_unknown_turn_still_prose_on_stderr_exit_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        seed_turn(root, &base_turn("t_JSONREALTURN00000000000001", vec![]));
+
+        let out = agentrec(root, &["diff", "t_DOESNOTEXIST", "--json"]);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+        assert!(out.stdout.is_empty(), "no JSON envelope on error: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unknown turn id"),
+            "stderr: {out:?}"
+        );
+    }
+
+    #[test]
+    fn blame_json_unknown_path_still_prose_on_stderr_exit_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = agentrec(root, &["blame", "nope.rs:1", "--json"]);
+        assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+        assert!(out.stdout.is_empty(), "no JSON envelope on error: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "agentrec: nope.rs: not found\n"
+        );
+    }
+
+    // ---- AC-2 (substituted): status --json is read-only, same zero-write --
+    // invariant as bare `status` -------------------------------------------
+
+    /// Both `status` and `status --json` on an over-budget store: neither
+    /// writes to `.agentrec/objects/`, appends to `log.jsonl`, or touches
+    /// `state.json` — matching `cmds::status_performs_zero_store_writes`'s
+    /// existing invariant for bare `status`, asserted here for BOTH
+    /// invocations (the corrected AC-2: not a paired "one evicts, one
+    /// doesn't" assertion — `status` no longer evicts anything at all,
+    /// eviction moved to the daemon's own tick in the perf-evidence round).
+    #[test]
+    fn status_and_status_json_are_both_zero_write_on_over_budget_store() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+
+        let victim = store.put(&[0xABu8; 200]).unwrap();
+        let turn = base_turn(
+            "t_JSONZEROWRITE00000000000001",
+            vec![FileEntry {
+                path: "big.bin".into(),
+                before: None,
+                after: Some(victim.clone()),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+
+        // A state.json that predates either call, so its mtime is a
+        // meaningful "did anything touch this" signal rather than an
+        // artifact of the file not existing yet.
+        let state_path = root.join(".agentrec/state.json");
+        std::fs::write(&state_path, "{}").unwrap();
+        let state_before = std::fs::read_to_string(&state_path).unwrap();
+        let mtime_before = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        let store_before = total_store_bytes(root);
+        let log_before = log_bytes(root);
+
+        // Budget of 5 bytes: `big.bin`'s 200-byte snapshot is a genuine,
+        // structurally over-budget eviction candidate — a real eviction
+        // pass (the daemon's tick) would delete it. Neither `status` nor
+        // `status --json` may.
+        let envs = [("AGENTREC_TEST_STORE_BUDGET_BYTES", "5")];
+        let out = agentrec_env(root, &["status"], &envs);
+        assert!(out.status.success(), "status failed: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("over"),
+            "expected the over-budget notice: {out:?}"
+        );
+
+        let out = agentrec_env(root, &["status", "--json"], &envs);
+        assert_eq!(out.status.code(), Some(0), "status --json failed: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["over_budget"], true, "status --json: {v}");
+
+        assert_eq!(
+            total_store_bytes(root),
+            store_before,
+            "neither status nor status --json may write to .agentrec/objects/"
+        );
+        assert_eq!(
+            log_bytes(root),
+            log_before,
+            "neither status nor status --json may append to log.jsonl"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            state_before,
+            "neither status nor status --json may rewrite state.json"
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            mtime_before,
+            "neither status nor status --json may touch state.json's mtime"
+        );
+        assert!(store.contains(&victim), "victim must survive both calls");
+    }
+
+    // ---- AC-6: malformed/torn log line's counter surfaces, exit 0 --------
+
+    #[test]
+    fn status_json_surfaces_unparsed_lines_counter_and_exits_0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        seed_turn(root, &base_turn("t_JSONTORNTURN00000000000001", vec![]));
+        // A non-empty, non-JSON tail line — the torn-line-after-a-crash shape
+        // `Ledger::unparsed_lines` exists to count.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.join(".agentrec/log.jsonl"))
+                .unwrap();
+            writeln!(f, "not json at all — a torn tail line").unwrap();
+        }
+
+        let out = agentrec(root, &["status", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(
+            v["unparsed_lines"], 1,
+            "status --json must surface the tolerant-parse counter: {v}"
+        );
+    }
+
+    // ---- status --json: exact typed value, not a reshaped subset ---------
+
+    /// `status --json`'s health-derived fields are the SAME facts the human
+    /// `status` report renders off the same `RepositoryView::health` call —
+    /// not an independently reshaped subset (AC-1's substance, applied to
+    /// `status`).
+    #[test]
+    fn status_json_health_fields_match_what_status_report_renders() {
+        use agentrec_core::record::FileEntry;
+        use agentrec_core::store::BlobStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let blob = store.put(b"hello\n").unwrap();
+
+        let turn = base_turn(
+            "t_JSONHEALTHFIELDS000000001",
+            vec![FileEntry {
+                path: "h.rs".into(),
+                before: None,
+                after: Some(blob),
+                op: "create".into(),
+                skipped: false,
+                withheld: false,
+                baseline_unknown: false,
+                skipped_reason: None,
+                after_synthesized: None,
+            }],
+        );
+        seed_turn(root, &turn);
+        // A crash gap: a `start` following a still-open `start` (see
+        // `view::recording_gaps` — a single trailing, never-closed `start`
+        // alone is not yet a gap; it is the SECOND `start` that proves the
+        // first was never terminated).
+        seed_epoch(root, "start", "2026-07-05T00:00:00.000Z");
+        seed_epoch(root, "start", "2026-07-05T00:05:00.000Z");
+
+        let out = agentrec(root, &["status", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "expected exit 0: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["turn_count"], 1, "{v}");
+        assert_eq!(v["crash_gaps"], 1, "{v}");
+        assert_eq!(v["over_budget"], false, "{v}");
+        assert!(v["store_bytes"].as_u64().unwrap() > 0, "{v}");
+
+        let text_out = agentrec(root, &["status"]);
+        let text = String::from_utf8_lossy(&text_out.stdout);
+        assert!(
+            text.contains("1 recording gap(s)"),
+            "human status must report the same crash-gap fact: {text}"
+        );
+    }
+}
+
+// ---- D46: service-unit leak guard (AC-S1/S3) --------------------------------
+//
+// End-to-end legs that must go through the real binary: clap's flag conflict,
+// and the fact that a temp-root `init` writes no unit. Every other AC of D46 is
+// covered by the hermetic unit tests in `initcmd.rs`/`service.rs`/`doctorcmd.rs`
+// — and nothing here (or anywhere in the suite) executes `service::install`,
+// which shells out to the real `launchctl`/`systemctl`.
+mod service_leak_guard {
+    use super::*;
+
+    // AC-S3: `--no-service` and `--service` together must be a hard CLI error,
+    // not a silent precedence rule. A user who passes both has contradicted
+    // themselves about a side effect that outlives the directory; guessing
+    // which they meant is exactly the wrong call.
+    #[test]
+    fn init_rejects_no_service_together_with_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = agentrec(tmp.path(), &["init", "--no-service", "--service"]);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "conflicting flags must not succeed: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--no-service") && stderr.contains("--service"),
+            "the error must name both flags: {stderr}"
+        );
+    }
+
+    // AC-S1, through the real binary: a `tempfile::tempdir()` root gets the
+    // full init MINUS the service unit, and says why. The unit-file assertion
+    // is the load-bearing one — this test failing means the suite itself is
+    // leaking launchd units, which is the defect D46 exists to stop.
+    #[test]
+    fn init_under_temp_root_installs_no_unit_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let out = agentrec(root, &["init", "--no-hook"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("temporary directory") && stdout.contains("--service"),
+            "init must name the reason and the override: {stdout}"
+        );
+        assert!(
+            !stdout.contains("wrote service unit"),
+            "no unit may be written under a temp root: {stdout}"
+        );
+        assert!(root.join(".agentrec/config.toml").exists(), "{stdout}");
+    }
+
+    // AC-S1: `--dry-run` shares the decision function, so it can never promise
+    // an install the real run would skip.
+    #[test]
+    fn dry_run_reports_the_same_temp_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = agentrec(tmp.path(), &["init", "--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("temporary directory"),
+            "dry-run must predict the skip: {stdout}"
+        );
+        assert!(
+            !stdout.contains("would write and load a per-repo service unit"),
+            "dry-run must not promise an install that won't happen: {stdout}"
+        );
+    }
+
+    // The exec path baked into a service unit must be the path agentrec was
+    // INVOKED through, never the symlink's resolved target.
+    //
+    // Homebrew installs `/opt/homebrew/bin/<tool>` as a symlink into a
+    // version-pinned Cellar directory (verified on this machine:
+    // `/opt/homebrew/bin/rg -> ../Cellar/ripgrep/15.2.0/bin/rg`). A unit that
+    // records the resolved target keeps running the OLD binary after `brew
+    // upgrade`, and becomes a permanent launchd status-78 respawn loop once
+    // the old Cellar version is reaped — the same failure mode as the 39
+    // orphans cleaned on 2026-07-31.
+    //
+    // Driven through `--dry-run` deliberately: `service::install` ends in a
+    // real `launchctl load -w`, so a non-dry end-to-end assertion would leak
+    // a live LaunchAgent from the test suite. `--dry-run` shares
+    // `service_exec_path()` with the real run, so the value asserted here is
+    // the value that would be written.
+    //
+    // Neutered BOTH ways, because the first attempt only proved the weaker
+    // thing. Restoring `.canonicalize()` *before* the dry-run print existed
+    // reds this test on an ABSENT LINE, which pins the print statement and
+    // not the behavior. Re-run with the print in place, the neuter reds on a
+    // WRONG VALUE: `[dry-run]   recording exec: …/target/debug/agentrec`, the
+    // resolved target, failing both asserts below.
+    //
+    // **macOS only, and NOT an oversight.** Linux's `std::env::current_exe()`
+    // reads `/proc/self/exe`, which the kernel resolves — the invocation path
+    // is unrecoverable there by any means this binary has, so linuxbrew-style
+    // symlink installs keep the resolved path. Recorded as a bounded residual
+    // rather than asserted-and-skipped, since a `#[cfg]`-hidden assert reads
+    // as coverage that does not exist.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn service_exec_path_is_the_invocation_path_not_the_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let link = bin_dir.join("agentrec");
+        std::os::unix::fs::symlink(bin(), &link).unwrap();
+
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `--service` forces past the temp-root guard; `--dry-run` keeps the
+        // whole run side-effect-free.
+        let out = Command::new(&link)
+            .args(["init", "--no-hook", "--service", "--dry-run"])
+            .args(["--root", root.to_str().unwrap()])
+            .env("AGENTREC_TEST_SERVICE_DIR", empty_service_dir())
+            .output()
+            .expect("spawn via symlink");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            stdout.contains(link.to_str().unwrap()),
+            "the unit must record the invocation path {}: {stdout}",
+            link.display()
+        );
+        assert!(
+            !stdout.contains(bin()),
+            "the unit must not record the resolved target {}: {stdout}",
+            bin()
+        );
+    }
 }
