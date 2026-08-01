@@ -1900,15 +1900,21 @@ fn normalize_declared<'a>(
     paths: impl Iterator<Item = &'a str>,
     root: &Path,
 ) -> (std::collections::HashSet<String>, usize) {
-    let root_str = root.to_string_lossy();
-    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+    let root_norm = lexical_normalize(Path::new(root));
     let mut out = std::collections::HashSet::new();
     let mut out_of_root = 0usize;
     for p in paths {
-        let norm = lexical_normalize(p);
-        match norm.strip_prefix(&prefix) {
-            Some(rel) if !rel.is_empty() => {
-                out.insert(rel.to_string());
+        let norm = lexical_normalize(Path::new(p));
+        match norm.strip_prefix(&root_norm) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                // FileEntry.path is `/`-joined on every platform (D19: the
+                // wire format has one separator; only OS calls vary).
+                let rel = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.insert(rel);
             }
             _ => out_of_root += 1,
         }
@@ -1916,20 +1922,39 @@ fn normalize_declared<'a>(
     (out, out_of_root)
 }
 
-/// Resolve `.` / `..` / duplicate separators lexically. No symlink
-/// resolution and no fs access by design.
-fn lexical_normalize(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for comp in path.split('/') {
+/// Resolve `.` / `..` lexically via `std::path::Component` (D19: no
+/// hardcoded separator). No symlink resolution and no fs access by design.
+fn lexical_normalize(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
         match comp {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
             }
-            c => parts.push(c),
+            c => out.push(c),
         }
     }
-    format!("/{}", parts.join("/"))
+    out
+}
+
+/// Byte cap on the Stop hook's transcript read for declaration extraction.
+/// The largest real corpus transcript measured 27 MiB (~14 ms warm read);
+/// the cap exists so a pathological transcript cannot stall every future
+/// Stop hook — hook latency asserts have flaked on shared runners before.
+/// Over-cap ⇒ no declaration at all (`None`, the under-declare-safe
+/// direction), never a partial parse presented as complete.
+pub(crate) const MAX_DECLARATION_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Size-gated transcript read for the declaration path: `None` when the file
+/// is missing, unreadable, not UTF-8, or larger than `cap`.
+pub(crate) fn read_transcript_capped(path: &Path, cap: u64) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > cap {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// Extract the CURRENT turn's declared writes from a Claude Code transcript:
@@ -2627,6 +2652,21 @@ mod tests {
         assert_eq!(d.tier, DeclaredTier::SignalField);
         assert!(d.paths.is_empty());
         assert_eq!(d.out_of_root, 0);
+    }
+
+    #[test]
+    fn read_transcript_capped_refuses_oversize_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.jsonl");
+        std::fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(
+            read_transcript_capped(&p, 100).as_deref(),
+            Some("0123456789")
+        );
+        // At the cap is allowed; one past it is refused whole, never truncated.
+        assert!(read_transcript_capped(&p, 10).is_some());
+        assert!(read_transcript_capped(&p, 9).is_none());
+        assert!(read_transcript_capped(&tmp.path().join("missing"), 100).is_none());
     }
 
     /// Mirrors `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`:

@@ -174,6 +174,18 @@ one; tick (:392) and shutdown (:411) pass `None`.
       change additively only, regenerated with `UPDATE_GOLDEN=1` and said so in the commit.
 - [ ] `withheld`/`skipped` files: attribution never contradicts their existing semantics (they stay
       non-revertible regardless of attribution).
+- [ ] **Wiring proven, not inherited (2a+2b skeptic residual):** the dark `let _declared` binding
+      is replaced by real consumption; deleting the `resolve_declared` call site must red an E2E
+      (attribution values observed in `log.jsonl` through the real daemon). The `#[allow(dead_code)]`
+      markers on `DeclaredWrites` are removed in the same commit.
+- [ ] **`out_of_root` surfaced (2a+2b skeptic residual):** the per-turn out-of-root declare count
+      is visible somewhere a user can find it (status counter or DEGRADED-adjacent accounting —
+      exact surface decided at implementation), not counted into a field nothing reads. The spike
+      measured 559/1439 = 39% out-of-root; that number must not be invisible.
+- [ ] **Value set matches the relayed contract:** wire values exactly `"declared"` / `"undeclared"`
+      / absent, per `D6-ATTRIBUTION-CONTRACT.md` (relayed to the periphery worktree 2026-08-01) and
+      periphery's open-enum consumer rules (unknown values degrade to unattributed, never
+      refuse-to-parse/act).
 **Expected test outputs:** `cargo test --workspace -- --test-threads=3` → prior+M / 0 / 3, M ≥ 4
 new named `d6_attr_*` tests (exact prior count = post-rebase baseline, recorded in the commit).
 

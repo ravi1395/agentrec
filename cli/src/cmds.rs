@@ -1000,7 +1000,12 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     let files_written = if event == "stop" {
         transcript
             .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|p| {
+                crate::daemon::read_transcript_capped(
+                    std::path::Path::new(p),
+                    crate::daemon::MAX_DECLARATION_TRANSCRIPT_BYTES,
+                )
+            })
             .map(|text| crate::daemon::declared_writes_from_transcript(&text))
             .filter(|w| !w.is_empty())
     } else {
