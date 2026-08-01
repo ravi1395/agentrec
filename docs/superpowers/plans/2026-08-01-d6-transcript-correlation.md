@@ -112,13 +112,15 @@ against phase 2b's larger surface.
 **Acceptance criteria:**
 - [ ] Old-format signal lines (no field) deserialize unchanged; new-format lines round-trip with
       the field intact.
-- [ ] PROTOCOL conformance fixtures pass with a new fixture line carrying the field.
+- [x] Conformance coverage via `signal_stream_with_files_written_keeps_existing_routing` — NOTE:
+      the original text named "PROTOCOL conformance fixtures", a corpus that does not exist in
+      this repo (skeptic-verified); satisfied as restated, recorded rather than quietly reworded.
 - [ ] Zero behavior change: daemon ignores the field at this phase; all goldens byte-identical.
 - [ ] claimd doc-scope note: PROTOCOL.md is not lint-ignored — declare the doc-edit claim before
       the edit (the Stop hook WILL fire; the undecided doc-scope rule is a known repo debt, not a
       surprise).
 **Expected test outputs:** `cargo test --workspace -- --test-threads=3` → 666+N / 0 / 3, N ≥ 2
-(serde round-trip + conformance); all 33 goldens byte-identical.
+(serde round-trip + conformance); all 30 golden fixture files byte-identical.
 
 ## Phase 2b — Tiered declared-writes resolution in the daemon + hook emitter (dark)
 **Description:** Daemon resolves a `DeclaredWrites` value on the Stop path via a three-tier ladder —
