@@ -1934,10 +1934,20 @@ fn lexical_normalize(path: &str) -> String {
 
 /// Extract the CURRENT turn's declared writes from a Claude Code transcript:
 /// absolute paths from write-tool `tool_use` inputs and top-level
-/// `toolUseResult.filePath` entries (probe-verified Write/Edit-only — a Read
-/// result nests its path under `file.filePath` and is never harvested),
-/// scoped to lines timestamped at/after the transcript's LAST real user
-/// prompt. Scoping caveats, all erring toward under-declaration (the safe
+/// `toolUseResult.filePath` entries, scoped to lines timestamped at/after
+/// the transcript's LAST real user prompt.
+///
+/// The `toolUseResult` channel is SHAPE-keyed, not tool-keyed. Measured over
+/// all 2138 corpus transcripts (2026-08-01 skeptic gate): top-level
+/// `filePath` origins are Edit 862 / Write 160 / ExitPlanMode 2. A Read
+/// result nests its path under `file.filePath` and never matches; the two
+/// ExitPlanMode paths are its own plan file under `~/.claude/plans/` —
+/// out-of-root for any watched repo, so they land in `out_of_root`, not the
+/// declared set. If a future tool emits the top-level shape for a file it
+/// merely read, this channel over-declares; tool-identity gating needs a
+/// tool_use_id→name join and is deferred until an in-root case exists.
+///
+/// Scoping caveats, all erring toward under-declaration (the safe
 /// direction — an undeclared write stays unattributed):
 /// - a prompt queued mid-turn advances the cutoff past earlier same-turn
 ///   writes;
@@ -2512,6 +2522,16 @@ mod tests {
         // non-declaring tool
         r#"{"timestamp":"2026-08-01T10:05:13.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"touch /repo/via_bash.rs"}}]}}"#,
         "\n",
+        // Over-declaration teeth (skeptic gap 1): tools OUTSIDE the allowlist
+        // carrying a real `file_path` input — a Read tool_use has file_path
+        // as often as Edit in the corpus; widening DECLARING_TOOLS to any of
+        // these must red the assertions below.
+        r#"{"timestamp":"2026-08-01T10:05:13.100Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/read_only.rs"}}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:05:13.200Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Grep","input":{"file_path":"/repo/grepped.rs"}}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:05:13.300Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"file_path":"/repo/bash_with_filepath.rs","command":"x"}}]}}"#,
+        "\n",
         // out-of-root declared write
         r#"{"timestamp":"2026-08-01T10:05:14.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/elsewhere/x.rs"}}]}}"#,
         "\n",
@@ -2527,8 +2547,17 @@ mod tests {
                 "/repo/src/main.rs".to_string(),
                 "/elsewhere/x.rs".to_string(),
             ],
-            "pre-prompt write scoped out; Read/Bash never declare"
+            "pre-prompt write scoped out; non-allowlisted tools never declare \
+             even when their input carries file_path"
         );
+        // Belt-and-braces per path: these are IN-window, file_path-carrying
+        // inputs from non-declaring tools. Any allowlist widening reds here.
+        for banned in ["read_only.rs", "grepped.rs", "bash_with_filepath.rs"] {
+            assert!(
+                !writes.iter().any(|w| w.contains(banned)),
+                "over-declaration: {banned} leaked into the declared set"
+            );
+        }
     }
 
     #[test]

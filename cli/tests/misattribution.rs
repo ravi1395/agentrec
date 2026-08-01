@@ -678,3 +678,57 @@ fn d6_signal_field_absent_without_transcript_and_on_start() {
         );
     }
 }
+
+/// A turn whose transcript declares NO writes (agent only read) must emit a
+/// stop signal with NO `files_written` key at all — not an empty list.
+/// Pins two rules the skeptic gate found unpinned (gaps 1+2):
+/// - the hook's empty-list guard: an empty parse is "did not declare"
+///   (`None`), never an explicit empty declaration (`[]`) — the two tiers
+///   must not disagree on emptiness with the daemon fallback, which applies
+///   the same rule;
+/// - the over-declaration allowlist at the E2E boundary: the Read tool_use
+///   here carries a real in-root `file_path`, so widening DECLARING_TOOLS
+///   to Read turns this red.
+#[test]
+fn d6_signal_field_all_read_turn_declares_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = &tmp.path().canonicalize().unwrap();
+    init(root);
+
+    let transcript = root.join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        format!(
+            concat!(
+                r#"{{"timestamp":"2026-08-01T11:00:00.000Z","message":{{"role":"user","content":"what does this do?"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-08-01T11:00:05.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Read","input":{{"file_path":"{read}"}}}}]}}}}"#,
+                "\n",
+                // Read result: nested file.filePath shape, never harvested
+                r#"{{"timestamp":"2026-08-01T11:00:06.000Z","type":"user","toolUseResult":{{"type":"text","file":{{"filePath":"{read}"}}}}}}"#,
+                "\n",
+            ),
+            read = root.join("only_read.rs").display(),
+        ),
+    )
+    .unwrap();
+
+    send_hook(
+        root,
+        &format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s_d6r","transcript_path":"{}"}}"#,
+            transcript.display()
+        ),
+    );
+
+    let signals = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap();
+    let stop = signals
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("event").and_then(|e| e.as_str()) == Some("stop"))
+        .expect("stop signal appended");
+    assert!(
+        stop.get("files_written").is_none(),
+        "an all-read turn must not declare — no key, not an empty list: {stop}"
+    );
+}
