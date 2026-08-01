@@ -19,6 +19,24 @@
 //!   INV-M2 — every memory `recall` returns re-hashes Fresh right now (no
 //!            drifted pin ever surfaces) — see `op_recall`.
 //!
+//! Imported turns (F19, redteam round 2) get their own DETERMINISTIC scenario
+//! suite — `run_imported_turn_scenarios`, called from `run_torture` so it
+//! rides every invocation including the nightly `-- --ignored` gate — because
+//! the randomized world above can only ever produce daemon-recorded turns,
+//! and an imported turn is the one class whose `before`/`after` bytes are
+//! DERIVED rather than observed:
+//!
+//!   INV-I1 — an imported turn carrying any provenance-only entry (`before:
+//!            null`, not a `create`) refuses the WHOLE undo, at preview AND
+//!            under `--confirm`, and writes nothing — never a partial revert
+//!            of its reconstructable siblings.
+//!   INV-I2 — a DERIVED (`after_synthesized`) after-state is never presented
+//!            as observed: undo's modified-since cause and `diff` both say
+//!            "derived (not observed)", never "human or external edit".
+//!   INV-I3 — when an imported turn IS reverted, the bytes written are
+//!            exactly the transcript-recorded `before` (never fabricated),
+//!            and the revert is itself re-revertible byte-exact.
+//!
 //! `torture_survives_chaos` (the heavy run, `#[ignore]`) reads
 //! `AGENTREC_TORTURE_OPS` (default 1200) and `AGENTREC_TORTURE_SEED` (default
 //! a fixed constant) so a failure is reproducible: re-run with the printed
@@ -956,6 +974,16 @@ fn checkpoint(world: &mut World) {
 /// printing SEED at start and (with the full ordered op trace) on any panic.
 fn run_torture(ops: usize, seed: u64) {
     println!("SEED={seed}");
+
+    // F19: the imported-turn suite runs from HERE, not only as its own
+    // `#[test]`, because the nightly launch gate invokes
+    // `cargo test --test torture -- --ignored`, which runs ONLY ignored
+    // tests — a plain `#[test]` would be invisible to the very gate F19 is
+    // about. Deterministic, daemon-free and fast (~1s), so it costs the
+    // chaos run nothing; it runs first so a regression here reds before a
+    // 2000-op interleaving is spent.
+    run_imported_turn_scenarios();
+
     let mut world = World::new(seed);
 
     // Baseline: the anchor memory `World::new` just seeded must itself be a
@@ -1029,6 +1057,619 @@ fn run_torture(ops: usize, seed: u64) {
         world.stat_forgets,
         world.stat_candidates,
     );
+}
+
+// ---- F19: imported-turn scenarios ------------------------------------------
+//
+// Deliberately DAEMON-FREE. Every world below drives `agentrec import claude`
+// against a synthetic Claude Code corpus and then the real read/undo verbs
+// over the resulting `log.jsonl` — no `agentrec record` child, because a live
+// watcher would record its own bare turns for these fixtures' worktree writes
+// (changing which turn `blame` credits, and adding a second revert source that
+// would make "undo wrote exactly the transcript's bytes" unfalsifiable), and
+// because it reintroduces the FSEvents contention this repo already tracks as
+// a flake source. The chaos world above owns daemon coverage; this suite owns
+// the import path.
+//
+// Every fixture repo is `git init`ed with ZERO commits on purpose: import's
+// T2 tier resolves `before` bytes out of git history, so a commitless repo
+// pins each entry's tier deterministically (a T3 entry can never accidentally
+// become T2-resolved on a machine whose git behaves differently).
+
+/// One scenario's worktree root plus its synthetic `~/.claude`-shaped corpus.
+struct ImportWorld {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    source: PathBuf,
+}
+
+impl ImportWorld {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let source = tmp.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(source.join("projects").join("proj")).unwrap();
+        let st = Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .expect("git init");
+        assert!(st.success(), "git init failed for import fixture");
+        ImportWorld {
+            _tmp: tmp,
+            root,
+            source,
+        }
+    }
+
+    /// The transcript `cwd` — also the `--root`, which is what puts every
+    /// fixture session in scope of the import's root filter.
+    fn cwd(&self) -> String {
+        self.root.to_string_lossy().into_owned()
+    }
+
+    fn write_file(&self, rel: &str, bytes: &[u8]) {
+        std::fs::write(self.root.join(rel), bytes).expect("write fixture file");
+    }
+
+    fn write_session(&self, session_id: &str, lines: &[String]) {
+        std::fs::write(
+            self.source
+                .join("projects")
+                .join("proj")
+                .join(format!("{session_id}.jsonl")),
+            lines.join("\n") + "\n",
+        )
+        .expect("write session transcript");
+    }
+
+    /// Persist mode (no `--dry-run`): appends imported turns to `log.jsonl`.
+    fn import(&self) -> Output {
+        let out = agentrec(
+            &self.root,
+            &[
+                "import",
+                "claude",
+                "--source",
+                self.source.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "import failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        out
+    }
+
+    /// The single imported turn this fixture produced. Asserting exactly one
+    /// is a fixture-non-vacuity check, not a product claim: a scenario that
+    /// silently imported zero turns would make every assertion below vacuous.
+    fn imported_turn(&self, scenario: &str) -> TurnRecord {
+        let imported: Vec<TurnRecord> = load_turns(&self.root)
+            .into_iter()
+            .filter(|t| t.imported == Some(true))
+            .collect();
+        assert_eq!(
+            imported.len(),
+            1,
+            "{scenario}: fixture must produce exactly one imported turn, got {}",
+            imported.len()
+        );
+        imported.into_iter().next().unwrap()
+    }
+
+    fn newest_agentrec_turn_id(&self, scenario: &str) -> String {
+        let turns = agentrec_tool_turns(&self.root);
+        assert!(
+            !turns.is_empty(),
+            "{scenario}: expected an undo to have recorded a tool=\"agentrec\" turn"
+        );
+        turns.last().unwrap().id.clone()
+    }
+
+    fn undo(&self, id: &str, extra: &[&str]) -> Output {
+        let mut args = vec!["undo", id];
+        args.extend_from_slice(extra);
+        agentrec(&self.root, &args)
+    }
+}
+
+fn out_text(out: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A `user` transcript line — the prompt an imported turn carries.
+fn claude_user_line(session: &str, cwd: &str, ts: &str, prompt: &str) -> String {
+    format!(
+        r#"{{"type":"user","uuid":"u_{session}","timestamp":"{ts}","sessionId":"{session}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"{prompt}"}}}}"#
+    )
+}
+
+/// An `Edit`-shaped assistant line. `original_file` present ⇒ tier T1 (the
+/// pre-edit bytes ride inline in the transcript, so `before` resolves);
+/// absent ⇒ nothing to reconstruct from in a commitless repo ⇒ tier T3,
+/// `before: null`. Neither form carries `content`, so `after` is DERIVED by
+/// `oldString`→`newString` substitution and the entry is flagged
+/// `after_synthesized` whenever an `after` resolves at all
+/// (`cli/src/importcmd.rs`, `after_will_be_synthesized`).
+///
+/// The line `uuid` is derived from `rel` (every fixture below edits each path
+/// at most once per session), which keeps this under clippy's argument cap
+/// without a parameter that no assertion reads.
+fn claude_edit_line(
+    session: &str,
+    cwd: &str,
+    ts: &str,
+    rel: &str,
+    old: &str,
+    new: &str,
+    original_file: Option<&str>,
+) -> String {
+    let uuid = format!("a_{}", rel.replace(['/', '.'], "_"));
+    let orig = match original_file {
+        Some(o) => format!(r#","originalFile":"{o}""#),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"{ts}","sessionId":"{session}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{uuid}","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/{rel}","oldString":"{old}","newString":"{new}"{orig}}}}}"#
+    )
+}
+
+/// A `Write`-shaped assistant line: `type:"create"` with real `content`, so
+/// `op` is `create` and `after` is OBSERVED (never synthesized).
+fn claude_create_line(
+    session: &str,
+    cwd: &str,
+    uuid: &str,
+    ts: &str,
+    rel: &str,
+    content: &str,
+) -> String {
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"{ts}","sessionId":"{session}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{uuid}","name":"Write","input":{{}}}}]}},"toolUseResult":{{"type":"create","filePath":"{cwd}/{rel}","content":"{content}"}}}}"#
+    )
+}
+
+fn assert_bytes(w: &ImportWorld, rel: &str, expected: Option<&[u8]>, ctx: &str) {
+    let actual = disk_bytes(&w.root, rel);
+    assert_eq!(
+        actual.as_deref(),
+        expected,
+        "{ctx}: {rel} bytes differ (expected {:?}, got {:?})",
+        expected.map(String::from_utf8_lossy),
+        actual.as_deref().map(String::from_utf8_lossy),
+    );
+}
+
+/// A T1 (inline `originalFile`) edit paired with a T3 (nothing to reconstruct
+/// from) edit in the SAME session, so both land in one imported turn.
+/// `t1.txt` starts at `t1_disk`; `t3.txt` is left at a fixed human string.
+fn mixed_tier_world(session: &str, t1_disk: &[u8]) -> ImportWorld {
+    let w = ImportWorld::new();
+    let cwd = w.cwd();
+    w.write_file("t1.txt", t1_disk);
+    w.write_file("t3.txt", b"human-content\n");
+    w.write_session(
+        session,
+        &[
+            claude_user_line(session, &cwd, "2026-06-12T09:00:00.000Z", "do it"),
+            claude_edit_line(
+                session,
+                &cwd,
+                "2026-06-12T09:00:05.000Z",
+                "t1.txt",
+                "alpha",
+                "beta",
+                Some(r"alpha\n"),
+            ),
+            claude_edit_line(
+                session,
+                &cwd,
+                "2026-06-12T09:00:06.000Z",
+                "t3.txt",
+                "nope",
+                "NOPE",
+                None,
+            ),
+        ],
+    );
+    w.import();
+    w
+}
+
+/// A single-entry T1 world: `t1.txt`'s recorded `before` is the transcript's
+/// own `originalFile` bytes (`alpha\n`), its `after` is the DERIVED
+/// substitution (`beta\n`). `disk` sets the on-disk state undo is judged
+/// against.
+fn t1_only_world(session: &str, disk: &[u8]) -> ImportWorld {
+    let w = ImportWorld::new();
+    let cwd = w.cwd();
+    w.write_file("t1.txt", disk);
+    w.write_session(
+        session,
+        &[
+            claude_user_line(session, &cwd, "2026-06-12T09:00:00.000Z", "do it"),
+            claude_edit_line(
+                session,
+                &cwd,
+                "2026-06-12T09:00:05.000Z",
+                "t1.txt",
+                "alpha",
+                "beta",
+                Some(r"alpha\n"),
+            ),
+        ],
+    );
+    w.import();
+    w
+}
+
+/// INV-I1. A turn imported from external history whose file list contains a
+/// provenance-only entry (`before: null` on a non-`create` op) refuses the
+/// WHOLE undo — at preview and under `--confirm` — and writes nothing. The
+/// load-bearing half is the SIBLING: `t1.txt` in the same turn is perfectly
+/// reconstructable, and must still not be touched. A partial revert here
+/// would leave the worktree in a state neither the agent nor the human ever
+/// produced.
+///
+/// Spec-derived: `cli/src/readcmds.rs::undo` runs the imported guard ABOVE
+/// both `build_plan` and the `if !confirm` preview return, so the preview
+/// prints no revert plan at all — undo never even DISPLAYS a revert source it
+/// cannot honestly produce.
+fn scenario_unreconstructable_undo_refuses_whole_turn() {
+    const S: &str = "imported_unreconstructable_undo_refuses_whole_turn";
+    let w = mixed_tier_world("s_inv_i1", b"beta\n");
+    let turn = w.imported_turn(S);
+
+    // Fixture non-vacuity: exactly the two tiers this scenario is about.
+    assert_eq!(turn.files.len(), 2, "{S}: fixture must import two entries");
+    let t1 = turn.files.iter().find(|f| f.path == "t1.txt").unwrap();
+    let t3 = turn.files.iter().find(|f| f.path == "t3.txt").unwrap();
+    assert!(
+        t1.before.is_some(),
+        "{S}: the T1 sibling must be reconstructable, else the no-partial-revert \
+         assertion below is vacuous: {t1:?}"
+    );
+    assert!(
+        t3.before.is_none() && t3.op != "create",
+        "{S}: the T3 entry must be provenance-only (before: null, op != create): {t3:?}"
+    );
+
+    let before_t1 = disk_bytes(&w.root, "t1.txt");
+    let before_t3 = disk_bytes(&w.root, "t3.txt");
+
+    for extra in [&[][..], &["--confirm"][..]] {
+        let out = w.undo(&turn.id, extra);
+        let (stdout, stderr) = out_text(&out);
+        assert!(
+            !out.status.success(),
+            "INV-I1 VIOLATED ({S}, args={extra:?}): undo of an imported turn with a \
+             provenance-only entry must exit non-zero\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("undo refused") && stderr.contains("provenance-only, never fabricated"),
+            "INV-I1 VIOLATED ({S}, args={extra:?}): refusal must name itself as \
+             provenance-only and never-fabricated\nstderr: {stderr}"
+        );
+        // No revert source displayed, for either path — the guard sits above
+        // `build_plan`, so nothing is planned, previewed or written.
+        assert!(
+            !stdout.contains("revert") && !stdout.contains("t1.txt"),
+            "INV-I1 VIOLATED ({S}, args={extra:?}): refusal must not display a revert \
+             plan for the reconstructable sibling\nstdout: {stdout}"
+        );
+        assert_bytes(
+            &w,
+            "t1.txt",
+            before_t1.as_deref(),
+            &format!("{S} args={extra:?}"),
+        );
+        assert_bytes(
+            &w,
+            "t3.txt",
+            before_t3.as_deref(),
+            &format!("{S} args={extra:?}"),
+        );
+    }
+
+    // And nothing was recorded either: a refused undo is not a turn.
+    assert!(
+        agentrec_tool_turns(&w.root).is_empty(),
+        "INV-I1 VIOLATED ({S}): a refused undo must append no tool=\"agentrec\" turn"
+    );
+}
+
+/// INV-I2. An imported entry whose `after` was DERIVED (`after_synthesized`)
+/// is compared against a value nobody ever observed, so a mismatch must never
+/// be reported as human authorship.
+///
+/// Spec-derived: `cli/src/readcmds.rs::modified_cause` returns the
+/// derived-not-observed string for a synthesized `after` and returns it
+/// FIRST, above both the later-rich-turn and recording-gap branches. The
+/// negative assertion (`human or external edit` must not appear) is the one
+/// that discriminates — it is that function's own default branch, i.e. the
+/// exact fabrication D1 exists to prevent.
+fn scenario_synthesized_after_never_fabricates_human_attribution() {
+    const S: &str = "imported_synthesized_after_never_fabricates_human_attribution";
+    let w = t1_only_world("s_inv_i2", b"human wrote this\n");
+    let turn = w.imported_turn(S);
+    let t1 = turn.files.iter().find(|f| f.path == "t1.txt").unwrap();
+    assert_eq!(
+        t1.after_synthesized,
+        Some(true),
+        "{S}: fixture must produce a synthesized after-state, else this scenario is \
+         vacuous: {t1:?}"
+    );
+
+    let pre = disk_bytes(&w.root, "t1.txt");
+    let out = w.undo(&turn.id, &["--confirm"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(
+        out.status.success(),
+        "{S}: undo of a modified-since imported entry is a clean no-op, not an \
+         error\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("EXCLUDE") && stdout.contains("nothing to revert"),
+        "INV-I2 ({S}): a modified-since imported entry must be excluded, not \
+         reverted\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("derived (not observed)"),
+        "INV-I2 VIOLATED ({S}): the exclusion cause must say the after-state was \
+         derived, not observed\nstdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("human or external edit"),
+        "INV-I2 VIOLATED ({S}): a difference against a DERIVED after-state was \
+         attributed to a human — that attribution was never earned\nstdout: {stdout}"
+    );
+    assert_bytes(&w, "t1.txt", pre.as_deref(), S);
+    assert!(
+        agentrec_tool_turns(&w.root).is_empty(),
+        "INV-I2 ({S}): a revert of nothing must append no tool=\"agentrec\" turn"
+    );
+}
+
+/// INV-I3. When an imported turn IS revertible (on-disk bytes still match its
+/// recorded `after`), the bytes undo writes must be exactly the transcript's
+/// own recorded pre-edit content — `alpha\n`, the inline `originalFile` — and
+/// never a reconstruction of it. The re-revert half is the imported-turn
+/// analogue of INV2.
+fn scenario_revert_writes_recorded_before_and_is_re_revertible() {
+    const S: &str = "imported_revert_writes_recorded_before_and_is_re_revertible";
+    // Disk = the DERIVED after-state, so the modified-since rail does not
+    // fire and the revert genuinely executes.
+    let w = t1_only_world("s_inv_i3", b"beta\n");
+    let turn = w.imported_turn(S);
+
+    let out = w.undo(&turn.id, &["--confirm"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(
+        out.status.success(),
+        "{S}: undo failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("reverted 1 file(s)"),
+        "{S}: fixture must actually revert, else INV-I3 is vacuous\nstdout: {stdout}"
+    );
+    assert_bytes(
+        &w,
+        "t1.txt",
+        Some(b"alpha\n"),
+        &format!(
+            "INV-I3 VIOLATED ({S}): revert source must be the transcript's own \
+                  recorded pre-edit bytes"
+        ),
+    );
+
+    // Re-revertible, byte-exact (INV2 analogue over the import path).
+    let undo_id = w.newest_agentrec_turn_id(S);
+    let out2 = w.undo(&undo_id, &["--confirm"]);
+    let (stdout2, stderr2) = out_text(&out2);
+    assert!(
+        out2.status.success(),
+        "{S}: re-revert failed\nstdout: {stdout2}\nstderr: {stderr2}"
+    );
+    assert_bytes(
+        &w,
+        "t1.txt",
+        Some(b"beta\n"),
+        &format!(
+            "INV-I3 VIOLATED ({S}): undo-of-undo must restore the pre-undo state \
+                  byte-exact"
+        ),
+    );
+}
+
+/// INV-I3, `create` arm. A `create` entry's `before: null` is legitimate
+/// (there was no prior content), NOT a reconstruction failure — so the
+/// imported guard admits it (`f.op != "create"` in
+/// `cli/src/readcmds.rs::undo`) and undo deletes the file. The inverse turn
+/// snapshots the pre-undo bytes, so the delete is re-revertible byte-exact.
+fn scenario_create_op_undo_deletes_and_re_revert_restores() {
+    const S: &str = "imported_create_op_undo_deletes_and_re_revert_restores";
+    let w = ImportWorld::new();
+    let cwd = w.cwd();
+    w.write_file("new.txt", b"made\n");
+    w.write_session(
+        "s_inv_i3c",
+        &[
+            claude_user_line("s_inv_i3c", &cwd, "2026-06-12T09:00:00.000Z", "create it"),
+            claude_create_line(
+                "s_inv_i3c",
+                &cwd,
+                "a1",
+                "2026-06-12T09:00:05.000Z",
+                "new.txt",
+                r"made\n",
+            ),
+        ],
+    );
+    w.import();
+
+    let turn = w.imported_turn(S);
+    let entry = turn.files.iter().find(|f| f.path == "new.txt").unwrap();
+    assert_eq!(entry.op, "create", "{S}: fixture must import a create op");
+    assert!(
+        entry.before.is_none() && entry.after.is_some(),
+        "{S}: a create entry has no before and an OBSERVED after: {entry:?}"
+    );
+    assert_eq!(
+        entry.after_synthesized, None,
+        "{S}: `content` was present, so `after` is observed and must not be flagged \
+         synthesized: {entry:?}"
+    );
+
+    let out = w.undo(&turn.id, &["--confirm"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(
+        out.status.success(),
+        "{S}: undo failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_bytes(
+        &w,
+        "new.txt",
+        None,
+        &format!("{S}: revert of a create must delete"),
+    );
+
+    let undo_id = w.newest_agentrec_turn_id(S);
+    let out2 = w.undo(&undo_id, &["--confirm"]);
+    let (stdout2, stderr2) = out_text(&out2);
+    assert!(
+        out2.status.success(),
+        "{S}: re-revert failed\nstdout: {stdout2}\nstderr: {stderr2}"
+    );
+    assert_bytes(
+        &w,
+        "new.txt",
+        Some(b"made\n"),
+        &format!(
+            "INV-I3 VIOLATED ({S}): undo-of-undo must restore the deleted file \
+                  byte-exact"
+        ),
+    );
+}
+
+/// INV-I2, read-verb half: what `diff`, `log` and `blame` disclose about an
+/// imported turn.
+///
+/// Spec-derived:
+///   * `diff`'s derived-after line — `cli/src/readcmds.rs::render_file_diff`
+///     emits it for `FileDiffState::Text { after_synthesized: true }`.
+///   * `log`'s `partial file list (imported)` — `cli/src/fmt.rs::turn_list_line`,
+///     gated on `files_complete == Some(false)`.
+///
+/// PINNED-AS-OBSERVED (probed 2026-08-01, not spec-derived — nothing in
+/// PROTOCOL.md/IMPLEMENTATION.md rules on it): `blame` credits an imported
+/// turn with NO import marker at all. `blame` renders through
+/// `fmt::turn_detail_header`, which — unlike `turn_list_line` — has no
+/// `files_complete` clause, so `blame <path>` on a file only ever touched by
+/// an imported turn prints an ordinary rich-turn line. The assertion below
+/// pins the id-is-credited half (which is real coverage) and the comment
+/// records the disclosure asymmetry; it is deliberately NOT asserted as
+/// absent, so adding an honest marker later is not blocked by this test.
+fn scenario_read_verbs_disclose_derivation() {
+    const S: &str = "imported_read_verbs_disclose_derivation";
+    let w = t1_only_world("s_inv_i2r", b"beta\n");
+    let turn = w.imported_turn(S);
+
+    let out = agentrec(&w.root, &["diff", &turn.id]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(out.status.success(), "{S}: diff failed\nstderr: {stderr}");
+    assert!(
+        stdout.contains("after-state DERIVED from imported oldString/newString substitution")
+            && stdout.contains("not observed"),
+        "INV-I2 VIOLATED ({S}): diff rendered a DERIVED after-state without saying \
+         so\nstdout: {stdout}"
+    );
+
+    let out = agentrec(&w.root, &["log"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(out.status.success(), "{S}: log failed\nstderr: {stderr}");
+    assert!(
+        stdout.contains("partial file list (imported)"),
+        "{S}: log must mark an imported turn's file list as partial\nstdout: {stdout}"
+    );
+
+    let out = agentrec(&w.root, &["blame", "t1.txt"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(out.status.success(), "{S}: blame failed\nstderr: {stderr}");
+    let short = &turn.id[turn.id.len() - 4..];
+    assert!(
+        stdout.contains(short) && stdout.contains("claude"),
+        "{S}: blame must credit the imported turn that touched this path\nstdout: {stdout}"
+    );
+}
+
+/// PINNED-AS-OBSERVED (probed 2026-08-01). `--allow-modified` on an imported
+/// entry whose `after` was DERIVED still reverts: `build_plan` moves the
+/// entry from `Excluded` into `Revert { warn }` on the flag alone, without
+/// consulting `after_synthesized` (which only shapes the WORDING of the
+/// warning). So the flag overwrites on-disk content whose provenance is
+/// unknown with a `before` selected by a comparison nobody ever observed.
+///
+/// This test pins CURRENT behavior — it is not an endorsement. Neither
+/// PROTOCOL.md nor the decision register rules on whether `--allow-modified`
+/// should be admissible against a synthesized `after`; the escape hatch is
+/// documented as the user's explicit override, and the warning does say the
+/// after-state was derived. Flagged as the sharpest open question under any
+/// "undo is safe" claim for imported turns. If the founder rules that this
+/// combination must refuse, THIS test is the one to change — deliberately,
+/// not by accident.
+fn scenario_allow_modified_against_derived_after_pinned() {
+    const S: &str = "imported_allow_modified_against_derived_after_pinned";
+    let w = t1_only_world("s_inv_i2am", b"human wrote this\n");
+    let turn = w.imported_turn(S);
+
+    let out = w.undo(&turn.id, &["--confirm", "--allow-modified"]);
+    let (stdout, stderr) = out_text(&out);
+    assert!(
+        out.status.success(),
+        "{S}: undo failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // The override must at minimum still say the after-state was derived.
+    assert!(
+        stdout.contains("WARNING") && stdout.contains("derived (not observed)"),
+        "INV-I2 VIOLATED ({S}): --allow-modified reverted against a DERIVED \
+         after-state without warning that it was derived\nstdout: {stdout}"
+    );
+    assert_bytes(
+        &w,
+        "t1.txt",
+        Some(b"alpha\n"),
+        &format!(
+            "{S}: PINNED-AS-OBSERVED — --allow-modified currently overwrites \
+                  unknown-provenance content with the recorded before"
+        ),
+    );
+}
+
+/// The whole imported-turn suite, in one call so `run_torture` (and hence the
+/// nightly `--ignored` gate) covers every scenario.
+fn run_imported_turn_scenarios() {
+    scenario_unreconstructable_undo_refuses_whole_turn();
+    scenario_synthesized_after_never_fabricates_human_attribution();
+    scenario_revert_writes_recorded_before_and_is_re_revertible();
+    scenario_create_op_undo_deletes_and_re_revert_restores();
+    scenario_read_verbs_disclose_derivation();
+    scenario_allow_modified_against_derived_after_pinned();
+    println!("torture: imported-turn scenarios OK (INV-I1, INV-I2, INV-I3)");
+}
+
+/// Standalone entry point for the same suite, so an ordinary
+/// `cargo test --test torture` names the failing area directly instead of
+/// reporting it as `torture_smoke`.
+#[test]
+fn imported_turn_scenarios() {
+    run_imported_turn_scenarios();
 }
 
 const DEFAULT_SEED: u64 = 20260710;
