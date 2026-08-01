@@ -103,3 +103,23 @@ phases 2a/2b in the plan carry the revised scope. Both binding consequences abov
 Bash-command path extraction (parsing `tool_use` Bash inputs for redirect/heredoc targets)
 is a possible future coverage extension; out of scope for this branch, recorded here so it
 is not reinvented as scope creep.
+
+## Addendum (2026-08-01, post-2b gate): production scoping rule, population-level
+
+The skeptic gate noted the last-user-prompt cutoff (the PRODUCTION scoping rule in
+`declared_writes_from_transcript`) was only spot-checked on two transcripts — the spike above
+measured time-windows, not this rule. Closed by running the real release `hook` binary over the
+first 300 transcripts in `~/.claude/projects/-Users-ravichandrasekhar-Projects-agentrec/` against
+a scratch root and reading the emitted `signal.jsonl`:
+
+- 300 stop signals: **290 carry no `files_written` (97%)** — consistent with the stub/read-only
+  session mix measured above; honest silence, not empty lists.
+- 10 declaring signals: set sizes min 1 / p50 2 / p90 5 / **max 5** — no whole-session unions
+  (sessions in this corpus hold up to ~40 writes; an unscoped parser would emit them).
+
+Replay: loop `printf '{"hook_event_name":"Stop","session_id":"pop","transcript_path":"<t>"}' |
+agentrec hook claude --root <scratch>` over the transcript glob, then histogram `files_written`
+lengths in `<scratch>/.agentrec/signal.jsonl`.
+
+Still open (recorded, not closable here): Linux leg for this branch — macOS-only evidence until
+CI runs it.
