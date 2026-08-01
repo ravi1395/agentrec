@@ -100,7 +100,7 @@ crash gap, names the gap instead of naming a turn (`view.rs`, `BlameState::NoTur
 scripts and hooks you have not read.** Those run under your uid, and so does agentrec. Anything
 with your uid can write `.agentrec/` directly — append to `signal.jsonl`, rewrite `log.jsonl`,
 replace objects, reset `state.json`. The signal inbox carries no provenance: `tool` is a free-form
-string (`record.rs`, `TurnRecord::tool`) and a line is accepted by a bare deserialize with no
+string (`record.rs`, `SignalEvent::tool`) and a line is accepted by a bare deserialize with no
 check of who wrote it (`record.rs`, `parse_signals`), so an appended line mints a turn that `log` and
 `blame` then render exactly like one the daemon observed. `log.jsonl` carries no chain or MAC over
 its lines; append-only is a discipline the writer keeps, not a property the format enforces. And
@@ -108,7 +108,8 @@ tampering with the record is the one class of filesystem change the recorder str
 witness, because `.agentrec` is in the watcher's denylist (`daemon.rs`, `classify`) — with no
 second copy to compare against, since `init` adds `.agentrec/` to `.gitignore`
 (`initcmd.rs`, `ensure_gitignore`). A record deleted outright prints `no turns recorded — is agentrec
-record running?` (`record.rs`, `load_log`'s open-failure fallback), which is what a repo where
+record running?` (printed by `cmds.rs`; the indistinguishability comes from `record.rs`,
+`load_log`'s open-failure fallback returning an empty ledger), which is what a repo where
 nothing has happened yet also prints.
 
 **"Independent," above, means independent of the agent's self-report — not tamper-resistant
