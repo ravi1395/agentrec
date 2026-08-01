@@ -2,7 +2,9 @@ stdout:
 store:      307 B
 inbox:      0 B signal.jsonl
 turns:      7 (agent turns; git activity hidden)
-gaps:       1 recording gap(s)
+gaps:       2 recording gap(s) (1 crash, 0 restart, 1 since last stop)
+daemon:     not running
+  ⚠ recorder not running — nothing is being recorded (run `agentrec record`)
 rich-rate:  83% over trailing 6 agent turn(s)
   ⚠ rich-rate below 90% — hooks may be broken (check `agentrec doctor`)
 memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures

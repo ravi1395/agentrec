@@ -231,8 +231,10 @@ fn format_turn(
     fmt::turn_list_line(t, &when, &files, color)
 }
 
-/// `status`: store size, recording gaps, and rich-rate (the health stat that
-/// catches silently broken hooks). `ack_degraded` clears a prior DEGRADED
+/// `status`: store size, recording gaps (every uncovered-interval kind, with
+/// the crash/restart/since-last-stop breakdown — F13), recorder liveness
+/// (F31), and rich-rate (the health stat that catches silently broken
+/// hooks). `ack_degraded` clears a prior DEGRADED
 /// snapshot-failure banner (D35) instead of printing status; clap rejects
 /// combining it with `json` (see `main.rs`'s `Status` variant) — the ack
 /// path is prose-on-success by design, and prose on stdout under a `--json`
@@ -290,7 +292,8 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 ///
 /// Field order is flatten-then-literal: `RepositoryHealth`'s fields
 /// (`store_bytes`, `budget`, `over_budget`, `turn_count`, `crash_gaps`,
-/// `unknown_type_lines`, `unparsed_lines`) appear first, followed by the
+/// `restart_gaps`, `trailing_stop_gaps`, `unknown_type_lines`,
+/// `unparsed_lines`) appear first, followed by the
 /// operational fields below in their declared order — nothing pins this
 /// order as a contract (unlike `DiffResult`'s empty-case literal), so this
 /// is a legible default, not a promise.
@@ -428,12 +431,35 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         .map_err(|e| cursor_error_text(&e))?
         .items;
 
-    let gaps = health.crash_gaps;
+    // F13 (redteam round 2): this was `health.crash_gaps` — the crash shape
+    // ONLY — so the two other uncovered-interval kinds `view::recording_gaps`
+    // already tagged were rendered as no gap at all. `kill <daemon>` → damage
+    // → restart is a `Restart` gap and read `gaps: 0`; a cleanly stopped
+    // recorder (`TrailingStop`, everything from the stop to now uncovered)
+    // read `gaps: 0` too. Silent non-recording is the worst failure mode for a
+    // flight recorder, so the total is what leads and the kinds are broken out
+    // rather than collapsed — "the recorder crashed" and "the recorder was
+    // deliberately off" call for different responses.
+    let gap_counts = agentrec_core::view::GapCounts {
+        crash: health.crash_gaps,
+        restart: health.restart_gaps,
+        trailing_stop: health.trailing_stop_gaps,
+    };
+    let gaps = gap_counts.total();
 
     // Read once, reused below for the ignore-reload line and (further down)
     // the memory/DEGRADED sections — same single-read pattern those already
     // used, just hoisted so this line can consult it too.
     let state = read_state(root);
+
+    // F31 (redteam round 2): the recorder's own liveness, hoisted from the
+    // ignore-reload line below (which already gated on it) so the `daemon:`
+    // line can render it too. Deliberately the SAME primitive `doctor`'s
+    // `check_daemon` and `purge`'s refusal use — `daemon::daemon_is_running`,
+    // a non-blocking `flock` probe on `.agentrec/daemon.lock` (D2) — not a
+    // second liveness notion: a pid check false-passes on pid recycling, and
+    // two probes that can disagree would be worse than the missing line was.
+    let daemon_live = crate::daemon::daemon_is_running(root);
 
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
@@ -489,7 +515,43 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         "turns:      {} (agent turns; git activity hidden)\n",
         turns.len()
     ));
-    out.push_str(&format!("gaps:       {gaps} recording gap(s)\n"));
+    out.push_str(&format!("gaps:       {gaps} recording gap(s)"));
+    // Breakdown only when there is something to break down: at zero every
+    // kind is zero and "0 recording gap(s)" already says so unambiguously, so
+    // a healthy repo's line stays exactly the bytes it has always been. (The
+    // inbox line's "0 B is a fact about accounting" argument does not carry
+    // here — that line reports a measurement, this one reports a census whose
+    // total already encodes the parts when it is 0.) "since last stop" rather
+    // than the type name `TrailingStop`: the human report should say what the
+    // interval IS (uncovered from the last stop until now), not name a
+    // variant.
+    if gaps > 0 {
+        out.push_str(&format!(
+            " ({} crash, {} restart, {} since last stop)",
+            gap_counts.crash, gap_counts.restart, gap_counts.trailing_stop
+        ));
+    }
+    out.push('\n');
+    // F31: a dead recorder was invisible here — worse, the inbox line above
+    // looks HEALTHIER the longer the outage runs (the hook keeps appending to
+    // signal.jsonl and succeeds whether or not anything consumes it, so
+    // nothing "unconsumed" accumulates in the human's field of view). Nothing
+    // in an agent session surfaces the recorder's absence, and `status` is one
+    // of only two verbs that could; it was reporting everything except whether
+    // recording is happening at all. Unconditional (both states rendered): a
+    // line that appears only when dead is a line a human learns to not look
+    // for. The warning row uses the rich-rate warning's shape, and its remedy
+    // is worded to match `doctor`'s `check_daemon` and the over-budget
+    // branch's "daemon not running — nothing is evicting" below, so a stopped
+    // recorder reads as one fact restated, not as separate claims.
+    if daemon_live {
+        out.push_str("daemon:     running\n");
+    } else {
+        out.push_str("daemon:     not running\n");
+        out.push_str(
+            "  ⚠ recorder not running — nothing is being recorded (run `agentrec record`)\n",
+        );
+    }
     // Only rendered once a rebuild has ever happened THIS DAEMON EPOCH — a
     // repo whose .gitignore never churned since the daemon last started has
     // nothing to report, and printing "0 reloads" would be exactly the
@@ -517,8 +579,10 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // can be nonzero for an epoch that is no longer running. The text line
     // is a daily-driver surface a human reads as "current" — so it is
     // gated on an actual liveness probe (the same non-blocking flock check
-    // `doctor`/`purge` already use), not just on the epoch-nonce match.
-    let daemon_live = crate::daemon::daemon_is_running(root);
+    // `doctor`/`purge` already use), not just on the epoch-nonce match. F31
+    // hoisted that probe above (the `daemon:` line needs the same bit); this
+    // gate is unchanged, it just reuses the one binding instead of probing a
+    // second time.
     if daemon_live && epoch_reloads > 0 {
         let when = fmt::relative_time(
             &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
@@ -647,7 +711,12 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         // #7) is accepted as rare/bounded, but must be self-announcing — a
         // human reading `status` on a stopped daemon must not be left
         // thinking eviction is happening when nothing is evicting anything.
-        if !crate::daemon::daemon_is_running(root) {
+        // F31: reuses the single `daemon_live` binding hoisted above rather
+        // than re-probing. Two flock probes in one report can disagree if the
+        // daemon exits between them — an over-budget store could otherwise
+        // render `daemon:     running` and "daemon not running — nothing is
+        // evicting" in the same output. Same value, one observation.
+        if !daemon_live {
             out.push_str("; daemon not running — nothing is evicting");
         }
         out.push('\n');
@@ -2083,10 +2152,168 @@ mod tests {
              inbox:      0 B signal.jsonl\n\
              turns:      0 (agent turns; git activity hidden)\n\
              gaps:       0 recording gap(s)\n\
+             daemon:     not running\n\
+             \x20 ⚠ recorder not running — nothing is being recorded (run `agentrec record`)\n\
              rich-rate:  n/a (no agent turns yet)\n\
              memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures\n",
             "healthy-store status output must be unchanged: {out}"
         );
+    }
+
+    /// F31, stated as the asymmetry that motivates the line: this fixture is
+    /// a repo where **nothing is recording** — no daemon holds the lock —
+    /// and every other line of the report is a clean bill of health,
+    /// `gaps: 0` included (there are no epoch records, so there is no
+    /// uncovered interval to name; the report cannot infer non-recording
+    /// from a ledger that was never written to). Before F31 that output had
+    /// no way to say so. Probed, not asserted from reasoning: the pinned
+    /// bytes above are what `status_report` actually emits for this fixture.
+    ///
+    /// Neuter (both directions): drop the `daemon:` line → RED here and in
+    /// the pinned test above; render it unconditionally as "running" → RED
+    /// on the dead half; render it unconditionally as "not running" → RED on
+    /// the live half.
+    #[test]
+    fn status_reports_daemon_liveness_both_ways() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let dead = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            dead.contains("daemon:     not running\n"),
+            "a repo with no recorder must say so: {dead}"
+        );
+        assert!(
+            dead.contains("⚠ recorder not running — nothing is being recorded"),
+            "the dead case must warn, not merely state: {dead}"
+        );
+
+        // Same real `libc::flock` probe `doctor`/`purge` use — `status` must
+        // not have grown a second liveness notion that can disagree with
+        // theirs.
+        let _guard = hold_daemon_lock(root);
+        let live = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            live.contains("daemon:     running\n"),
+            "a held daemon.lock must read as running: {live}"
+        );
+        assert!(
+            !live.contains("⚠ recorder not running"),
+            "a live daemon must not carry the dead-recorder warning: {live}"
+        );
+    }
+
+    /// F13: `status` rendered `health.crash_gaps`, so the `Restart` and
+    /// `TrailingStop` intervals `view::recording_gaps` already tagged were
+    /// reported as no gap at all — "kill the daemon, damage happens, restart"
+    /// read `gaps: 0`. This ledger holds 1 crash + 1 restart + 1 trailing;
+    /// the crash-only figure would be 1.
+    ///
+    /// The three kinds are asserted separately AND the total is asserted, so
+    /// a renderer that sums them into an opaque number, or one that keeps
+    /// rendering only the crash count, both go RED. Neuter: restore
+    /// `let gaps = health.crash_gaps;` → RED (total reads 1, breakdown gone).
+    #[test]
+    fn status_counts_restart_and_trailing_stop_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        for (event, ts) in [
+            ("start", "2026-01-01T00:00:00.000Z"),
+            ("start", "2026-01-01T01:00:00.000Z"), // crash
+            ("stop", "2026-01-01T02:00:00.000Z"),
+            ("start", "2026-01-01T03:00:00.000Z"), // restart
+            ("stop", "2026-01-01T04:00:00.000Z"),  // trailing
+        ] {
+            append_log(
+                &log_path(root),
+                &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                    v: 1,
+                    event: event.to_string(),
+                    ts: ts.to_string(),
+                }),
+            )
+            .unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains(
+                "gaps:       3 recording gap(s) (1 crash, 1 restart, 1 since last stop)\n"
+            ),
+            "every uncovered-interval kind must be counted and stay \
+             distinguishable: {out}"
+        );
+
+        // The pre-F13 rendering, pinned as the thing that must NOT come back.
+        assert!(
+            !out.contains("gaps:       1 recording gap(s)"),
+            "crash-only gap reporting must not survive: {out}"
+        );
+    }
+
+    /// The zero case keeps its exact pre-F13 bytes: with no gaps at all there
+    /// is nothing to break down, and "(0 crash, 0 restart, 0 since last
+    /// stop)" would be the vacuous line the zero-turn `rich-rate: n/a`
+    /// precedent (D-PD3) refuses. Guards against the breakdown being made
+    /// unconditional later.
+    #[test]
+    fn status_gap_breakdown_is_omitted_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        // A single open `start` is coverage, not a gap (see
+        // `view::recording_gaps`).
+        append_log(
+            &log_path(root),
+            &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                v: 1,
+                event: "start".to_string(),
+                ts: "2026-01-01T00:00:00.000Z".to_string(),
+            }),
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("gaps:       0 recording gap(s)\n"),
+            "no gaps must render bare, with no breakdown: {out}"
+        );
+    }
+
+    /// F13's JSON half: `crash_gaps` keeps its established meaning and value
+    /// (a consumer already reading it sees no change), and the two other
+    /// kinds arrive as additive siblings rather than being folded into it.
+    /// Vacuity guard: distinct counts per kind (2/1/1).
+    #[test]
+    fn status_health_carries_every_gap_kind_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        for (event, ts) in [
+            ("start", "2026-01-01T00:00:00.000Z"),
+            ("start", "2026-01-01T01:00:00.000Z"), // crash
+            ("start", "2026-01-01T02:00:00.000Z"), // crash
+            ("stop", "2026-01-01T03:00:00.000Z"),
+            ("start", "2026-01-01T04:00:00.000Z"), // restart
+            ("stop", "2026-01-01T05:00:00.000Z"),  // trailing
+        ] {
+            append_log(
+                &log_path(root),
+                &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                    v: 1,
+                    event: event.to_string(),
+                    ts: ts.to_string(),
+                }),
+            )
+            .unwrap();
+        }
+
+        let payload = status_json(root).unwrap();
+        assert_eq!(payload["crash_gaps"], 2, "{payload}");
+        assert_eq!(payload["restart_gaps"], 1, "{payload}");
+        assert_eq!(payload["trailing_stop_gaps"], 1, "{payload}");
     }
 
     // AC3.2 (T3/D48): the hook inbox is the file that actually grew on the

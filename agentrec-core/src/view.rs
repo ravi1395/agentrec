@@ -86,13 +86,56 @@ pub fn has_crash_gap(records: &[LogRecord]) -> bool {
         .any(|g| g.kind == GapKind::Crash)
 }
 
-/// How many times (E2 crash shape only — `status` reports crashes, not
-/// deliberate restarts).
+/// How many times (E2 crash shape only). Kept as the crash-specific
+/// primitive; `status` no longer reports ONLY this — see [`gap_counts`].
 pub fn crash_gap_count(records: &[LogRecord]) -> usize {
     recording_gaps(records)
         .iter()
         .filter(|g| g.kind == GapKind::Crash)
         .count()
+}
+
+/// Every uncovered interval, counted per kind (redteam round 2, F13).
+///
+/// `status` previously surfaced [`crash_gap_count`] alone, so the intervals
+/// [`recording_gaps`] tags [`GapKind::Restart`] and [`GapKind::TrailingStop`]
+/// were reported as no gap at all — a daemon killed, damage done, daemon
+/// restarted read `gaps: 0` on the one verb README advertises as reporting
+/// recording gaps. The kinds stay separate rather than collapsing into one
+/// number: "the recorder crashed" and "the recorder was deliberately off"
+/// are different facts about the same missing coverage, and the callers that
+/// legitimately want only one shape ([`has_crash_gap`]) keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GapCounts {
+    /// A `start` while one was already open ([`GapKind::Crash`]).
+    pub crash: usize,
+    /// A clean `stop` later followed by a `start` ([`GapKind::Restart`]).
+    pub restart: usize,
+    /// A trailing `stop` with no `start` after it — everything from that
+    /// stop onward is uncovered ([`GapKind::TrailingStop`]). This is the
+    /// shape a stopped recorder leaves behind.
+    pub trailing_stop: usize,
+}
+
+impl GapCounts {
+    /// Uncovered intervals of any kind.
+    pub fn total(&self) -> usize {
+        self.crash + self.restart + self.trailing_stop
+    }
+}
+
+/// Count [`recording_gaps`] by kind — one walk of the already-parsed
+/// records per call.
+pub fn gap_counts(records: &[LogRecord]) -> GapCounts {
+    let mut c = GapCounts::default();
+    for g in recording_gaps(records) {
+        match g.kind {
+            GapKind::Crash => c.crash += 1,
+            GapKind::Restart => c.restart += 1,
+            GapKind::TrailingStop => c.trailing_stop += 1,
+        }
+    }
+    c
 }
 
 /// Was any interval after `since` uncovered, of any shape? RFC 3339 strings
@@ -274,6 +317,13 @@ pub struct RepositoryHealth {
     pub turn_count: usize,
     /// Crash-shaped recording gaps ([`GapKind::Crash`]).
     pub crash_gaps: usize,
+    /// Restart-shaped recording gaps ([`GapKind::Restart`]) — F13. Additive
+    /// sibling of `crash_gaps`, never a replacement: `crash_gaps` keeps its
+    /// established meaning and value for every consumer already reading it.
+    pub restart_gaps: usize,
+    /// Trailing-stop recording gaps ([`GapKind::TrailingStop`]) — F13. At
+    /// most 1 by construction (only the last unmatched `stop` produces one).
+    pub trailing_stop_gaps: usize,
     pub unknown_type_lines: usize,
     pub unparsed_lines: usize,
 }
@@ -760,7 +810,9 @@ impl RepositoryView {
             budget,
             over_budget: store_bytes > budget,
             turn_count,
-            crash_gaps: crash_gap_count(&ledger.records),
+            crash_gaps: gap_counts(&ledger.records).crash,
+            restart_gaps: gap_counts(&ledger.records).restart,
+            trailing_stop_gaps: gap_counts(&ledger.records).trailing_stop,
             unknown_type_lines: ledger.unknown_type_lines,
             unparsed_lines: ledger.unparsed_lines,
         })
@@ -1580,10 +1632,48 @@ mod tests {
         let gaps = recording_gaps(&recs);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].kind, GapKind::Restart);
-        // The distinction is load-bearing: `status` counts crashes only, so a
-        // deliberate restart must not inflate its gap count.
+        // The distinction is load-bearing for the CRASH-shaped predicates —
+        // `has_crash_gap` and `crash_gap_count` must not count a deliberate
+        // restart. It is NOT a licence to drop the interval from the total:
+        // F13 found `status` doing exactly that, so `gap_counts` sees it.
+        // (This comment previously read "`status` counts crashes only"; that
+        // stopped being true when F13 was fixed.)
         assert_eq!(crash_gap_count(&recs), 0);
         assert!(!has_crash_gap(&recs));
+        assert_eq!(gap_counts(&recs).restart, 1);
+        assert_eq!(gap_counts(&recs).total(), 1);
+    }
+
+    /// F13: every kind [`recording_gaps`] can tag is counted, and the total
+    /// is their sum — the property `status` violated by reporting
+    /// `crash_gaps` alone. One ledger carrying all three shapes at once:
+    /// start, start (crash), stop, start (restart), stop (trailing).
+    ///
+    /// Neuter (both directions): make `gap_counts` filter to
+    /// `GapKind::Crash` — the pre-F13 behavior — and `restart`/
+    /// `trailing_stop`/`total` all go RED. Make it count every gap as
+    /// `crash` and the per-kind asserts go RED. Vacuity guard: the three
+    /// kinds carry DISTINCT counts (2/1/1), so a renderer that reads one
+    /// field where it means another cannot pass by coincidence.
+    #[test]
+    fn gap_counts_counts_every_kind_not_just_crash() {
+        let recs = vec![
+            epoch("start", "2026-01-01T00:00:00Z"),
+            epoch("start", "2026-01-01T01:00:00Z"), // crash 1
+            epoch("start", "2026-01-01T02:00:00Z"), // crash 2
+            epoch("stop", "2026-01-01T03:00:00Z"),
+            epoch("start", "2026-01-01T04:00:00Z"), // restart 1
+            epoch("stop", "2026-01-01T05:00:00Z"),  // trailing 1
+        ];
+        let counts = gap_counts(&recs);
+        assert_eq!(counts.crash, 2, "{counts:?}");
+        assert_eq!(counts.restart, 1, "{counts:?}");
+        assert_eq!(counts.trailing_stop, 1, "{counts:?}");
+        assert_eq!(counts.total(), 4, "{counts:?}");
+        // The pre-F13 figure, retained as the contrast: crash-only reporting
+        // hid 2 of these 4 uncovered intervals.
+        assert_eq!(crash_gap_count(&recs), 2);
+        assert_eq!(counts.total(), recording_gaps(&recs).len());
     }
 
     #[test]
