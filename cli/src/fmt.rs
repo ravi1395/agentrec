@@ -203,6 +203,13 @@ fn contains_word(text: &str, word: &str) -> bool {
 /// the C1 range — passes through unchanged; this is display-only and never
 /// touches what's persisted (the scrub/excerpt pipeline in
 /// `agentrec_core::scrub` already ran before this text ever reaches here).
+///
+/// Prompt excerpts were the first caller and are no longer the only class:
+/// `readcmds::render_plan` routes `path`/`tool`/`op` through this before the
+/// `undo` confirmation the user reads (redteam round 2, F8) — a FILENAME is
+/// equally attacker-authored text reaching stdout verbatim. That attack
+/// needed no extension here; the `sanitize_terminal_strips_f8_*` tests below
+/// are the probe for that, not an assumption.
 pub fn sanitize_terminal(s: &str) -> String {
     s.chars()
         .filter(|c| {
@@ -384,6 +391,33 @@ mod tests {
     #[test]
     fn sanitize_terminal_noop_on_plain_text() {
         assert_eq!(sanitize_terminal("write g.rs — done"), "write g.rs — done");
+    }
+
+    // F8 (redteam round 2): the exact filename payload — cursor-up (CUU) +
+    // erase-line (EL), legal bytes in a filename — that would delete the
+    // `revert` line the user reads before `undo --confirm`. Pinned here as
+    // the PROBE behind `readcmds::render_plan`'s claim that this function
+    // needed no extension to cover F8: ESC is 0x1b, already below the
+    // `cp >= 0x20` cut, so the sequence degrades to inert literal text and
+    // the filename itself stays readable (it must — the user is deciding
+    // about that file). The neuter is `cp >= 0x20` → `cp >= 0x00`.
+    #[test]
+    fn sanitize_terminal_strips_f8_cursor_up_erase_line() {
+        let evil = "\x1b[1A\x1b[2Ksrc/decoy.rs";
+        let clean = sanitize_terminal(evil);
+        assert!(!clean.contains('\x1b'));
+        assert_eq!(clean, "[1A[2Ksrc/decoy.rs");
+    }
+
+    // The same attack spelled with the single-byte C1 introducer instead of
+    // ESC-`[`: a terminal honoring CSI (U+009B) directly needs no ESC at all,
+    // so an F8 fix keying on 0x1b alone would miss this. Already covered, and
+    // this pins that it stays covered from the path/tool render sites.
+    #[test]
+    fn sanitize_terminal_strips_f8_c1_csi_variant() {
+        let clean = sanitize_terminal("\u{9b}1A\u{9b}2Ksrc/decoy.rs");
+        assert!(!clean.contains('\u{9b}'));
+        assert_eq!(clean, "1A2Ksrc/decoy.rs");
     }
 
     fn turn(id: &str, grade: &str, tool: Option<&str>, excerpt: Option<&str>) -> TurnRecord {

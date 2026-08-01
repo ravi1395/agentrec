@@ -842,37 +842,68 @@ fn modified_cause(
     "human or external edit".to_string()
 }
 
-fn print_plan(target: &TurnRecord, plans: &[Plan]) {
-    println!(
-        "undo {} ({})",
-        fmt::short_id(&target.id),
-        target.tool.as_deref().unwrap_or("—")
-    );
+/// The exact bytes of the pre-`--confirm` undo plan, one `\n`-terminated line
+/// per emitted row. Split out of [`print_plan`] so the text a user reads
+/// before authorizing a destructive op is unit-testable as a value; the
+/// printer is a thin wrapper and nothing else builds this text.
+///
+/// Every WIRE-SOURCED field interpolated here — `target.tool`, `entry.path`,
+/// `entry.op` — passes through [`fmt::sanitize_terminal`] (redteam round 2,
+/// F8). A filename is attacker-controllable (nothing stops an agent or a
+/// postinstall script creating `"\x1b[1A\x1b[2Ksrc/decoy.rs"` — all legal
+/// bytes), and cursor-up + erase-line reaching a real terminal would wipe the
+/// `revert` line printed above it from the display while `--confirm` reverts
+/// that file anyway, rewriting the one human checkpoint this destructive op
+/// has. `sanitize_terminal` needed no extension for this: ESC is `0x1b`, so
+/// its existing `cp >= 0x20` filter already dropped it — `fmt.rs`'s
+/// `sanitize_terminal_strips_f8_cursor_up_erase_line` and
+/// `render_plan_neutralizes_f8_erase_line_payload` below pin that rather
+/// than assuming it.
+///
+/// `cause` and `reason` are deliberately NOT sanitized, and that was probed
+/// rather than reasoned: every value able to reach them is a fixed literal
+/// built in [`build_plan`], [`modified_cause`], or [`fmt::skip_reason_text`]
+/// — none interpolates a wire string. Adding one that does makes this comment
+/// false and that field then needs sanitizing here too. `target.id` is
+/// likewise left as-is: it is reachable only under a different (hostile
+/// log-writer) threat model, and [`fmt::turn_list_line`] renders the same id
+/// unsanitized, so treating it here alone would split the treatment without
+/// closing anything.
+fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
+    let mut out = String::new();
+    let tool = fmt::sanitize_terminal(target.tool.as_deref().unwrap_or("—"));
+    out.push_str(&format!("undo {} ({tool})\n", fmt::short_id(&target.id)));
     for p in plans {
+        let path = fmt::sanitize_terminal(&p.entry.path);
         match &p.kind {
             PlanKind::Revert { warn } => {
-                println!("  revert  {} ({})", p.entry.path, p.entry.op);
+                let op = fmt::sanitize_terminal(&p.entry.op);
+                out.push_str(&format!("  revert  {path} ({op})\n"));
                 if let Some(cause) = warn {
-                    println!(
-                        "    WARNING: {} modified since ({cause}) — reverting anyway (--allow-modified)",
-                        p.entry.path
-                    );
+                    out.push_str(&format!(
+                        "    WARNING: {path} modified since ({cause}) — reverting anyway (--allow-modified)\n"
+                    ));
                 }
             }
             PlanKind::Excluded { cause } => {
-                println!(
-                    "  EXCLUDE {} — modified since ({cause}); --allow-modified to include",
-                    p.entry.path
-                );
+                out.push_str(&format!(
+                    "  EXCLUDE {path} — modified since ({cause}); --allow-modified to include\n"
+                ));
             }
             PlanKind::Refused { reason } => {
-                println!("  REFUSE  {} — {reason}", p.entry.path);
+                out.push_str(&format!("  REFUSE  {path} — {reason}\n"));
             }
         }
     }
     if let Some(caution) = window_caution(target, plans) {
-        println!("{caution}");
+        out.push_str(&caution);
+        out.push('\n');
     }
+    out
+}
+
+fn print_plan(target: &TurnRecord, plans: &[Plan]) {
+    print!("{}", render_plan(target, plans));
 }
 
 /// D6 honesty line. A rich turn's file list is an *activity window*, not an
@@ -1091,4 +1122,146 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, op: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: Some("a".repeat(64)),
+            after: Some("b".repeat(64)),
+            op: op.to_string(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+        }
+    }
+
+    fn turn(grade: &str, tool: Option<&str>) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            id: "t_ABCD00000000000000EFGH".to_string(),
+            grade: grade.to_string(),
+            truncated: false,
+            started: "2026-01-01T00:00:00.000Z".into(),
+            ended: "2026-01-01T00:00:01.000Z".into(),
+            tool: tool.map(String::from),
+            model: None,
+            session: None,
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: None,
+            files_complete: None,
+            files: vec![],
+        }
+    }
+
+    // Byte-exact shape of every plan row on clean input. There is no `undo`
+    // golden file (checked: `cli/tests/fixtures/golden/` has none), so this
+    // stands in for one — sanitizing an already-clean path/tool/op MUST be
+    // the identity, and a stray extra or missing `\n` from the
+    // `println!`-per-row → single-`String` refactor reds here. `tool:
+    // "agentrec"` keeps `window_caution` out of the expected text (its own
+    // tests own that line).
+    #[test]
+    fn render_plan_clean_input_is_byte_exact() {
+        let t = turn("rich", Some("agentrec"));
+        let plans = vec![
+            Plan {
+                entry: entry("src/app.rs", "modify"),
+                kind: PlanKind::Revert { warn: None },
+            },
+            Plan {
+                entry: entry("src/b.rs", "modify"),
+                kind: PlanKind::Excluded {
+                    cause: "later agent turn".to_string(),
+                },
+            },
+            Plan {
+                entry: entry("src/c.rs", "modify"),
+                kind: PlanKind::Refused {
+                    reason: "no prior snapshot to restore".to_string(),
+                },
+            },
+        ];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (agentrec)\n\
+             \x20 revert  src/app.rs (modify)\n\
+             \x20 EXCLUDE src/b.rs — modified since (later agent turn); --allow-modified to include\n\
+             \x20 REFUSE  src/c.rs — no prior snapshot to restore\n"
+        );
+    }
+
+    // F8 (redteam round 2), the attack as reported: a second file named
+    // `"\x1b[1A\x1b[2Ksrc/decoy.rs"` (cursor-up + erase-line) whose EXCLUDE
+    // row, rendered raw, erases the `revert src/prod_config.rs` row above it
+    // from the display — while `--confirm` reverts prod_config.rs anyway.
+    // Asserting only "no 0x1b in output" is too weak (a fix that swapped ESC
+    // for another active introducer would pass it), so this pins the
+    // structural property the attack needs: both rows survive, on separate
+    // lines, with the hostile filename still readable as inert literal text.
+    // RED before the fix: `p.entry.path`/`target.tool` were interpolated raw.
+    #[test]
+    fn render_plan_neutralizes_f8_erase_line_payload() {
+        let t = turn("rich", Some("\x1b[2Kclaude"));
+        let plans = vec![
+            Plan {
+                entry: entry("src/prod_config.rs", "modify"),
+                kind: PlanKind::Revert { warn: None },
+            },
+            Plan {
+                entry: entry("\x1b[1A\x1b[2Ksrc/decoy.rs", "modify"),
+                kind: PlanKind::Excluded {
+                    cause: "later agent turn".to_string(),
+                },
+            },
+        ];
+        let out = render_plan(&t, &plans);
+        assert!(!out.contains('\x1b'), "raw ESC reached the plan: {out:?}");
+        assert!(!out.chars().any(|c| {
+            let cp = c as u32;
+            cp < 0x20 && c != '\n' || cp == 0x7f || (0x80..=0x9f).contains(&cp)
+        }));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "undo t_ABCD…EFGH ([2Kclaude)");
+        assert_eq!(lines[1], "  revert  src/prod_config.rs (modify)");
+        assert_eq!(
+            lines[2],
+            "  EXCLUDE [1A[2Ksrc/decoy.rs — modified since (later agent turn); --allow-modified to include"
+        );
+    }
+
+    // The same vector on the two remaining wire fields this row can carry:
+    // `entry.op` (interpolated beside the path on a revert row) and the path
+    // repeated in the `--allow-modified` WARNING row. Both are attacker-
+    // reachable on an imported or foreign-written log, and the WARNING row is
+    // the one that says a modified file is being clobbered anyway.
+    #[test]
+    fn render_plan_sanitizes_op_and_warning_row() {
+        let t = turn("rich", None);
+        let plans = vec![Plan {
+            entry: entry("\u{9b}2Ksrc/evil.rs", "mod\x1b[1Aify"),
+            kind: PlanKind::Revert {
+                warn: Some("human or external edit".to_string()),
+            },
+        }];
+        let out = render_plan(&t, &plans);
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\u{9b}'));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "undo t_ABCD…EFGH (—)");
+        assert_eq!(lines[1], "  revert  2Ksrc/evil.rs (mod[1Aify)");
+        assert_eq!(
+            lines[2],
+            "    WARNING: 2Ksrc/evil.rs modified since (human or external edit) — reverting anyway (--allow-modified)"
+        );
+    }
 }
