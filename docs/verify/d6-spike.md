@@ -116,15 +116,19 @@ a scratch root and reading the emitted `signal.jsonl`:
   286 of the 300 transcripts have zero session writes at all, so the bulk of that silence is
   "nothing to declare", not the cutoff rule working: **the discriminating base for the cutoff
   rule is the 14 write-bearing transcripts**, not 300.
-- 10 declaring signals: set sizes min 1 / p50 2 / max 5.
+- 10 declaring signals: set sizes, full multiset (percentile conventions disagree on n=10, so
+  no percentiles): **[1, 1, 1, 1, 1, 2, 2, 3, 4, 5]**.
 
 **Corrected by the 2026-08-01 re-gate (the first version of this addendum said "sessions hold up
 to ~40 writes" — false at this scope; skeptic-measured max over these 300 is 16):**
 
-- Scoping evidence proper: **4 of 10** declaring transcripts emit fewer paths than their session
-  total — the clean pair is `3104ac02-…jsonl`: **emitted 2 vs 11 session-total**. The other 6
-  have emitted == session-total, indistinguishable from an unscoped parser. The cutoff
-  demonstrably scopes; the base is narrow and a different 300 could move these numbers.
+- Scoping evidence proper: **5 of 10** declaring transcripts emit fewer paths than their session
+  total (gaps: 2<11, 1<6, 1<5, 1<4, 1<2) — the clean pair is `3104ac02-…jsonl`: **emitted 2 vs
+  11 session-total**. The other **5** have emitted == session-total, indistinguishable from an
+  unscoped parser. The cutoff demonstrably scopes; the base is narrow and a different 300 could
+  move these numbers. (Re-gate round 2 corrected this row: round 1's report said 4-of-10 — the
+  skeptic's own prose miscount of its own gap table — and the first version of this correction
+  copied it verbatim. Numbers here are from the round-2 fresh replay.)
 - **Under-declaration magnitude, first measurement:** 4 of the 14 write-bearing transcripts
   (session totals 6/7/9/16) declared **nothing** — 29% fully silent. The code comment discloses
   under-declaration as a direction; this is its measured size on this sample. Phase 3/4 must not
