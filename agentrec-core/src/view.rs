@@ -312,8 +312,34 @@ pub fn load_ledger(path: &std::path::Path) -> Ledger {
 /// call for `skip_serializing_if`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryHealth {
+    /// Every byte under `.agentrec/objects/`, orphans included — a `read_dir`
+    /// walk ([`crate::store::BlobStore::total_bytes`]). Unchanged meaning; it
+    /// is simply no longer what `over_budget` compares (F26).
+    ///
+    /// Scope note (F24): this walks `objects/` only, so `.agentrec/daemon.log`
+    /// — where the launchd unit now routes the daemon's stdio — is a sibling
+    /// of the store and invisible to both this figure and `budgeted_bytes`.
     pub store_bytes: u64,
+    /// The bytes `budget` is actually enforced against:
+    /// [`crate::retention::managed_bytes`] over every turn record in the
+    /// ledger — the unique snapshot blobs `retention::plan_eviction`
+    /// accumulates. Strictly `<= store_bytes`; the difference is orphans,
+    /// prompt-only blobs, and anything else the evictor cannot reclaim.
+    ///
+    /// F26 (redteam round 2): `over_budget` used to be `store_bytes > budget`,
+    /// so a store whose orphan share alone exceeded the budget sat
+    /// permanently "over budget" while every eviction tick freed nothing. The
+    /// two figures are now both reported rather than one silently standing in
+    /// for the other — a consumer that wants disk pressure reads
+    /// `store_bytes`, one that wants "will eviction help" reads this.
+    pub budgeted_bytes: u64,
     pub budget: u64,
+    /// `budgeted_bytes > budget` — equivalently (see
+    /// [`crate::retention::managed_bytes`]'s proof) "the evictor has
+    /// candidates". NOT "eviction will free bytes": A2/A5/protected/freshness
+    /// can spare every candidate. NOT "the store is over budget on disk"
+    /// either — that is `store_bytes > budget`, a strictly weaker condition
+    /// this field deliberately no longer answers.
     pub over_budget: bool,
     /// Turns as recorded, before any superseded/git filtering.
     pub turn_count: usize,
@@ -802,19 +828,36 @@ impl RepositoryView {
     pub fn health_of(&self, ledger: &Ledger, budget: u64) -> Result<RepositoryHealth, RepoError> {
         let store = crate::store::BlobStore::new(self.objects_dir());
         let store_bytes = store.total_bytes();
-        let turn_count = ledger
+        // F26: the turn set fed to `managed_bytes` must be the UNFILTERED one
+        // — every `LogRecord::Turn` in ledger order, no git/superseded
+        // narrowing — because that is exactly what both eviction call sites
+        // pass to `plan_eviction` (`cmds::eviction_plan` uses
+        // `TurnQuery { include_all: true }`; `daemon::run_eviction_pass` uses
+        // a raw `load_log`). Narrowing here would silently break the
+        // `managed_bytes > budget` <-> "the evictor has candidates"
+        // equivalence that makes `over_budget` meaningful.
+        let turns: Vec<&TurnRecord> = ledger
             .records
             .iter()
-            .filter(|r| matches!(r, LogRecord::Turn(_)))
-            .count();
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+        let budgeted_bytes = crate::retention::managed_bytes(&store, turns.iter().copied());
+        // One walk, three fields (residual handed over from the F13 wave:
+        // this was three `gap_counts(&ledger.records)` calls, i.e. three full
+        // passes over every record to answer one census).
+        let gaps = gap_counts(&ledger.records);
         Ok(RepositoryHealth {
             store_bytes,
+            budgeted_bytes,
             budget,
-            over_budget: store_bytes > budget,
-            turn_count,
-            crash_gaps: gap_counts(&ledger.records).crash,
-            restart_gaps: gap_counts(&ledger.records).restart,
-            trailing_stop_gaps: gap_counts(&ledger.records).trailing_stop,
+            over_budget: budgeted_bytes > budget,
+            turn_count: turns.len(),
+            crash_gaps: gaps.crash,
+            restart_gaps: gaps.restart,
+            trailing_stop_gaps: gaps.trailing_stop,
             unknown_type_lines: ledger.unknown_type_lines,
             unparsed_lines: ledger.unparsed_lines,
         })
@@ -1580,6 +1623,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -2074,6 +2119,52 @@ mod tests {
         assert_eq!(h.turn_count, 0);
         assert_eq!(h.crash_gaps, 0);
         assert!(!h.over_budget);
+        assert_eq!(h.budgeted_bytes, 0);
+    }
+
+    /// F26 at the health level: `over_budget` must key on the bytes eviction
+    /// ranges over, not on disk bytes. The fixture is the failure state the
+    /// redteam measured — a store dominated by blobs no turn references —
+    /// with a budget deliberately between the two figures, so the OLD
+    /// predicate (`store_bytes > budget`) and the new one disagree and only
+    /// one of them can pass.
+    ///
+    /// Neuter: restore `over_budget: store_bytes > budget` and the third
+    /// assertion reds.
+    #[test]
+    fn over_budget_keys_on_evictable_bytes_not_disk_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_log(root, &[]);
+        let store = crate::store::BlobStore::new(root.join(".agentrec").join("objects"));
+
+        let referenced = store.put(&[0xAAu8; 20]).unwrap();
+        // No turn cites this: on disk, ineligible as an eviction victim.
+        store.put(&[0xBBu8; 180]).unwrap();
+
+        // Written as a wire line rather than a constructed `FileEntry` so this
+        // fixture does not have to be edited every time PROTOCOL gains an
+        // additive optional field — `#[serde(default)]` on the optionals is
+        // what makes the short form legal, and exercising it here is a small
+        // bonus check of that tolerance.
+        let line = format!(
+            r#"{{"type":"turn","v":1,"id":"t_F26HEALTH","grade":"rich","started":"2026-01-01T00:00:00Z","ended":"2026-01-01T00:00:00Z","root":"/repo","files":[{{"path":"x.bin","after":"{referenced}","op":"create"}}]}}"#
+        );
+        write_log(root, &[&line]);
+
+        let h = RepositoryView::open(root).unwrap().health(100).unwrap();
+        assert_eq!(h.store_bytes, 200, "disk bytes still include the orphan");
+        assert_eq!(h.budgeted_bytes, 20, "only the referenced snapshot counts");
+        assert!(
+            !h.over_budget,
+            "200 B on disk over a 100 B budget must NOT read as over-budget \
+             when only 20 B of it is evictable — that is the permanent \
+             'over budget, evicting nothing' state F26 describes"
+        );
+
+        // And the predicate still fires when the evictable set really is over.
+        let h2 = RepositoryView::open(root).unwrap().health(19).unwrap();
+        assert!(h2.over_budget, "20 B evictable against a 19 B budget");
     }
     #[test]
     fn a_known_type_written_malformed_is_unparsed_not_an_unknown_kind() {
@@ -2359,6 +2450,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         t.prompt_ref = Some("sha256:bb".to_string());

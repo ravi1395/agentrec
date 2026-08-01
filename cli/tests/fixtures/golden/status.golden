@@ -1,5 +1,5 @@
 stdout:
-store:      307 B
+store:      307 B on disk, 235 B counted toward the budget
 inbox:      0 B signal.jsonl
 turns:      7 (agent turns; git activity hidden)
 gaps:       2 recording gap(s) (1 crash, 0 restart, 1 since last stop)
