@@ -14,12 +14,17 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
-- **Redteam remediation round (delivered 2026-08-01, GATE PASS after 5 skeptic rounds) — branch
-  `fix/redteam-immediate-actions`, 10 commits, unmerged.** External redteam (technical +
+- **Redteam remediation round (delivered 2026-08-01, extended by founder acceptance of all
+  recommendations; 7 skeptic rounds total) — branch `fix/redteam-immediate-actions`, 15
+  commits, unmerged.** Extension added: PROTOCOL §3 append-only definition + D48 reclaim
+  clause; D46→D48 renumber (collision with PR #10 resolved); D49 bare-turn caution; full
+  stale-claims verify (73 confirmed). Claim-authorship lesson recorded: 7 replay refutations
+  this round were all claim-cmd bugs (stale counts, overbroad greps, multi-filter cargo
+  invocations match only one name), zero code defects — superseded with corrected replays. External redteam (technical +
   product) drove 4 immediate actions: (T1) README discloses D6 intra-bracket misattribution +
   silent-undo consequence; (T2) E2E test pins the D6 data-loss chain against the real daemon,
-  `undo` gains a CAUTION activity-window line scoped to revert-marked files (mixed-plan-true,
-  bare-turn exclusion pinned); (T3) `purge --signals-consumed` — third sanctioned rewrite class
+  `undo` gains a CAUTION activity-window line scoped to revert-marked files (mixed-plan-true;
+  bare turns get their own unattributed-window variant — D49, founder-directed 2026-08-01); (T3) `purge --signals-consumed` — third sanctioned rewrite class
   (D48), inbox was 13.4 MB unbounded — plus `status` inbox accounting; (T4) memory 1-week
   dogfood ledger row **CLOSED FAILED** with per-conjunct evidence (candidate emitter never
   fired; hit-rate unfalsifiable as written). Gate found and fixed 2 REAL daemon defects: startup
@@ -87,10 +92,11 @@ carries only current state, what's next, and standing debts.
   defines append-only precisely with a MAY-reclaim clause for consumed `signal.jsonl` lines
   (D48). claimd doc-scope rule for PROTOCOL.md remains undecided (Stop hook fired, claim
   declared covering the edit).
-- **CAUTION feature + bare-turn decision (re-gate N4):** the undo activity-window CAUTION
-  shipped with no IMPLEMENTATION.md AC row (against "new features add their AC there first")
-  and the bare-turn exclusion is pinned only in code comments; founder decides whether bare
-  turns also get the caution, then both need register/ledger rows.
+- ~~CAUTION feature + bare-turn decision (re-gate N4)~~ **DONE 2026-08-01 (founder-directed):**
+  bare turns get their own unattributed-window caution; D49 + AC-CAUTION-1..4 registered, each
+  mapped to a named misattribution.rs test. Residual: a foreign L1+ producer emitting
+  `grade:"bare"` WITH a tool would falsify the "no recorded tool" clause — becomes live when
+  Phase 2 import lands (disclosed in code comment).
 - Merge decision for `fix/redteam-immediate-actions` (gate PASS, 465/0/1) vs PR #10's
   in-flight `feat/phase-2-0-view-completion` ordering. The former D46-number collision is
   RESOLVED (2026-08-01): this branch's signals-consumed decision renumbered to **D48**,
