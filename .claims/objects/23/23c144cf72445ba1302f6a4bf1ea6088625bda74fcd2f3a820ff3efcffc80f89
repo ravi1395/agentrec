@@ -1,0 +1,5 @@
+error: unexpected argument 'status_clamps_a_signal_offset_past_eof' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
