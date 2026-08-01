@@ -99,7 +99,8 @@ built to catch edits made *after* the turn closed, and there is nothing for it t
 `undo` therefore restores the file to its pre-turn `before` content, dropping the human edit,
 and the per-file output shows an ordinary clean revert — that rail has nothing to fire on.
 
-What `undo` does flag is the turn as a whole. Previewing a rich turn it did not itself record
+What `undo` does flag is the turn as a whole. Previewing a rich turn it did not itself record —
+or a bare turn, which gets its own wording because it has no recorded tool to name at all —
 prints — whenever the plan actually reverts anything — a CAUTION that the turn's file list is an activity window rather than an authorship
 record, and that every file the plan reverts is reverted regardless of who wrote it. That is a
 blanket disclosure, not per-file detection: agentrec still cannot tell your edits from the

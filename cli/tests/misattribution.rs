@@ -44,6 +44,25 @@ const CAUTION_SCOPE_SUBSTR: &str =
 /// False on any plan carrying an `EXCLUDE` or `REFUSE` line; pinned absent.
 const CAUTION_OVERCLAIM_SUBSTR: &str = "every file listed above is reverted";
 
+/// The BARE variant (D49, founder decision 2026-08-01). A separate sentence,
+/// not a reworded `CAUTION_SUBSTR`: the rich text names "the recorded tool" and
+/// D6, and a bare turn has no recorded tool — every bare producer opens on
+/// `Source::Quiet`, which is constructed `tool: None` (agentrec-core
+/// `engine.rs`), and crash recovery forces `None` for a bare grade
+/// (`cli/src/daemon.rs`). Asserting the two constants against each other is how
+/// "the variants must not bleed" stays checkable.
+const BARE_CAUTION_SUBSTR: &str =
+    "this is a bare turn — an unattributed activity window with no recorded tool; agentrec cannot \
+     say who or what made these writes";
+
+/// The bare caution's *scope* clause, a second constant for the same reason
+/// `CAUTION_SCOPE_SUBSTR` is one: a regression printing only the first clause
+/// must not pass. Deliberately worded "who or what" — the rich constant's
+/// "who wrote it" must not match this string, or the negatives that separate
+/// the two variants go vacuous.
+const BARE_CAUTION_SCOPE_SUBSTR: &str =
+    "every file marked `revert` above is reverted regardless of who or what wrote it";
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
 }
@@ -482,17 +501,22 @@ fn mixed_plan_caution_scopes_itself_to_reverted_files_only() {
     );
 }
 
-/// D7 (minor, recorded): bare turns are excluded from the caution by the
-/// `grade != "rich"` arm of the gate, and nothing pinned that. Whether a bare
-/// turn's undo *should* carry a window caution is a founder call (the residual
-/// is escalated, not decided here) — this test pins only the CURRENT behavior
-/// so a change to it is visible in a diff rather than silent.
+/// D49 (founder decision, 2026-08-01, resolving the re-gate residual this test
+/// previously pinned open): a bare turn's undo DOES carry a caution, but its
+/// own — the rich sentence names "the recorded tool" and D6, and a bare turn
+/// has no recorded tool at all, so reusing it would fabricate the very
+/// attribution the grade exists to withhold.
+///
+/// The two variants must not bleed: this test asserts the bare text present AND
+/// the rich text's tool/D6 clause absent. (The reverse direction — bare text
+/// absent on rich turns — is closed by construction, `window_caution` returning
+/// one branch or the other and never concatenating.)
 ///
 /// Non-vacuity matters: the gate has two suppression paths, so the fixture
 /// deliberately yields a plan with a real `revert` line. Without that, the test
 /// would pass because nothing was revertible, pinning nothing about `grade`.
 #[test]
-fn bare_turn_undo_carries_no_window_caution() {
+fn bare_turn_undo_carries_unattributed_window_caution() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     init(root);
@@ -502,21 +526,51 @@ fn bare_turn_undo_carries_no_window_caution() {
     seed_turn(root, "t_BARETURNNOCAUTION000000001", "bare", None, files);
     std::fs::write(root.join("c.txt"), b"c-v2\n").unwrap();
 
+    // --- preview ----------------------------------------------------------
     let out = agentrec(root, &["undo", "t_BARETURNNOCAUTION000000001"]);
     assert!(out.status.success(), "undo preview failed: {out:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let preview = String::from_utf8_lossy(&out.stdout).into_owned();
 
     assert!(
-        stdout.contains("revert  c.txt"),
+        preview.contains("revert  c.txt"),
         "the plan must contain a revert, or the caution gate is not even \
-         reached and this test pins nothing: {stdout}"
+         reached and this test pins nothing: {preview}"
     );
     assert!(
-        !stdout.contains(CAUTION_SUBSTR),
-        "PINNED (residual, not endorsed): bare turns get no window caution: {stdout}"
+        preview.contains(BARE_CAUTION_SUBSTR),
+        "a bare turn's undo must disclose the unattributed window: {preview}"
     );
     assert!(
-        !stdout.contains(CAUTION_SCOPE_SUBSTR),
-        "no partial caution either: {stdout}"
+        preview.contains(BARE_CAUTION_SCOPE_SUBSTR),
+        "the bare caution must scope its revert claim to files marked \
+         `revert`: {preview}"
+    );
+    assert!(
+        !preview.contains(CAUTION_SUBSTR),
+        "VARIANT BLEED: the rich text names the recorded tool and D6, and a \
+         bare turn has neither: {preview}"
+    );
+
+    // --- confirm: the same disclosure, on the path that actually writes ----
+    let out = agentrec(root, &["undo", "t_BARETURNNOCAUTION000000001", "--confirm"]);
+    assert!(out.status.success(), "undo --confirm failed: {out:?}");
+    let confirmed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        confirmed.contains(BARE_CAUTION_SUBSTR),
+        "confirm path must carry the bare caution too: {confirmed}"
+    );
+    assert!(
+        confirmed.contains(BARE_CAUTION_SCOPE_SUBSTR),
+        "confirm path must carry the scope clause too: {confirmed}"
+    );
+    assert!(
+        !confirmed.contains(CAUTION_SUBSTR),
+        "VARIANT BLEED on the confirm path: {confirmed}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("c.txt")).unwrap(),
+        b"c-v1\n",
+        "the revert the caution warns about really happened (non-vacuity: \
+         the confirm path reached the writes)"
     );
 }

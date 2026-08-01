@@ -1066,15 +1066,23 @@ fn print_plan(target: &TurnRecord, plans: &[Plan]) {
 /// other — which is why the wording says "the recorded tool's own writes"
 /// rather than "the agent's": the sentence has to stay true for every turn
 /// class the gate admits.
+///
+/// BARE turns get their own sentence (D49, founder decision 2026-08-01; this
+/// was an open residual until then). They are cautioned — the writes are as
+/// real and as irreversible-by-preview as a rich turn's — but not with the
+/// rich text, which names "the recorded tool" and D6: a bare turn has no
+/// recorded tool, so that sentence would fabricate the attribution the grade
+/// exists to withhold. "No recorded tool" is an invariant, not an observation:
+/// every bare close runs through `Source::Quiet`, whose `OpenTurn` is built
+/// `tool: None` (agentrec-core `engine.rs`), and crash recovery hard-codes
+/// `None` for a bare grade (`daemon.rs`) — a producer minting bare-with-tool
+/// would make this sentence false and must change it. The gate stays on
+/// `grade` alone (founder-specified), so that invariant is documented here
+/// rather than defensively re-checked at the call site.
 fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
-    // Bare turns are excluded here deliberately, and that exclusion is pinned
-    // by `bare_turn_undo_carries_no_window_caution` (cli/tests/misattribution.rs)
-    // — a bare turn is already rendered as an unattributed window everywhere,
-    // so the line would restate its grade rather than add anything. Whether it
-    // should nonetheless be printed is an open founder call (escalated as a
-    // residual, not decided here); the test exists so changing it shows in a
-    // diff instead of silently.
-    if target.grade != "rich" || target.tool.as_deref() == Some("agentrec") {
+    let rich = target.grade == "rich" && target.tool.as_deref() != Some("agentrec");
+    let bare = target.grade == "bare";
+    if !rich && !bare {
         return None;
     }
     if !plans
@@ -1082,6 +1090,19 @@ fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
         .any(|p| matches!(p.kind, PlanKind::Revert { .. }))
     {
         return None; // nothing will be written; no scope to caution about
+    }
+    // One branch or the other, never a concatenation: that is what makes
+    // "the variants do not bleed" structural rather than test-enforced in
+    // both directions (only the bare-shows-no-rich-text direction is
+    // asserted; the reverse is closed here).
+    if bare {
+        return Some(
+            "  CAUTION: this is a bare turn — an unattributed activity window with no recorded \
+             tool; agentrec cannot say who or what made these writes, and every file marked \
+             `revert` above is reverted regardless of who or what wrote it. Review the list \
+             before confirming."
+                .to_string(),
+        );
     }
     Some(
         "  CAUTION: this turn's file list is an activity window, not an authorship record — \
