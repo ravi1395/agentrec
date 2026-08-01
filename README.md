@@ -83,6 +83,42 @@ Run it yourself:
 AGENTREC_TORTURE_OPS=1200 cargo test --test torture -- --ignored
 ```
 
+## Threat model
+
+**agentrec is built against accidents, not against an adversary.** The cases it is designed for
+are an honest agent doing the wrong thing, a human overwriting a file without noticing, a process
+killed mid-write, and a snapshot rotting on disk. Those it handles: turns and file snapshots are
+written by the daemon as it observes the filesystem, not reconstructed afterward from anyone's
+memory; the object store verifies a blob against its own address when it reads it and reports a
+mismatch as an error rather than serving corrupt bytes (`agentrec-core/src/store.rs:152-163`); and
+a recording gap is surfaced rather than guessed across — a file whose last turn is followed by an
+uncovered interval blames as `· attribution stale — recording gap`
+(`agentrec-core/src/view.rs:563-566`), and a path no turn touches at all, in a history with a
+crash gap, names the gap instead of naming a turn (`view.rs:556-558`).
+
+**It does not defend against a malicious or prompt-injected agent, or against a repo whose build
+scripts and hooks you have not read.** Those run under your uid, and so does agentrec. Anything
+with your uid can write `.agentrec/` directly — append to `signal.jsonl`, rewrite `log.jsonl`,
+replace objects, reset `state.json`. The signal inbox carries no provenance: `tool` is a free-form
+string (`agentrec-core/src/record.rs:17`) and a line is accepted by a bare deserialize with no
+check of who wrote it (`record.rs:307-317`), so an appended line mints a turn that `log` and
+`blame` then render exactly like one the daemon observed. `log.jsonl` carries no chain or MAC over
+its lines; append-only is a discipline the writer keeps, not a property the format enforces. And
+tampering with the record is the one class of filesystem change the recorder structurally cannot
+witness, because `.agentrec` is in the watcher's denylist (`cli/src/daemon.rs:766-770`) — with no
+second copy to compare against, since `init` adds `.agentrec/` to `.gitignore`
+(`cli/src/initcmd.rs:353`). A record deleted outright prints `no turns recorded — is agentrec
+record running?` (`cli/src/cmds.rs:77`), which is what a repo where nothing has happened yet also
+prints.
+
+**"Independent," above, means independent of the agent's self-report — not tamper-resistant
+against the agent.** Attribution here comes from watching the filesystem rather than from trusting
+a transcript, which is what makes it useful when a tool's own logs are missing, disabled or wrong.
+It is not evidence against the actor it records. The torture harness above covers the accident
+half — that `undo` does not corrupt your tree when turns, human edits and crashes interleave — and
+bears on the adversarial half not at all. Signing or hash-chaining the log would not change that:
+the key would sit on the same machine, under the same uid, as the process being recorded.
+
 ## Known limitations
 
 **A human edit made while an agent's turn is open is attributed to the agent.** The recorder
