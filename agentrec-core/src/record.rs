@@ -132,6 +132,45 @@ pub struct FileEntry {
     /// `after` to "human or external edit" — see `readcmds::modified_cause`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_synthesized: Option<bool>,
+    /// Kind of the filesystem object at `path` AT SNAPSHOT TIME, when it is
+    /// something other than an ordinary file (PROTOCOL §5, additive, open
+    /// string enum — see [`link_kind`]). `None` on every ordinary-file entry
+    /// and on every entry written before this field existed, so the wire
+    /// shape of those stays byte-identical.
+    ///
+    /// The only value this implementation writes is [`link_kind::SYMLINK`]
+    /// (writer: the daemon, `cli/src/daemon.rs`). It means the entry's
+    /// `before`/`after` hashes address the **link target string**, not file
+    /// content — the recorder deliberately does not follow symlinks
+    /// (IMPLEMENTATION.md AC B5).
+    ///
+    /// Consumers MUST refuse to *act* on an entry carrying any non-`None`
+    /// value, including an unknown future one — refuse-to-act, never
+    /// refuse-to-parse. Treating a target string as content replaces the
+    /// link with a text file, and writing to the path follows the link and
+    /// truncates a file that was never in the plan (red team round 2, F2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_kind: Option<String>,
+    /// Per-file attribution (PROTOCOL §5, additive, open string enum).
+    /// **Writer-optional, and never written by this code** — reserved for
+    /// the D6 transcript-correlation producer, which defines the value set.
+    /// Every entry this workspace constructs leaves it `None`, so it is
+    /// absent from the wire and existing records are unaffected. Consumers
+    /// MUST tolerate any value (including unknown ones) and MUST NOT derive
+    /// undo safety from it — undo safety keys on `modified-since`
+    /// (PROTOCOL §5) and on the refusal gates, never on attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
+}
+
+/// Open string enum of [`FileEntry::link_kind`] values (PROTOCOL §5).
+/// Unknown/future values MUST make a consumer refuse to ACT on the entry,
+/// never refuse to parse the line — so never match exhaustively on these,
+/// and never gate a destructive operation on recognizing one.
+pub mod link_kind {
+    /// The path was a symbolic link at snapshot time; the entry's hashes
+    /// address the link target string, not file content.
+    pub const SYMLINK: &str = "symlink";
 }
 
 /// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
@@ -437,6 +476,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         };
         append_log(&path, &LogRecord::Turn(turn)).unwrap();
@@ -476,6 +517,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("skipped"));
@@ -510,6 +553,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         };
         let json = serde_json::to_string(&entry_none).unwrap();
         assert_eq!(
@@ -529,6 +574,52 @@ mod tests {
         );
         let back: FileEntry = serde_json::from_str(&json2).unwrap();
         assert_eq!(back.skipped_reason.as_deref(), Some(skip_reason::OVER_CAP));
+    }
+
+    // F2 wire shape, half 1: BOTH new fields absent from the wire when
+    // `None`, so every record written before they existed is byte-identical
+    // — and an old-shape line still parses with both defaulting to `None`.
+    #[test]
+    fn link_kind_and_attribution_absent_when_none() {
+        let old_shape =
+            r#"{"path":"a.rs","before":null,"after":null,"op":"modify","skipped":true}"#;
+        let entry: FileEntry = serde_json::from_str(old_shape).unwrap();
+        assert_eq!(entry.link_kind, None);
+        assert_eq!(entry.attribution, None);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            json, old_shape,
+            "None link_kind/attribution must not appear on the wire"
+        );
+        assert!(!json.contains("link_kind"));
+        assert!(!json.contains("attribution"));
+    }
+
+    // Half 2: `Some` values survive a full round trip, including a value
+    // this binary never writes and does not recognize. Parsing MUST succeed
+    // — the refusal is the consumer's job (refuse-to-act, not
+    // refuse-to-parse); the acting half is
+    // `readcmds::build_plan_refuses_unknown_link_kind_value`.
+    #[test]
+    fn link_kind_and_attribution_round_trip_including_unknown_values() {
+        let wire = r#"{"path":"a.rs","before":null,"after":null,"op":"modify","link_kind":"junction","attribution":"agent:claude/tool-call-7"}"#;
+        let entry: FileEntry = serde_json::from_str(wire).unwrap();
+        assert_eq!(entry.link_kind.as_deref(), Some("junction"));
+        assert_eq!(
+            entry.attribution.as_deref(),
+            Some("agent:claude/tool-call-7")
+        );
+        assert_eq!(serde_json::to_string(&entry).unwrap(), wire);
+
+        let sym = FileEntry {
+            link_kind: Some(link_kind::SYMLINK.to_string()),
+            ..entry
+        };
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(json.contains(r#""link_kind":"symlink""#), "json: {json}");
+        let back: FileEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.link_kind.as_deref(), Some(link_kind::SYMLINK));
     }
 
     #[test]

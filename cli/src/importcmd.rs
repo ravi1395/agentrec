@@ -2105,6 +2105,8 @@ mod persist {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             });
         }
 
@@ -2267,6 +2269,8 @@ mod persist {
             baseline_unknown: false,
             skipped_reason,
             after_synthesized,
+            link_kind: None,
+            attribution: None,
         })
     }
 

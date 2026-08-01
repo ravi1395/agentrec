@@ -17,8 +17,8 @@ use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
 use agentrec_core::record::{
-    append_log, parse_signals, skip_reason, EpochRecord, FileEntry, LogRecord, SignalEvent,
-    TurnRecord,
+    append_log, link_kind, parse_signals, skip_reason, EpochRecord, FileEntry, LogRecord,
+    SignalEvent, TurnRecord,
 };
 use agentrec_core::scrub;
 use agentrec_core::store::{hash_bytes, BlobStore, PutResult};
@@ -99,7 +99,7 @@ fn run_eviction_pass(root: &Path) {
         })
         .collect();
     let extra_protected = crate::cmds::extra_protected_refs(root);
-    let budget = crate::cmds::effective_store_budget();
+    let budget = crate::cmds::effective_store_budget(root);
     let plan =
         agentrec_core::retention::plan_eviction(&store, &owned_turns, budget, &extra_protected);
     let evicted = agentrec_core::retention::execute(&store, plan);
@@ -961,6 +961,22 @@ struct Recorder {
     baseline: HashMap<PathBuf, String>,
     /// Path (relative, string) → latest `after` hash, resolved at turn close.
     after: HashMap<String, Option<String>>,
+    /// Paths (relative, string) whose LAST live observation found a symbolic
+    /// link, i.e. whose snapshotted bytes are a link target string and not
+    /// file content. Read by `resolve` into `FileEntry::link_kind` (F2).
+    ///
+    /// Keyed and resolved exactly like `after` above — same key type, same
+    /// last-observation-wins semantics at turn close — because `ChangeObs`
+    /// lives in `agentrec-core::engine` and carries no link-kind field, so
+    /// there is no per-observation channel to use instead. Consequence,
+    /// stated rather than hidden: a path observed as a link and then as a
+    /// regular file within one turn resolves as the regular file, exactly
+    /// as its `after` hash does.
+    ///
+    /// A `delete` observation deliberately does NOT clear an entry — the
+    /// last live observation is the only record that a now-absent path was
+    /// a link, and that is precisely the entry undo must refuse (F2a).
+    link_kinds: HashSet<String>,
     /// Session id → model, extracted from transcripts; resolved at persist.
     models: HashMap<String, String>,
     /// (rel_path, cause) pairs for genuine snapshot I/O failures this batch,
@@ -1022,6 +1038,7 @@ impl Recorder {
             known,
             baseline: HashMap::new(),
             after: HashMap::new(),
+            link_kinds: HashSet::new(),
             models: HashMap::new(),
             io_failures: Vec::new(),
             non_utf8_skips: 0,
@@ -1184,6 +1201,16 @@ impl Recorder {
                 (None, false) => {}
             }
             self.after.insert(rel_str.clone(), after);
+            // F2: track link-kind alongside `after`, on the same key, so
+            // `resolve` can mark the entry. A path seen as an ordinary file
+            // clears any earlier mark — an honest record must not claim a
+            // regular file is a link. A `delete` clears nothing: the mark is
+            // the only surviving evidence that the vanished path was a link.
+            if is_symlink {
+                self.link_kinds.insert(rel_str.clone());
+            } else if !deleted {
+                self.link_kinds.remove(&rel_str);
+            }
 
             out.push(ChangeObs {
                 path: rel_str,
@@ -1224,6 +1251,21 @@ impl Recorder {
             baseline_unknown: obs.baseline_unknown,
             skipped_reason: obs.skip_reason.clone(),
             after_synthesized: None,
+            // F2 (red team round 2): the entry must SAY that its hashes
+            // address a link target string rather than file content, so
+            // undo can refuse instead of writing that string into a file.
+            // Resolved from `self.link_kinds` for the same reason `after`
+            // is resolved from `self.after` — `ChangeObs` (agentrec-core's
+            // engine type) carries no link-kind field, so the daemon keeps
+            // the fact in its own per-path map and both share the same
+            // last-observation-wins resolution at turn close.
+            link_kind: self
+                .link_kinds
+                .contains(&obs.path)
+                .then(|| link_kind::SYMLINK.to_string()),
+            // Never written here — see `FileEntry::attribution`. Populating
+            // it is the D6 transcript-correlation producer's job.
+            attribution: None,
         }
     }
 }
@@ -2409,6 +2451,7 @@ mod tests {
                 .iter()
                 .map(|(p, h)| (p.to_string(), h.map(String::from)))
                 .collect(),
+            link_kinds: HashSet::new(),
             models: HashMap::new(),
             io_failures: Vec::new(),
             non_utf8_skips: 0,
@@ -2590,6 +2633,131 @@ mod tests {
         assert_eq!(skip_cause.as_deref(), Some(skip_reason::UNREADABLE));
         assert!(!deduped, "a failed read_link never reaches the put path");
         assert_eq!(reread_bytes, 0);
+    }
+
+    // F2 writer half, through the REAL `stage` → `resolve` path against a
+    // real on-disk symlink (a `symlink_change`-level test would be vacuous
+    // here — `symlink_change` never sees `link_kind` under this design; the
+    // fact travels via `Recorder::link_kinds`, so only a stage→resolve test
+    // proves the map actually crossed).
+    //
+    // This test is also the PROBE for what the daemon snapshots for a link:
+    // it asserts the stored blob's bytes, so the record's claim that
+    // `before`/`after` address the link TARGET STRING rather than the
+    // pointed-to file's content is measured here, not assumed.
+    #[test]
+    #[cfg(unix)]
+    fn stage_symlink_records_link_kind_and_snapshots_target_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        // The pointed-to file has DIFFERENT content from the target string,
+        // so "followed the link" and "stored the target string" cannot be
+        // confused by an accidental byte match.
+        std::fs::write(root.join("target.txt"), b"POINTED-TO CONTENT\n").unwrap();
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+
+        let mut paths = HashSet::new();
+        paths.insert(link);
+        let changes = recorder.stage(&paths);
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+
+        let entry = recorder.resolve(&changes[0]);
+        assert_eq!(
+            entry.link_kind.as_deref(),
+            Some(link_kind::SYMLINK),
+            "entry: {entry:?}"
+        );
+
+        // Probe: what did the daemon actually store?
+        let store2 = BlobStore::new(root.join(".agentrec/objects"));
+        let stored = store2
+            .get(entry.after.as_deref().expect("symlink must have an after"))
+            .expect("symlink target blob must be in the store");
+        assert_eq!(
+            stored, b"target.txt",
+            "the snapshot must be the LINK TARGET STRING, not the pointed-to file's bytes"
+        );
+        assert_ne!(
+            stored, b"POINTED-TO CONTENT\n",
+            "the recorder must not follow the link (AC B5)"
+        );
+    }
+
+    // Honesty in the other direction: an ordinary file must never be marked,
+    // and a path that WAS a link and is now an ordinary file must lose the
+    // mark — a record that over-claims is not a safer record, it is a false
+    // one. Safety for that window lives in undo's on-disk lstat check.
+    #[test]
+    #[cfg(unix)]
+    fn stage_clears_link_kind_when_path_becomes_a_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        std::fs::write(root.join("t.txt"), b"t\n").unwrap();
+        let p = root.join("swap");
+        std::os::unix::fs::symlink("t.txt", &p).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(p.clone());
+
+        let changes = recorder.stage(&paths);
+        assert_eq!(
+            recorder.resolve(&changes[0]).link_kind.as_deref(),
+            Some(link_kind::SYMLINK)
+        );
+
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"now an ordinary file\n").unwrap();
+        let changes = recorder.stage(&paths);
+        let entry = recorder.resolve(&changes[0]);
+        assert_eq!(
+            entry.link_kind, None,
+            "a regular file must never be recorded as a link: {entry:?}"
+        );
+
+        // Control: a path never observed as a link is never marked.
+        let plain = root.join("plain.rs");
+        std::fs::write(&plain, b"fn main() {}\n").unwrap();
+        let mut paths2 = HashSet::new();
+        paths2.insert(plain);
+        let changes = recorder.stage(&paths2);
+        assert_eq!(recorder.resolve(&changes[0]).link_kind, None);
+    }
+
+    // F2a's own case: the link is DELETED. Nothing is left to lstat, so the
+    // record is the only surviving evidence that the vanished path was a
+    // link — the delete entry must keep `link_kind`, or undo restores the
+    // target string as a text file.
+    #[test]
+    #[cfg(unix)]
+    fn stage_deleted_symlink_keeps_link_kind_on_the_delete_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+
+        std::fs::write(root.join("t.txt"), b"t\n").unwrap();
+        let p = root.join("gone");
+        std::os::unix::fs::symlink("t.txt", &p).unwrap();
+        let mut paths = HashSet::new();
+        paths.insert(p.clone());
+        let _ = recorder.stage(&paths);
+
+        std::fs::remove_file(&p).unwrap();
+        let changes = recorder.stage(&paths);
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        let entry = recorder.resolve(&changes[0]);
+        assert_eq!(entry.op, "delete");
+        assert_eq!(
+            entry.link_kind.as_deref(),
+            Some(link_kind::SYMLINK),
+            "a delete must not erase the only record that the path was a link: {entry:?}"
+        );
     }
 
     // SR2 (io_failed producer): the write itself fails, but the bytes WERE
@@ -4385,6 +4553,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }];
 
         let existing = TurnRecord {
@@ -4466,6 +4636,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }];
 
         let id = turn_id();
@@ -4552,6 +4724,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
             id: turn_id(),
         };

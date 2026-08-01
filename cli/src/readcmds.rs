@@ -701,6 +701,31 @@ fn build_plan(
             }
         }
 
+        // F2 (red team round 2). This gate is FIRST, above every other
+        // refusal, because it is the only one whose failure mode writes to a
+        // file that was never in the plan: `std::fs::write` follows a
+        // symlink and truncates its target, and the post-write read-back
+        // follows it too, so the corruption verifies clean and reports
+        // success. It is also unconditional w.r.t. `--allow-modified` — it
+        // sits above the modified-since gate below, so that flag never
+        // reaches it.
+        //
+        // TWO INDEPENDENT triggers, each sufficient on its own:
+        //   1. the record says the path was a link when it was snapshotted;
+        //   2. the path IS a link on disk right now.
+        // (1) does not cover records written before `link_kind` existed —
+        // they carry no such field and never will, so (2) is the ONLY guard
+        // for the entire pre-existing log. (2) does not cover a link that
+        // has since been deleted (nothing to lstat), which is exactly the
+        // F2a delete-restore case — so (1) is the only guard there. Neither
+        // subsumes the other; both stay.
+        if let Some(kind) = symlink_refusal(root, entry) {
+            plans.push(Plan {
+                entry: entry.clone(),
+                kind,
+            });
+            continue;
+        }
         if entry.withheld {
             plans.push(Plan {
                 entry: entry.clone(),
@@ -807,6 +832,49 @@ fn build_plan(
 /// (a spurious `None` looks like a legitimate delete-target, not a bypass).
 fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
     std::fs::read(root.join(rel)).ok().map(|b| hash_bytes(&b))
+}
+
+/// True when `path` is itself a symbolic link. `symlink_metadata` is an
+/// lstat: it describes the link, where `metadata`/`Path::exists` would
+/// describe (and a write would hit) the pointed-to file. A metadata error —
+/// absent path, permission denied — is `false`: this predicate answers only
+/// "is there a link here", and the absent case is handled by the record-side
+/// trigger instead.
+fn is_symlink_on_disk(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
+/// be reverted because a link is involved, `None` otherwise.
+///
+/// The two triggers produce DELIBERATELY DIFFERENT text. They are different
+/// facts — "the record says this was a link" vs "there is a link here now" —
+/// and only distinct wording lets a reader (or a test) tell which one fired;
+/// identical text would let the legacy-record path pass a test for the wrong
+/// reason.
+///
+/// `entry.link_kind` is matched on `is_some()`, never against the known
+/// value: an unrecognized future kind is still not an ordinary file, so
+/// refusing to act on it is the correct degradation (PROTOCOL §5,
+/// refuse-to-act-not-refuse-to-parse). Never make this an equality test
+/// against [`link_kind::SYMLINK`].
+fn symlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
+    if let Some(kind) = entry.link_kind.as_deref() {
+        return Some(PlanKind::Refused {
+            reason: format!(
+                "recorded as a {kind} — its snapshot is the link target, not file content"
+            ),
+        });
+    }
+    if is_symlink_on_disk(&root.join(&entry.path)) {
+        return Some(PlanKind::Refused {
+            reason: "path is a symlink on disk — reverting would write through the link"
+                .to_string(),
+        });
+    }
+    None
 }
 
 /// Best-effort explanation for why a path is modified-since the target turn:
@@ -1038,6 +1106,8 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
         baseline_unknown: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
     })
 }
 
@@ -1049,6 +1119,20 @@ fn restore_from_before(
     store: &BlobStore,
     entry: &FileEntry,
 ) -> Result<String, String> {
+    // F2, second gate. `build_plan::symlink_refusal` already keeps every
+    // link-involved entry out of the revert set; this repeats the check at
+    // the write primitive itself so no future caller of `restore_from_before`
+    // can reach `fs::write` on a link by skipping the planner. The `create`
+    // arm's `remove_file` is covered by the planner gate only — `remove_file`
+    // unlinks the link rather than following it, so it destroys a link but
+    // cannot truncate a file outside the plan.
+    if entry.link_kind.is_some() || is_symlink_on_disk(path) {
+        return Err(format!(
+            "{}: symlink — refusing to restore (writing here would replace the link or \
+             truncate its target)",
+            entry.path
+        ));
+    }
     let before_hash = entry
         .before
         .as_deref()
@@ -1139,6 +1223,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -1262,6 +1348,172 @@ mod tests {
         assert_eq!(
             lines[2],
             "    WARNING: 2Ksrc/evil.rs modified since (human or external edit) — reverting anyway (--allow-modified)"
+        );
+    }
+
+    // ---- F2 (red team round 2): symlink refusals -------------------------
+
+    fn plan_for(
+        root: &Path,
+        entries: Vec<FileEntry>,
+        allow_modified: bool,
+    ) -> (TurnRecord, Vec<Plan>) {
+        let store = BlobStore::new(objects_dir(root));
+        let mut t = turn("rich", Some("claude"));
+        t.files = entries;
+        let turns = vec![&t];
+        let plans = build_plan(root, &store, &t, 0, &turns, &[], &[], allow_modified);
+        (t.clone(), plans)
+    }
+
+    fn refusal_reason(plans: &[Plan]) -> String {
+        match &plans[0].kind {
+            PlanKind::Refused { reason } => reason.clone(),
+            PlanKind::Excluded { cause } => panic!("expected REFUSE, got EXCLUDE ({cause})"),
+            PlanKind::Revert { .. } => panic!("expected REFUSE, got revert"),
+        }
+    }
+
+    // Trigger 1, record side. An UNKNOWN `link_kind` value must refuse to
+    // ACT while still having parsed fine (the parse half is
+    // `record.rs::link_kind_unknown_value_round_trips`) — refuse-to-act,
+    // never refuse-to-parse. If this ever becomes an `== "symlink"` equality
+    // test, this reds.
+    #[test]
+    fn build_plan_refuses_unknown_link_kind_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut e = entry("mnt/j", "modify");
+        e.link_kind = Some("junction".to_string());
+        let (_, plans) = plan_for(root, vec![e], false);
+        assert_eq!(
+            refusal_reason(&plans),
+            "recorded as a junction — its snapshot is the link target, not file content"
+        );
+    }
+
+    // Trigger 2, the LEGACY-RECORD guard: the entry carries no `link_kind`
+    // (it predates the field), so only the on-disk lstat can save it. The
+    // distinct wording is what proves this branch fired rather than trigger
+    // 1 — identical text would let this test pass for the wrong reason.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_on_disk_symlink_for_legacy_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.yaml"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.yaml", root.join("cfg.yaml")).unwrap();
+
+        let e = entry("cfg.yaml", "modify");
+        assert_eq!(e.link_kind, None, "fixture must be a pre-link_kind entry");
+        let (_, plans) = plan_for(root, vec![e], false);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link"
+        );
+    }
+
+    // `--allow-modified` overrides the modified-since EXCLUDE and nothing
+    // else. Both triggers are asserted under the flag, because the flag is
+    // exactly the path F2b weaponized.
+    #[test]
+    #[cfg(unix)]
+    fn allow_modified_never_overrides_a_symlink_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.yaml"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.yaml", root.join("cfg.yaml")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("cfg.yaml", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link"
+        );
+
+        let mut e = entry("nowhere/link", "delete");
+        e.link_kind = Some(agentrec_core::record::link_kind::SYMLINK.to_string());
+        let (_, plans) = plan_for(root, vec![e], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "recorded as a symlink — its snapshot is the link target, not file content"
+        );
+    }
+
+    // Byte-exact REFUSE row, same standing-in-for-a-golden role as
+    // `render_plan_clean_input_is_byte_exact` (there is still no `undo`
+    // golden file).
+    #[test]
+    fn render_plan_symlink_refusal_row_is_byte_exact() {
+        let t = turn("rich", Some("agentrec"));
+        let plans = vec![Plan {
+            entry: entry("cfg.yaml", "modify"),
+            kind: PlanKind::Refused {
+                reason: "path is a symlink on disk — reverting would write through the link"
+                    .to_string(),
+            },
+        }];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (agentrec)\n\
+             \x20 REFUSE  cfg.yaml — path is a symlink on disk — reverting would write through \
+             the link\n"
+        );
+    }
+
+    // F2b at the write primitive itself (the second gate). The pointed-to
+    // file must survive byte-identical — that is the whole finding: today
+    // `fs::write` truncates it and the read-back verification passes.
+    #[test]
+    #[cfg(unix)]
+    fn restore_from_before_refuses_symlink_and_leaves_target_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(objects_dir(root));
+        let target = root.join("prod.yaml");
+        std::fs::write(&target, b"PRODUCTION CONFIG\n").unwrap();
+        let link = root.join("cfg.yaml");
+        std::os::unix::fs::symlink("prod.yaml", &link).unwrap();
+
+        let mut e = entry("cfg.yaml", "modify");
+        e.before = Some(store.put(b"dev.yaml").unwrap());
+
+        let err = restore_from_before(&link, &store, &e).unwrap_err();
+        assert!(err.contains("symlink — refusing to restore"), "err: {err}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"PRODUCTION CONFIG\n",
+            "a file that was never in the plan must not be touched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive"
+        );
+    }
+
+    // The one op path `restore_from_before`'s second gate does NOT cover:
+    // reverting a `create` deletes rather than writes, so it never reaches
+    // `restore_from_before` at all and the planner gate is the only thing
+    // standing between an on-disk link and `remove_file`. That is exactly
+    // what the comment on `restore_from_before` claims, so it is pinned here
+    // rather than left as an assertion nobody measured. `remove_file`
+    // unlinks the link (it does not follow it), so the pointed-to file would
+    // survive — but the LINK would not, and undo never recorded it.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_create_op_when_path_is_an_on_disk_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", root.join("made.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("made.txt", "create")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link",
+            "a create-revert must not unlink a symlink undo never recorded"
         );
     }
 }
