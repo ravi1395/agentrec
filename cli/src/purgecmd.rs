@@ -32,6 +32,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_TTL_DAYS: u64 = 90;
 const DAY_MS: u64 = 86_400_000;
 
+// F9 pushed this to 8 parameters (clippy's threshold is 7). Kept as a flat
+// signature rather than folded into a flags struct: this is a 1:1 mirror of
+// clap's `Command::Purge` variant, and the mirror is what makes it obvious at
+// the call site that every flag is forwarded. A struct is the right shape once
+// a ninth flag lands; recorded here rather than done as drive-by churn across
+// this module's test call sites.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     root: &Path,
     all_prompts: bool,
@@ -40,6 +47,7 @@ pub fn run(
     log_duplicates: bool,
     orphans: bool,
     signals_consumed: bool,
+    path: Option<&str>,
 ) -> Result<(), String> {
     // F11 (red team round 2): the verb-level daemon-liveness refusal sits
     // HERE, ahead of every destructive step in this file, rather than only
@@ -59,6 +67,22 @@ pub fn run(
              turns, blobs and signals concurrently"
                 .to_string(),
         );
+    }
+
+    // F9: `--path` is a SURGICAL op ("forget what you recorded about this
+    // file"), and it returns here rather than falling through to the shared
+    // steps below. That is a deliberate exception to this verb's structure,
+    // for one reason: `purge_prompts` runs UNCONDITIONALLY on every other
+    // invocation, so without this early return `agentrec purge --path
+    // secrets/prod.yaml` would also archive every prompt blob older than
+    // `ttl_days` — 90 days of prompt text reclaimed as a side effect of a
+    // request to forget one file. That is the same class of surprise F11 just
+    // fixed (a step the user did not ask for, running ahead of the step they
+    // did), and shipping the flag with it intact would re-open it. The clap
+    // layer additionally refuses `--path` combined with any other purge flag,
+    // so this return can never skip work the user asked for.
+    if let Some(pattern) = path {
+        return purge_path(root, pattern);
     }
 
     let records = agentrec_core::record::load_log(&log_path(root));
@@ -1163,6 +1187,286 @@ fn rewrite_signal_atomic(sig_path: &Path, tail: &[u8]) -> Result<(), String> {
     }
 }
 
+// ---- purge --path (F9: path-targeted forget) -------------------------------
+//
+// F9 (red team round 2): every pre-existing removal path is date-, budget- or
+// class-based, so a credential that was snapshotted into the CAS was permanent.
+// Rotating the key, `git rm`-ing the file and gitignoring it left the
+// pre-rotation bytes readable through `diff`/`show`/`undo` forever, and the
+// only remediation was a blanket date purge that also destroyed unrelated
+// recovery history. This op is the path-scoped remediation, and it is the
+// reason F6/F7 land in the same change: without it, every shape those two
+// tables still miss stays permanent.
+//
+// THE SEMANTICS ARE CONSTRAINED BY THE STORE MODEL, not chosen freely. Blobs
+// are content-addressed: one object per distinct byte-string, shared by every
+// entry whose content is identical. "Delete the blobs of file X" is therefore
+// not always expressible — if `secrets/prod.yaml` and `config/example.yaml`
+// ever held identical bytes, they ARE one object, and removing it would blow a
+// hole in the second file's history. So the honest contract is:
+//
+//   archive every blob referenced ONLY by matching file entries;
+//   KEEP every blob also referenced from outside the pattern, and report the
+//   count loudly rather than silently doing half a job.
+//
+// "Outside the pattern" is deliberately over-inclusive, the same safe
+// direction `purge_orphans` takes. The protect-set unions:
+//   * `before`/`after` of every NON-matching file entry;
+//   * EVERY `prompt_ref`, matching turn or not — a prompt blob is not
+//     path-scoped, and a short file's snapshot can be byte-identical to a
+//     prompt, which would make them one object;
+//   * every `sha256:` ref on a log line that does NOT parse as a turn record —
+//     torn lines, epochs, future record types. `load_log` drops those, so a
+//     structured read alone would treat a blob cited only by a torn line as
+//     unreferenced-outside-the-match and archive it;
+//   * every ref in `open.json` (in-flight crash journal) and `memory.jsonl`
+//     (pin hashes), via the same `referenced_hashes` primitive `--orphans` uses.
+//
+// `log.jsonl` IS NOT REWRITTEN. The matching paths and hashes stay in the
+// record — dropping them would be a fourth sanctioned rewrite class, which
+// needs a decision-register entry this op does not have. Measured consequences
+// (driven through the real binary in `cli/tests/purge_path.rs`, not read off
+// the source): `diff` prints `  <path>: (snapshot unavailable)` via
+// `FileDiffState::Unresolvable`, and `undo`'s `build_plan` refuses the
+// entry with `prior snapshot unavailable — refusing to restore` before
+// mutating anything. Both are the pre-existing missing-blob paths; this op
+// adds no new rendering.
+//
+// One qualifier, learned by measuring rather than assumed: `undo` only reaches
+// that refusal when the file is otherwise UNMODIFIED. An entry whose file has
+// changed (or vanished) since the turn is EXCLUDEd as modified-since first, and
+// the user sees that instead — the first version of the integration test used a
+// fixture with no file on disk and got `undo t_A (—)` with no refusal at all.
+// Either way `undo` does not restore the purged bytes, which is the property
+// that matters; the command's own output is worded to that, not to the refusal
+// string alone.
+
+/// `purge --path <PATTERN>`: archive the snapshot blobs referenced only by
+/// file entries whose path matches `PATTERN`. See the module comment above for
+/// the shared-blob contract and the protect-set completeness argument.
+fn purge_path(root: &Path, pattern: &str) -> Result<(), String> {
+    // Sibling parity: `run` already refused above, but every op in this module
+    // also refuses on its own (they are driven directly by this module's unit
+    // tests, and a future dispatch reorder must not be able to strip the
+    // guarantee). Same posture as `purge_prompts`/`purge_orphans`.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before purging by path — \
+             the daemon appends new snapshot blobs and turns concurrently"
+                .to_string(),
+        );
+    }
+    if pattern.trim().is_empty() {
+        return Err("--path requires a non-empty pattern".to_string());
+    }
+
+    let store = BlobStore::new(objects_dir(root));
+    let Scan {
+        candidates,
+        protect,
+        matched_entries,
+    } = scan_for_path(root, pattern);
+
+    if matched_entries == 0 {
+        println!("no recorded file entry matches {pattern} — nothing to reclaim");
+        return Ok(());
+    }
+
+    // Same A3(b) narrowing as `purge_prompts`/`purge_snapshots_before`:
+    // recompute the protect-set from a FRESH read immediately before the
+    // destructive step, so a turn appended by `undo`/`import` (which take
+    // `log.lock`, not `daemon.lock`, and are therefore invisible to the
+    // liveness probe above) between the scan and here still protects its
+    // blobs. Narrowed, not closed — and archive-only, so the residual is
+    // recoverable by moving the archive directory back.
+    let fresh = scan_for_path(root, pattern);
+    let mut archivable: Vec<&String> = candidates
+        .iter()
+        .filter(|h| !protect.contains(*h) && !fresh.protect.contains(*h))
+        .collect();
+    archivable.sort();
+    let shared = candidates.len() - archivable.len();
+
+    let archive_dir = objects_archive_path(root);
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for hash in &archivable {
+        if let Some(size) = store.archive(hash, &archive_dir) {
+            count += 1;
+            bytes += size;
+        }
+    }
+
+    if count > 0 {
+        agentrec_core::perms::lock_dir(&archive_dir);
+        println!(
+            "purged {count} snapshot blob(s) of {matched_entries} file entrie(s) matching \
+             {pattern}, {} freed — archived to {}",
+            human_bytes(bytes),
+            archive_dir.display()
+        );
+    } else {
+        println!(
+            "purged 0 snapshot blob(s) of {matched_entries} file entrie(s) matching {pattern} \
+             — nothing to reclaim"
+        );
+    }
+    if shared > 0 {
+        println!(
+            "  {shared} blob(s) KEPT — identical content is also referenced outside {pattern} \
+             (content-addressed store: it is the same object)"
+        );
+    }
+    if count > 0 {
+        println!(
+            "  log.jsonl is unchanged: those paths and hashes remain recorded. `diff` now \
+             prints `(snapshot unavailable)` for them, and `undo` will not restore them — \
+             an entry whose file is otherwise unmodified is refused with `prior snapshot \
+             unavailable — refusing to restore`."
+        );
+    }
+    Ok(())
+}
+
+/// One pass over everything that can reference a CAS blob, split into the
+/// blobs a `--path` pattern selects and the blobs anything else protects.
+struct Scan {
+    /// Hashes referenced by at least one MATCHING file entry.
+    candidates: HashSet<String>,
+    /// Hashes referenced by anything that is not a matching file entry.
+    protect: HashSet<String>,
+    /// How many file entries matched — distinguishes "pattern matched nothing"
+    /// from "matched, but every blob is shared".
+    matched_entries: usize,
+}
+
+fn scan_for_path(root: &Path, pattern: &str) -> Scan {
+    let mut candidates: HashSet<String> = HashSet::new();
+    let mut protect: HashSet<String> = HashSet::new();
+    let mut matched_entries = 0usize;
+
+    let text = std::fs::read_to_string(log_path(root)).unwrap_or_default();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(turn) = classify_turn_line(line) else {
+            // Epoch, unknown record type, or a torn line. `load_log` would
+            // drop it; harvest its refs raw so a blob cited only here is
+            // protected. Epochs carry no refs, so this costs nothing there.
+            harvest_refs(line, &mut protect);
+            continue;
+        };
+        if let Some(pref) = turn.prompt_ref.as_deref() {
+            protect.insert(pref.to_string());
+        }
+        for entry in &turn.files {
+            let matched = path_matches(pattern, &entry.path);
+            if matched {
+                matched_entries += 1;
+            }
+            for hash in [entry.before.as_deref(), entry.after.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if matched {
+                    candidates.insert(hash.to_string());
+                } else {
+                    protect.insert(hash.to_string());
+                }
+            }
+        }
+    }
+
+    // `open.json` + `memory.jsonl` (and `log.jsonl` again, harmlessly — this
+    // primitive scans all three). Anything it finds is protected: an in-flight
+    // turn or a memory pin is not a matching file entry.
+    for hash in referenced_hashes_outside_log(root) {
+        protect.insert(hash);
+    }
+
+    Scan {
+        candidates,
+        protect,
+        matched_entries,
+    }
+}
+
+/// The `open.json` + `memory.jsonl` half of [`referenced_hashes`] — the refs
+/// that exist OUTSIDE `log.jsonl`. `purge_path` needs these separately because
+/// it derives its own per-entry view of `log.jsonl`; folding in the whole-log
+/// scan would protect every blob and make the op a no-op.
+fn referenced_hashes_outside_log(root: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for path in [crate::open_path(root), memory_path(root)] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            harvest_refs(&text, &mut out);
+        }
+    }
+    out
+}
+
+/// Does `pattern` select the recorded (root-relative, `/`-separated) path
+/// `path`? Three forms, checked in order:
+///   * exact equality — `src/config.ts`;
+///   * directory prefix — `secrets` or `secrets/` selects `secrets/prod.yaml`
+///     at any depth beneath it (only when the pattern has no glob character,
+///     so a glob is never silently widened into a prefix match);
+///   * glob — `*` matches within one path segment, `**` crosses separators,
+///     `?` is one non-separator character.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    if pattern == path {
+        return true;
+    }
+    let has_glob = pattern.contains(['*', '?']);
+    if !has_glob {
+        let dir = pattern.trim_end_matches('/');
+        if !dir.is_empty()
+            && path.len() > dir.len()
+            && path.starts_with(dir)
+            && path.as_bytes()[dir.len()] == b'/'
+        {
+            return true;
+        }
+        return false;
+    }
+    glob_rec(pattern.as_bytes(), path.as_bytes())
+}
+
+/// Backtracking glob matcher. Deliberately hand-rolled rather than pulling in
+/// `globset`: `agentrec-core` and the CLI both stay dependency-light, and the
+/// inputs are recorded repo-relative paths (short, bounded), so the
+/// backtracking cost this shape can reach on adversarial patterns is not
+/// reachable from a real `log.jsonl`.
+fn glob_rec(p: &[u8], t: &[u8]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    if p[0] == b'*' {
+        if p.len() > 1 && p[1] == b'*' {
+            // `**/x` must also match `x` at depth zero, otherwise the most
+            // natural "this file anywhere" pattern misses the repo root.
+            if p.len() > 2 && p[2] == b'/' && glob_rec(&p[3..], t) {
+                return true;
+            }
+            return (0..=t.len()).any(|i| glob_rec(&p[2..], &t[i..]));
+        }
+        for i in 0..=t.len() {
+            if t[..i].contains(&b'/') {
+                break;
+            }
+            if glob_rec(&p[1..], &t[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if p[0] == b'?' {
+        return !t.is_empty() && t[0] != b'/' && glob_rec(&p[1..], &t[1..]);
+    }
+    !t.is_empty() && p[0] == t[0] && glob_rec(&p[1..], &t[1..])
+}
+
 // ---- purge --orphans (superseded-snapshot GC) ------------------------------
 //
 // The daemon `put`s a file's current content into the CAS on EVERY debounced
@@ -1642,7 +1946,7 @@ mod tests {
         );
 
         // orphans = true: the F11 scenario verbatim.
-        let err = run(root, false, None, false, false, true, false).unwrap_err();
+        let err = run(root, false, None, false, false, true, false, None).unwrap_err();
         assert!(
             err.contains("stop recording"),
             "the verb must refuse while recording: {err}"
@@ -1685,7 +1989,7 @@ mod tests {
         let (tmp, store, prompt) = expired_prompt_fixture();
         let root = tmp.path();
 
-        run(root, false, None, false, false, false, false).unwrap();
+        run(root, false, None, false, false, false, false, None).unwrap();
 
         assert!(
             !store.contains(&prompt),
@@ -2104,5 +2408,406 @@ mod tests {
         .unwrap();
 
         assert_eq!(orphan_bytes(root, &store), 25, "only the 25-byte orphan");
+    }
+
+    // ---- F9: purge --path (path-targeted forget) -------------------------
+
+    /// One `log.jsonl` turn line. `files` is a pre-rendered JSON array so each
+    /// test can shape entries exactly; `prompt` is an optional `prompt_ref`.
+    fn turn_line(id: &str, files: &str, prompt: Option<&str>) -> String {
+        let pref = match prompt {
+            Some(p) => format!("\"prompt_ref\":\"{p}\","),
+            None => String::new(),
+        };
+        format!(
+            "{{\"type\":\"turn\",\"v\":1,\"id\":\"{id}\",\"grade\":\"rich\",\
+             \"started\":\"2026-01-01T00:00:00.000Z\",\
+             \"ended\":\"2026-01-01T00:00:01.000Z\",\"root\":\"/x\",{pref}\
+             \"files\":{files}}}\n"
+        )
+    }
+
+    fn file_entry(path: &str, before: Option<&str>, after: Option<&str>) -> String {
+        let j = |v: Option<&str>| match v {
+            Some(h) => format!("\"{h}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"path\":\"{path}\",\"before\":{},\"after\":{},\"op\":\"modify\"}}",
+            j(before),
+            j(after)
+        )
+    }
+
+    /// Absolute path a blob would occupy inside `archive_dir` (fan-out layout).
+    fn archived_blob(archive_dir: &Path, hash: &str) -> PathBuf {
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        archive_dir.join(&hex[..2]).join(&hex[2..])
+    }
+
+    // The core F9 contract: blobs referenced ONLY by matching entries leave
+    // the store (into the archive, never deleted); everything else stays.
+    // Neuter: make `path_matches` return true unconditionally -> the
+    // non-matching blobs are archived too -> RED on the `contains` asserts.
+    #[test]
+    fn path_purge_archives_only_blobs_exclusive_to_the_matching_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let leaked_before = store.put(b"the pre-rotation credential bytes").unwrap();
+        let leaked_after = store.put(b"the post-rotation credential bytes").unwrap();
+        let source_before = store.put(b"fn main() { old }").unwrap();
+        let source_after = store.put(b"fn main() { new }").unwrap();
+
+        let files = format!(
+            "[{},{}]",
+            file_entry(
+                "secrets/prod.yaml",
+                Some(&leaked_before),
+                Some(&leaked_after)
+            ),
+            file_entry("src/main.rs", Some(&source_before), Some(&source_after))
+        );
+        std::fs::write(log_path(root), turn_line("t_A", &files, None)).unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(
+            !store.contains(&leaked_before) && !store.contains(&leaked_after),
+            "both blobs of the matching path must leave objects/"
+        );
+        assert!(
+            store.contains(&source_before) && store.contains(&source_after),
+            "a non-matching file's blobs must be untouched"
+        );
+
+        // Archived, not deleted — and in the same fan-out layout the sibling
+        // ops use, so moving the directory back restores the store.
+        let archive = objects_archive_dirs(root);
+        assert_eq!(archive.len(), 1, "exactly one archive dir");
+        for h in [&leaked_before, &leaked_after] {
+            assert!(
+                archived_blob(&archive[0], h).exists(),
+                "{h} preserved in the archive (never deleted)"
+            );
+        }
+    }
+
+    // log.jsonl is NOT rewritten — dropping those lines would be a fourth
+    // sanctioned rewrite class, which this op does not have.
+    #[test]
+    fn path_purge_leaves_log_jsonl_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let blob = store.put(b"leaked").unwrap();
+        let log = turn_line(
+            "t_A",
+            &format!("[{}]", file_entry("secrets/prod.yaml", None, Some(&blob))),
+            None,
+        );
+        std::fs::write(log_path(root), &log).unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(!store.contains(&blob), "the blob is gone from objects/");
+        assert_eq!(
+            std::fs::read_to_string(log_path(root)).unwrap(),
+            log,
+            "log.jsonl must be byte-identical: paths and hashes stay recorded"
+        );
+    }
+
+    // The content-addressing consequence: identical bytes are ONE object. A
+    // blob a non-matching entry also references must be kept, not silently
+    // half-removed. Neuter: drop the `else { protect.insert(..) }` arm in
+    // `scan_for_path` -> the shared blob is archived -> RED.
+    #[test]
+    fn path_purge_keeps_a_blob_shared_with_a_non_matching_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        // Same bytes recorded under two paths => one CAS object.
+        let shared = store.put(b"identical content under two paths").unwrap();
+        let exclusive = store.put(b"content only the matching path has").unwrap();
+        let files = format!(
+            "[{},{}]",
+            file_entry("secrets/prod.yaml", Some(&shared), Some(&exclusive)),
+            file_entry("docs/example.yaml", None, Some(&shared))
+        );
+        std::fs::write(log_path(root), turn_line("t_A", &files, None)).unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(
+            store.contains(&shared),
+            "a blob shared with a non-matching entry must be KEPT"
+        );
+        assert!(
+            !store.contains(&exclusive),
+            "the exclusive blob is still reclaimed"
+        );
+    }
+
+    // A prompt blob is not path-scoped, and a small file's snapshot can be
+    // byte-identical to a prompt — which makes them the same object. Every
+    // prompt_ref is protected regardless of which turn it belongs to.
+    #[test]
+    fn path_purge_never_archives_a_prompt_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let same = store.put(b"fix the yaml").unwrap();
+        let files = format!("[{}]", file_entry("secrets/prod.yaml", None, Some(&same)));
+        // The matching entry's `after` IS the other turn's prompt blob.
+        let log = format!(
+            "{}{}",
+            turn_line("t_A", &files, None),
+            turn_line("t_B", "[]", Some(&same))
+        );
+        std::fs::write(log_path(root), log).unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(
+            store.contains(&same),
+            "a blob that is also a prompt_ref must be kept"
+        );
+    }
+
+    // `load_log` silently drops torn lines, so a structured-only read would
+    // treat a blob cited ONLY by a torn line as unreferenced-outside-the-match
+    // and archive it. Mirrors `purge_orphans`' torn-line test.
+    // Neuter: delete the `harvest_refs(line, &mut protect)` fallback -> RED.
+    #[test]
+    fn path_purge_protects_a_blob_cited_only_by_a_torn_log_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let torn_ref = store.put(b"cited by a torn line and by the match").unwrap();
+        let clean = store.put(b"cited only by the matching entry").unwrap();
+        let files = format!(
+            "[{}]",
+            file_entry("secrets/prod.yaml", Some(&torn_ref), Some(&clean)),
+        );
+        let log = format!(
+            "{}{{\"v\":1,\"id\":\"t_TORN\",\"files\":[{{\"after\":\"{torn_ref}\"\n",
+            turn_line("t_A", &files, None)
+        );
+        std::fs::write(log_path(root), log).unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(
+            store.contains(&torn_ref),
+            "a blob cited by a torn (unparseable) line must be kept"
+        );
+        assert!(!store.contains(&clean), "the exclusive blob is reclaimed");
+    }
+
+    // `open.json` (in-flight crash journal) and `memory.jsonl` (pin hashes)
+    // are outside log.jsonl entirely; neither is a matching file entry.
+    #[test]
+    fn path_purge_protects_open_json_and_memory_pin_refs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let pending = store.put(b"in-flight open turn content").unwrap();
+        let pinned = store.put(b"a memory-pinned version").unwrap();
+        let files = format!(
+            "[{},{}]",
+            file_entry("secrets/prod.yaml", Some(&pending), None),
+            file_entry("secrets/other.yaml", None, Some(&pinned))
+        );
+        std::fs::write(log_path(root), turn_line("t_A", &files, None)).unwrap();
+        std::fs::write(
+            crate::open_path(root),
+            format!("{{\"files\":[{{\"before_hash\":\"{pending}\"}}]}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            memory_path(root),
+            format!(
+                "{{\"v\":1,\"type\":\"memory\",\"id\":\"01AAA\",\"op\":\"assert\",\
+                 \"fact\":\"x\",\"pins\":[{{\"path\":\"f.rs\",\"hash\":\"{pinned}\"}}],\
+                 \"source_turns\":[],\"origin\":\"human\",\"ts\":1}}\n"
+            ),
+        )
+        .unwrap();
+
+        purge_path(root, "secrets").unwrap();
+
+        assert!(store.contains(&pending), "open.json ref must be kept");
+        assert!(store.contains(&pinned), "memory pin ref must be kept");
+        assert!(
+            objects_archive_dirs(root).is_empty(),
+            "nothing archived => no archive dir created"
+        );
+    }
+
+    // Sibling parity with every other op in this module (F11's ordering
+    // property): the step refuses on its own, not only via `run`.
+    #[test]
+    fn path_purge_refuses_while_the_daemon_holds_the_lock() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let blob = store.put(b"leaked credential bytes").unwrap();
+        std::fs::write(
+            log_path(root),
+            turn_line(
+                "t_A",
+                &format!("[{}]", file_entry("secrets/prod.yaml", None, Some(&blob))),
+                None,
+            ),
+        )
+        .unwrap();
+
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(agentrec_dir(root).join("daemon.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        // Through the verb...
+        let err = run(
+            root,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            Some("secrets/prod.yaml"),
+        )
+        .unwrap_err();
+        assert!(err.contains("stop recording"), "verb must refuse: {err}");
+        // ...and driven directly.
+        let direct = purge_path(root, "secrets/prod.yaml").unwrap_err();
+        assert!(
+            direct.contains("stop recording"),
+            "the step must refuse on its own: {direct}"
+        );
+
+        assert!(store.contains(&blob), "a refused purge destroys nothing");
+        assert!(
+            objects_archive_dirs(root).is_empty(),
+            "a refused purge creates no archive dir either"
+        );
+    }
+
+    // `--path` must NOT drag the unconditional prompt purge along with it:
+    // "forget one file" may not also reclaim 90 days of prompt text.
+    // Neuter: remove the early `return purge_path(..)` in `run` -> the expired
+    // prompt blob leaves the store -> RED.
+    #[test]
+    fn path_purge_does_not_run_the_default_prompt_purge() {
+        let (tmp, store, prompt) = expired_prompt_fixture();
+        let root = tmp.path();
+
+        run(
+            root,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            Some("no/such/file"),
+        )
+        .unwrap();
+
+        assert!(
+            store.contains(&prompt),
+            "purge --path must leave expired prompt blobs alone"
+        );
+        assert!(
+            objects_archive_dirs(root).is_empty(),
+            "and must not create an archive dir for them"
+        );
+    }
+
+    #[test]
+    fn path_purge_reports_no_match_without_touching_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let blob = store.put(b"unrelated content").unwrap();
+        std::fs::write(
+            log_path(root),
+            turn_line(
+                "t_A",
+                &format!("[{}]", file_entry("src/main.rs", None, Some(&blob))),
+                None,
+            ),
+        )
+        .unwrap();
+
+        purge_path(root, "secrets/prod.yaml").unwrap();
+
+        assert!(store.contains(&blob), "no match => nothing touched");
+        assert!(objects_archive_dirs(root).is_empty());
+    }
+
+    #[test]
+    fn path_purge_refuses_an_empty_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let err = purge_path(root, "   ").unwrap_err();
+        assert!(err.contains("non-empty"), "must name the cause: {err}");
+    }
+
+    #[test]
+    fn path_matches_exact_prefix_and_glob_forms() {
+        // exact
+        assert!(path_matches("src/config.ts", "src/config.ts"));
+        assert!(!path_matches("src/config.ts", "src/config.tsx"));
+        // directory prefix, at any depth
+        assert!(path_matches("secrets", "secrets/prod.yaml"));
+        assert!(path_matches("secrets/", "secrets/prod.yaml"));
+        assert!(path_matches("secrets", "secrets/a/b/c.yaml"));
+        // a prefix must end on a separator, never mid-name
+        assert!(!path_matches("secret", "secrets/prod.yaml"));
+        assert!(!path_matches("secrets", "secretsx/prod.yaml"));
+        // `*` stays inside one segment
+        assert!(path_matches("secrets/*.yaml", "secrets/prod.yaml"));
+        assert!(!path_matches("secrets/*.yaml", "secrets/sub/prod.yaml"));
+        // `**` crosses separators, and `**/x` also matches at depth zero
+        assert!(path_matches("**/*.pem", "certs/inner/server.pem"));
+        assert!(path_matches("**/id_rsa", "id_rsa"));
+        assert!(path_matches("secrets/**", "secrets/a/b.yaml"));
+        // `?` is exactly one non-separator character
+        assert!(path_matches("src/config.t?", "src/config.ts"));
+        assert!(!path_matches("src/config.t?", "src/config.tsx"));
+        assert!(!path_matches("src?config.ts", "src/config.ts"));
+    }
+
+    // A glob pattern must never be silently widened into a directory-prefix
+    // match — `secrets/*` selects the files directly under `secrets/`, not the
+    // whole subtree.
+    #[test]
+    fn path_matches_does_not_widen_a_glob_into_a_prefix() {
+        assert!(path_matches("secrets/*", "secrets/prod.yaml"));
+        assert!(!path_matches("secrets/*", "secrets/sub/prod.yaml"));
     }
 }

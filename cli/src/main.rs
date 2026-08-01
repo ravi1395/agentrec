@@ -200,6 +200,34 @@ enum Command {
         /// operation. Refuses while the daemon is recording (D48).
         #[arg(long = "signals-consumed")]
         signals_consumed: bool,
+        /// Forget the recorded content of files matching PATTERN (exact path,
+        /// directory prefix, or a `*`/`**`/`?` glob): archives (never deletes)
+        /// every snapshot blob referenced ONLY by matching file entries into
+        /// `.agentrec/objects.archived.<ts>/`. A blob whose identical bytes are
+        /// also referenced from outside the pattern is KEPT and reported as
+        /// shared — the store is content-addressed, so those are the same
+        /// object. `log.jsonl` is NOT rewritten: the matching paths and hashes
+        /// stay in the record, so `diff` then prints `(snapshot unavailable)`
+        /// for them and `undo` will not restore them — an entry whose file is
+        /// otherwise unmodified is refused with `prior snapshot unavailable —
+        /// refusing to restore`, and one that changed since the turn is
+        /// excluded as modified-since exactly as it was before.
+        /// Prompt blobs are never touched by this flag.
+        /// Refuses while the daemon is recording; cannot be combined with the
+        /// other purge flags.
+        #[arg(
+            long = "path",
+            value_name = "PATTERN",
+            conflicts_with_all = [
+                "all_prompts",
+                "snapshots_before",
+                "memories_retracted",
+                "log_duplicates",
+                "orphans",
+                "signals_consumed",
+            ]
+        )]
+        path: Option<String>,
     },
     /// Record a manual, human-authored pinned memory.
     Remember {
@@ -379,6 +407,7 @@ fn main() {
             log_duplicates,
             orphans,
             signals_consumed,
+            path,
         } => purgecmd::run(
             &root,
             all_prompts,
@@ -387,6 +416,7 @@ fn main() {
             log_duplicates,
             orphans,
             signals_consumed,
+            path.as_deref(),
         ),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
         Command::Recall {
