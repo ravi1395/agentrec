@@ -862,6 +862,12 @@ fn is_symlink_on_disk(path: &Path) -> bool {
 /// against [`link_kind::SYMLINK`].
 fn symlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
     if let Some(kind) = entry.link_kind.as_deref() {
+        // `link_kind` is wire data on an OPEN enum — a foreign producer can
+        // put any bytes here, and this string reaches the pre-confirm plan
+        // the user reads (F8's exact surface). Sanitized at the one
+        // interpolation site so `render_plan`'s every-reason-is-safe
+        // invariant holds by construction.
+        let kind = fmt::sanitize_terminal(kind);
         return Some(PlanKind::Refused {
             reason: format!(
                 "recorded as a {kind} — its snapshot is the link target, not file content"
@@ -928,11 +934,14 @@ fn modified_cause(
 /// `render_plan_neutralizes_f8_erase_line_payload` below pin that rather
 /// than assuming it.
 ///
-/// `cause` and `reason` are deliberately NOT sanitized, and that was probed
-/// rather than reasoned: every value able to reach them is a fixed literal
-/// built in [`build_plan`], [`modified_cause`], or [`fmt::skip_reason_text`]
-/// — none interpolates a wire string. Adding one that does makes this comment
-/// false and that field then needs sanitizing here too. `target.id` is
+/// `cause` and `reason` are NOT sanitized at this render site, and that was
+/// probed rather than reasoned: every value able to reach them is either a
+/// fixed literal built in [`build_plan`], [`modified_cause`], or
+/// [`fmt::skip_reason_text`], or — the one wire interpolation, added by F2
+/// after this comment first claimed there were none — `entry.link_kind` in
+/// [`symlink_refusal`], which sanitizes it at the interpolation site.
+/// Adding another wire interpolation requires sanitizing it where it is
+/// built, or this render site stops being safe. `target.id` is
 /// likewise left as-is: it is reachable only under a different (hostile
 /// log-writer) threat model, and [`fmt::turn_list_line`] renders the same id
 /// unsanitized, so treating it here alone would split the treatment without
@@ -1390,6 +1399,27 @@ mod tests {
             refusal_reason(&plans),
             "recorded as a junction — its snapshot is the link target, not file content"
         );
+    }
+
+    // Skeptic-gate blocker (2026-08-01): `link_kind` is wire data on an open
+    // enum, and its value is interpolated into the REFUSE row the user reads
+    // before `--confirm` — F8's exact surface, reachable by a hostile log
+    // writer or a future importer. The kind must render inert.
+    #[test]
+    fn refusal_reason_sanitizes_a_hostile_link_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut e = entry("mnt/evil", "modify");
+        e.link_kind = Some("\x1b[1A\x1b[2Ksymlink".to_string());
+        let (_, plans) = plan_for(root, vec![e], false);
+        let reason = refusal_reason(&plans);
+        assert!(!reason.contains('\x1b'), "reason leaked ESC: {reason:?}");
+        assert_eq!(
+            reason,
+            "recorded as a [1A[2Ksymlink — its snapshot is the link target, not file content"
+        );
+        let rendered = render_plan(&turn("rich", Some("claude")), &plans);
+        assert!(!rendered.contains('\x1b'), "plan leaked ESC: {rendered:?}");
     }
 
     // Trigger 2, the LEGACY-RECORD guard: the entry carries no `link_kind`

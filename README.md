@@ -90,26 +90,26 @@ are an honest agent doing the wrong thing, a human overwriting a file without no
 killed mid-write, and a snapshot rotting on disk. Those it handles: turns and file snapshots are
 written by the daemon as it observes the filesystem, not reconstructed afterward from anyone's
 memory; the object store verifies a blob against its own address when it reads it and reports a
-mismatch as an error rather than serving corrupt bytes (`agentrec-core/src/store.rs:152-163`); and
+mismatch as an error rather than serving corrupt bytes (`store.rs`, `BlobStore::get`); and
 a recording gap is surfaced rather than guessed across — a file whose last turn is followed by an
 uncovered interval blames as `· attribution stale — recording gap`
-(`agentrec-core/src/view.rs:563-566`), and a path no turn touches at all, in a history with a
-crash gap, names the gap instead of naming a turn (`view.rs:556-558`).
+(`view.rs`, `gap_stale`), and a path no turn touches at all, in a history with a
+crash gap, names the gap instead of naming a turn (`view.rs`, `BlameState::NoTurnRecordingGap`).
 
 **It does not defend against a malicious or prompt-injected agent, or against a repo whose build
 scripts and hooks you have not read.** Those run under your uid, and so does agentrec. Anything
 with your uid can write `.agentrec/` directly — append to `signal.jsonl`, rewrite `log.jsonl`,
 replace objects, reset `state.json`. The signal inbox carries no provenance: `tool` is a free-form
-string (`agentrec-core/src/record.rs:17`) and a line is accepted by a bare deserialize with no
-check of who wrote it (`record.rs:307-317`), so an appended line mints a turn that `log` and
+string (`record.rs`, `TurnRecord::tool`) and a line is accepted by a bare deserialize with no
+check of who wrote it (`record.rs`, `parse_signals`), so an appended line mints a turn that `log` and
 `blame` then render exactly like one the daemon observed. `log.jsonl` carries no chain or MAC over
 its lines; append-only is a discipline the writer keeps, not a property the format enforces. And
 tampering with the record is the one class of filesystem change the recorder structurally cannot
-witness, because `.agentrec` is in the watcher's denylist (`cli/src/daemon.rs:766-770`) — with no
+witness, because `.agentrec` is in the watcher's denylist (`daemon.rs`, `classify`) — with no
 second copy to compare against, since `init` adds `.agentrec/` to `.gitignore`
-(`cli/src/initcmd.rs:353`). A record deleted outright prints `no turns recorded — is agentrec
-record running?` (`cli/src/cmds.rs:77`), which is what a repo where nothing has happened yet also
-prints.
+(`initcmd.rs`, `ensure_gitignore`). A record deleted outright prints `no turns recorded — is agentrec
+record running?` (`record.rs`, `load_log`'s open-failure fallback), which is what a repo where
+nothing has happened yet also prints.
 
 **"Independent," above, means independent of the agent's self-report — not tamper-resistant
 against the agent.** Attribution here comes from watching the filesystem rather than from trusting
