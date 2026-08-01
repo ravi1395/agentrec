@@ -1,5 +1,7 @@
-//! `agentrec purge` (AC I5–I6): default deletes prompt-blob objects for turns
-//! older than `ttl_days` (config.toml, default 90). `--all-prompts` deletes
+//! `agentrec purge` (AC I5–I6): default archives prompt-blob objects for turns
+//! older than `ttl_days` (config.toml, default 90) into
+//! `.agentrec/objects.archived.<ts>/` (F11 — never unlinks them).
+//! `--all-prompts` archives
 //! every prompt blob regardless of age; `--snapshots-before <DATE>` deletes
 //! snapshot blobs (`before`/`after`) for turns started before that date. Both
 //! keep a dedup keep-set so a blob still referenced by a kept turn — content
@@ -11,6 +13,11 @@
 //! `log.jsonl` to repair a pre-fix daemon's same-id duplicate `TurnRecord`s
 //! (the read-side migration/repair deferred after PR #2's curative
 //! `readcmds::same_revert` dedup — see that module for the underlying bug).
+//!
+//! The verb as a whole refuses while the recorder daemon is live: `run`
+//! probes `daemon_is_running` before any step, and each sub-op probes again
+//! for itself (F11 — before that, the prompt purge ran ahead of every
+//! handler's refusal and destroyed blobs the refusal implied were untouched).
 
 use crate::cmds::wall_now_ms;
 use crate::{agentrec_dir, log_path, objects_dir, signal_path};
@@ -34,11 +41,31 @@ pub fn run(
     orphans: bool,
     signals_consumed: bool,
 ) -> Result<(), String> {
+    // F11 (red team round 2): the verb-level daemon-liveness refusal sits
+    // HERE, ahead of every destructive step in this file, rather than only
+    // inside the individual flag handlers. It used to live only in the
+    // handlers, while `purge_prompts` ran unconditionally as the FIRST step
+    // of every invocation with no liveness check of its own — so
+    // `agentrec purge --orphans` against a live daemon unlinked every expired
+    // prompt blob and only THEN refused, and the user read the refusal as
+    // "nothing happened". Each op keeps its own check too (they are called
+    // directly by this module's unit tests and must refuse on their own, and
+    // defence in depth costs one flock probe): this one makes the ordering
+    // property hold for the whole verb no matter what order the ops are
+    // dispatched in, or what a future op forgets.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before purging — the daemon appends \
+             turns, blobs and signals concurrently"
+                .to_string(),
+        );
+    }
+
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = owned_turns(&records);
     let store = BlobStore::new(objects_dir(root));
 
-    purge_prompts(&store, &turns, root, all_prompts);
+    purge_prompts(&store, &turns, root, all_prompts)?;
     if let Some(date) = snapshots_before {
         purge_snapshots_before(&store, &turns, date, root)?;
     }
@@ -85,10 +112,43 @@ fn prompt_hashes<'a>(turns: &[&'a TurnRecord]) -> HashSet<&'a str> {
         .collect()
 }
 
-/// Delete prompt-blob objects: all of them (`all_prompts`) or just those
+/// Reclaim prompt-blob objects: all of them (`all_prompts`) or just those
 /// belonging to turns older than `ttl_days`, keeping any blob still shared
 /// with a turn inside the TTL window.
-fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prompts: bool) {
+///
+/// F11 (red team round 2) changed two things about this function and nothing
+/// else about which blobs it selects:
+///  (1) it refuses while the daemon is live, like its four sibling ops — it
+///      is the only step `run` performs unconditionally, so before the fix a
+///      refusal raised by a LATER op (e.g. `--orphans`) was printed after
+///      this function had already destroyed blobs, reading to the user as
+///      "nothing happened";
+///  (2) it ARCHIVES rather than unlinks. Blobs are archive-*renamed* into
+///      `.agentrec/objects.archived.<ts>/` by `BlobStore::archive` — the
+///      same-fs, fan-out-preserving move `purge --orphans` uses — so moving
+///      that directory back under `objects/` fully restores them, and the
+///      house rule ("`purge` archives, never silent removal") holds on this
+///      path too. `--all-prompts` on a large store therefore frees nothing
+///      until the archive directory is removed by hand, exactly as
+///      `--orphans` already behaved.
+fn purge_prompts(
+    store: &BlobStore,
+    turns: &[&TurnRecord],
+    root: &Path,
+    all_prompts: bool,
+) -> Result<(), String> {
+    // Mirrors each sibling op's own probe (`purge_memories_retracted`,
+    // `purge_log_duplicates`, `purge_orphans`, `purge_signals_consumed`).
+    // `run` checks this first as well; this one keeps the guarantee local to
+    // the function, which is also what this module's unit tests drive.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before purging prompt blobs — \
+             the daemon appends new turns and prompt blobs concurrently"
+                .to_string(),
+        );
+    }
+
     let ttl_days = read_ttl_days(root);
     let cutoff = ttl_cutoff(ttl_days);
 
@@ -120,8 +180,16 @@ fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prom
 
     // A3(b): re-load the log immediately before the destructive step and
     // re-union the keep-set, narrowing the TOCTOU window between this
-    // function's initial log read (in `run`) and the delete below — a live
-    // daemon may have appended a turn referencing a candidate in between.
+    // function's initial log read (in `run`) and the archive below.
+    //
+    // The liveness check above does NOT close this window, and the writers it
+    // does not cover are the reason the reload stays: `undo`
+    // (`readcmds.rs:629`) and `import` (`importcmd.rs:1477`) append turns
+    // through `loglock::append_log_locked`, which takes `log.lock` — not the
+    // `daemon.lock` `daemon_is_running` probes — so a concurrent manual undo
+    // or import is invisible to that check; and a daemon started between the
+    // probe and here is likewise unseen. Narrowed, not closed — same honest
+    // posture as `purge_log_duplicates`' length recheck.
     let fresh_records = agentrec_core::record::load_log(&log_path(root));
     let fresh_turns = owned_turns(&fresh_records);
     let mut fresh_keep: HashSet<&str> = if all_prompts {
@@ -136,18 +204,29 @@ fn purge_prompts(store: &BlobStore, turns: &[&TurnRecord], root: &Path, all_prom
     fresh_keep.extend(snapshot_hashes(&fresh_turns));
     candidates.retain(|h| !fresh_keep.contains(h));
 
-    let (count, bytes) = delete_all(store, &candidates);
+    let archive_dir = objects_archive_path(root);
+    let (count, bytes) = archive_all(store, &candidates, &archive_dir);
+    // `BlobStore::archive` creates the fan-out directories lazily, so a
+    // zero-count pass leaves no empty archive directory behind and there is
+    // nothing to lock down — mirrors `purge_orphans`' two-branch shape.
+    let suffix = if count > 0 {
+        agentrec_core::perms::lock_dir(&archive_dir);
+        format!(" — archived to {}", archive_dir.display())
+    } else {
+        String::new()
+    };
     if all_prompts {
         println!(
-            "purged {count} prompt blob(s) (all), {} freed",
+            "purged {count} prompt blob(s) (all), {} freed{suffix}",
             human_bytes(bytes)
         );
     } else {
         println!(
-            "purged {count} expired prompt blob(s) (ttl {ttl_days}d), {} freed",
+            "purged {count} expired prompt blob(s) (ttl {ttl_days}d), {} freed{suffix}",
             human_bytes(bytes)
         );
     }
+    Ok(())
 }
 
 /// Delete snapshot-blob objects (`before`/`after`) for turns started before
@@ -208,6 +287,23 @@ fn purge_snapshots_before(
         human_bytes(bytes)
     );
     Ok(())
+}
+
+/// Archive-rename every blob in `hashes` out of the store into
+/// `archive_dir`, returning `(count, bytes)` — the never-delete counterpart
+/// of `delete_all`, and the same `BlobStore::archive` call `purge_orphans`
+/// reclaims with (same-fs rename, fan-out layout preserved, so moving
+/// `archive_dir` back under `objects/` restores the store).
+fn archive_all(store: &BlobStore, hashes: &HashSet<&str>, archive_dir: &Path) -> (usize, u64) {
+    let mut count = 0;
+    let mut bytes = 0u64;
+    for h in hashes {
+        if let Some(size) = store.archive(h, archive_dir) {
+            count += 1;
+            bytes += size;
+        }
+    }
+    (count, bytes)
 }
 
 fn delete_all(store: &BlobStore, hashes: &HashSet<&str>) -> (usize, u64) {
@@ -1468,6 +1564,146 @@ mod tests {
         assert!(
             store.contains(&pinned),
             "a memory-pinned blob must never be archived as an orphan"
+        );
+    }
+
+    // ---- F11: prompt purge is behind the liveness check, and archives -----
+
+    /// Every `.agentrec/objects.archived.<ts>/` directory, sorted. Used both
+    /// to prove one was created and to prove none was.
+    fn objects_archive_dirs(root: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(agentrec_dir(root)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("objects.archived.")
+            })
+            .map(|e| e.path())
+            .collect();
+        out.sort();
+        out
+    }
+
+    const EXPIRED_PROMPT_BODY: &[u8] = b"the full scrubbed prompt text of an old turn";
+
+    /// A store holding one prompt blob, and a `log.jsonl` whose single turn
+    /// started in 2000 — well past any plausible `ttl_days`, so the default
+    /// purge selects that blob. `"type":"turn"` is explicit rather than
+    /// relying on the tag default, so the line's classification is not part
+    /// of what these tests are trusting.
+    fn expired_prompt_fixture() -> (tempfile::TempDir, BlobStore, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let prompt = store.put(EXPIRED_PROMPT_BODY).unwrap();
+        std::fs::write(
+            log_path(root),
+            format!(
+                "{{\"type\":\"turn\",\"v\":1,\"id\":\"t_EXPIRED00000000000000001\",\
+                 \"grade\":\"rich\",\"started\":\"2000-01-01T00:00:00.000Z\",\
+                 \"ended\":\"2000-01-01T00:00:01.000Z\",\"root\":\"/x\",\
+                 \"prompt_ref\":\"{prompt}\",\"files\":[]}}\n"
+            ),
+        )
+        .unwrap();
+        (tmp, store, prompt)
+    }
+
+    // F11 (a): with the daemon live, `purge --orphans` must destroy NOTHING.
+    // Before the fix this exact call unlinked the expired prompt blob inside
+    // `purge_prompts` — the unconditional first step — and only then hit the
+    // orphan handler's refusal, so the user read "stop recording ... before
+    // reclaiming orphans" and concluded nothing had happened.
+    //
+    // The lock is taken with the same raw non-blocking flock
+    // `daemon::acquire_lock` uses (not a pid, not a mock), so this exercises
+    // the real `daemon_is_running` probe. Neuter: drop either liveness check
+    // -> RED.
+    #[test]
+    fn prompt_purge_destroys_nothing_while_the_daemon_holds_the_lock() {
+        use std::os::unix::io::AsRawFd;
+        let (tmp, store, prompt) = expired_prompt_fixture();
+        let root = tmp.path();
+
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(agentrec_dir(root).join("daemon.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        // orphans = true: the F11 scenario verbatim.
+        let err = run(root, false, None, false, false, true, false).unwrap_err();
+        assert!(
+            err.contains("stop recording"),
+            "the verb must refuse while recording: {err}"
+        );
+
+        // The distinguishing assertion: archiving ALSO makes `contains`
+        // false, so only "still in objects/" separates "nothing happened"
+        // from "moved out, then refused".
+        assert!(
+            store.contains(&prompt),
+            "a refused purge must leave every prompt blob in the store"
+        );
+        assert!(
+            objects_archive_dirs(root).is_empty(),
+            "a refused purge must not create an archive dir either"
+        );
+
+        // Same guarantee when the step is driven directly rather than
+        // through `run`'s ordering — including under `--all-prompts`, the
+        // widest selection this function offers.
+        let records = agentrec_core::record::load_log(&log_path(root));
+        let turns = owned_turns(&records);
+        let direct = purge_prompts(&store, &turns, root, true).unwrap_err();
+        assert!(
+            direct.contains("stop recording"),
+            "purge_prompts must refuse on its own: {direct}"
+        );
+        assert!(store.contains(&prompt), "direct call must destroy nothing");
+        assert!(objects_archive_dirs(root).is_empty());
+
+        drop(lock);
+    }
+
+    // F11 (b): a successful prompt purge ARCHIVES the expired blob — it
+    // leaves `objects/` but survives byte-for-byte under
+    // `objects.archived.<ts>/`, so moving that directory back restores it.
+    // Neuter: swap `archive_all` back to `delete_all` -> RED.
+    #[test]
+    fn prompt_purge_archives_the_expired_blob_rather_than_unlinking_it() {
+        let (tmp, store, prompt) = expired_prompt_fixture();
+        let root = tmp.path();
+
+        run(root, false, None, false, false, false, false).unwrap();
+
+        assert!(
+            !store.contains(&prompt),
+            "the expired prompt blob must leave objects/"
+        );
+
+        let dirs = objects_archive_dirs(root);
+        assert_eq!(dirs.len(), 1, "exactly one archive dir expected: {dirs:?}");
+        let hex = prompt.strip_prefix("sha256:").unwrap();
+        let archived = dirs[0].join(&hex[..2]).join(&hex[2..]);
+        assert!(
+            archived.exists(),
+            "expired prompt preserved in the archive (never deleted)"
+        );
+        assert_eq!(
+            std::fs::read(&archived).unwrap(),
+            EXPIRED_PROMPT_BODY,
+            "the archived blob must hold the original bytes verbatim"
         );
     }
 
