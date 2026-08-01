@@ -25,6 +25,17 @@ stays transcript-free. Spec: `BRANCH-SCOPE.md` item 4; findings doc `docs/redtea
    explicit `undo --file <path>` still reverts them (explicit-name = consent). No new flag.
 9. **Q4 RESOLVED (founder, 2026-08-01):** spike is python in `scripts/`, committed as replayable
    evidence.
+10. **SPIKE GATE RULING (founder, 2026-08-01): PROCEED with option 1 — emitter-side declaration.**
+    The Stop signal gains an additive `files_written` field (L2+ emitters compute the declared-write
+    list themselves, before signaling); the daemon-side transcript parse survives as a FALLBACK for
+    signals that name a transcript but carry no list; no list AND no transcript → all files
+    unattributed, never guessed. Rationale: same honesty model and same coverage as daemon-side
+    parsing, but tool-agnostic (Codex 2.1 gets attribution the day its hook exists), no transcript
+    IO on the daemon hot path, and the emitter's list is complete before the signal exists — closing
+    the write-lag hole the spike measured (declares landing 20–50 s after turn end). The PROTOCOL.md
+    signal-schema addition MUST land before the 1.0 freeze — this branch's window is the only one.
+    Spike's other binding finding stands: correlation keys off the CLOSING SIGNAL's data at
+    Stop-time, never persisted `turn.session` (F4 contamination, 739/803 stub sessions measured).
 
 **Infeasible/rejected (against real code):**
 - Reusing `importcmd.rs::process_session_file`/`persist_session_file` directly — both private,
@@ -86,33 +97,58 @@ written. Read-only against both corpora.
 in the doc from the pre-edit run). `python3 scripts/d6_spike.py --root ~/Projects/agentrec` →
 prints the same figures the doc carries.
 
-## Phase 2 — Declared-writes extraction in the daemon (dark)
-**Description:** Extend the daemon's existing single transcript read to also extract the declared
-write-path set. Pure function + plumbing to the Stop path; nothing persisted yet, so the phase
-lands dark and mergeable regardless of periphery timing. Shapes and normalization informed by
-phase 1's measured corpus (probe-first rule).
-**Files:** `cli/src/daemon.rs` (edit), `cli/tests/misattribution.rs` (edit)
+## Phase 2a — `files_written` signal field (protocol, freeze-critical)
+**Description:** Per decision 10: additive `files_written` field on the Stop-signal schema. Wire
+format only — no daemon behavior change; the field parses and is ignored. This is the piece that
+must precede the PROTOCOL 1.0 freeze; landing it first and small de-risks the freeze deadline
+against phase 2b's larger surface.
+**Files:** `PROTOCOL.md` (edit — §2 signal schema), `agentrec-core/src/record.rs` (edit —
+`SignalEvent.files_written: Option<Vec<String>>`), conformance fixtures `(mech)`
 **Changes:**
-- New fn (near `signal_context`, daemon.rs:1692-1713): parse the already-read transcript content →
-  `DeclaredWrites { paths: HashSet<PathBuf> /* root-relative */, counts... }`; single
-  `read_to_string`, no second read.
-- Normalization: absolutize→strip root prefix→lexical normalize; out-of-root declared paths
-  excluded and counted, never silently dropped (skipped_out_of_cwd precedent).
-- Unit tests: fixture transcript lines for each shape phase 1 found live; missing/unreadable/
-  absent transcript → `None`, no panic; out-of-root exclusion counted.
+- PROTOCOL.md §2: `files_written` on `event:"stop"` — optional array of absolute paths the emitter
+  itself wrote during the turn; L2+ emitters SHOULD populate; consumers MUST tolerate absence.
+  Conformance fixture updated in the same commit (protocol house rule).
+- `SignalEvent`: new optional field, `#[serde(default)]` — old signal lines parse unchanged.
 **Acceptance criteria:**
-- [ ] Given a fixture transcript with declared writes in each corpus-observed shape, extraction
-      returns exactly the expected root-relative set.
-- [ ] `transcript: None` (L1 emitter) and unreadable-file cases return `None` without error;
-      daemon Stop path behavior otherwise unchanged (existing tests green).
-- [ ] Transcript file is read exactly once per Stop (no added read syscall on the hot path —
-      assert by construction: extraction takes `&str` already held by `signal_context`).
-- [ ] Zero change to any golden and zero change to persisted output (dark).
-**Expected test outputs:** `cargo test --workspace -- --test-threads=3` → 666+N / 0 / 3 where N =
-new extraction tests (≥5, named `d6_extract_*` in misattribution.rs + daemon.rs unit tests); all
-33 goldens byte-identical.
+- [ ] Old-format signal lines (no field) deserialize unchanged; new-format lines round-trip with
+      the field intact.
+- [ ] PROTOCOL conformance fixtures pass with a new fixture line carrying the field.
+- [ ] Zero behavior change: daemon ignores the field at this phase; all goldens byte-identical.
+- [ ] claimd doc-scope note: PROTOCOL.md is not lint-ignored — declare the doc-edit claim before
+      the edit (the Stop hook WILL fire; the undecided doc-scope rule is a known repo debt, not a
+      surprise).
+**Expected test outputs:** `cargo test --workspace -- --test-threads=3` → 666+N / 0 / 3, N ≥ 2
+(serde round-trip + conformance); all 33 goldens byte-identical.
 
-## Phase 3 — Attribution producer at persist [gated on Q1 PROCEED, Q2 field shape, periphery merge]
+## Phase 2b — Tiered declared-writes resolution in the daemon + hook emitter (dark)
+**Description:** Daemon resolves a `DeclaredWrites` value on the Stop path via a three-tier ladder —
+signal field, transcript-parse fallback, honest `None` — and drops it (nothing persisted; dark).
+Claude Code hook emitter computes the list before signaling. Shapes and normalization informed by
+phase 1's measured corpus (probe-first rule).
+**Files:** `cli/src/daemon.rs` (edit), `cli/tests/misattribution.rs` (edit), hook emitter script
+(edit — the installed Stop hook under `init`'s hook template)
+**Changes:**
+- daemon.rs resolution ladder: (1) `files_written` present → normalize, done, transcript untouched;
+  (2) else transcript named → fallback parse from the single existing `signal_context` read (fn
+  near daemon.rs:1692-1713); (3) else `None`. Tier recorded in the value — phase 3's tri-state and
+  phase 4's wording need to know declared-by-list vs declared-by-parse vs nothing.
+- Hook emitter: compute list from its transcript pre-emit; keep emitting the transcript path too
+  (fallback tier stays live for other emitters, not silently dead code).
+- Normalization (both tiers): absolutize→strip root prefix→lexical normalize; out-of-root declared
+  paths excluded and counted, never silently dropped (skipped_out_of_cwd precedent).
+**Acceptance criteria:**
+- [ ] Signal with `files_written` → exactly that set (normalized); transcript NOT read in this tier
+      (fixture names a nonexistent transcript path — still resolves from the field, no error).
+- [ ] Signal without the field but readable transcript → same set via fallback parse; fixture
+      transcripts cover each corpus-observed shape (`tool_use` input + `toolUseResult`, both — the
+      spike measured both firing ~equally).
+- [ ] No field AND no/unreadable transcript → `None`, no panic, Stop path otherwise unchanged
+      (existing tests green).
+- [ ] Zero change to any golden and zero change to persisted output (dark).
+**Expected test outputs:** `cargo test --workspace -- --test-threads=3` → prior+N / 0 / 3, N ≥ 6
+new tests named `d6_signal_field_*` / `d6_extract_*`; all goldens byte-identical.
+
+## Phase 3 — Attribution producer at persist [gated on periphery merge; Q1 ruled PROCEED, Q2 ruled tri-state — decisions 6/7/10]
 **Description:** Populate the periphery-defined `FileEntry` attribution field at the single
 `ChangeObs`→`FileEntry` conversion point. Rebase onto merged `main` first (coordination protocol).
 `persist()` gains an `Option<&DeclaredWrites>` — only the sig-loop call site (daemon.rs:387) has

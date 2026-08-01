@@ -95,7 +95,10 @@ consequences bind phases 2–4:
    shrinkage must be presented as scope-narrowing, not breakage; `blame` wording must not
    imply "human" for unattributed files (tri-state, decision 7).
 
-Founder decision per plan decision 6: PROCEED / REDESIGN — **pending**.
+Founder decision per plan decision 6: **PROCEED, as option 1 (emitter-side declaration) —
+ruled 2026-08-01.** The Stop signal gains an additive `files_written` field; the daemon-side
+transcript parse becomes the fallback tier. Plan decision 10 records the ruling and rationale;
+phases 2a/2b in the plan carry the revised scope. Both binding consequences above stand.
 
 Bash-command path extraction (parsing `tool_use` Bash inputs for redirect/heredoc targets)
 is a possible future coverage extension; out of scope for this branch, recorded here so it
