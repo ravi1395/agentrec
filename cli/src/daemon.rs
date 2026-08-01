@@ -379,10 +379,18 @@ pub fn run(root: &Path) -> Result<(), String> {
                 ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
                 continue;
             }
-            let (prompt, model) = signal_context(&sig);
+            let (prompt, model, transcript_raw) = signal_context(&sig);
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
             }
+            // D6 phase 2b: resolved but not yet consumed — phase 3 threads
+            // this into persist() to populate per-file attribution. Dark by
+            // design; resolution itself is unit-tested.
+            let _declared = if !sig.is_start() {
+                resolve_declared(&sig, transcript_raw.as_deref(), &root)
+            } else {
+                None
+            };
             let closed = apply_signal(&root, &mut engine, &sig, prompt, now);
             persist(&root, &recorder, &clock, closed)?;
         }
@@ -1735,9 +1743,13 @@ fn record_unknown_signal(root: &Path) {
 /// value, falling back to the transcript's last real user message (Q+). Model is
 /// read from the transcript's assistant messages. Extraction is best-effort and
 /// tolerant: a parse failure yields None rather than a wrong attribution.
-fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>) {
+/// Also returns the raw transcript text so downstream consumers (declared-write
+/// fallback, D6 phase 2b) reuse this single read — the transcript is read at
+/// most once per signal.
+fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>, Option<String>) {
     let mut prompt = sig.prompt.clone();
     let mut model = None;
+    let mut transcript = None;
     if let Some(path) = &sig.transcript {
         if let Ok(text) = std::fs::read_to_string(path) {
             let (tp, tm) = parse_transcript(&text);
@@ -1745,13 +1757,14 @@ fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>) {
                 prompt = tp;
             }
             model = tm;
+            transcript = Some(text);
         }
     }
     // Scrub HERE, before the prompt enters the engine: the transcript fallback
     // yields raw text, and the open turn is mirrored to `.agentrec/open.json`
     // (a disk path) every loop — no pre-scrub prompt may reach it. Re-scrubbing
     // the already-clean hook-provided prompt is idempotent.
-    (prompt.map(|p| scrub::scrub(&p)), model)
+    (prompt.map(|p| scrub::scrub(&p)), model, transcript)
 }
 
 /// Parse a Claude Code JSONL transcript for (last real user prompt, last model).
@@ -1806,6 +1819,196 @@ fn transcript_text(message: &serde_json::Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+// ---- declared writes (D6 phase 2b, PROTOCOL §4 files_written) ---------------
+
+/// Tool names whose transcript `tool_use` entries declare a file write.
+/// Additive-safe: unknown tools never declare. Bash is deliberately absent —
+/// a bash-side write is undeclared by design (the spike measured that gap;
+/// inferring paths from shell text would be a guess, and a guess that is
+/// sometimes a lie loses to a bare statement that is always true).
+const DECLARING_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// How a `DeclaredWrites` value was obtained. Phase 3 persists this
+/// distinction (tri-state attribution, plan decision 7); phase 4 wording
+/// depends on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DeclaredTier {
+    /// The emitter itself declared (`files_written` on the stop signal).
+    SignalField,
+    /// Recorder-side fallback parse of the transcript the signal named.
+    TranscriptFallback,
+}
+
+/// Root-relative declared-write set for one stop signal.
+// Fields are read only by unit tests until phase 3 threads this into
+// `persist()` (per-file attribution) — dead in a release build BY DESIGN
+// (dark launch); remove the allows when phase 3 lands.
+#[derive(Clone, Debug)]
+pub(crate) struct DeclaredWrites {
+    #[allow(dead_code)]
+    pub(crate) paths: std::collections::HashSet<String>,
+    #[allow(dead_code)]
+    pub(crate) tier: DeclaredTier,
+    /// Declared paths outside the watched root — counted, never silently
+    /// dropped (the `skipped_out_of_cwd` lesson from import P1/P2).
+    #[allow(dead_code)]
+    pub(crate) out_of_root: usize,
+}
+
+/// Resolve the declared-write set for a stop signal via the tier ladder:
+/// (1) `files_written` on the signal — the transcript is NOT consulted;
+/// (2) fallback parse of `transcript_text` (the single read `signal_context`
+///     already performed — no second read);
+/// (3) `None`: no declaration exists. `None` means "emitter did not declare",
+///     never "no files written" (PROTOCOL §4).
+pub(crate) fn resolve_declared(
+    sig: &SignalEvent,
+    transcript_text: Option<&str>,
+    root: &Path,
+) -> Option<DeclaredWrites> {
+    if let Some(list) = &sig.files_written {
+        let (paths, out_of_root) = normalize_declared(list.iter().map(String::as_str), root);
+        return Some(DeclaredWrites {
+            paths,
+            tier: DeclaredTier::SignalField,
+            out_of_root,
+        });
+    }
+    let text = transcript_text?;
+    let abs = declared_writes_from_transcript(text);
+    if abs.is_empty() {
+        // A fallback parse that found nothing is indistinguishable from a
+        // transcript shape we cannot read — stay at "did not declare" rather
+        // than asserting an empty declaration.
+        return None;
+    }
+    let (paths, out_of_root) = normalize_declared(abs.iter().map(String::as_str), root);
+    Some(DeclaredWrites {
+        paths,
+        tier: DeclaredTier::TranscriptFallback,
+        out_of_root,
+    })
+}
+
+/// Absolute declared paths → root-relative set + out-of-root count. Lexical
+/// only (no fs access — declared paths may already be gone); the root itself
+/// is canonicalized by startup (D5), so a lexical prefix strip against it is
+/// the same normalization import uses (`normalize_backup_key` precedent).
+fn normalize_declared<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    root: &Path,
+) -> (std::collections::HashSet<String>, usize) {
+    let root_str = root.to_string_lossy();
+    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+    let mut out = std::collections::HashSet::new();
+    let mut out_of_root = 0usize;
+    for p in paths {
+        let norm = lexical_normalize(p);
+        match norm.strip_prefix(&prefix) {
+            Some(rel) if !rel.is_empty() => {
+                out.insert(rel.to_string());
+            }
+            _ => out_of_root += 1,
+        }
+    }
+    (out, out_of_root)
+}
+
+/// Resolve `.` / `..` / duplicate separators lexically. No symlink
+/// resolution and no fs access by design.
+fn lexical_normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Extract the CURRENT turn's declared writes from a Claude Code transcript:
+/// absolute paths from write-tool `tool_use` inputs and top-level
+/// `toolUseResult.filePath` entries (probe-verified Write/Edit-only — a Read
+/// result nests its path under `file.filePath` and is never harvested),
+/// scoped to lines timestamped at/after the transcript's LAST real user
+/// prompt. Scoping caveats, all erring toward under-declaration (the safe
+/// direction — an undeclared write stays unattributed):
+/// - a prompt queued mid-turn advances the cutoff past earlier same-turn
+///   writes;
+/// - lines with no timestamp are excluded;
+/// - a transcript with no user prompt at all declares nothing (a whole-
+///   session union would over-declare prior turns' files — the D6 shape
+///   through the side door).
+///
+/// ISO-8601 `Z` timestamps compare lexicographically == chronologically
+/// (single format across the probed corpus).
+pub(crate) fn declared_writes_from_transcript(text: &str) -> Vec<String> {
+    let mut cutoff: Option<String> = None;
+    let mut writes: Vec<(Option<String>, String)> = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let ts = value
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .map(String::from);
+        let message = value.get("message").unwrap_or(&value);
+        let role = message
+            .get("role")
+            .and_then(|r| r.as_str())
+            .or_else(|| value.get("type").and_then(|t| t.as_str()));
+        if role == Some("user") {
+            if let Some(t) = transcript_text(message) {
+                if !t.trim().is_empty() && ts.is_some() {
+                    cutoff = ts.clone();
+                }
+            }
+        }
+        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                    && block
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|n| DECLARING_TOOLS.contains(&n))
+                {
+                    let path = block
+                        .get("input")
+                        .and_then(|i| i.get("file_path").or_else(|| i.get("notebook_path")))
+                        .and_then(|p| p.as_str());
+                    if let Some(p) = path {
+                        writes.push((ts.clone(), p.to_string()));
+                    }
+                }
+            }
+        }
+        if let Some(p) = value
+            .get("toolUseResult")
+            .and_then(|r| r.get("filePath"))
+            .and_then(|p| p.as_str())
+        {
+            writes.push((ts.clone(), p.to_string()));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (ts, p) in writes {
+        let keep = match (&cutoff, &ts) {
+            (Some(c), Some(t)) => t.as_str() >= c.as_str(),
+            _ => false,
+        };
+        if keep && seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 // ---- persistence ------------------------------------------------------------
@@ -2271,6 +2474,131 @@ fn watch_error(e: &notify::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- D6 phase 2b: declared-write resolution ladder ----------------------
+
+    fn stop_sig(files_written: Option<Vec<String>>, transcript: Option<&str>) -> SignalEvent {
+        SignalEvent {
+            v: 1,
+            ts: 1000,
+            tool: "claude".into(),
+            event: Some("stop".into()),
+            session: None,
+            transcript: transcript.map(String::from),
+            prompt: None,
+            files_written,
+            kind: None,
+            fact: None,
+            pins: None,
+        }
+    }
+
+    const FIXTURE_TRANSCRIPT: &str = concat!(
+        // pre-prompt write from an EARLIER turn: must be scoped out
+        r#"{"timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/stale_prior_turn.rs"}}]}}"#,
+        "\n",
+        // the current turn's trigger
+        r#"{"timestamp":"2026-08-01T10:05:00.000Z","message":{"role":"user","content":"fix the bug"}}"#,
+        "\n",
+        // declared via tool_use input
+        r#"{"timestamp":"2026-08-01T10:05:10.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/src/lib.rs"}}]}}"#,
+        "\n",
+        // declared via top-level toolUseResult.filePath (Write/Edit result shape)
+        r#"{"timestamp":"2026-08-01T10:05:11.000Z","type":"user","toolUseResult":{"filePath":"/repo/src/main.rs","oldString":"a"}}"#,
+        "\n",
+        // Read result: path nests under file.filePath — must NOT be harvested
+        r#"{"timestamp":"2026-08-01T10:05:12.000Z","type":"user","toolUseResult":{"type":"text","file":{"filePath":"/repo/README.md"}}}"#,
+        "\n",
+        // non-declaring tool
+        r#"{"timestamp":"2026-08-01T10:05:13.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"touch /repo/via_bash.rs"}}]}}"#,
+        "\n",
+        // out-of-root declared write
+        r#"{"timestamp":"2026-08-01T10:05:14.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/elsewhere/x.rs"}}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn declared_transcript_scopes_to_last_prompt_and_write_tools_only() {
+        let writes = declared_writes_from_transcript(FIXTURE_TRANSCRIPT);
+        assert_eq!(
+            writes,
+            vec![
+                "/repo/src/lib.rs".to_string(),
+                "/repo/src/main.rs".to_string(),
+                "/elsewhere/x.rs".to_string(),
+            ],
+            "pre-prompt write scoped out; Read/Bash never declare"
+        );
+    }
+
+    #[test]
+    fn declared_transcript_without_prompt_declares_nothing() {
+        // No user-prompt boundary -> a whole-session union would over-declare
+        // prior turns' files (the D6 shape through the side door). Must be empty.
+        let no_prompt = r#"{"timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/a.rs"}}]}}"#;
+        assert!(declared_writes_from_transcript(no_prompt).is_empty());
+        // Untimestamped writes are excluded even with a prompt present.
+        let untimed = concat!(
+            r#"{"timestamp":"2026-08-01T10:05:00.000Z","message":{"role":"user","content":"go"}}"#,
+            "\n",
+            r#"{"message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/a.rs"}}]}}"#,
+        );
+        assert!(declared_writes_from_transcript(untimed).is_empty());
+    }
+
+    #[test]
+    fn resolve_declared_signal_field_wins_and_skips_transcript() {
+        // Tier 1: field present -> transcript text must not even be consulted;
+        // pass a transcript whose parse would yield a DIFFERENT set to prove it.
+        let sig = stop_sig(
+            Some(vec![
+                "/repo/from_field.rs".into(),
+                "/repo/sub/../sub/b.rs".into(),
+                "/outside/c.rs".into(),
+            ]),
+            Some("/nonexistent/transcript.jsonl"),
+        );
+        let d = resolve_declared(&sig, Some(FIXTURE_TRANSCRIPT), Path::new("/repo")).unwrap();
+        assert_eq!(d.tier, DeclaredTier::SignalField);
+        assert!(d.paths.contains("from_field.rs"));
+        assert!(d.paths.contains("sub/b.rs"), "lexical .. normalization");
+        assert_eq!(d.paths.len(), 2);
+        assert_eq!(d.out_of_root, 1);
+    }
+
+    #[test]
+    fn resolve_declared_falls_back_to_transcript_then_none() {
+        // Tier 2: no field, transcript text present.
+        let sig = stop_sig(None, Some("/ignored/path.jsonl"));
+        let d = resolve_declared(&sig, Some(FIXTURE_TRANSCRIPT), Path::new("/repo")).unwrap();
+        assert_eq!(d.tier, DeclaredTier::TranscriptFallback);
+        assert_eq!(
+            d.paths,
+            ["src/lib.rs", "src/main.rs"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        assert_eq!(d.out_of_root, 1);
+
+        // Tier 3: nothing to go on -> None, not an empty assertion.
+        assert!(resolve_declared(&stop_sig(None, None), None, Path::new("/repo")).is_none());
+        // Fallback parse finding nothing is also "did not declare".
+        assert!(resolve_declared(&stop_sig(None, None), Some("{}"), Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn resolve_declared_empty_field_is_explicit_empty_declaration() {
+        // An emitter that SAYS "I wrote nothing" is a declaration, distinct
+        // from silence — tier stays SignalField with zero paths, and the
+        // transcript fallback must NOT resurrect paths the emitter did not
+        // declare.
+        let sig = stop_sig(Some(vec![]), None);
+        let d = resolve_declared(&sig, Some(FIXTURE_TRANSCRIPT), Path::new("/repo")).unwrap();
+        assert_eq!(d.tier, DeclaredTier::SignalField);
+        assert!(d.paths.is_empty());
+        assert_eq!(d.out_of_root, 0);
+    }
 
     /// Mirrors `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`:
     /// in a release build (`debug_assertions` off), the D-M6 pause seam must
