@@ -353,6 +353,8 @@ fn agentrec_own_turn_carries_no_window_caution() {
         prompt_ref: None,
         prompt_excerpt: Some("undo of t_EARLIER".into()),
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: vec![FileEntry {
             path: "restored.txt".into(),
             op: "create".into(),
@@ -360,6 +362,7 @@ fn agentrec_own_turn_carries_no_window_caution() {
             after: Some(after),
             skipped: false,
             skipped_reason: None,
+            after_synthesized: None,
             withheld: false,
             baseline_unknown: false,
         }],
@@ -401,6 +404,7 @@ fn modify_entry(
         after: Some(store.put(after).expect("snapshot after")),
         skipped: false,
         skipped_reason: None,
+        after_synthesized: None,
         withheld: false,
         baseline_unknown: false,
     }
@@ -428,6 +432,8 @@ fn seed_turn(
         prompt_ref: None,
         prompt_excerpt: None,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files,
     };
     agentrec_core::record::append_log(&root.join(".agentrec/log.jsonl"), &LogRecord::Turn(turn))

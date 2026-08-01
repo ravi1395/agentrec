@@ -1223,6 +1223,7 @@ impl Recorder {
             withheld: obs.withheld,
             baseline_unknown: obs.baseline_unknown,
             skipped_reason: obs.skip_reason.clone(),
+            after_synthesized: None,
         }
     }
 }
@@ -1821,6 +1822,8 @@ fn persist(
             prompt_ref,
             prompt_excerpt,
             merges: turn.merges.clone(),
+            imported: None,
+            files_complete: None,
             files,
         };
         append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -2004,6 +2007,8 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         prompt_ref,
         prompt_excerpt,
         merges: vec![],
+        imported: None,
+        files_complete: None,
         files: journal.files.clone(),
     };
     append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -4379,6 +4384,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }];
 
         let existing = TurnRecord {
@@ -4395,6 +4401,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
@@ -4457,6 +4465,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         }];
 
         let id = turn_id();
@@ -4476,6 +4485,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
@@ -4540,6 +4551,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
             id: turn_id(),
         };

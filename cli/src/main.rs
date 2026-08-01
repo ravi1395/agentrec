@@ -5,6 +5,7 @@ mod cmds;
 mod daemon;
 mod doctorcmd;
 mod fmt;
+mod importcmd;
 mod initcmd;
 mod loglock;
 mod memlock;
@@ -45,6 +46,10 @@ enum Command {
         /// Skip writing/loading the per-repo service unit (launchd/systemd).
         #[arg(long)]
         no_service: bool,
+        /// Install the service unit even under a temporary directory, where
+        /// it is skipped by default (D46: the unit outlives the directory).
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
         /// Print the actions init would take without touching disk.
         #[arg(long)]
         dry_run: bool,
@@ -92,11 +97,19 @@ enum Command {
     Diff {
         /// Turn id, full or an unambiguous prefix.
         turn: String,
+        /// Emit `serde_json` of the exact `DiffResult` `RepositoryView::diff`
+        /// returned, instead of the unified-diff text.
+        #[arg(long)]
+        json: bool,
     },
     /// Which turn last touched a file or line.
     Blame {
         /// `<file>` or `<file>:<line>`.
         target: String,
+        /// Emit `serde_json` of the exact `BlameResult` `RepositoryView::blame`
+        /// returned, instead of the prose line.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a turn's header; the full prompt requires the explicit --prompt flag.
     Show {
@@ -279,6 +292,38 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Import history from another agent tool's transcript store (Claude
+    /// Code only). `--dry-run` classifies and reports without writing
+    /// (P1); omitting it persists imported turns into this repo's
+    /// `log.jsonl`, scoped to sessions whose `cwd` resolves under `--root`
+    /// (P2).
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Classify (and, without `--dry-run`, persist) Claude Code's
+    /// ~/.claude/projects transcript corpus: per-tier before-bytes
+    /// reconstructability, fidelity figures, peak RSS. `--dry-run` is
+    /// read-only classification only (P1); omitting it persists imported
+    /// turns into `log.jsonl` for sessions in scope of `--root` (P2) —
+    /// idempotent (re-running appends nothing new) and safe to interrupt.
+    Claude {
+        /// Read-only classify-and-report mode (P1) — no writes. Omit to
+        /// persist (P2).
+        #[arg(long)]
+        dry_run: bool,
+        /// Corpus root containing sibling `projects/` and `file-history/`
+        /// dirs (mirrors the real `~/.claude` layout). Defaults to `~/.claude`.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Emit the machine-readable report instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -291,8 +336,9 @@ fn main() {
         Command::Init {
             no_hook,
             no_service,
+            service,
             dry_run,
-        } => initcmd::run(&root, no_hook, no_service, dry_run),
+        } => initcmd::run(&root, no_hook, no_service, service, dry_run),
         Command::Record => daemon::run(&root),
         Command::Log {
             all,
@@ -303,8 +349,8 @@ fn main() {
             all_files,
         } => cmds::log(&root, all, json, limit, utc, explain, all_files),
         Command::Status { ack_degraded, json } => cmds::status(&root, ack_degraded, json),
-        Command::Diff { turn } => readcmds::diff(&root, &turn),
-        Command::Blame { target } => readcmds::blame(&root, &target),
+        Command::Diff { turn, json } => readcmds::diff(&root, &turn, json),
+        Command::Blame { target, json } => readcmds::blame(&root, &target, json),
         Command::Show {
             turn,
             prompt,
@@ -371,6 +417,7 @@ fn main() {
             replace_pin,
         } => memorycmds::verify(&root, &id, confirm, &drop_pin, &replace_pin),
         Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
+        Command::Import { source } => importcmd::run(&root, source),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");

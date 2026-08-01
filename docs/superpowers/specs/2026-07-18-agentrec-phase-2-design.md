@@ -236,12 +236,43 @@ blame, gap honesty, memory recall, pagination, and report-safe sanitization.
 
 ```rust
 RepositoryView::open(root: &Path) -> Result<RepositoryView, RepoError>
-RepositoryView::list(query: TurnQuery) -> Result<Page<TurnSummary>, RepoError>
-RepositoryView::diff(query: DiffQuery) -> Result<Page<FileDiff>, RepoError>
-RepositoryView::blame(query: BlameQuery) -> Result<BlameResult, RepoError>
-RepositoryView::recall(query: RecallQuery) -> Result<Page<MemoryHit>, RepoError>
-RepositoryView::health() -> Result<RepositoryHealth, RepoError>
+RepositoryView::list(query: TurnQuery) -> Result<Page<TurnSummary>, CursorError>
+RepositoryView::diff(query: DiffQuery) -> Result<DiffResult, DiffError>
+RepositoryView::blame(query: BlameQuery) -> Result<BlameResult, BlameError>
+RepositoryView::recall(query: RecallQuery) -> Result<RecallPage, RecallError>
+RepositoryView::health(budget: u64) -> Result<RepositoryHealth, RepoError>
 ```
+
+> **Amended 2026-07-30 (P4b, decisions 8–10; signature drift resolves toward the code — the
+> parent spec is amended, not the code). Each amendment below is a ratchet-up: it adds
+> precision or information the original signature could not carry, never removes a
+> guarantee.**
+>
+> - `health` takes an explicit `budget: u64`. The view deliberately holds no config; the
+>   budget comes from the caller (config), and re-coupling the view to config would also
+>   disturb P5's `status --json` AC surface. **Ratchet-up:** the pure/impure split this makes
+>   possible is strictly more information than a config-reading `health()` could expose.
+> - `list` returns `Result<.., CursorError>`, not the blanket `RepoError`. **Ratchet-up:**
+>   strictly more precise — a cursor failure (e.g. `stale_cursor`) is no longer indistinguishable
+>   from an I/O failure.
+> - `diff` returns `Result<DiffResult, DiffError>`, not `Result<Page<FileDiff>, RepoError>`.
+>   A bare `Page<FileDiff>` has no slot for the turn-level header
+>   (`turn <id> · <tool> · N files`), so a fileless turn's empty page would make that header
+>   unproducible — `DiffResult` carries `turn_id`/`tool`/`total_files` alongside the page.
+>   `DiffError` separates turn lookup failure from cursor failure from I/O, which a single
+>   `RepoError` cannot. **Ratchet-up:** adds the header carrier and the error-cause distinction;
+>   loses nothing `Page<FileDiff>` had.
+> - `blame` returns `Result<BlameResult, BlameError>`, not `Result<BlameResult, RepoError>`.
+>   `RepoError` is a single `Io(String)`; reproducing prose like
+>   `<path> has only N line(s)` through it would require crafting that prose inside
+>   `agentrec-core`, which violates decision 9 (the human CLI keeps ownership of its prose) and
+>   misfiles a user-input error as I/O. **Ratchet-up:** the per-cause error enum is strictly
+>   more information than one `Io(String)` variant.
+> - `recall` returns `Result<RecallPage, RecallError>`, not `Result<Page<MemoryHit>, RepoError>`.
+>   A bare `Page<MemoryHit>` drops `capped` (F3 — results may be missing from what was
+>   fetched), `store_corrupt` (F10), and `store_empty` (PD3), each of which drives real adapter
+>   behavior today. **Ratchet-up:** `RecallPage` is a strict superset — the underlying `Page`
+>   is still there (`RecallPage.page`), plus the three flags a bare `Page` could not carry.
 
 Rules:
 
@@ -389,27 +420,66 @@ load-bearing:
 1. **T1** — transcript `toolUseResult.originalFile`: Claude Code embeds the full
    pre-edit file content on Edit/Write results, but **unreliably** (~30% of edit
    results in the audited corpus, varying 4–70% per session with no version
-   correlation). Opportunistic, never assumed. Measured share: 42.5% of file
-   entries (incl. create ops).
+   correlation). Opportunistic, never assumed. Measured share (P1's real-corpus
+   importer run, corrected 2026-07-29 evening, 2159 file entries): **856 entries
+   — 39.6%** (of which 595 — 27.6% — carry inline `originalFile` and yield real
+   pre-edit bytes; 261 — 12.1% — are `create` ops, which correctly have no
+   pre-edit bytes) — supersedes the 2026-07-24 audit's 42.5% prediction.
 2. **T1.5** — `~/.claude/file-history/<sessionId>/<hash>@<vN>`, resolved via
-   `snapshot.trackedFileBackups[path].backupFileName`: verbatim pre-edit bytes.
-   Measured 25.3% of entries (518 of 2044); separately, 508/508 backups
-   *referenced by the audit sample* resolved on disk — a resolve-rate check
-   with its own denominator, not the tier count. Retention-limited (~30 days)
-   so coverage degrades with age — opportunistic, same class as T1.
+   `snapshot.trackedFileBackups[path].backupFileName`: verbatim pre-edit bytes,
+   admitted only when a **structural** check passes — no edit to the same path
+   intervened between the snapshot that recorded the backup and the edit being
+   classified. (File-history blobs are written at snapshot time, not per edit,
+   so for a 2nd-or-later edit the naive blob is a pre-*snapshot*, not pre-edit,
+   state.) The 2026-07-24 audit predicted 25.3% of entries, but that figure
+   counted files with *any* same-session backup reference, not entries the
+   ladder's first-hit-wins logic actually resolves via T1.5. **T1.5 was wrong
+   twice, in opposite directions, before this figure — it was never "genuinely
+   near-empty."** First it was *under-detected* to 0.5% (11 entries) by a bug
+   comparing an absolute `filePath` against `trackedFileBackups` keys that are
+   relative to the session `cwd` in most of the corpus. Fixing that path
+   compare raised the count to 210 — which was then found to be *over-counted*:
+   a ground-truth subsample put the fabrication rate at ~30% (115 of that
+   sample provably stale), because the textual `oldString`-containment guard
+   let stale blobs (pre-snapshot, not pre-edit) through. Gating on the
+   structural check above rejects **170 entries corpus-wide** as stale;
+   P1's corrected, twice-re-measured marginal contribution is **90 entries —
+   4.2%** (1 structurally-inferred). Ground-truth
+   check (entries that also carry an inline `originalFile`, so the true bytes
+   are known): **101 correct / 1 fabricated — 1.0% residual**, down from ~30%
+   fabricated before the structural fix. Retention-limited (~30 days) so
+   coverage degrades with age — opportunistic, same class as T1.
 3. **T2** — git history blob (commit-time reconstruction) when the repo's git log
    covers the file at the turn's timestamp. **Upper bound by construction**: git
    holds committed states only, so a mid-session intermediate edit was never in
    git — a T2 candidate whose exact bytes were never committed falls through to
-   T3, never to a nearby commit's bytes. Measured candidate share: 24.5%.
+   T3, never to a nearby commit's bytes. 2026-07-24 predicted candidate share
+   24.5%; P1's real-corpus run measured T2-candidate share at **41.5%** (897 of
+   2159 entries; bytes still not resolved — see "Do not quote 92.3%" below).
 4. **T3** — none of the above → `before: null` + provenance-only; refused by undo
    with an explicit imported-history reason. Import never fabricates a revertible
-   snapshot. Measured share: 7.7%.
+   snapshot. 2026-07-24 predicted 7.7%; P1's real-corpus run measured **14.6%**
+   (316 of 2159).
 
-Honest reconstructible figure: **67.9% without git** (T1 + T1.5, as measured on
-unrounded entry counts; the rounded tier shares above sum to 67.8 — quote 67.9,
-the direct measurement), plus an unknown resolved share of the 24.5% T2
-candidates. Do not quote 92.3%.
+**Honest reconstructible figure — two numbers, read separately, never collapsed
+to one** (measured 2026-07-29 evening by the built importer's real-corpus run —
+task P1; see `VERIFY-LEDGER.md`'s "Phase 2.0 P1" section and
+`docs/verify/p1-gate-run-t15fix2.txt`):
+- **43.8%** (T1 856 + T1.5 90 = 946 of 2159) counting `create` ops as
+  reconstructible, since a new file's correct `before` genuinely is "nothing".
+- **31.7%** (595 + 90 = 685 of 2159) counting only entries that yield **actual
+  pre-edit bytes**.
+
+This figure has been wrong twice: the 2026-07-24 prediction (67.9%), then a
+first real-corpus reading (40.4%) that undercounted T1.5 via the path-compare
+bug and — had it not been caught — would next have overcounted it via stale
+blobs. Neither superseded number should be quoted again.
+Do not quote 92.3% — T2-candidate measured 41.5% (P1), still an unresolved
+upper bound. **The same ban applies to the ~85% ceiling** (43.8 + 41.5
+T2-candidate): it is an upper bound by the identical argument (git holds
+committed states only, so a mid-session intermediate edit was never in git at
+all), and P2 will not resolve every T2 candidate. Do not quote ~85% as a
+recovery rate.
 
 **File lists are structurally incomplete** — the deeper honesty problem. In the
 audited corpus, Bash tool calls outnumber Edit+Write ~2:1, and Bash and subagent
@@ -549,8 +619,22 @@ mode requires restart and is reported in `agentrec_status`.
 | `agentrec_recall` | query, k, cursor | fresh hash-verified memory hits only |
 | `agentrec_status` | none | repo/daemon/config/health summary |
 
+> **Amended 2026-07-30 (P4b, decision 12).** This row promised both "≤200 turn **summaries**"
+> and, in the paragraph below, that read tools "mirror the Phase 2.0 `--json` contracts exactly
+> … same typed values, one serializer." Under decision 5 those are irreconcilable for
+> `agentrec_log` specifically: `log --json` serializes full `TurnRecord`s, while the row's own
+> "summaries" promise is `TurnSummary` — a different, smaller typed value with its own
+> serializer (`list()`'s). **`agentrec_log` mirrors `list()`'s summary contract**
+> (`Page<TurnSummary>`), not `log --json`'s full-record contract. A full-record MCP tool or
+> parameter is deferred, not designed here. This is consistent with the spec's own "prompt
+> contents never in generic summaries" rule — `TurnSummary` already excludes prompt fields.
+> The other four rows are unaffected: `agentrec_diff`/`agentrec_blame`/`agentrec_recall`/
+> `agentrec_status` each mirror one `--json` contract with no second typed value competing for
+> the name.
+
 Read tool JSON mirrors the Phase 2.0 `--json` contracts exactly (P2) — same typed
-values, one serializer. Tool descriptions state capability and data shape only;
+values, one serializer, **except `agentrec_log`, which mirrors `list()`'s summary contract per
+the amendment above.** Tool descriptions state capability and data shape only;
 outputs contain data, not instructions to the model (P7). Read tools carry
 read-only MCP annotations.
 

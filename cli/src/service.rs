@@ -3,13 +3,15 @@
 //! unit runs `<agentrec> record --root <repo>` so the daemon survives reboots
 //! and restarts on crash (`KeepAlive true` / `Restart=always`).
 //!
-//! `slug`/`launchd_plist`/`systemd_unit`/`unit_path` are pure — no filesystem
-//! or process access — and are unit-tested directly below. `install`/
-//! `uninstall` do real (best-effort, failure-tolerant) I/O, including
-//! spawning `launchctl`/`systemctl`; per the hermetic-tests requirement they
-//! are exercised ONLY through manual verification and `agentrec init/
-//! uninstall --no-service` in the CLI test suite, never called from an
-//! automated test.
+//! `slug`/`launchd_plist`/`systemd_unit`/`unit_path`/`service_dir` are pure —
+//! no filesystem or process access — and are unit-tested directly below.
+//! `parse_unit_root`/`scan_units` (D46, the discovery half) touch the
+//! filesystem but spawn NOTHING, so unlike the install path they are fully
+//! covered by the automated suite. `install`/`uninstall` do real (best-effort,
+//! failure-tolerant) I/O, including spawning `launchctl`/`systemctl`; per the
+//! hermetic-tests requirement they are exercised ONLY through manual
+//! verification and `agentrec init/uninstall --no-service` in the CLI test
+//! suite, never called from an automated test.
 
 use agentrec_core::store::hash_bytes;
 use std::path::{Path, PathBuf};
@@ -54,7 +56,42 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// macOS launchd plist: runs `record --root <root>` at load and on crash.
+/// macOS launchd plist: runs `record --root <root>` at load and on crash,
+/// but ONLY while the root still exists.
+///
+/// `KeepAlive` is a dict carrying `PathState`, not a bare `<true/>`. A bare
+/// `KeepAlive` is what turned a stale path snapshot into permanent noise: the
+/// unit records the root at `init` time, nothing re-validates it at load
+/// time, and when the root is deleted launchd respawns the doomed job forever
+/// (39 such units accumulated on the author's machine by 2026-07-31).
+/// `PathState` makes the precondition declarative, so the init system —
+/// which is the only thing still running once a path goes stale — enforces
+/// it.
+///
+/// **Only the ROOT is listed, and that is a measured constraint, not an
+/// omission.** A probed two-key `PathState` with one path absent still
+/// produced 3 spawns in 30s (macOS, 2026-07-31), so a co-listed path that
+/// still exists defeats the gate: `{root, exec}` would keep the job alive
+/// whenever EITHER exists, making the exec gate inert in exactly the case
+/// that motivates it (root present, binary upgraded away).
+///
+/// Precise about the mechanism, because the gate round caught this doc
+/// overstating it: the man page's "launchd ORs them" is stated at the
+/// `KeepAlive`-dict level, and the probe does not uniquely distinguish
+/// "`PathState` ORs its entries" from "an absent path is disregarded while a
+/// present co-key is satisfied". Both hypotheses give the same consequence
+/// for this decision, which is why root-only is right either way — but the
+/// OR label itself is inference, not measurement. No AND is reachable in
+/// either reading: `false` values invert individual conditions, they cannot
+/// negate whatever combines them. A vanished exec is therefore DETECTED
+/// (`doctorcmd::check_orphan_services`), not prevented.
+///
+/// Measured with a missing root, macOS 2026-07-31: `RunAtLoad` fires once
+/// and the job then reads `runs = 1`, `state = not running` — versus
+/// `state = spawn scheduled` for a job launchd is still respawning, which is
+/// what makes the two distinguishable. Read as "no respawn observed in that
+/// window", not "every restart blocked forever": it is ONE load cycle whose
+/// duration went unrecorded.
 pub fn launchd_plist(exec: &Path, root: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -73,7 +110,13 @@ pub fn launchd_plist(exec: &Path, root: &Path) -> String {
 \t<key>RunAtLoad</key>\n\
 \t<true/>\n\
 \t<key>KeepAlive</key>\n\
-\t<true/>\n\
+\t<dict>\n\
+\t\t<key>PathState</key>\n\
+\t\t<dict>\n\
+\t\t\t<key>{root}</key>\n\
+\t\t\t<true/>\n\
+\t\t</dict>\n\
+\t</dict>\n\
 </dict>\n\
 </plist>\n",
         slug = slug(root),
@@ -111,11 +154,35 @@ fn systemd_escape(s: &str) -> String {
     out
 }
 
+/// Escape a path for a systemd setting that takes ONE value rather than a
+/// command line (`ConditionPathIsDirectory=`, …). Only `%` needs doubling: a
+/// literal `%` would otherwise start a specifier expansion. Deliberately does
+/// NOT reuse `systemd_escape`, whose whitespace quoting exists to stop a path
+/// splitting into extra `ExecStart=` argv entries — there is no argv to split
+/// here, and a quoted value would likely be taken with its quotes.
+fn systemd_value_escape(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
 /// Linux systemd user unit: same exec; `Restart=always` mirrors `KeepAlive`.
+///
+/// `ConditionPathIsDirectory` is systemd's counterpart to launchd's
+/// `PathState` — a start job whose condition is false is skipped, leaving the
+/// unit inactive rather than failed, so a deleted root stops producing restart
+/// churn. Kept to the ROOT alone for parity with the launchd side, where
+/// listing the exec too was measured to be actively wrong (see
+/// `launchd_plist`); the exec is DETECTED by `doctor`, not gated here.
+///
+/// **Honesty note:** unlike the launchd behavior above, this one is NOT
+/// measured. It was written on a macOS host with no systemd to probe, so the
+/// generator is unit-tested but the runtime effect rests on documentation and
+/// carries a VERIFY-LEDGER row. Do not upgrade this to a proven claim without
+/// running it on Linux.
 pub fn systemd_unit(exec: &Path, root: &Path) -> String {
     format!(
         "[Unit]\n\
 Description=agentrec recorder for {root}\n\
+ConditionPathIsDirectory={root_cond}\n\
 \n\
 [Service]\n\
 ExecStart={exec} record --root {root_q}\n\
@@ -126,6 +193,7 @@ WantedBy=default.target\n",
         root = root.display(),
         exec = systemd_escape(&exec.display().to_string()),
         root_q = systemd_escape(&root.display().to_string()),
+        root_cond = systemd_value_escape(&root.display().to_string()),
     )
 }
 
@@ -149,29 +217,298 @@ fn config_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".config"))
 }
 
-/// Per-OS unit file path. A bare env read (no filesystem access), so it errs
-/// rather than panics when `HOME` is unset, and stays hermetically
-/// unit-testable. macOS always uses `$HOME/Library/LaunchAgents` (not an XDG
-/// path); Linux resolves the systemd user-unit directory via `config_home`
-/// (`$XDG_CONFIG_HOME`, falling back to `$HOME/.config`) — the single
-/// resolver `install`/`uninstall` both go through.
-pub fn unit_path(root: &Path) -> Result<PathBuf, String> {
-    let s = slug(root);
-    let path = if cfg!(target_os = "macos") {
+/// Per-OS directory holding installed unit files. A bare env read (no
+/// filesystem access), so it errs rather than panics when `HOME` is unset, and
+/// stays hermetically unit-testable. macOS always uses
+/// `$HOME/Library/LaunchAgents` (not an XDG path); Linux resolves the systemd
+/// user-unit directory via `config_home` (`$XDG_CONFIG_HOME`, falling back to
+/// `$HOME/.config`) — the single resolver `install`/`uninstall`/`unit_path`
+/// and `doctor`'s orphan scan all go through.
+pub fn service_dir() -> Result<PathBuf, String> {
+    // D46: debug-only seam so `doctor`'s orphan scan can be driven against a
+    // fixture directory from the integration suite instead of the developer's
+    // real `~/Library/LaunchAgents`. `#[cfg(debug_assertions)]` keeps it out
+    // of release binaries — verified by the release-`strings` check.
+    #[cfg(debug_assertions)]
+    if let Ok(dir) = std::env::var("AGENTREC_TEST_SERVICE_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    if cfg!(target_os = "macos") {
         let home = std::env::var("HOME").map_err(|_| {
             "HOME environment variable is not set — cannot locate the service directory".to_string()
         })?;
-        PathBuf::from(home)
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("com.agentrec.{s}.plist"))
+        Ok(PathBuf::from(home).join("Library").join("LaunchAgents"))
     } else {
-        config_home()?
-            .join("systemd")
-            .join("user")
-            .join(format!("agentrec-{s}.service"))
+        Ok(config_home()?.join("systemd").join("user"))
+    }
+}
+
+/// Per-OS unit file path for one repo root.
+pub fn unit_path(root: &Path) -> Result<PathBuf, String> {
+    let s = slug(root);
+    let name = if cfg!(target_os = "macos") {
+        format!("com.agentrec.{s}.plist")
+    } else {
+        format!("agentrec-{s}.service")
     };
-    Ok(path)
+    Ok(service_dir()?.join(name))
+}
+
+// ---- D46: installed-unit discovery ------------------------------------------
+//
+// `slug()` is a ONE-WAY hash of the repo path, so the set of installed units
+// cannot be mapped back to roots by inverting filenames — the only way to learn
+// which root a unit records is to parse the unit's own contents. Everything
+// below is pure text/filesystem reading: no `launchctl`/`systemctl` process is
+// spawned, so unlike `install`/`uninstall` this code IS exercised by the
+// automated suite.
+
+/// What an installed unit's recorded `--root` currently looks like on disk.
+/// Three disjoint states — `Unparseable` is deliberately NOT folded into
+/// `VanishedRoot`: a unit we failed to read tells us nothing about its root,
+/// and reporting it as an orphan would be a fabricated finding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnitState {
+    /// Recorded root parsed and the directory is present.
+    Live(PathBuf),
+    /// Recorded root parsed and the directory is NOT present. Note this is
+    /// exactly what an unmounted volume or a detached network mount also looks
+    /// like — "vanished" is an observation, not a verdict that the unit is
+    /// abandoned.
+    VanishedRoot(PathBuf),
+    /// No `--root` could be recovered from the unit's contents.
+    Unparseable,
+}
+
+#[derive(Debug)]
+pub struct InstalledUnit {
+    /// launchd label (`com.agentrec.<slug>`) or systemd unit name
+    /// (`agentrec-<slug>.service`) — whichever the platform's tooling takes.
+    pub label: String,
+    pub path: PathBuf,
+    pub state: UnitState,
+    /// The recorded exec, when it was recoverable AND no longer exists on
+    /// disk. `None` covers three DIFFERENT situations on purpose — exec
+    /// present, exec unrecoverable, unit unreadable — because none of them is
+    /// evidence the exec is missing.
+    ///
+    /// Deliberately a separate field rather than a `UnitState` variant: the
+    /// two paths a unit bakes go stale INDEPENDENTLY. A vanished root with a
+    /// live exec and a live root with a vanished exec are both real, and the
+    /// second is the shape a `brew upgrade` produces — invisible to a
+    /// root-only classification, and invisible to the daemon too, since a
+    /// missing exec fails at spawn before any of this code runs.
+    ///
+    /// `Unparseable` must never carry `Some`: a unit we could not read tells
+    /// us nothing about its exec, and reporting one would be a fabricated
+    /// finding — the same rule that keeps `Unparseable` out of `VanishedRoot`.
+    pub missing_exec: Option<PathBuf>,
+}
+
+/// Does `name` look like a unit file this tool installed? Both platforms'
+/// spellings are recognized regardless of the host OS, so a fixture of either
+/// form is scannable from any test runner.
+fn is_agentrec_unit_name(name: &str) -> bool {
+    (name.starts_with("com.agentrec.") && name.ends_with(".plist"))
+        || (name.starts_with("agentrec-") && name.ends_with(".service"))
+}
+
+/// The identifier `launchctl bootout` / `systemctl --user disable` expects:
+/// launchd wants the bare label (filename minus `.plist`), systemd wants the
+/// unit filename including its `.service` suffix.
+fn unit_label(name: &str) -> String {
+    name.strip_suffix(".plist").unwrap_or(name).to_string()
+}
+
+/// Every agentrec unit installed in `dir`, each classified by whether its
+/// recorded root still exists. A `dir` that doesn't exist yields an empty list
+/// (nothing installed is not an error). Sorted by path so output is stable.
+pub fn scan_units(dir: &Path) -> Vec<InstalledUnit> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut units: Vec<InstalledUnit> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if !is_agentrec_unit_name(&name) {
+                return None;
+            }
+            let content = std::fs::read_to_string(&path).ok();
+            let state = match content.as_deref().and_then(parse_unit_root) {
+                Some(root) if root.is_dir() => UnitState::Live(root),
+                Some(root) => UnitState::VanishedRoot(root),
+                None => UnitState::Unparseable,
+            };
+            // Read from the same `content`, so an unreadable file yields
+            // `None` here for the same reason it yields `Unparseable` above,
+            // rather than by a second independent read that could disagree.
+            let missing_exec = content
+                .as_deref()
+                .and_then(parse_unit_exec)
+                .filter(|exec| !exec.exists());
+            Some(InstalledUnit {
+                label: unit_label(&name),
+                path,
+                state,
+                missing_exec,
+            })
+        })
+        .collect();
+    units.sort_by(|a, b| a.path.cmp(&b.path));
+    units
+}
+
+/// Recover the exec a unit file records — `ProgramArguments[0]` on launchd,
+/// the first `ExecStart=` token on systemd. Dispatches on CONTENT like
+/// `parse_unit_root`, so both writers' output is parseable from either host.
+pub fn parse_unit_exec(content: &str) -> Option<PathBuf> {
+    if content.trim_start().starts_with('<') {
+        parse_launchd_exec(content)
+    } else {
+        parse_systemd_exec(content)
+    }
+}
+
+fn parse_launchd_exec(content: &str) -> Option<PathBuf> {
+    let after_key = content.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key
+        .split("<array>")
+        .nth(1)?
+        .split("</array>")
+        .next()?;
+    array
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()
+        .map(|v| xml_unescape(v.trim()))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_systemd_exec(content: &str) -> Option<PathBuf> {
+    let line = content
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("ExecStart="))?;
+    split_exec_start(line)
+        .into_iter()
+        .next()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Recover the `--root` a unit file records. Dispatches on CONTENT, not on the
+/// host OS, so both parsers are exercised on every platform's test run.
+pub fn parse_unit_root(content: &str) -> Option<PathBuf> {
+    if content.trim_start().starts_with('<') {
+        parse_launchd_root(content)
+    } else {
+        parse_systemd_root(content)
+    }
+}
+
+/// Inverse of `xml_escape` — only the five entities that function emits.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        // `&amp;` LAST: an escaped literal `&amp;lt;` in a path must decode to
+        // the text `&lt;`, not be re-decoded into `<`.
+        .replace("&amp;", "&")
+}
+
+/// Pull `ProgramArguments`' `<string>` values and return the one after
+/// `--root`. Deliberately a narrow scan rather than a real XML parse: the only
+/// documents this ever sees are the ones `launchd_plist` writes.
+fn parse_launchd_root(content: &str) -> Option<PathBuf> {
+    let after_key = content.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key
+        .split("<array>")
+        .nth(1)?
+        .split("</array>")
+        .next()?;
+    let mut args = array.split("<string>").skip(1).filter_map(|chunk| {
+        chunk
+            .split("</string>")
+            .next()
+            .map(|v| xml_unescape(v.trim()))
+    });
+    args.find(|a| a == "--root")?;
+    args.next().filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Split an `ExecStart=` value into argv the way systemd does for the subset
+/// `systemd_escape` can produce: whitespace separates tokens, a double quote
+/// opens/closes a quoted run, and a backslash inside quotes escapes the next
+/// character. `%%` -> `%` is undone per-token afterwards.
+fn split_exec_start(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut in_quotes = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                started = true;
+                in_quotes = !in_quotes;
+            }
+            '\\' if in_quotes => {
+                started = true;
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                started = true;
+                current.push(c);
+            }
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens.into_iter().map(|t| t.replace("%%", "%")).collect()
+}
+
+fn parse_systemd_root(content: &str) -> Option<PathBuf> {
+    let line = content
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("ExecStart="))?;
+    let tokens = split_exec_start(line);
+    let idx = tokens.iter().position(|t| t == "--root")?;
+    tokens
+        .get(idx + 1)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The exact command pair a human runs to reap one unit. Displayed by
+/// `doctor`; never executed here — removing a unit shells out to
+/// `launchctl`/`systemctl`, and that stays a human action (see D46).
+pub fn manual_remove_command(label: &str, path: &Path) -> String {
+    if cfg!(target_os = "macos") {
+        format!(
+            "launchctl bootout gui/$(id -u)/{label} && rm {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "systemctl --user disable --now {label} && rm {}",
+            path.display()
+        )
+    }
 }
 
 /// Write (or refresh) the unit file for `root` and attempt to load it.
@@ -596,4 +933,329 @@ mod tests {
     // No test drives `install`/`uninstall` directly — both shell out to the
     // real `launchctl`/`systemctl`, which the hermetic-tests requirement
     // forbids touching from the automated suite.
+
+    // ---- D46 AC-S5/S6: unit discovery -----------------------------------
+
+    /// Roots that stress every escaping rule on both writers at once: the XML
+    /// entities, the systemd `%` specifier, quote/backslash escaping, and the
+    /// whitespace-triggered quoting.
+    const TRICKY_ROOTS: &[&str] = &[
+        "/repo/plain",
+        "/repo with space",
+        "/repo/AT&T",
+        "/repo/100%done",
+        "/repo/\"weird\" dir",
+        "/repo/<angle>&amp;lt;",
+        "/repo/it's mine",
+    ];
+
+    // The unit must gate its own restarts on the root still existing, or a
+    // deleted repo respawns a doomed job forever — the mechanism behind 39
+    // leaked units. A bare `KeepAlive <true/>` is exactly that defect.
+    #[test]
+    fn launchd_plist_gates_keepalive_on_the_root_path() {
+        let plist = launchd_plist(Path::new("/usr/local/bin/agentrec"), Path::new("/repo"));
+        assert!(
+            plist.contains("<key>PathState</key>"),
+            "KeepAlive must be conditional: {plist}"
+        );
+        // The gated path must be the ROOT.
+        let path_state = plist
+            .split("<key>PathState</key>")
+            .nth(1)
+            .expect("PathState section");
+        assert!(
+            path_state.contains("<key>/repo</key>"),
+            "PathState must name the root: {plist}"
+        );
+        assert!(
+            !plist.contains("<key>KeepAlive</key>\n\t<true/>"),
+            "a bare KeepAlive is the defect this replaces: {plist}"
+        );
+    }
+
+    // MEASURED CONSTRAINT, not a style choice: launchd ORs the entries in a
+    // KeepAlive dict, and the OR extends inside PathState — a probe with two
+    // keys, one absent, still produced 3 spawns in 30s. Listing the exec
+    // alongside the root would therefore keep a job alive whenever EITHER
+    // exists, silently making the gate useless in the very case it is meant
+    // for (root present, binary upgraded away). This test exists so a future
+    // reader who thinks "why isn't the exec gated too?" adds it and reds
+    // here instead of shipping an inert condition.
+    #[test]
+    fn launchd_pathstate_lists_only_the_root_never_the_exec() {
+        let exec = Path::new("/opt/homebrew/bin/agentrec");
+        let plist = launchd_plist(exec, Path::new("/repo"));
+        let path_state = plist
+            .split("<key>PathState</key>")
+            .nth(1)
+            .expect("PathState section");
+        assert!(
+            !path_state.contains(exec.to_str().unwrap()),
+            "PathState ORs its entries — adding the exec makes the gate inert: {plist}"
+        );
+    }
+
+    // systemd counterpart. NOT measured (no systemd host available when this
+    // was written) — the generator is pinned here, the runtime effect carries
+    // a VERIFY-LEDGER row.
+    #[test]
+    fn systemd_unit_gates_start_on_the_root_directory() {
+        let unit = systemd_unit(Path::new("/usr/local/bin/agentrec"), Path::new("/repo"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo"),
+            "start must be conditional on the root: {unit}"
+        );
+    }
+
+    // A `%` in the root would start a systemd specifier expansion. The
+    // Condition value takes ONE value, so it must be `%`-doubled but NOT
+    // shell-quoted the way an ExecStart token is.
+    #[test]
+    fn condition_value_escapes_percent_without_quoting() {
+        let unit = systemd_unit(Path::new("/bin/agentrec"), Path::new("/repo/100%done"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo/100%%done"),
+            "% must be doubled: {unit}"
+        );
+        let unit = systemd_unit(Path::new("/bin/agentrec"), Path::new("/repo with space"));
+        assert!(
+            unit.contains("ConditionPathIsDirectory=/repo with space\n"),
+            "a single-value setting must not gain argv quoting: {unit}"
+        );
+    }
+
+    // The exec is the unit's OTHER baked path, and it needs the same
+    // round-trip guarantee as the root: a mangled exec would make the scan
+    // stat a path the unit never named and report a healthy install as
+    // stranded. Reuses TRICKY_ROOTS as exec paths — the escaping rules are
+    // per-writer, not per-field, so the same corpus stresses both.
+    #[test]
+    fn parse_unit_exec_round_trips_both_unit_forms() {
+        let root = Path::new("/repo/plain");
+        for raw in TRICKY_ROOTS {
+            let exec = Path::new(raw);
+            let plist = launchd_plist(exec, root);
+            assert_eq!(
+                parse_unit_exec(&plist).as_deref(),
+                Some(exec),
+                "launchd exec round-trip failed for {raw}: {plist}"
+            );
+            let unit = systemd_unit(exec, root);
+            assert_eq!(
+                parse_unit_exec(&unit).as_deref(),
+                Some(exec),
+                "systemd exec round-trip failed for {raw}: {unit}"
+            );
+        }
+    }
+
+    // The two parsers must not cross-talk: an exec and a root that differ have
+    // to come back distinct from the SAME document. A `nth(0)`/`nth(1)` slip
+    // in either direction would return the exec as the root, which the scan
+    // would then stat as a repo.
+    #[test]
+    fn exec_and_root_are_recovered_independently() {
+        let exec = Path::new("/opt/homebrew/bin/agentrec");
+        let root = Path::new("/Users/x/repo with space");
+        for doc in [launchd_plist(exec, root), systemd_unit(exec, root)] {
+            assert_eq!(parse_unit_exec(&doc).as_deref(), Some(exec), "{doc}");
+            assert_eq!(parse_unit_root(&doc).as_deref(), Some(root), "{doc}");
+        }
+    }
+
+    // AC-S5: parsing must invert BOTH writers exactly. A root that survives
+    // `xml_escape`/`systemd_escape` but comes back mangled would make the
+    // orphan scan compare a wrong path against the filesystem and report a
+    // live repo as vanished.
+    #[test]
+    fn parse_unit_root_round_trips_both_unit_forms() {
+        let exec = Path::new("/usr/local/bin/agentrec");
+        for raw in TRICKY_ROOTS {
+            let root = Path::new(raw);
+            let plist = launchd_plist(exec, root);
+            assert_eq!(
+                parse_unit_root(&plist).as_deref(),
+                Some(root),
+                "launchd round-trip failed for {raw}: {plist}"
+            );
+            let unit = systemd_unit(exec, root);
+            assert_eq!(
+                parse_unit_root(&unit).as_deref(),
+                Some(root),
+                "systemd round-trip failed for {raw}: {unit}"
+            );
+        }
+    }
+
+    // The dispatcher keys on CONTENT, not on the host OS — otherwise half the
+    // parsing surface would be dead code on any given test runner.
+    #[test]
+    fn parse_unit_root_dispatches_on_content_not_platform() {
+        let exec = Path::new("/usr/local/bin/agentrec");
+        let root = Path::new("/repo/example");
+        // Both forms parse on THIS platform, whichever it is.
+        assert!(parse_unit_root(&launchd_plist(exec, root)).is_some());
+        assert!(parse_unit_root(&systemd_unit(exec, root)).is_some());
+    }
+
+    // A unit whose contents carry no recoverable `--root` must yield None, so
+    // `scan_units` can classify it `Unparseable` rather than inventing a root.
+    #[test]
+    fn parse_unit_root_returns_none_on_unrecoverable_contents() {
+        assert_eq!(parse_unit_root(""), None);
+        assert_eq!(parse_unit_root("<plist><dict></dict></plist>"), None);
+        assert_eq!(parse_unit_root("[Service]\nExecStart=/bin/true\n"), None);
+        // `--root` present but with no following value.
+        assert_eq!(
+            parse_unit_root("[Service]\nExecStart=/bin/agentrec record --root\n"),
+            None
+        );
+    }
+
+    // AC-S6: three DISJOINT buckets, and an unparseable unit is never counted
+    // as an orphan — that would be a fabricated finding about a unit we could
+    // not read. Unrelated files sharing the directory are ignored entirely.
+    #[test]
+    fn scan_units_classifies_live_vanished_and_unparseable_disjointly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("units");
+        std::fs::create_dir_all(&dir).unwrap();
+        let live_root = tmp.path().join("live-repo");
+        std::fs::create_dir_all(&live_root).unwrap();
+        let gone_root = tmp.path().join("deleted-repo"); // never created
+
+        let exec = Path::new("/usr/local/bin/agentrec");
+        std::fs::write(
+            dir.join(format!("com.agentrec.{}.plist", slug(&live_root))),
+            launchd_plist(exec, &live_root),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("com.agentrec.{}.plist", slug(&gone_root))),
+            launchd_plist(exec, &gone_root),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("com.agentrec.deadbeef0000.plist"),
+            "<plist><dict></dict></plist>",
+        )
+        .unwrap();
+        // Neither of these is ours; both must be invisible to the scan.
+        std::fs::write(dir.join("com.other.tool.plist"), "<plist/>").unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello").unwrap();
+
+        let units = scan_units(&dir);
+        assert_eq!(units.len(), 3, "only agentrec units: {units:?}");
+
+        let live: Vec<_> = units
+            .iter()
+            .filter(|u| matches!(u.state, UnitState::Live(_)))
+            .collect();
+        let vanished: Vec<_> = units
+            .iter()
+            .filter(|u| matches!(u.state, UnitState::VanishedRoot(_)))
+            .collect();
+        let unparseable: Vec<_> = units
+            .iter()
+            .filter(|u| u.state == UnitState::Unparseable)
+            .collect();
+        assert_eq!(live.len(), 1, "{units:?}");
+        assert_eq!(vanished.len(), 1, "{units:?}");
+        assert_eq!(unparseable.len(), 1, "{units:?}");
+        assert_eq!(live[0].state, UnitState::Live(live_root));
+        assert_eq!(vanished[0].state, UnitState::VanishedRoot(gone_root));
+        // The label must be what `launchctl bootout` takes — no `.plist`.
+        assert!(
+            vanished[0].label.starts_with("com.agentrec."),
+            "{:?}",
+            vanished[0].label
+        );
+        assert!(!vanished[0].label.ends_with(".plist"));
+    }
+
+    // A systemd-form unit is scanned identically (and on any host OS), so the
+    // Linux install shape is covered without a Linux runner.
+    #[test]
+    fn scan_units_reads_systemd_form_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("units");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone_root = tmp.path().join("deleted-repo");
+        std::fs::write(
+            dir.join(format!("agentrec-{}.service", slug(&gone_root))),
+            systemd_unit(Path::new("/usr/local/bin/agentrec"), &gone_root),
+        )
+        .unwrap();
+
+        let units = scan_units(&dir);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].state, UnitState::VanishedRoot(gone_root));
+        // systemd's own tooling takes the full unit filename.
+        assert!(units[0].label.ends_with(".service"));
+    }
+
+    // Nothing installed (or no service directory at all) is not an error.
+    #[test]
+    fn scan_units_of_missing_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(scan_units(&tmp.path().join("nope")).is_empty());
+    }
+
+    // AC-S9: REAL-CORPUS probe, `#[ignore]`d by design — it reads this
+    // machine's actual service directory, so it is environment-coupled and
+    // must never run as part of the hermetic suite. Run it explicitly:
+    //
+    //   cargo test --bin agentrec real_corpus_unit_scan -- --ignored --nocapture
+    //
+    // Its whole purpose is that a round-trip test against our OWN writer
+    // cannot establish that the parser reads the plists actually installed
+    // here (this repo has been bitten four times by fixture-only evidence for
+    // a corpus-shape claim). It asserts nothing about counts — the corpus is
+    // expected to shrink once the orphans are reaped — it REPORTS the three
+    // bucket sizes for the ledger, and fails only if a unit exists that the
+    // parser cannot read at all, which would be a real parser bug.
+    #[test]
+    #[ignore = "reads the real user service directory; run explicitly for corpus evidence"]
+    fn real_corpus_unit_scan() {
+        let dir = service_dir().expect("HOME must be set");
+        let units = scan_units(&dir);
+        let live = units
+            .iter()
+            .filter(|u| matches!(u.state, UnitState::Live(_)))
+            .count();
+        let vanished = units
+            .iter()
+            .filter(|u| matches!(u.state, UnitState::VanishedRoot(_)))
+            .count();
+        let unparseable: Vec<_> = units
+            .iter()
+            .filter(|u| u.state == UnitState::Unparseable)
+            .collect();
+        println!(
+            "real-corpus scan of {}: {} agentrec unit(s) — {} parsed ({} live, {} vanished-root), {} unparseable",
+            dir.display(),
+            units.len(),
+            units.len() - unparseable.len(),
+            live,
+            vanished,
+            unparseable.len()
+        );
+        for u in &units {
+            println!("  {:?} {}", u.state, u.label);
+        }
+        assert!(
+            unparseable.is_empty(),
+            "every unit this tool installed must be parseable; unreadable: {unparseable:?}"
+        );
+    }
+
+    // The printed remedy must name the unit and its file — a remedy the user
+    // has to reconstruct by hand is not a remedy.
+    #[test]
+    fn manual_remove_command_names_label_and_path() {
+        let cmd = manual_remove_command("com.agentrec.abc123", Path::new("/tmp/x.plist"));
+        assert!(cmd.contains("com.agentrec.abc123"), "{cmd}");
+        assert!(cmd.contains("/tmp/x.plist"), "{cmd}");
+    }
 }

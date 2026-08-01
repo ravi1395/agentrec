@@ -1,0 +1,40 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/golden.rs (target/debug/deps/golden-0abd446fefa80cba)
+
+running 33 tests
+test golden_blame_untouched_file_no_gap ... ok
+test fixture_contains_every_required_shape ... ok
+test golden_blame_human_edited ... ok
+test golden_blame_line_out_of_range_fails ... ok
+test golden_diff_dup_turn_collapses ... ok
+test golden_blame_untouched_file ... ok
+test golden_diff_rich_turn ... ok
+test golden_blame_line_level ... ok
+test golden_blame_touched_clean ... ok
+test golden_diff_edge_cases ... ok
+test golden_recall_human_no_memories ... ok
+test golden_recall_json_empty_store ... ok
+test golden_log_noise_all_files_reveals ... ok
+test golden_recall_human_no_match ... ok
+test golden_log_noise_fold ... ok
+test golden_diff_unknown_id_fails ... ok
+test golden_recall_json_hits ... ok
+test golden_recall_json_no_match ... ok
+test golden_recall_json_stale_pin ... ok
+test golden_log_explain ... ok
+test golden_log_all ... ok
+test golden_log_default ... ok
+test harness_never_spawns_the_daemon ... ok
+test golden_log_json ... ok
+test golden_show_bare_header_no_fabrication ... ok
+test golden_show_prompt_none_attached_fails ... ok
+test golden_show_prompt ... ok
+test golden_show_rich_header ... ok
+test golden_show_unknown_id_fails ... ok
+test golden_status ... ok
+test golden_status_ack_degraded_json_conflict_fails ... ok
+test golden_status_json ... ok
+test three_fresh_builds_are_byte_identical ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.57s
+

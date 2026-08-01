@@ -82,6 +82,18 @@ pub struct FileEntry {
     /// and aggregate, driving the DEGRADED banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,
+    /// Additive, UNFROZEN (Phase 2.0 P2 fix round, founder decision 2):
+    /// `Some(true)` when `after` was DERIVED (e.g. applying an imported
+    /// turn's `oldString`→`newString` substitution to a resolved-or-
+    /// unresolved `before`) rather than observed directly from the source
+    /// (a live daemon snapshot, or a transcript's own recorded `content`
+    /// field). `None` on every entry where `after` is real observed bytes,
+    /// including every live-recorded entry — so this stays byte-identical
+    /// to the pre-this-field wire shape for every existing record.
+    /// Consumers MUST NOT attribute a mismatch against a synthesized
+    /// `after` to "human or external edit" — see `readcmds::modified_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_synthesized: Option<bool>,
 }
 
 /// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
@@ -136,6 +148,18 @@ pub struct TurnRecord {
     /// PROTOCOL §4). Consumers must treat merged turns as superseded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merges: Vec<String>,
+    /// Import provenance (Phase 2.0 P2). Additive + UNFROZEN per spec
+    /// decision 5. `None` on every live-recorded record, so existing lines
+    /// stay byte-identical — neither this nor `files_complete` is emitted
+    /// unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<bool>,
+    /// `Some(false)` on imported turns: their file list is known-partial
+    /// (opaque tool calls and non-file activity are not captured). Never
+    /// `Some(true)` today — reserved for a future importer that can attest
+    /// completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_complete: Option<bool>,
     pub files: Vec<FileEntry>,
 }
 
@@ -198,6 +222,69 @@ fn open_append(path: &Path, line: &str) -> Result<fs::File, String> {
     Ok(file)
 }
 
+/// The `type` tags [`LogRecord`] knows. Used to tell "a record kind this
+/// binary predates" apart from "a kind we know, written malformed" — the two
+/// are indistinguishable by parse failure alone, and conflating them makes a
+/// census that asserts a producer exists on evidence of corruption.
+pub const KNOWN_RECORD_TYPES: [&str; 2] = ["turn", "epoch"];
+
+/// What one `log.jsonl` line turned out to be.
+// Same rationale as `LogRecord`: the record-bearing variant dominates real
+// logs and is consumed straight into a Vec, so the gap to the unit variants
+// is immaterial.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ParsedLine {
+    Record(LogRecord),
+    /// Well-formed JSON tagged with a `type` this binary does not know. A
+    /// newer producer is allowed to write these; consumers tolerate them.
+    UnknownType,
+    /// Not interpretable at all — a torn tail line after a crash, or a
+    /// known record kind written malformed.
+    Unparsed,
+    Blank,
+}
+
+/// Classify one line. The single parser: both [`load_log`] and
+/// `view::load_ledger` go through here, so the records a reader gets and the
+/// census of what it skipped can never disagree.
+pub fn parse_log_line(line: &str) -> ParsedLine {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return ParsedLine::Blank;
+    }
+    // `type` defaults to turn for lines written before epochs existed.
+    if let Ok(rec) = serde_json::from_str::<LogRecord>(trimmed) {
+        return ParsedLine::Record(rec);
+    }
+    // The bare-TurnRecord fallback exists only for legacy lines that predate
+    // the `type` tag entirely (C6). A line that DOES have a `type` field —
+    // just one `LogRecord` doesn't recognize, e.g. a future additive record
+    // kind — must never be coerced into a turn: serde ignores unknown fields
+    // by default, so a `type:"future_thing"` line with turn-shaped fields
+    // would otherwise silently misparse.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return ParsedLine::Unparsed;
+    };
+    // Keyed on PRESENCE of `type`, not on it being a string: a line tagged
+    // `"type": 5` is still a line that carries a type, and coercing it into a
+    // turn is exactly the misparse this guard exists to prevent.
+    match value.get("type") {
+        None => match serde_json::from_str::<TurnRecord>(trimmed) {
+            Ok(turn) => ParsedLine::Record(LogRecord::Turn(turn)),
+            Err(_) => ParsedLine::Unparsed,
+        },
+        Some(tag) => match tag.as_str() {
+            // A kind this binary predates. Tolerated and counted.
+            Some(t) if !KNOWN_RECORD_TYPES.contains(&t) => ParsedLine::UnknownType,
+            // A kind we know, written malformed — corruption, not a newer
+            // producer. A non-string tag is no kind at all, and lands here
+            // for the same reason: it is not evidence a producer exists.
+            _ => ParsedLine::Unparsed,
+        },
+    }
+}
+
 /// Load all parseable records; torn/corrupt lines are skipped, never fatal
 /// (a bad line must not wipe history — lesson inherited from Sutra).
 pub fn load_log(path: &Path) -> Vec<LogRecord> {
@@ -208,29 +295,8 @@ pub fn load_log(path: &Path) -> Vec<LogRecord> {
     let mut out = vec![];
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // `type` defaults to turn for lines written before epochs existed.
-        if let Ok(rec) = serde_json::from_str::<LogRecord>(trimmed) {
+        if let ParsedLine::Record(rec) = parse_log_line(&line) {
             out.push(rec);
-            continue;
-        }
-        // The bare-TurnRecord fallback exists only for legacy lines that
-        // predate the `type` tag entirely (C6). A line that DOES have a
-        // `type` field — just one `LogRecord` doesn't recognize, e.g. a
-        // future additive record kind — must never be coerced into a turn:
-        // serde ignores unknown fields by default, so a `type:"future_thing"`
-        // line with turn-shaped fields would otherwise silently misparse.
-        let has_type_field = serde_json::from_str::<serde_json::Value>(trimmed)
-            .ok()
-            .and_then(|v| v.as_object().map(|o| o.contains_key("type")))
-            .unwrap_or(false);
-        if !has_type_field {
-            if let Ok(turn) = serde_json::from_str::<TurnRecord>(trimmed) {
-                out.push(LogRecord::Turn(turn));
-            }
         }
     }
     out
@@ -287,6 +353,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: Some("add rate limiting".into()),
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![FileEntry {
                 path: "src/a.rs".into(),
                 before: None,
@@ -296,6 +364,7 @@ mod tests {
                 withheld: false,
                 baseline_unknown: false,
                 skipped_reason: None,
+                after_synthesized: None,
             }],
         };
         append_log(&path, &LogRecord::Turn(turn)).unwrap();
@@ -334,6 +403,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("skipped"));
@@ -367,6 +437,7 @@ mod tests {
             withheld: false,
             baseline_unknown: false,
             skipped_reason: None,
+            after_synthesized: None,
         };
         let json = serde_json::to_string(&entry_none).unwrap();
         assert_eq!(
@@ -408,6 +479,8 @@ mod tests {
             prompt_ref: None,
             prompt_excerpt: None,
             merges: vec![],
+            imported: None,
+            files_complete: None,
             files: vec![],
         };
         append_log(&log_path, &LogRecord::Turn(turn)).unwrap();
@@ -480,5 +553,89 @@ mod tests {
             LogRecord::Turn(t) => assert_eq!(t.id, "t_LEGACY"),
             LogRecord::Epoch(_) => panic!("expected turn record"),
         }
+    }
+
+    // AC1 (clm_3V5KN3YSKEEWYVQ03NFRVCQJ6F, P2): a live-recorded turn
+    // (`imported`/`files_complete` both `None`) serializes byte-identically
+    // to its pre-P2 wire form — no new key appears at all. `old_shape` below
+    // is not an invented literal: it is the exact field set/order
+    // `TurnRecord` had at parent commit `5ea946b` (`git show
+    // 5ea946b:agentrec-core/src/record.rs`), confirmed before this field was
+    // added — this diff adds ONLY the two new fields between `merges` and
+    // `files`, reordering nothing else, so `old_shape` is provably what this
+    // exact struct used to emit for these values.
+    #[test]
+    fn imported_fields_absent_on_live_turn_keeps_pre_p2_wire_shape_byte_identical() {
+        let old_shape = concat!(
+            "{\"v\":1,\"id\":\"t_GOLD\",\"grade\":\"rich\",",
+            "\"started\":\"2026-07-05T00:00:00.000Z\",\"ended\":\"2026-07-05T00:00:01.000Z\",",
+            "\"tool\":\"claude-code\",\"session\":\"s1\",\"root\":\"/repo\",",
+            "\"prompt_excerpt\":\"add rate limiting\",",
+            "\"files\":[{\"path\":\"src/a.rs\",\"before\":null,\"after\":\"sha256:aa\",\"op\":\"create\"}]}"
+        );
+
+        // Old-shape JSON deserializes fine (additive-field tolerance).
+        let turn: TurnRecord = serde_json::from_str(old_shape).unwrap();
+        assert_eq!(turn.imported, None, "absent field must default to None");
+        assert_eq!(
+            turn.files_complete, None,
+            "absent field must default to None"
+        );
+
+        // A live-recorded record (both fields None) re-serializes to
+        // EXACTLY `old_shape` — the additive-field promise this whole file
+        // makes for every wire type, now proven for `imported`/
+        // `files_complete` specifically.
+        let json = serde_json::to_string(&turn).unwrap();
+        assert_eq!(
+            json, old_shape,
+            "a live (non-imported) turn must not gain any new wire key"
+        );
+        assert!(!json.contains("imported"));
+        assert!(!json.contains("files_complete"));
+    }
+
+    // AC1's other half: an IMPORTED turn (P2) emits both new keys, and in
+    // the frozen position (immediately after `merges`, before `files`).
+    #[test]
+    fn imported_turn_emits_both_new_keys_between_merges_and_files() {
+        let turn = TurnRecord {
+            v: 1,
+            id: "t_imp_abc".into(),
+            grade: "rich".into(),
+            truncated: false,
+            started: "2026-07-05T00:00:00.000Z".into(),
+            ended: "2026-07-05T00:00:01.000Z".into(),
+            tool: Some("claude".into()),
+            model: None,
+            session: Some("s1".into()),
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            // Test nit (P2 fix round): `merges: vec![]` is
+            // `skip_serializing_if`'d away, so its own wire position could
+            // never be observed by this test — a non-empty `merges` is
+            // required to actually prove `imported`/`files_complete` land
+            // AFTER it, not merely before `files`.
+            merges: vec!["t_MERGED".into()],
+            imported: Some(true),
+            files_complete: Some(false),
+            files: vec![],
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        let merges_pos = json
+            .find("\"merges\":[\"t_MERGED\"]")
+            .expect("merges key present");
+        let files_pos = json.find("\"files\":[]").unwrap();
+        let imported_pos = json
+            .find("\"imported\":true")
+            .expect("imported key present");
+        let complete_pos = json
+            .find("\"files_complete\":false")
+            .expect("files_complete key present");
+        assert!(
+            merges_pos < imported_pos && imported_pos < complete_pos && complete_pos < files_pos,
+            "expected order ...merges, imported, files_complete, files...: {json}"
+        );
     }
 }

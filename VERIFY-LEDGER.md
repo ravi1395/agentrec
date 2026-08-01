@@ -22,6 +22,161 @@ allowing a "M3 shipped" claim. Each names the exact command/environment that clo
 | D11 (service reload on re-init) | `service.rs`'s `install`/`uninstall`/`load`/`unload` shell out to real `launchctl`/`systemctl` and are, by this file's own long-standing design (see its module doc comment), deliberately never invoked from the automated suite — only `--no-service` paths are. The fix (launchd: `unload` best-effort then `load -w`; systemd: `daemon-reload` before `enable --now`) is implemented and reads correctly, but "re-`init` on an already-loaded service actually restarts it with the new unit content" needs a real macOS box with a previously-loaded `com.agentrec.<slug>` label, and a real Linux box with a previously-loaded `agentrec-<slug>.service`, to prove `launchctl load` no longer silently no-ops and `systemctl` actually re-reads the rewritten unit. | A manual run on both a macOS box and a Linux box: `agentrec init` twice in a row against a real (non-`--no-service`) repo, second run — confirm via `launchctl list \| grep com.agentrec` / `systemctl --user status agentrec-<slug>` that the service is loaded and its `ExecStart` matches the freshly written unit content. |
 | Residuals round P4 — `wait_for_live_daemon` race-closure at the population level | `watcher_arm_stamp_keys_on_current_epoch_nonce` (unit) and `live_daemon_reports_watcher_armed` (integration) prove the MECHANISM: the daemon stamps `watcher_armed_nonce == epoch_nonce` only after `.watch()` succeeds, keyed on the current epoch's nonce so a crashed prior epoch's stale value self-invalidates, and `wait_for_live_daemon` now blocks on that condition instead of a bare `pid != 0`. Neither test — nor any fixture — can directly observe "no live-daemon test loses an event emitted in the ~4.3ms window between `acquire_lock` writing the pid and `.watch()` returning `Ok`" going forward, because that is an absence-of-a-flake claim across the whole suite's history, not a single assertion. | Measured over CI/local-run history: after this fix lands, zero live-daemon integration test failures attributable to "event emitted before the watcher armed" (as opposed to genuine FSEvents/inotify coalescing flake, already documented separately) across N subsequent full-suite runs. Not closeable by a single run; track failures of any live-daemon test (`live_daemon_reports_watcher_armed`, `doctor_healthy_all_pass_exit_0`, `status_suppresses_reload_line_after_daemon_crash`, `daemon_counts_ignore_rebuilds`, etc.) going forward and attribute root cause before counting one against this claim. |
 
+## Phase 2.0 P1 — `import claude` fidelity report (spec decision 8's required row)
+
+Recorded 2026-07-29 from the first real-corpus gate run of the built importer. Command:
+`agentrec import claude --dry-run` (release build, `--source` defaulted to `~/.claude`), full
+output captured at `docs/verify/p1-gate-run.txt`. **No fidelity threshold is asserted** — per
+spec decision 8 the founder sets one from this first measurement.
+
+**Importability predicate used for these numbers** (P1.md Pinned decision 3, recorded verbatim
+so the figure's definition cannot float):
+- *Denominator* = every `*.jsonl` directly under `~/.claude/projects/<project>/` (depth 1;
+  never `subagents/`). Re-measured at run time — the corpus is a rolling ≤30-day window.
+- *Numerator* = a denominator session that is not entirely sidechain-excluded AND completes
+  classification without ever establishing a `cwd` on any line (AC8's loud path). Malformed
+  lines alone do not disqualify a session; a session of only opaque calls still counts.
+
+**THIS ROW WAS WRONG TWICE AND IS NOW ON ITS THIRD SET OF NUMBERS.** The figures below are the
+corrected ones (gate run `docs/verify/p1-gate-run-t15fix2.txt`, 2026-07-29 evening). The two
+superseded readings and exactly why each was wrong are recorded beneath the table — deleting
+that history would hide the failure mode that produced it three times running.
+
+| Figure | Measured 2026-07-29 (corrected) |
+|---|---|
+| sessions_total (denominator) | **1631** |
+| sessions_importable | **1625 — 99.6%** (AC1 bar is ≥90%) |
+| tier: T1 total | 856 entries — 39.6% of 2159 file entries |
+| — of which inline `originalFile` (**yields real pre-edit bytes**) | **595 — 27.6%** |
+| — of which `create` ops (no pre-edit bytes exist; correctly none) | 261 — 12.1% |
+| tier: T1.5 (`file-history` blob, staleness-gated) | **90 — 4.2%** (1 structurally-inferred) |
+| tier: T2-candidate (git-tracked, bytes NOT resolved in P1) | 897 — 41.5% |
+| tier: T3 (no recoverable before) | 316 — 14.6% |
+| T1.5 rejected — blob stale by an intervening edit | **170** |
+| T1.5 rejected — `oldString` not found in blob | 3 |
+| T1.5 rejected — unsafe path component / blob missing | 0 / 0 |
+| peak RSS | **17.17 MB** (AC7 bar is <500 MB) |
+
+**Honest reconstructible figure — read the two numbers separately.**
+- **43.8%** (T1 856 + T1.5 90 = 946 of 2159) counting `create` ops as reconstructible, since a
+  new file's correct `before` genuinely is "nothing".
+- **31.7%** (595 + 90 = 685 of 2159) counting only entries that yield **actual pre-edit bytes**.
+
+Quote whichever you mean and say which. Neither is 67.9% (the 2026-07-24 prediction) and
+neither is 40.4% (this row's own superseded second reading).
+
+**Accuracy of the surviving T1.5 entries — measured, not asserted.** Ground-truth channel:
+entries that carry an inline `originalFile` (so the true pre-edit bytes are known) **and** also
+resolve a file-history backup **and** pass the classifier's checks — compare the resolved blob
+against `originalFile`. Result: **101 correct, 1 fabricated (1.0% residual)**, reproduced
+independently by two parties. Before the staleness fix the same channel measured **29.6-30.3%
+fabricated**. The single residual traces to an out-of-order snapshot line in one transcript
+(`memory/MEMORY.md`, a concurrent writer invisible to a linear read) — recorded, not chased.
+
+### Superseded reading #1 (first gate run): "T1.5 = 0"
+
+Cause: the classifier gated backup harvesting on `type == "snapshot"` — a literal the
+*synthetic fixture had invented*. The real corpus emits it on `type: "file-history-snapshot"`
+(884 lines, zero under any other type). Fixed to presence-based harvesting.
+
+### Superseded reading #2: "T1.5 = 11 (0.5%), genuinely near-empty, not under-detected"
+
+That sentence was **false** and this row asserted it. Cause: the T1.5 lookup compared
+`toolUseResult.filePath` (always absolute) against `trackedFileBackups` keys that are
+**relative to the session `cwd`** in 1606 of 1883 cases — so the raw string compare almost
+never matched. The existing fixture happened to use an absolute key, so every test passed and
+an 8/8 skeptic gate cleared it.
+
+Worse, this row cited "a standalone Python sweep of the corpus, written without reference to
+the importer" as independent corroboration. That sweep **re-implemented the importer's own
+raw-path assumption**. It was independent of the *author*, not of the *assumption* — which is
+the only independence that mattered. Two rounds of review and a passing gate all missed it.
+
+### What actually drove T1.5 down, and the correction to the correction
+
+Fixing the path compare raised T1.5 to 210 — and *that* number was also wrong, in the opposite
+and more dangerous direction. Claude Code writes file-history backups **at snapshot time, not
+per edit**, so for the 2nd-and-later edit of a file the blob is the pre-*snapshot* state. The
+`oldString`-containment guard still passed, because a later edit's `oldString` usually sits in
+a region earlier edits didn't touch. 115 of those 210 were provably stale; the ground-truth
+channel put the fabrication rate at ~30%. Import would have handed P2 fabricated pre-states to
+persist as recoverable history — a direct violation of the never-fabricate invariant.
+
+The correct predicate is **structural, not textual**: a blob is a valid pre-edit state only if
+no edit to that same path intervened between the snapshot that recorded the backup and the edit
+being classified. 170 entries fail that test and now fall through instead of resolving. T1.5's
+honest share is **4.2%**, not 25.3% (predicted), not 0.5% (under-detected), not 9.7% (inflated
+by fabrication).
+
+**The standing lesson, now with three instances behind it:** every T1.5 fixture was a
+single-snapshot / single-edit session, so no fixture could ever exercise version alignment —
+and each bug was a case of *the fixture and the code agreeing on a shape the real corpus does
+not have*. Fixture-only evidence cannot close a corpus-shape claim, and a cross-check that
+re-implements the implementation's assumption is not a cross-check. Fixtures for the
+multi-edit and redundant-announcement shapes now exist.
+
+**Defect this row exists to record (found by the gate run, not by tests):** the first gate run
+reported `t1_5 = 0`. Root cause — the importer gated backup harvesting on `type == "snapshot"`,
+a literal the *synthetic fixture had invented*; the real corpus emits this bookkeeping on
+`type: "file-history-snapshot"` (measured: 884 such lines, zero under any other type). Every
+unit test passed against the fixture while no real T1.5 entry could ever resolve. Fixed by
+harvesting on the **presence** of `snapshot.trackedFileBackups` rather than any `type` literal,
+and the fixture was corrected to carry the real type value. This is the exact failure mode the
+independent-fixture-authoring rule was meant to catch and did not — the fixture author and the
+implementer were independent of each other, but both derived the type literal from the same
+under-specified brief. Recorded as a standing lesson: **fixture-only evidence cannot close a
+corpus-shape claim; the real-corpus run is the gate.**
+
+**Closed by P2 (2026-07-30), not still open:** T2-candidate bytes were detected but never
+resolved in P1 scope — the **897** candidates (corrected; an earlier reading of 963 is
+superseded and must not be re-cited) were always a ceiling, never a proven recovery rate. P2
+resolved git blobs and converted a small fraction to real recoveries, the rest to T3. See
+the P2 row below for the measured outcome and its caveats.
+
+### Anti-overclaim rider (added at the final skeptic gate — read before quoting any figure)
+
+The 8/8 AC gate that produced this rider was passed against figures **since proven wrong** (see
+the two superseded readings above) — treat "the skeptic reproduced every figure" as reproducing
+what the code then did, not as validating the numbers. The misreadings it named all still hold:
+
+1. **"99.6% importable" is an ingestion-without-loud-failure rate, not a recovery rate.** It
+   must never be quoted bare. Context this table omitted: only ~**184 of 1631 sessions (11%)**
+   contain any file-mutation entry at all — every tier-laddered entry lives in those — and some
+   have zero T1/T1.5-recoverable entries. A session whose every entry is T3 still counts
+   importable (correctly: it imports as provenance-only turns with `before: null`, the pinned
+   semantics — import never fabricates a snapshot). The honest recoverable figure is **43.8%**
+   of entries (**31.7%** if you count only entries yielding actual bytes), with a ceiling near
+   85% only if P2 converts every T2 candidate — and P2 will not, since git holds committed
+   states only. Quoted bare, "99.6% importable" will be heard as "99.6% recoverable."
+1b. **The 85% ceiling needs the same ban 92.3% has.** 43.8 + 41.5 (T2-candidate) ≈ 85%, and it
+   is an upper bound by exactly the argument that banned 92.3%: a mid-session intermediate edit
+   was never committed, so its bytes are not in git at all. **Do not quote ~85% as a recovery
+   rate.** It is the ceiling if every candidate resolved, which is known to be false.
+2. **The opaque bucket is not "Bash/Task."** An earlier revision of this row labeled it so; the
+   8618 actually include ~1434 `Read` results, ~430 string-form `toolUseResult`s (mostly
+   errors), plus Grep/TodoWrite/AskUserQuestion. The count is honest; the old parenthetical was
+   not, and `mean_opaque_share_pct` is therefore **not** an "unattributable-mutation share."
+   Corrected above. Anyone setting a fidelity threshold off 13.25% must know this.
+3. **AC7's Linux leg is arithmetic-tested, not platform-proven.** The `ru_maxrss` divisor
+   selection is `#[cfg]`-gated; the unit test covers both divisors' math from one machine, but
+   which constant Linux actually selects closes only on the CI Linux run — still blocked on the
+   unopened `fix/perf-evidence-round` PR. Same for the release-only debug-seam guard test,
+   which never runs in the default suite (the `strings` check is the real evidence there).
+4. **This is one machine's 30-day window.** ~1631 sessions of one user's Claude Code habits.
+   The 4-tier shares — especially T1.5 at 4.2% — are a property of this corpus and this Claude
+   Code version's snapshot behavior. Not a population claim.
+5. **Open, unverifiable by any channel available today:** the ~90 surviving T1.5 entries that
+   have no inline `originalFile` cannot be checked against ground truth — by construction there
+   is nothing to compare them to. An edit by another tool or a human between the snapshot and
+   the recorded edit would silently invalidate one, and the transcript cannot see it. The only
+   channel that would close this is P2 comparing a resolved `before` against the git blob at
+   the session timestamp for the T1.5∩T2 overlap. Until then the 1.0% residual error rate is
+   measured over the *checkable* subset only, not over all of T1.5.
+6. **Pinned decision 14 (`cwd` is session-level, first line wins) is contradicted by the
+   corpus** — 67 sessions carry more than one distinct `cwd`, usually a subdirectory move.
+   Resolving each key against the `cwd` in effect at its own snapshot line finds more
+   candidates at slightly better precision. The decision is marked non-re-litigable, so this
+   was deliberately NOT changed and is escalated to the founder as an open question.
 ### AC1.3 reproduction — 10k recall-latency envelope (verbatim, 2026-07-28)
 
 Deliberately not a committed script: this repo shipped two real defects inside
@@ -261,6 +416,107 @@ claim is the *shape*, not the totals: the signal file still exhibits exactly one
 does not contain `kind`, and the injection counter still has no failure/attempt column to divide
 by. Both hold at any snapshot; neither can be repaired by waiting.
 
+## Phase 2.0 plan exit — hard-gate re-verification at the final commit (2026-07-31, `88c7e9b`)
+
+Plan-exit item 1 requires the hard gate retired **at the plan's final commit**, not only at P1's,
+with the denominator re-measured at run time (the corpus is a rolling ≤30-day window). Item 6
+requires P1's zero-bytes dir-digest AC re-verified against that same real-corpus run. Both were
+re-run here; the P1 row above is the earlier measurement and is **not** superseded — it is the
+same instrument at a different point on a moving corpus, and the drift between them is the point.
+
+Release build at `88c7e9b`. Command: `agentrec import claude --dry-run` (`--source` defaulted to
+`~/.claude`). Full output: `docs/verify/plan-exit-gate-run.txt`. Importability predicate is
+unchanged from the P1 row above (P1.md pinned decision 3) and is not restated here, so it cannot
+drift between the two rows.
+
+**Units differ by row and the table mixes them — read the Unit column before dividing anything.**
+(Flagged by the plan-exit gate: the tier counts do **not** sum to the session denominator —
+839+87+881+416 = 2223 file entries against 1937 sessions — because they count different things.
+The tool's own output has the same shape; this column is the fix.)
+
+| Figure | Unit | P1 gate run (2026-07-29) | Plan exit (2026-07-31) |
+|---|---|---|---|
+| sessions_total (denominator, re-measured) | sessions | 1631 | **1937** |
+| sessions_importable | sessions | 1625 — 99.6% | **1930 — 99.6%** (bar is ≥90%) |
+| tier: T1 | file entries | 856 | **839** |
+| tier: T1.5 | file entries | 90 | **87** (of which `t15_unverified=1` — the tool's own field name; "structurally-inferred" elsewhere in this ledger is a gloss on that same field, not a second figure) |
+| tier: T2-candidate | file entries | — | **881** |
+| tier: T3 | file entries | — | **416** |
+| opaque_calls | tool calls | — | **9558** |
+| mean_opaque_share_pct | % per session, averaged | — | **10.91** |
+| T1.5 rejected — blob stale by intervening edit | file entries | 170 | **170** |
+| T1.5 rejected — unverifiable / blob missing / unsafe path | file entries | 3 / 0 / 0 | **3 / 1 / 0** |
+| skipped_sidechain | sessions | — | **1320** |
+| skipped malformed / non-UTF8 / io-error | lines | — | **0 / 0 / 0** |
+| skipped_missing_field: cwd | lines | — | **7** (schema drift, loud on stderr; the affected sessions are *not* counted importable) |
+| peak_rss_mb | MB | — | **16.56** |
+
+**Verdict: the hard gate is RETIRED.** 99.6% ≥ the 90% bar, against a denominator re-measured at
+run time, with per-tier and per-session opaque-share fidelity figures recorded — which is what
+spec decision 8 requires and what a parse-only pass would not have satisfied.
+
+**Zero-bytes (item 6): PASS.** Recursive digest over `.agentrec/` was byte-identical across the
+run — `e682de84…` before and after.
+
+### Honesty notes on these numbers — read before citing them
+
+1. **The corpus moved *during this session*.** Two dry runs minutes apart measured
+   `opaque_calls` 9554 then 9558, and `peak_rss_mb` 16.66 then 16.56. The source is this
+   machine's live `~/.claude`, which the very session doing the verification is writing to. Every
+   figure here is a **timestamped sample of a moving corpus**, not a repeatable constant; a re-run
+   will differ and that is not a regression. Only the *ratio* (99.6%) is stable across the two
+   runs and the two dates.
+2. **T1 fell 856 → 839 and T1.5 fell 90 → 87 while the denominator rose 1631 → 1937.** This is
+   the rolling ≤30-day window doing exactly what the spec says it does: old sessions with
+   reconstructible pre-edit bytes aged out while newer sessions aged in. It is **not** a
+   classifier regression, but nothing in this run *proves* that — the two runs share no pinned
+   session set. Corpus decay is the reason "durable archive" stays embargoed.
+3. **The first attempt at the zero-bytes check was confounded and would have read as a FAIL.**
+   The scratch repo was created with `agentrec init`, which installs and starts a **live
+   daemon**; the daemon then snapshotted the run's own redirected output file into `.agentrec`,
+   changing the digest. The importer wrote nothing — the recorder did. The valid measurement uses
+   a repo with a hand-written `.agentrec/config.toml` and no daemon. **Any future
+   re-verification of this row must not run under a live recorder.** (The stray LaunchAgent from
+   that first attempt was uninstalled; the production daemon on `~/Projects/agentrec` was never
+   touched.)
+4. **`sessions_in_root: 0`** — no session was attributed to a bare `~/.claude/projects` root, so
+   the depth-1 denominator rule was not silently widened.
+
+### Binding plan-exit gate — Fable skeptic, isolated worktree at `46e5bf0`: **GATE PASS (9/9)**
+
+The plan mandates this round after the orchestrator's own verification. The skeptic re-derived
+every checkbox independently rather than reading the verdicts, including **re-running the
+importer against the real corpus itself** (daemon-free scratch repo, per the item-6 trap):
+**1937/1944 = 99.6%** on its run vs this row's 1930/1937 = 99.6% — *different absolutes, same
+ratio, hours apart*, which is honesty note 1 reproduced by an independent party rather than
+merely asserted by the party that benefits from it. It also independently confirmed 615/0/2,
+both clippy profiles + fmt clean, release-seam count 0 vs debug 6, the zero-write digest, the
+single `has_gap_after` definition, and that the two manual founder-judgment claims carry **zero
+attest events** — not self-attested.
+
+Both substitutions were judged **defensible on their premises, verified in source, not accepted
+on the orchestrator's word**: item 4's impossibility confirmed (every `enforce_budget` caller in
+`cli/src` is inside `mod tests`; real eviction exists only at `daemon.rs:92 run_eviction_pass`),
+and item 2's seven added keys confirmed to be **exactly** `RepositoryHealth`'s fields
+(`view.rs:269-279`) — nothing smuggled in alongside the change AC-1 forces.
+
+**Five findings, all non-blocking; three are corrections to this repo's own record and are fixed
+in the commit that carries this paragraph** (an overstated "no longer exist in any form"
+sentence, a too-generous characterization of `AGENTREC_CLAUDE_PROJECTS_DIR`, and this table's
+unlabeled units). The two carried forward as debts:
+
+- **`clm_75W2H9NC0YF3Q2GMHG6V2Q98NT`'s replay is weaker than its claim text.** It automates only
+  the "exactly one modified golden" half; the **additive-only key property was verified by hand,
+  and has no standing replay**. A future `status_json` key *removal* is caught only implicitly,
+  by the golden test re-rendering. Adequate, not airtight — and stated here rather than left for
+  a reader to assume the replay covers the whole sentence.
+- **The three deterministic replays hardcode `/Users/ravichandrasekhar/Projects/agentrec-phase2`**,
+  so they are checkout-coupled and will not replay from another clone or worktree.
+
+Also noted, not fixed: `clm_16WKRQZSM5K8YV72EAJN0FHT7S`'s neuter *discriminates* (the skeptic
+duplicated the fn on a scratch copy and the replay failed), but it counts *files* rather than
+*definitions* — a second definition added inside `view.rs` itself would slip past it.
+
 ## Memory v1 — closed at the done-gate (skeptical-reviewer GATE PASS, 2026-07-12)
 
 Verdict: **GATE PASS** (binding done-gate, opus skeptical-reviewer, round 2 after one loop-back). 269 tests, 0 failed; clippy `-D warnings` + fmt clean. Independent codex (gpt-5.6-terra) cross-review ran alongside and surfaced 2 real bugs the per-task reviews missed (equal-ts fold nondeterminism, crash-window dangling `source_turns`) — both fixed + re-verified before the gate.
@@ -316,3 +572,501 @@ _(see the Open table near the top.)_ **J3 (CI matrix), I++1 (Linux perms), Y++2 
 - **CONCERN #2 — FIXED:** the torture default seed was a fixed constant, so a nightly D36 run with an unset seed would repeat one interleaving 7× and never broaden INV2 coverage. `env_seed()` now derives from the wall clock when `AGENTREC_TORTURE_SEED` is unset (explicit seed still honored + printed for reproducibility). Verified: two unset-seed runs print different seeds.
 - **CONCERN #1 (accepted):** the 1200-op run exercised INV2 (undo-of-undo byte-exact) on only 2/21 checkpoints; INV2 also has dedicated integration coverage. With the varying nightly seed (above), the 7-night streak will accumulate broader INV2 coverage — folded into the D36 launch-gate ladder row.
 - **CONCERN #3 (accepted, cosmetic):** idempotent `init` re-run reprints "scaffolded"/"set 0700" lines though it redid no work (operation is genuinely idempotent — no hook dup). Message-only nicety, deferred.
+
+---
+
+## Phase 2.0 P2 + P3 — GATE PASS (2026-07-30, skeptic round 2 at `32ee9b7`)
+
+Binding done-gate: a Fable skeptic in an isolated worktree, per-AC, after a FAILED round 1.
+**All 13 ACs PASS** (8 P2 incl. the added AC5b, 5 P3). Verified on the merged tree:
+`cargo test --workspace -- --test-threads=3` → **504 passed / 0 failed / 2 ignored**
+(pre-P2/P3 baseline **460 / 0 / 1** measured at `c6bd069`); clippy `-D warnings` clean debug
+**and** release; `fmt --check` exit 0; `strings target/release/agentrec` → 0 hits for both
+debug seams (`AGENTREC_IMPORT_DEBUG_ENTRIES`, `AGENTREC_IMPORT_T2_ORACLE`).
+
+Round 1 FAILED on two blockers, both since resolved — recorded because the first is the third
+instance on this plan of the same defect class:
+
+1. **Silent uncounted drop of 23.4% of file-producing entries.** The persist path's
+   `strip_prefix(cwd).ok()?` discarded any entry whose `filePath` was not under the session's
+   first `cwd` — no `FileEntry`, no counter, no stderr — while the adjacent comment asserted cwd
+   "is lexically a prefix of `file_path` in every real transcript". Measured false: **507 of
+   2,170** entries (24 mid-session cwd moves; 196 under the first cwd's *parent*). Dry-run
+   tier-counted those same entries as reconstructible, so the two ladders disagreed on ~23% of
+   the corpus. Fixed by a `skipped_out_of_cwd` counter (text + `--json`), a corrected comment,
+   and `blocker1_out_of_cwd_entry_is_counted_not_silently_dropped`. **Countability was the
+   requirement; recovery of the 507 was explicitly not authorized.** The figure now has three
+   independent derivations that agree (round-1 analysis, the implementer's counter, the round-2
+   skeptic's own release-binary run).
+2. **AC5b's claim text was unattestable** — see the rider below.
+
+### T2 resolution — the measured outcome, with its mandatory caveats
+
+**17 T2 resolutions, n=1133 → 1.50%**, over the population the deployed guard actually serves
+(entries with no inline `originalFile`, not a `create` op). Refusal breakdown: gate 1 (path
+already edited earlier in the session) 853, `structuredPatch` line check 188, uniqueness 43,
+other (not git / no commit / no `oldString`) 32.
+
+**Two caveats travel with that figure, always:**
+
+- **(a) Never render it as "897 → 17".** P1's 897 T2-candidates and this 1133 use different
+  definitions; the denominators are not comparable and the arrow implies a conversion rate that
+  was never measured.
+- **(b) The oracle channel and the population channel are DISJOINT — overlap 0** — both
+  coincidentally n=17. So **none of the 17 population resolutions is scorable for correctness**:
+  the fabrication rate on the population T2 actually serves is unmeasured, and unmeasurable by
+  this oracle. The 0/17 fabrication result below applies to a different 17.
+
+A T2 resolution rate far below the 41.5% candidate share is **the honest outcome the plan
+predicted, not a failure** — git holds committed states only, so a mid-session intermediate edit
+was never committed at all. Gate 1 causes 75% of the loss and its refusals are structurally
+correct (an agent editing one file repeatedly in a session is the normal case).
+
+### Founder decision — both T2 gates retained (2026-07-30)
+
+Measured trade-off over 1655 real transcripts: **gate 1 alone → 137 resolved / 5.1% fabricated /
+130 correct**; **both gates → 17 resolved / 0% / 17 correct**. Gate 2 therefore discards **127 of
+144 previously-correct resolutions (88%)** to remove 7 fabricated ones — a 7.6x recall cost.
+The founder chose zero fabrication: a wrong `before` is a wrong-byte revert source in
+user-visible undo history, and no per-entry "unverified" marker exists that would make shipping
+one acceptable. Recorded so the cost is visible, not silent. An earlier code comment claimed the
+discarded cases "were exactly the fabrication-prone ones" — **false, 60% of what gate 2 refuses
+was correct**; the comment has been corrected to measured reality.
+
+### Anti-overclaim rider — AC5b's bar was set wrong and cannot be met
+
+**Never state that import's fabrication rate is "≤1%".** The bar was added mid-flight (by the
+orchestrating agent, not the founder) without checking whether the sample size could support it.
+It cannot: the oracle's guard-admitted channel is **n=17**, giving a one-sided Clopper-Pearson
+95% upper bound of **16.2%**; establishing ≤1% needs ~299 clean samples and the entire verifiable
+channel holds **228**. This is an impossibility result, not a "measure more later".
+
+**The defensible statement, verbatim:** *0 fabrications observed in 17 guard-admitted real-corpus
+samples (95% upper bound 16.2%). The ≤1% bar is not establishable on this corpus by this oracle;
+the whole verifiable channel is 228 cases.*
+
+Claim `clm_4KSWSEZXS894D2P0DC92ZHH8MA` carries the unmeetable "at most 1 percent" wording. It
+stays **DECLARED and unattested, permanently, as the honesty record** — a bar was set, tested,
+and found unmeetable. It was never self-attested and must not be. The founder re-declared the
+criterion with the honest wording; the implemented ratchet is `mismatches == 0`, asserted (not
+merely printed) in `ac5b_oracle_real_corpus_measurement`.
+
+### Import honesty semantics established here
+
+- **Derived bytes are marked, never presented as observed.** `after` is sometimes reconstructed
+  by applying `oldString`→`newString` to a resolved `before`. Such bytes carry
+  `FileEntry.after_synthesized`, `modified_cause` returns a derived-bytes reason *before* any
+  later-turn or gap signal, and `diff` prints an explicit DERIVED notice. Before this marker
+  existed, `undo` reported `modified since (human or external edit)` on files nothing had
+  edited — fabricated attribution, and it trained users toward `--allow-modified`, the flag spec
+  decision 6 says must never be auto-honored. Synthesized bytes never reach a working tree:
+  `execute_revert` re-snapshots actual disk bytes first.
+- **`status`'s rich-rate excludes imported turns** (founder decision, 2026-07-30). The metric
+  warns "your hooks may be broken"; an imported turn is `rich` without any hook having fired, so
+  a bulk import could flood the trailing-20 window and make a dead hook read 100% healthy. Git
+  turns were already excluded. Protected by
+  `status_rich_rate_still_reflects_broken_hooks_alongside_imported_turns` (20 imported + 10 bare
+  → `0% over trailing 10`, warning still fires).
+- **P1's figures re-measured and NOT stale** after the secret-path parity fix: fresh dry-run gave
+  `skipped_secret_path: 0`, reproducing 99.6% importable (with its rider), t1 859, t1_5 90,
+  t2_cand 898, t3 323, RSS 16.56 MB. The bans on **92.3%**, the **~85% ceiling**, and bare
+  **99.6%** without its rider all stand.
+
+### Goldens: two deliberate recaptures, each audited to the line
+
+P3's goldens pin today's CLI bytes so P4's byte-equivalence claim becomes falsifiable. Their
+**capture point is the integration commit, not the P3 branch** — the imported turn's
+serialization only exists once P2 lands, and its rendering shifts again with P2's marker
+(reasoning and the two rejected alternatives are recorded in `P3.md`). Recapture 1 (P2 merge):
+exactly 4 lines — the `partial file list (imported)` marker on `log`/`log --all`/`log --explain`,
+plus the two new keys on `log --json`. Recapture 2 (rich-rate fix): exactly 1 line in
+`status.golden`. **P4 must not regenerate these to make extraction pass** — that is the ratchet.
+
+### Non-blocking residuals carried forward (skeptic-accepted)
+
+- **Latent duplicate-`sessionId` append** — `existing_ids` never gains ids appended during the
+  current run. The shape is real, not hypothetical: the corpus holds one `sessionId` in two
+  project dirs (a worktree-resumed session), inert today only because one copy is a 1-line
+  cwd-less stub. Two in-root copies with file entries would append two turns sharing an id, and
+  `diff`/`show`/`undo <id>` would error "ambiguous". One-line fix; **recommended before plan
+  exit.**
+- Persist path lacks session-level skip counters (no-cwd / canonicalize-fail / out-of-root
+  sessions return empty silently) where dry-run counts them — posture parity gap, not AC-required.
+- `skipped_out_of_cwd` is corpus-wide, so it counts entries in sessions wholly outside `--root`
+  that would never import — overstates loss in the conservative direction.
+- Imported turns store the raw `--root` string (e.g. `"root":"."`) where daemon records carry
+  absolute paths. Cosmetic today (all verbs resolve from `--root`); take the `root_canon`
+  one-liner in the next wire-touching round with a FORMAT-CHANGELOG entry. Golden-safe.
+- Real `kill -9` mid-import remains **UNTESTED** — simulated at a deterministic interruption
+  point. The mechanism argument was independently checked: `append_line_synced` is a single
+  `write_all` + `sync_all`, so a SIGKILL cannot tear a line; torn-line duplication is
+  power-loss-only. Idempotency is re-derived from `log.jsonl` ids, not `state.json` offsets.
+- `UPDATE_GOLDEN=1` regeneration verified in round 1 but **permission-blocked** for the round-2
+  skeptic, which confirmed that branch by code-read only. The RED half it proved itself: a
+  one-char `fmt::SEP` mutation failed 13 of 27 goldens, restored `shasum`-identical.
+- P3 AC2 has no failing-invocation golden for `log` — `log` takes no id, so the AC's
+  "(unknown id)" form does not exist for it. Ruled inapplicable rather than unmet.
+- Linux legs (the `ru_maxrss` divisor, two release-only `#[cfg(not(debug_assertions))]` tests)
+  still close only on the unopened CI PR.
+
+## Phase 2.0 P4 — `RepositoryView` extraction (agent round, pre-skeptic)
+
+Branch `feat/phase-2-0-p4` off `feat/phase-2-0-substrate` @ `f19c17d`. Baseline re-measured on
+clean substrate: **504 / 0 / 2** (P4.md's "410" and its "21 goldens" are both stale — goldens
+are 27). Exit measured at ****533 / 0 / 2** (delta +29)**.
+
+| AC | Verdict | Evidence |
+|---|---|---|
+| AC1 gap logic unified, not relocated | MET | `rg 'fn has_recording_gap\|fn has_gap_after\|fn count_gaps' cli/src` → 0. One primitive `view::recording_gaps` returns every uncovered interval tagged `Crash`/`Restart`/`TrailingStop`; the three callers are one-line filters over it. |
+| AC2 lookup choke point moved | MET | `rg 'fn same_revert\|fn resolve_turn' cli/src` → 0. `resolve_turn` returns a typed `LookupError`; the CLI shim renders prose and holds no matching logic. `purgecmd` rewired to the core symbol. |
+| AC3 goldens byte-identical | MET | 27/27 pass; `git diff` over `cli/tests/fixtures/golden` empty at every commit. |
+| AC4 `health()` is a pure read | MET | `health_performs_no_writes_on_an_over_budget_store` asserts store bytes + `log.jsonl` length + `state.json` mtime unchanged. **Falsifiability proven**: re-inserting `enforce_budget` into `health()` fails it on the store-bytes assertion; restored → green. |
+| AC5 human `status` still evicts | MET | `status_prints_over_budget_notice` unmodified (`git diff` on it empty) and passing. |
+| AC6 cursor bound to query + ledger identity | MET | Cursor carries the last item's **id** plus a query fingerprint. Same-length `purge --log-duplicates`-shaped rewrite → `Stale` (the test asserts the rewrite really is same-length, or it proves nothing). Truncation → `Stale`. Different query → `QueryMismatch`. |
+| AC7 unknown fields/types tolerated and counted | MET | `Ledger` carries `unknown_type_lines` + `unparsed_lines`, surfaced through `health()`. Blobs referenced only by an unknown-type record survive a real over-budget eviction. |
+
+### Two defects caught in review, both fixed with the regression test that catches them
+
+- **Cursor went spuriously `Stale` on a pure append.** The cursor resolved its id inside the
+  *post-filter* list, so a retroactive merge (PROTOCOL §4 — append-only, documented engine
+  behavior) absorbing an already-returned turn dropped it from `selected` and read as a rewrite.
+  AC6 names exactly that case. Now resolved against the unfiltered ledger:
+  `a_retroactive_merge_appended_after_a_cursor_is_not_treated_as_a_rewrite`, proven falsifying by
+  reverting the fix.
+- **`unknown_type_lines` counted malformed known records.** A `{"type":"turn"}` line missing
+  required fields incremented the "a newer producer wrote a kind we predate" counter — a counter
+  asserting a false fact about the corpus, the same defect class that blocked P2/P3 round 1.
+  Now gated on the `type` *value* against `record::KNOWN_RECORD_TYPES`.
+
+### Deliberate deviations (recorded, not silent)
+
+- **`health(&self, budget: u64)`, not the contract's no-arg `health()`.** The budget stays
+  injected for the same reason `status_report(root, budget)` already injects it (AC I+: an
+  over-budget store is otherwise untestable without a real multi-GiB store), and it keeps
+  `agentrec-core` free of the CLI's config surface. P5 consumes this signature.
+- **`diff`/`blame`/`recall` are NOT implemented this phase.** No AC constrains them, and shipping
+  an unexercised second interpretation path is how a byte-equivalence claim gets quietly broken.
+  **This is P5's entry condition, not a free pass**: a `--json` serializer that reimplements diff
+  or blame interpretation in `cli/src` reopens the seam P4 exists to close.
+- **AC7 reading, stated so it is evaluated as written**: "counted" attaches to unknown record
+  *types*; unknown *fields* on a known record are tolerated by serde and are correctly counted as
+  neither unknown-type nor unparsed. A test pins that reading.
+- **`RepositoryView::open` deliberately has no "not initialized" error.** An early cut returned
+  one, which silently changed `agentrec status` in an uninitialized directory from a printed
+  report to exit 1 — an unsanctioned behavior change (`log` there still prints "no turns
+  recorded"). Caught by running the binary, not by a test; a test now pins the tolerant reading.
+
+### Measured, not assumed
+
+- **`status` latency is flat.** Routing `status` through the view initially made it parse
+  `log.jsonl` twice: **13.4 ms → 20.6 ms** per invocation on a copy of this project's real
+  2143-line / 2.3 MB dogfood log (50 warm runs, macOS release build). Fixed by giving
+  `load_log` and `load_ledger` one shared per-line classifier (`record::parse_log_line`) and
+  letting `status_report` read the ledger once: **6.4 ms vs 6.6 ms baseline**. The shared
+  classifier is also a correctness win — the records a reader gets and the census of what it
+  skipped can no longer disagree.
+
+### Residuals
+
+- Claims for P4 were declared **mid-phase, after the first commit landed**, not declare-first per
+  AC. Recorded rather than backdated.
+- Test delta is **+29**, not the task file's "+18" — the ladder there is stale, and the ratchet
+  only tightens.
+
+### Round 1 of the gate FAILED. Three defects, all real, each now fixed with the test that catches it
+
+- **AC6 FAIL — a cursor's `after_id` is not identity.** Turn ids are NOT unique in real ledgers:
+  a pre-fix daemon's orphan recovery re-appends a turn under its reserved id (the shape
+  `same_revert` and `purge --log-duplicates` exist for), and the known import defect appends a
+  second turn under a resumed `sessionId`. `list` resolved the cursor by FIRST match, so on
+  ledger `[t_0, t_DUP, t_1, t_DUP, t_2]` a cursor minted at the second `t_DUP` re-delivered
+  `t_1` and `t_DUP` after a **pure append** — silently, no `Stale`. That is AC6's growth clause
+  violated verbatim. `Cursor` now carries `after_occurrence`; losing the named occurrence is
+  `Stale`. Tests: `a_cursor_after_a_duplicated_id_resumes_at_the_right_occurrence`,
+  `losing_the_named_occurrence_of_a_duplicated_id_is_stale`.
+  **Note the shape: this is the second time this phase that binding to a "unique" identifier was
+  wrong, and both times the ledger already documented the non-uniqueness.**
+- **The signature defect, fourth instance — mine.** `record::parse_log_line` guarded on the
+  `type` tag being a *string*, so `{"type": 5}` fell through to the legacy no-tag fallback and
+  was coerced into a turn — beside a retained comment promising that a line carrying a `type`
+  is never coerced. Pre-P4 `load_log` keyed on **presence**. An unsanctioned behavior change for
+  every reader, caught by the gate probing the comment rather than reading it. Now presence-keyed;
+  `a_non_string_type_tag_is_never_coerced_into_a_turn` pins it.
+- **`limit: Some(0)` reported end-of-ledger** on a non-empty ledger. An empty page has no honest
+  continuation (no record to sit after), so it is now refused with `CursorError::ZeroLimit`
+  rather than answered with a lie a pager would act on.
+
+### Skeptic's honest UNTESTED rows (round 1), carried forward
+
+- The 504 baseline was not re-executed in the gate worktree (`git checkout` is forbidden there).
+  Arithmetic is consistent and matches this ledger; it rests on the orchestrator's run.
+- The latency figures need the live dogfood log the gate must not touch. Not an AC; UNTESTED by
+  the gate, measured by the orchestrator.
+- No release-mode **test** run (clippy/fmt were verified on release; the tests were not).
+
+### Round 2: GATE PASS (all 7 ACs), with one residual found and NOT charged
+
+Both mutations (the `health()` eviction re-insert and a `render_turn` perturbation) were re-run by
+the skeptic on the fix commit, RED then green. Six further cursor attacks held: triple-duplicate
+ids paged one at a time, growth appending another record under the cursor's own id, purge-collapse
+of an occurrence *earlier* than the named one (→ `Stale`, correct: occurrence indices shift down
+and re-anchoring would silently skip), truncation, and query mismatch. The parser fix was verified
+by construction over five tag shapes, including that the legacy no-`type` C6 fallback still works.
+
+- **Residual, recorded not charged — an id-preserving REORDER rewrite defeats the cursor.** Two
+  same-id records with different content, reordered in place: page 2 re-delivers the seen one and
+  never delivers the other, with no `Stale`. Not charged because the only sanctioned rewrite is
+  `purge --log-duplicates`, which collapses and never reorders, and everything else is append-only
+  — no cursor keyed on anything short of a full-record content hash could tell the two apart.
+  **Revisit if MCP 2.2 ever pages a ledger exposed to hand edits.**
+- The gate hit and corrected a multi-filter `cargo test` invocation that silently runs nothing —
+  the same malformed-replay shape that permanently REFUTED two P1 claims. One TESTNAME per replay.
+
+## D46 — service-unit leak: temp-root guard + orphan detection (2026-07-31)
+
+Closes the founder-pending "40 orphaned `com.agentrec.*` LaunchAgents" entry's **product-defect**
+half. It does **not** remove any plist from this machine — that stays founder-reserved, and the
+40 units are all still installed and untouched (re-counted at 41 before and after this round's
+full test run, including the run that exercises `init` under temp roots).
+
+### What is automated, and what is not — stated narrowly
+
+The honest scope line is **not** "`service.rs` is untested". This change adds no code to the
+`launchctl`/`systemctl`-spawning path and calls none of it:
+
+| Surface | Coverage |
+|---|---|
+| `parse_unit_root`, `scan_units`, `manual_remove_command` (D46 discovery half) | **Fully automated.** Filesystem + text only, spawns nothing. 8 unit tests in `service.rs`, both unit-file forms, on every platform (the parser dispatches on content, not host OS). |
+| `service_decision`, `temp_prefixes`, `temp_skip_line` (D46 prevention half) | **Fully automated.** Pure; full flag×path matrix asserted in `initcmd.rs`, plus a real-binary leg in `integration.rs::service_leak_guard`. |
+| `check_orphan_services` (`doctor`) | **Fully automated** against an injected fixture directory via the debug-only `AGENTREC_TEST_SERVICE_DIR` seam. Verified absent from the release binary: `strings target/release/agentrec \| grep -c AGENTREC_TEST_SERVICE_DIR` = **0** (debug = 1). |
+| Production resolution of the REAL service directory | Not directly asserted (it reads `$HOME`/`$XDG_CONFIG_HOME`). Covered indirectly by the pre-existing `unit_path`/`config_home` tests, which now route through the same `service_dir` resolver, **and** by the real-corpus run below, which resolved and scanned the real directory. |
+| `install`/`unload`/`load` (spawn `launchctl`/`systemctl`) | **Unchanged and still never invoked from an automated test** — see the existing "D11 (service reload on re-init)" open row above, which this round neither closes nor widens. |
+
+### Real-corpus evidence (AC-S9) — not a fixture round-trip
+
+A round-trip test proves the parser inverts *our own writer*; it cannot prove it reads the plists
+actually installed here. This repo has been bitten four times by fixture-only evidence for a
+corpus-shape claim, so the parser was run read-only over the real directory before the ACs were
+declared met. `cargo test --bin agentrec real_corpus_unit_scan -- --ignored --nocapture`
+(`#[ignore]`d by design — environment-coupled, never part of the hermetic suite), output archived
+at `docs/verify/d46-real-corpus-unit-scan.txt`:
+
+> `real-corpus scan of /Users/ravichandrasekhar/Library/LaunchAgents: 41 agentrec unit(s) — 41 parsed (1 live, 40 vanished-root), 0 unparseable`
+
+**41/41 parsed, 40 vanished, 1 live, 0 unparseable** — independently reproducing the 40-of-41 figure
+recorded in CLAUDE.md from a separate `plistlib` enumeration. The one live unit is
+`com.agentrec.bfa6bde6eaa4` → `/Users/ravichandrasekhar/Projects/agentrec`, the real dogfood daemon.
+
+**This claim pins a moving target and is declared `manual`, not `deterministic`** (`clm_5JMKH9FFCNA4T0EDSVD5M8B2C0`,
+DECLARED — never self-attested). The corpus is *expected* to shrink to 1 once the founder reaps
+the orphans; a deterministic replay asserting 40 would then go REFUTED for the right thing
+happening. The probe itself asserts only the invariant that survives reaping: **zero unparseable
+units**.
+
+### Discriminating-neuter proofs (a green test is not evidence until the broken version reds)
+
+| Neuter | Test that must red | Result |
+|---|---|---|
+| `service_decision` stops canonicalizing the root | `service_decision_skips_under_a_real_temp_dir` | **FAILED** (correct). This is the load-bearing one: on macOS `$TMPDIR` reads `/var/folders/…` while `resolve_root` stores `/private/var/folders/…`, so an uncanonicalized compare makes the guard silently never fire — it would have shipped looking correct. |
+| `scan_units` folds `Unparseable` into `VanishedRoot` | `scan_units_classifies_live_vanished_and_unparseable_disjointly` | **FAILED** (correct) — a unit we could not read must never be reported as an orphan. |
+| `check_orphan_services` returns `Check::fail` instead of `Check::advisory` | `orphaned_unit_is_advisory_not_fail` | **FAILED** (correct) — the exit-0 gate rail holds. |
+| `"orphaned services"` dropped from `diagnose`'s hardcoded uninitialized-repo `n/a` list | `uninitialized_report_has_the_same_check_set_as_an_initialized_one` | **FAILED** (correct), diffing the two name sets — so the rail catches any FUTURE check that forgets the list too, not just this one. |
+
+The full-init leg (`init_under_temp_root_still_does_everything_but_the_service`) was **deliberately
+not neutered**: removing the guard makes that test install a real launchd unit, i.e. leak exactly
+the thing being fixed. Only the pure decision function was neutered, and only the pure tests were
+run under it.
+
+### Suite hermeticity — fixed, not waived
+
+`check_orphan_services` scans the user-global service directory, so every `doctor` invocation in
+the integration suite would otherwise read whatever units happen to be installed on the machine
+running the tests (41 here, 0 on a fresh runner). The check is advisory, so no assertion would have
+flipped — but a test whose behavior depends on ambient user state is the exact defect class this
+repo keeps charging, so it was pinned rather than reasoned away: `integration.rs`'s `agentrec()`
+helper now sets `AGENTREC_TEST_SERVICE_DIR` to one process-wide empty tempdir. Verified both
+directions against the real binary: with the fixture, `doctor` prints `orphaned services  pass`
+with **no note**; without it, the same binary prints the 40-unit note and a runnable
+`launchctl bootout … && rm` pair — which is also this round's end-to-end production evidence that
+the check works on the real corpus, not only through unit tests.
+
+### Suite
+
+`cargo test --workspace -- --test-threads=3` → **635 passed / 0 failed / 3 ignored**
+(baseline at the Phase 2.0 plan exit: 615 / 0 / 2 — **+19 tests, +1 ignored**, the new ignored one
+being the real-corpus probe). clippy `-D warnings` + `fmt --check` clean on **debug and release**.
+
+### Deliberately NOT built, with reasons
+
+- **`service prune`** — the third candidate fix. Three facts, not a preference: it is the only
+  piece here that would shell out to `launchctl`/`systemctl` (which `service.rs`'s module contract
+  forbids the automated suite from exercising), it is destructive, and plist removal on this
+  machine is an explicitly founder-reserved item. `doctor` prints the exact command pair instead,
+  which closes the user-facing problem with zero untestable code.
+- **Reaping the existing 40 units.** Founder's, unchanged. `doctor` now finds and prints them.
+
+### The claim protocol caught a defect the four neuters did not
+
+`claimd verify` REFUTED AC-S2's claim (`clm_4AFDDT3XCSFHKDZ06D926XJVNY`, exit 101) after the first
+commit. It was right. `service_decision_matrix` and `service_decision_installs_for_an_ordinary_root`
+used `env!("CARGO_MANIFEST_DIR")` as their non-temp control — carrying a comment calling it "a real,
+non-temp path" — which holds only while the checkout is not itself under a temp prefix. `verify`
+replays committed state from a checkout under `$TMPDIR`, where that path genuinely is temp, so
+asserting `Install` was wrong there. Reproduced directly by `git clone` into `$TMPDIR`
+(`SkipTemp("/private/var/folders/…/T")` vs expected `Install`), fixed with fixed non-temp paths
+covering both predicate branches (`/usr` — canonicalization succeeds; a nonexistent absolute path —
+canonicalization fails and falls back), and re-verified green from a fresh `$TMPDIR` checkout.
+
+Two things worth recording. **Production code was never wrong** — the defect was entirely the tests'
+choice of control path, and it would have bitten any CI runner building in a temp workdir. And
+**AC-S4's test carried the identical defect while its claim verified CONFIRMED** — it happened to
+run somewhere non-temp. A green verify is not evidence the test is environment-independent.
+
+Per house rule the refuted claim is **not amended and no equivalent is re-declared**; AC-S2 now has
+a passing, fixed test and no live claim. Recorded in CLAUDE.md § Founder-pending for a ruling,
+same disposition as the two P1 claims refuted on malformed replays.
+
+### The guard leaked a 42nd unit before it was tight enough — recorded, not buried
+
+**This round's own test suite installed a real launchd unit** (`com.agentrec.c0bf764acce7` →
+`/private/var/folders/…/T/.tmpdW8v92`, mtime 2026-07-31 10:57:05), i.e. the guard failed at exactly
+the thing it exists to prevent. Caught by re-counting the plists after each suite run rather than
+assuming; the count went 41 → 42.
+
+Cause: the first version of `temp_prefixes` recognized macOS's per-user temp dir
+(`/var/folders/<x>/<y>/T/`) **only** by reading `$TMPDIR`. That read is not reliable —
+`std::env::set_var` on another thread races a concurrent `var()` (the data race that made
+`set_var` unsafe in edition 2024), and this very test binary mutates env in `service.rs`'s
+`ENV_LOCK` tests and `doctorcmd.rs`'s `with_service_dir`. One missed read left
+`/private/var/folders/…` matching no prefix, so `service_decision` returned `Install` and `init`
+wrote a permanent `KeepAlive` unit for a directory about to be deleted. The same miss also produced
+one transient assertion failure (199/1) that passed on re-run — a flake that was a real signal.
+
+The env-read was the wrong mechanism, not just unlucky: `$TMPDIR` is simply **unset** under
+launchd and cron, so the guard would have silently no-opped there in production too. Fixed by
+matching `/var/folders` as a STATIC prefix, so the common macOS case never reads an env var at
+all. `$TMPDIR` is still consulted for non-default and non-macOS values. Pinned by
+`macos_per_user_temp_is_recognized_without_reading_tmpdir`, neuter-proven (fifth neuter: dropping
+the static prefix reds it), and confirmed by counting plists across **four** subsequent full runs —
+41 held, then 42 held with zero further growth.
+
+**The 42nd plist was not removed by the agent when this was written.** It was subsequently reaped
+along with the other orphans on 2026-07-31, on the founder's explicit instruction — see
+"Orphans reaped" below.
+
+### Residual — the guard is preventive only, and only for future inits
+
+`doctor`'s check is user-global, but the temp guard changes only what THIS binary installs from now
+on. Any `agentrec` build predating this change still leaks a unit per temp-dir `init`. Nothing
+detects or blocks that, and nothing here reaps what already exists.
+
+### Orphans reaped (2026-07-31, founder-instructed) — and the detection half self-confirmed
+
+The founder instructed removal, so the 40 were reaped. **39 by the agent in one pass; 2 had already
+gone** (`com.agentrec.039364bb7dfe`, `com.agentrec.c0bf764acce7`) — inferred, not proven, to be the
+founder running the two removal commands this session had printed, since those are exactly the two
+labels that appeared in runnable form.
+
+Method, in the order it ran, because a destructive pass with no rails is not evidence of care:
+
+1. **Archive first** — all 40 plists copied to `ARCHIVE` (below) before anything was touched. Fully
+   reversible, consistent with the repo's never-delete house rule.
+2. **Removal list built from agentrec's own classifier**, not an ad-hoc `plistlib` script: the
+   `VanishedRoot` bucket of `service::scan_units`, i.e. the code D46 shipped.
+3. **Independently re-checked** — each listed root re-tested absent at removal time (a root that
+   reappeared, e.g. a remounted volume, would have aborted the pass).
+4. **Live unit asserted OUT of the list** (`grep -c bfa6bde6eaa4` = 0) and **every entry asserted
+   present in the archive** before any `rm`.
+5. `launchctl bootout gui/$(id -u)/<label>` then `rm` — **39 removed, 0 failures**.
+
+Verified after: exactly one plist remains (`com.agentrec.bfa6bde6eaa4`), `launchctl list` shows one
+agentrec job at **status 0** (before: 23 loaded orphans at status **78** — launchd respawning
+recorders whose roots were gone), and the real dogfood daemon is untouched and still running as
+pid 865 against `~/Projects/agentrec`.
+
+**`doctor`'s orphaned-services check now prints a silent `pass` with no note** — the D46 detection
+half confirming its own fix end-to-end against the real machine, having previously reported all 40.
+
+- **ARCHIVE:** `/Users/ravichandrasekhar/agentrec-launchagents-archive-20260731-152414` (40 plists). Safe to delete once the founder is satisfied; nothing
+  references it.
+
+## D47 — declarative liveness: stop the respawn loop at the unit (2026-07-31)
+
+Follows D46. D46 stopped `init` from *creating* units under temp roots; D47 stops a unit that
+already exists from **respawn-looping once its baked path goes stale**. The two baked paths (root,
+exec) are never re-validated at load time, and `KeepAlive true` turns one clean failure into
+permanent noise.
+
+### Measured on macOS 26.5 (Darwin 25.5.0), 2026-07-31 — three launchd probes
+
+Run with throwaway labels (`local.pathstateprobe*`, deliberately NOT `com.agentrec.*`), plists in
+a scratch dir, `launchctl bootout` in an EXIT trap. Residue re-checked after each: 0 probe jobs
+left, `~/Library/LaunchAgents` back to exactly 1 agentrec unit (the live dogfood daemon).
+
+| Probe | `KeepAlive` config | Result | Reading |
+|---|---|---|---|
+| 1 | `PathState {existing: true, missing: true}` | `runs = 3` in 30s, `state = spawn scheduled` | a present co-key defeats the gate (see the mechanism caveat below) |
+| 2 | `PathState {missing: true}`, no explicit `RunAtLoad` | `runs = 0`, `state = not running` | single failing key suppresses the job entirely |
+| 3 | `PathState {missing: true}` + explicit `RunAtLoad` | `runs = 1`, `state = not running` | `RunAtLoad` fires **once**, then every restart is blocked |
+
+**Probe 1 refuted the design this round started from.** The plan specified
+`PathState {root, exec}` on the assumption it ANDs. It does not: a `{root, exec}` pair would keep
+the job alive whenever **either** path exists, so the exec gate would have been **inert in exactly
+the case that motivates it** (root present, binary upgraded away) while reading as fixed. No AND
+is reachable — `false` values invert individual conditions, they cannot negate whatever combines
+them.
+
+**Mechanism caveat, added by the D47 gate round (2026-07-31) after this section overstated it.**
+`launchd.plist(5)`'s "If multiple keys are provided, launchd ORs them" is stated at the
+`KeepAlive`-**dict** level, not inside `PathState`. Probe 1 does NOT uniquely establish
+"`PathState` ORs its entries": it is equally consistent with "an absent path is disregarded while
+a present co-key is satisfied". The two are operationally identical for this decision — under
+either, a co-listed exec adds no gate — so root-only is correctly supported. **The OR label is
+inference; the consequence is what was measured.** Do not quote "PathState ORs" as measured fact.
+
+**Probe 3's observation window went unrecorded**, so "blocks every restart / one attempt per
+login" is an extrapolation from ONE load cycle. It is supported by a real discriminating
+observable — `state = not running` versus probe 1's `state = spawn scheduled`, which is how a
+throttled pending respawn reads — but "every" is not established. To close: reload the probe-3
+plist, wait ≥30s (3× the 10s default `ThrottleInterval`), confirm `runs` stays 1.
+
+**Shipped:** `PathState` on the **root only**. Probe 3 is the shipped configuration's behavior —
+one attempt per login, no loop. `launchd_pathstate_lists_only_the_root_never_the_exec` exists so a
+later reader who "fixes" the omission reds instead of shipping an inert condition.
+
+**Exec staleness is DETECTED, not prevented** — `doctor`'s second advisory clause (this round),
+naming the exec and the re-init remedy. Mitigating context: `eeef849` already made the recorded
+exec stable across `brew upgrade`, which was the motivating case. `ThrottleInterval` was
+considered to bound exec-failure noise and **rejected**: it would equally delay legitimate crash
+restarts, and a multi-minute recording gap is a worse defect than log noise in a tool whose
+purpose is not missing activity.
+
+### Open row — Linux, NOT measured
+
+`systemd_unit` emits `ConditionPathIsDirectory=<root>`. The generator is unit-tested; the
+**runtime effect is unverified** — written on a macOS host with no systemd to probe. Do not
+upgrade to a proven claim without running it on Linux. Needed: load a new-posture unit, delete
+the root, confirm the start job is skipped (unit inactive, not failed) and no restart churn
+appears in `systemctl --user status`.
+
+### Gate outcome (2026-07-31)
+
+Binding fable skeptic in an isolated worktree (`~/.gate-d47`, detached at `4c58b07`):
+**GATE PASS, 8/8 ACs.** It re-ran the full suite itself (644/0/3), executed 5 neuter/restore
+cycles rather than trusting the round's reported ones, confirmed each redded on a WRONG VALUE
+rather than absent output, and independently replayed the archive classification (39 temp-rooted
+/ 1 live daemon). It verified the edited fixture `no_orphans_is_a_silent_pass` was a genuine
+de-ambient-ing, not a weakening — the old fixture named an exec absent on this machine and would
+fail under correct new code. Its two wording findings are folded in above; both were this
+document's own overstatements.
+
+**Residual risk it named, carried deliberately:** no generator-emitted `PathState` plist has ever
+been loaded end-to-end — every probe plist was hand-written, and the hermetic-tests rule keeps
+`install` out of the suite. The first `agentrec init` after merge (the dogfood rewrite below) IS
+that end-to-end test; check `launchctl print gui/$(id -u)/com.agentrec.bfa6bde6eaa4` afterwards.
+
+### Founder decision pending
+
+The posture change means the **next `agentrec init` in `~/Projects/agentrec` rewrites and
+reloads the live dogfood unit** (`service::install` rewrites on content difference). Harmless in
+principle; flagged because that daemon is production evidence infrastructure.
