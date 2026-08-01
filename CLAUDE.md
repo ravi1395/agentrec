@@ -20,7 +20,7 @@ carries only current state, what's next, and standing debts.
   silent-undo consequence; (T2) E2E test pins the D6 data-loss chain against the real daemon,
   `undo` gains a CAUTION activity-window line scoped to revert-marked files (mixed-plan-true,
   bare-turn exclusion pinned); (T3) `purge --signals-consumed` — third sanctioned rewrite class
-  (D46), inbox was 13.4 MB unbounded — plus `status` inbox accounting; (T4) memory 1-week
+  (D48), inbox was 13.4 MB unbounded — plus `status` inbox accounting; (T4) memory 1-week
   dogfood ledger row **CLOSED FAILED** with per-conjunct evidence (candidate emitter never
   fired; hit-rate unfalsifiable as written). Gate found and fixed 2 REAL daemon defects: startup
   never detected a shrunk/missing inbox against a stale persisted offset (silent tail loss, now
@@ -83,17 +83,19 @@ carries only current state, what's next, and standing debts.
   in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
-- **PROTOCOL.md §3 amendment (D46 loose end):** `signal.jsonl` still annotated bare
-  "append-only"; the sanctioned consumed-prefix truncation makes that imprecise, and conflict
-  order (PROTOCOL > register) means the precise wording must land there, not only in D46.
+- ~~PROTOCOL.md §3 amendment (D48 loose end)~~ **DONE 2026-08-01 (founder-directed):** §3 now
+  defines append-only precisely with a MAY-reclaim clause for consumed `signal.jsonl` lines
+  (D48). claimd doc-scope rule for PROTOCOL.md remains undecided (Stop hook fired, claim
+  declared covering the edit).
 - **CAUTION feature + bare-turn decision (re-gate N4):** the undo activity-window CAUTION
   shipped with no IMPLEMENTATION.md AC row (against "new features add their AC there first")
   and the bare-turn exclusion is pinned only in code comments; founder decides whether bare
   turns also get the caution, then both need register/ledger rows.
-- Merge decision for `fix/redteam-immediate-actions` (10 commits, gate PASS, 465/0/1) —
-  branch vs PR #10's in-flight `feat/phase-2-0-view-completion` ordering; both touch
-  IMPLEMENTATION.md (D46 number reused by both branches for different decisions — collision
-  must be resolved at merge, whichever lands second renumbers).
+- Merge decision for `fix/redteam-immediate-actions` (gate PASS, 465/0/1) vs PR #10's
+  in-flight `feat/phase-2-0-view-completion` ordering. The former D46-number collision is
+  RESOLVED (2026-08-01): this branch's signals-consumed decision renumbered to **D48**,
+  leaving D46 (service-leak) and D47 (KeepAlive gate) to PR #10's branch; commits before the
+  renumber still say D46 in their messages — history, not current state.
 - Demand/launch gate (Show HN etc.) never run — ROADMAP Phase 0's 30-day kill criterion has
   no data; 2.2's post-ship evaluation row needs a probe repo picked + `agentrec init` there.
 - Plan open questions 2–3: memory-plan stale checkboxes; store-churn reclaim.
@@ -171,7 +173,7 @@ Two crates in one cargo workspace: `agentrec-core` (lib: TurnEngine, BlobStore, 
 - **Bracketing (v0.2, load-bearing):** Claude Code integration installs `UserPromptSubmit` (start) + `Stop` (stop). Open bracket suppresses quiet-window closure; on stop, interim bare turns are retroactively merged into the rich turn. Start-without-stop = close at last mutation, `truncated: true`.
 - **Git turns:** mutation bursts coinciding with `.git/HEAD`/index/ref transitions are rich turns with `tool: "git"`; hidden from `log` by default. Never let a `git checkout` become a 400-file bare turn.
 - **Epochs & gaps:** daemon start/stop append `type:"epoch"` records; blame across an uncovered interval must say "attribution stale — recording gap", never guess.
-- **Append-only everything:** `log.jsonl` and `signal.jsonl` are only ever appended to; no line is mutated, reordered, or rewritten in place. History is corrected by appending. Signal consumption tracked by byte offset in `state.json`. Turn ids are machine-scoped ULIDs. **Exactly three sanctioned rewrite classes exist, all manual `purge` sub-ops, all refusing while the daemon runs, all archive-before-touch + atomic tmp/fsync/rename:** (1) `--memories-retracted` — `memory.jsonl`, drops fully-retracted chains past TTL; (2) `--log-duplicates` — `log.jsonl`, drops same-id duplicate turns a pre-fix daemon wrote; (3) `--signals-consumed` (D46) — `signal.jsonl`, drops only WHOLE lines already consumed (strictly before `signal_offset`, whose prompts are already in `log.jsonl` + the CAS) and rebases `signal_offset` in the same operation. Nothing else may rewrite these files; adding a fourth class requires a decision-register entry.
+- **Append-only everything:** `log.jsonl` and `signal.jsonl` are only ever appended to; no line is mutated, reordered, or rewritten in place. History is corrected by appending. Signal consumption tracked by byte offset in `state.json`. Turn ids are machine-scoped ULIDs. **Exactly three sanctioned rewrite classes exist, all manual `purge` sub-ops, all refusing while the daemon runs, all archive-before-touch + atomic tmp/fsync/rename:** (1) `--memories-retracted` — `memory.jsonl`, drops fully-retracted chains past TTL; (2) `--log-duplicates` — `log.jsonl`, drops same-id duplicate turns a pre-fix daemon wrote; (3) `--signals-consumed` (D48) — `signal.jsonl`, drops only WHOLE lines already consumed (strictly before `signal_offset`, whose prompts are already in `log.jsonl` + the CAS) and rebases `signal_offset` in the same operation. Nothing else may rewrite these files; adding a fourth class requires a decision-register entry.
 - **Two predicates, never conflated:** `modified-since` (hash ≠ turn's after) gates every destructive op; `human-edited-since` (modified AND not covered by any *rich* turn) is blame display only. Bare turns never count as coverage.
 - **Undo is a turn:** every revert (CLI or MCP) snapshots current state first and appends a new turn with `tool: "agentrec"`. Reverts are blame-able and re-revertible. `skipped` (over-cap) and `withheld` (secret-pattern) files are never revertible.
 - **Prompts and snapshots both scrubbed:** prompt scrub (secret regexes + entropy) runs *inside* the persistence function; secret-file patterns (`.env*`, `*.pem`, credentials) are never snapshotted (`withheld: true`). Local-only; no network code exists in v1–v2; never claim "provably" safe.

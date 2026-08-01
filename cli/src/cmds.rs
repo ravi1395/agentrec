@@ -259,7 +259,7 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         "last_bad_field": state.last_bad_field,
         "dedup_hits": state.dedup_hits,
         "dedup_reread_bytes": state.dedup_reread_bytes,
-        // T3/D46: the same inbox accounting the text report renders, so a
+        // T3/D48: the same inbox accounting the text report renders, so a
         // monitoring script watching store growth sees the file that actually
         // grew (13.4 MB on the dogfood store vs. 2.5 MB of log.jsonl). Both
         // fields are ALWAYS present — never only-when-nonzero — the same
@@ -306,7 +306,7 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // vacuous (D-PD3), so this prints an honest "n/a" instead.
     let trailing: Vec<&&TurnRecord> = turns.iter().rev().take(20).collect();
 
-    // T3/D46: the hook inbox is store accounting `status` never showed. On the
+    // T3/D48: the hook inbox is store accounting `status` never showed. On the
     // dogfood store it reached 13.4 MB against a 2.5 MB `log.jsonl` — bigger
     // than anything else this report renders — because nothing ever removed a
     // signal line. Unconditional (like `store:`/`gaps:`, unlike the derived
@@ -1760,7 +1760,7 @@ mod tests {
         );
     }
 
-    // AC3.2 (T3/D46): the hook inbox is the file that actually grew on the
+    // AC3.2 (T3/D48): the hook inbox is the file that actually grew on the
     // dogfood store (13.4 MB vs. 2.5 MB of log.jsonl) and `status` never
     // accounted for it. The line must report the real byte size AND attribute
     // the already-consumed share to its reclaim command — the same honest

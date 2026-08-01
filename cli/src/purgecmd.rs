@@ -491,7 +491,7 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape — one
 /// of the three sanctioned rewrite classes in this codebase, in the order they
 /// landed: `--memories-retracted` (first), `--log-duplicates` (second, here),
-/// `--signals-consumed` (third, D46) — daemon-liveness
+/// `--signals-consumed` (third, D48) — daemon-liveness
 /// refusal, archive-before-touch, atomic tmp+fsync+rename+dir-fsync. Two
 /// differences, both load-bearing:
 ///
@@ -753,7 +753,7 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
     }
 }
 
-// ---- purge --signals-consumed (hook-inbox prefix truncation, D46) ----------
+// ---- purge --signals-consumed (hook-inbox prefix truncation, D48) ----------
 //
 // `signal.jsonl` is the emitter -> recorder inbox. Every hook fire appends a
 // line carrying the SCRUBBED PROMPT TEXT, and nothing has ever removed one:
@@ -775,7 +775,7 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 // bytes — the bytes below it are gone from the file — so the redundancy
 // argument above is unaffected.
 //
-// This is the THIRD sanctioned rewrite class (D46). The full set, in landing
+// This is the THIRD sanctioned rewrite class (D48). The full set, in landing
 // order: `purge --memories-retracted`, `purge --log-duplicates`, and this one.
 // What survives of "append-only": emitters only ever
 // append, no line is ever mutated, reordered, or rewritten in place, and only
@@ -802,7 +802,7 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 // daemon; the honest mitigation is that any growth detected before the rename
 // aborts the whole operation with a rerun instruction.
 
-/// `purge --signals-consumed` (D46): truncate `signal.jsonl` to its unconsumed
+/// `purge --signals-consumed` (D48): truncate `signal.jsonl` to its unconsumed
 /// tail. Mirrors `purge_log_duplicates`' shape — daemon-liveness refusal,
 /// archive-before-touch, length recheck, atomic tmp+fsync+rename+dir-fsync —
 /// with three differences, each load-bearing:
@@ -1471,7 +1471,7 @@ mod tests {
         );
     }
 
-    // ---- purge --signals-consumed (D46) -----------------------------------
+    // ---- purge --signals-consumed (D48) -----------------------------------
 
     /// A signal inbox whose first `consumed_lines` lines the daemon has
     /// already eaten, plus a deliberately TORN final line (no trailing

@@ -28,6 +28,8 @@ Requirement words **MUST**, **SHOULD**, **MAY** are used per RFC 2119.
   objects/         # content-addressed blob store (§6)
 ```
 
+"Append-only" for these two files means precisely: writers only ever append; no line is mutated, reordered, or rewritten in place; history is corrected by appending. A recorder MAY additionally reclaim `signal.jsonl` by removing whole lines it has already consumed (strictly before its persisted consumption offset), provided the removal is atomic, the removed lines are archived first, the unconsumed tail is preserved byte-identical, and the consumption offset is rebased in the same operation (reference implementation: `purge --signals-consumed`, decision D48). Emitters MUST NOT assume stable byte offsets across such a reclaim; consumers of `log.jsonl` get the stronger guarantee — turn records are never removed, only superseded by appended corrections (the reference implementation's narrow `--log-duplicates` repair for a historical daemon defect removes only byte-exact same-id duplicates and predates this clarification).
+
 `.agentrec/` SHOULD be gitignored by default. Shared team history is a valid, explicit opt-in — but never by committing the live `log.jsonl` (append-only files merge badly and id collisions were only solved for time-ordering, not for merge conflicts). The sharing mechanism is per-writer sidecar exports (`shared/log.<writer-id>.jsonl`, one append-only file per human/machine, merged at read time ordered by `started` — same model as L3 tool sidecars, D21). Prompt objects SHOULD NOT be committed in any arrangement.
 
 ## 4. Signal format — emitter → recorder

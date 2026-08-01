@@ -184,7 +184,7 @@ enum Command {
         /// and the object store. Archives (never deletes) that prefix to
         /// `.agentrec/signal.archived.<ts>.jsonl`, preserves the unconsumed
         /// tail byte-identically, and rebases `signal_offset` in the same
-        /// operation. Refuses while the daemon is recording (D46).
+        /// operation. Refuses while the daemon is recording (D48).
         #[arg(long = "signals-consumed")]
         signals_consumed: bool,
     },
