@@ -14,6 +14,32 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **MVP periphery round (delivered 2026-08-01) — branch `fix/mvp-periphery`, 14 commits on
+  `origin/main` @ `08cf0d9`, unmerged, unpushed. Fable skeptic GATE PASS at `7dd764e` (3
+  rounds).** All ten BRANCH-SCOPE items landed: F24 launchd stdio→`.agentrec/daemon.log`; F1
+  README threat model (the redteam's §5-suppression mechanism claim was refuted in source and
+  dropped); F8 undo-plan + turn-renderer sanitization; F11 purge liveness-before-delete +
+  prompt archival; F27 schema-major enforcement (SCHEMA_MAJOR=1, every wire deser site, §10
+  consumer clause); F13+F31 status all-gap-kinds + daemon liveness; F19 torture × imported
+  turns (rides the nightly `--ignored` gate); F26+F28 budget keys on evictor-managed bytes +
+  `config.toml store_budget_bytes`; F2 symlink undo refusal + **FileEntry gains `link_kind` AND
+  `attribution` in one additive change** (attribution written by nothing here — it is
+  `feat/mvp-promise`'s D6 producer field, per the cross-branch schema agreement; PROTOCOL §5 +
+  FORMAT-CHANGELOG entries); F6+F7+F9 scrub shapes + dir-component denylist + `purge --path`
+  (blob archival, NOT a fourth rewrite class). Register row D50. Suite **738 / 0 / 3**
+  (baseline 666/0/3); clippy `-D warnings` + fmt clean; release seam check 0 hits; release-only
+  budget test run explicitly. Gate rounds 1–2 caught 2 real blockers, both same-branch seam
+  drift: F2's `link_kind` interpolated unsanitized into the REFUSE row (falsifying F8's
+  fresh "probed" comment — signature-defect instance #7, now fixed + test-pinned) and F1's
+  line-number citations rotted by later same-branch commits (now file:symbol). **Skeptic
+  remaining risks, unverified by anyone:** nightly `--ignored` torture leg never run on this
+  HEAD in CI; launchd honoring the new plist keys is manual-only (install on a scratch repo,
+  confirm `daemon.log` receives daemon stderr). **Next: PR to `main`; then `feat/mvp-promise`
+  rebases and builds its attribution producer.** Founder-pending here: `./`-prefix
+  normalization for `purge --path` patterns; `--allow-modified` vs derived-`after` on imported
+  turns (pinned-as-observed, founder ruling candidate); F11's `--snapshots-before` still
+  unarchived (scope call, disclosed).
+
 - **Redteam remediation round (delivered 2026-08-01, extended by founder acceptance of all
   recommendations; 7 skeptic rounds total) — branch `fix/redteam-immediate-actions`, 15
   commits, unmerged.** Extension added: PROTOCOL §3 append-only definition + D48 reclaim
