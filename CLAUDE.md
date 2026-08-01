@@ -408,10 +408,18 @@ carries only current state, what's next, and standing debts.
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
   over 2026-07-28).
-- 5 claimd claims DECLARED awaiting manual attestation (never self-attested).
-- **66 claimd claims STALE on scope-drift** after the PR #8 merge brought the round's file
-  content onto `main` (`claimd status`, 2026-07-30). Re-confirmation is owed and was NOT done
-  in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
+- **17 claimd claims DECLARED awaiting manual attestation** (never self-attested; both
+  branches' queues combined by the merge union).
+- ~~66 claimd claims STALE (PR #8 scope-drift)~~ **mechanically re-confirmed 2026-08-01**
+  (full `verify --all-stale` batches during the redteam round). Post-merge-union state
+  (`claimd status`, 2026-08-01 02:20): **211 claims — 163 confirmed, 5 stale
+  (deferred/missing replay specs, cannot replay), 26 refuted, 17 declared.** Of the 26
+  refuted: this round's 9 are all claim-cmd authoring bugs, each superseded by a CONFIRMED
+  replacement (incl. 2 refuted only by the merge legitimately bringing PR #10's D46 comments
+  into cli/src — superseded by `clm_7W9107CC`); the remaining ~17 are **PR #10's round
+  claims broken by the squash + this branch's additive golden keys** (byte-identical-golden
+  and worktree-pinned replays) — re-declaration of that round's claims is owed and was NOT
+  done here (not this round's evidence to rewrite); same shape as the PR #8 debt above.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
 - ~~PROTOCOL.md §3 amendment (D48 loose end)~~ **DONE 2026-08-01 (founder-directed):** §3 now
