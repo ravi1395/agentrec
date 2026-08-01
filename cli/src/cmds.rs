@@ -999,6 +999,7 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         session,
         transcript,
         prompt,
+        files_written: None,
         kind: None,
         fact: None,
         pins: None,

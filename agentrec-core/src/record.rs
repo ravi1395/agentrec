@@ -62,6 +62,12 @@ pub struct SignalEvent {
     /// Post-scrub prompt text, when the emitting hook has it (UserPromptSubmit).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// PROTOCOL §4 additive (D6 attribution): absolute paths the emitting tool
+    /// itself wrote during the turn, populated by L2+ emitters on `stop`.
+    /// `None` means "emitter did not declare", never "no files written" —
+    /// consumers must not infer authorship for paths absent from the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_written: Option<Vec<String>>,
     /// Signal variant discriminator (PROTOCOL §4, additive). Absent/`None` on
     /// every existing turn-boundary signal (`start`/`stop`, keyed by `event`
     /// instead). Currently the only non-`None` value is `"memory-candidate"`
@@ -444,6 +450,60 @@ mod tests {
         assert_eq!(sigs[0].prompt.as_deref(), Some("fix it"));
         assert!(!sigs[1].is_start()); // event defaults to stop
         assert_eq!(sigs[1].v, 1); // v defaults
+    }
+
+    #[test]
+    fn signal_files_written_roundtrips_and_absence_stays_absent() {
+        // Pre-field line: parses with None, and re-serializing does NOT mint
+        // the key (absence means "emitter did not declare" — PROTOCOL §4).
+        let old = "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\"}";
+        let sig: SignalEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(sig.files_written, None);
+        let re = serde_json::to_string(&sig).unwrap();
+        assert!(!re.contains("files_written"));
+
+        // Field-carrying line round-trips with the list intact.
+        let new = concat!(
+            "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\",",
+            "\"files_written\":[\"/repo/a.rs\",\"/repo/b.rs\"]}"
+        );
+        let sig: SignalEvent = serde_json::from_str(new).unwrap();
+        assert_eq!(
+            sig.files_written.as_deref(),
+            Some(&["/repo/a.rs".to_string(), "/repo/b.rs".to_string()][..])
+        );
+        let re = serde_json::to_string(&sig).unwrap();
+        let back: SignalEvent = serde_json::from_str(&re).unwrap();
+        assert_eq!(back.files_written, sig.files_written);
+
+        // An empty declared list is distinct from no declaration and survives.
+        let empty = "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"files_written\":[]}";
+        let sig: SignalEvent = serde_json::from_str(empty).unwrap();
+        assert_eq!(sig.files_written.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn signal_stream_with_files_written_keeps_existing_routing() {
+        // Conformance: a files_written-carrying stop interleaved with legacy
+        // lines and a memory-candidate parses as before — the field changes
+        // no variant discrimination and no line is dropped or re-routed.
+        let text = concat!(
+            "{\"v\":1,\"ts\":1000,\"tool\":\"claude-code\",\"event\":\"start\"}\n",
+            "{\"v\":1,\"ts\":2000,\"tool\":\"claude-code\",\"event\":\"stop\",",
+            "\"files_written\":[\"/repo/src/lib.rs\"]}\n",
+            "{\"v\":1,\"ts\":3000,\"tool\":\"claude-code\",\"type\":\"memory-candidate\",",
+            "\"fact\":\"uses pnpm\",\"pins\":[\"package.json\"]}\n",
+        );
+        let sigs = parse_signals(text);
+        assert_eq!(sigs.len(), 3);
+        assert!(sigs[0].is_start() && sigs[0].files_written.is_none());
+        assert!(!sigs[1].is_start());
+        assert_eq!(
+            sigs[1].files_written.as_deref(),
+            Some(&["/repo/src/lib.rs".to_string()][..])
+        );
+        assert!(sigs[2].is_memory_candidate());
+        assert!(sigs[2].files_written.is_none());
     }
 
     #[test]

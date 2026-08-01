@@ -44,6 +44,7 @@ One JSON object per line in `signal.jsonl`:
 | `event` | string | SHOULD | `"stop"` (default) or `"start"`; stop-only emitters are conformant but degraded (see bracketing) |
 | `session` | string | MAY | Tool-native session id |
 | `transcript` | string (path) | MAY | Path to the tool's transcript for prompt extraction |
+| `files_written` | array of string (absolute paths) | MAY | On `"stop"` only: files the emitting tool **itself wrote** during the turn, as known to the tool (e.g. its own edit-tool invocations). An L2+ emitter SHOULD populate it — the emitter's own record is the only author-level signal; a recorder cannot distinguish a human save from an agent write at the filesystem layer. A recorder MAY use it for per-file attribution and MUST NOT infer authorship for observed mutations absent from it. Absence of the field means "emitter did not declare", never "no files written" |
 
 Example — a Claude Code Stop hook is a one-liner:
 
