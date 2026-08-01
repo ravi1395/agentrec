@@ -112,14 +112,29 @@ measured time-windows, not this rule. Closed by running the real release `hook` 
 first 300 transcripts in `~/.claude/projects/-Users-ravichandrasekhar-Projects-agentrec/` against
 a scratch root and reading the emitted `signal.jsonl`:
 
-- 300 stop signals: **290 carry no `files_written` (97%)** — consistent with the stub/read-only
-  session mix measured above; honest silence, not empty lists.
-- 10 declaring signals: set sizes min 1 / p50 2 / p90 5 / **max 5** — no whole-session unions
-  (sessions in this corpus hold up to ~40 writes; an unscoped parser would emit them).
+- 300 stop signals: **290 carry no `files_written` (97%)**, zero empty lists — honest silence.
+  286 of the 300 transcripts have zero session writes at all, so the bulk of that silence is
+  "nothing to declare", not the cutoff rule working: **the discriminating base for the cutoff
+  rule is the 14 write-bearing transcripts**, not 300.
+- 10 declaring signals: set sizes min 1 / p50 2 / max 5.
+
+**Corrected by the 2026-08-01 re-gate (the first version of this addendum said "sessions hold up
+to ~40 writes" — false at this scope; skeptic-measured max over these 300 is 16):**
+
+- Scoping evidence proper: **4 of 10** declaring transcripts emit fewer paths than their session
+  total — the clean pair is `3104ac02-…jsonl`: **emitted 2 vs 11 session-total**. The other 6
+  have emitted == session-total, indistinguishable from an unscoped parser. The cutoff
+  demonstrably scopes; the base is narrow and a different 300 could move these numbers.
+- **Under-declaration magnitude, first measurement:** 4 of the 14 write-bearing transcripts
+  (session totals 6/7/9/16) declared **nothing** — 29% fully silent. The code comment discloses
+  under-declaration as a direction; this is its measured size on this sample. Phase 3/4 must not
+  present declared-coverage as approximating agent activity.
 
 Replay: loop `printf '{"hook_event_name":"Stop","session_id":"pop","transcript_path":"<t>"}' |
 agentrec hook claude --root <scratch>` over the transcript glob, then histogram `files_written`
 lengths in `<scratch>/.agentrec/signal.jsonl`.
 
 Still open (recorded, not closable here): Linux leg for this branch — macOS-only evidence until
-CI runs it.
+CI runs it. Also open: the >64 MiB cap path has never executed anywhere (corpus max 27 MiB) — an
+oversize E2E plus a daemon-tier observation would empirically pin the tier-shift behavior the cap
+comment now describes.

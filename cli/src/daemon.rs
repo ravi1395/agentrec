@@ -1943,8 +1943,15 @@ fn lexical_normalize(path: &Path) -> std::path::PathBuf {
 /// The largest real corpus transcript measured 27 MiB (~14 ms warm read);
 /// the cap exists so a pathological transcript cannot stall every future
 /// Stop hook — hook latency asserts have flaked on shared runners before.
-/// Over-cap ⇒ no declaration at all (`None`, the under-declare-safe
-/// direction), never a partial parse presented as complete.
+/// Over-cap ⇒ the HOOK declares nothing (`None`, never a partial parse
+/// presented as complete). This caps hook latency only, NOT the system's
+/// declaration path: the daemon's `signal_context` read of the same
+/// transcript is uncapped (pre-existing, prompt extraction), so the
+/// `TranscriptFallback` tier can still declare for an over-cap transcript —
+/// the daemon is not latency-sensitive, so that is acceptable, but it means
+/// over-cap shifts the declaring tier rather than silencing declaration.
+/// (Skeptic re-gate 2026-08-01: the earlier wording claimed system-level
+/// silence — false; never executed in reality either, corpus max 27 MiB.)
 pub(crate) const MAX_DECLARATION_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Size-gated transcript read for the declaration path: `None` when the file
@@ -1962,15 +1969,18 @@ pub(crate) fn read_transcript_capped(path: &Path, cap: u64) -> Option<String> {
 /// `toolUseResult.filePath` entries, scoped to lines timestamped at/after
 /// the transcript's LAST real user prompt.
 ///
-/// The `toolUseResult` channel is SHAPE-keyed, not tool-keyed. Measured over
-/// all 2138 corpus transcripts (2026-08-01 skeptic gate): top-level
-/// `filePath` origins are Edit 862 / Write 160 / ExitPlanMode 2. A Read
-/// result nests its path under `file.filePath` and never matches; the two
-/// ExitPlanMode paths are its own plan file under `~/.claude/plans/` —
-/// out-of-root for any watched repo, so they land in `out_of_root`, not the
-/// declared set. If a future tool emits the top-level shape for a file it
-/// merely read, this channel over-declares; tool-identity gating needs a
-/// tool_use_id→name join and is deferred until an in-root case exists.
+/// The `toolUseResult` channel is SHAPE-keyed, not tool-keyed. Two
+/// independent corpus joins (2026-08-01 gate at 2138 transcripts and re-gate
+/// at 2808; absolute counts grow with the corpus and were not mutually
+/// reconcilable, so none are quoted here) agree on the shape facts that
+/// matter: top-level `filePath` originates ONLY from Edit and Write, plus
+/// exactly two ExitPlanMode cases whose path is ExitPlanMode's own plan
+/// file under `~/.claude/plans/` — out-of-root for any watched repo, so
+/// they land in `out_of_root`, not the declared set. A Read result nests
+/// its path under `file.filePath` and never matches (pinned by test). If a
+/// future tool emits the top-level shape for a file it merely read, this
+/// channel over-declares; tool-identity gating needs a tool_use_id→name
+/// join and is deferred until an in-root case exists.
 ///
 /// Scoping caveats, all erring toward under-declaration (the safe
 /// direction — an undeclared write stays unattributed):
