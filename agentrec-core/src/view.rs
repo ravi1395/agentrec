@@ -268,8 +268,10 @@ impl std::error::Error for RepoError {}
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
     pub records: Vec<LogRecord>,
-    /// Well-formed JSON objects carrying a `type` this binary does not know.
-    /// Tolerated (a newer producer is allowed to write them) and counted.
+    /// Well-formed JSON objects this binary does not implement: a `type` it
+    /// does not know, or a known `type` at an unimplemented schema major
+    /// (record.rs refuses those at deserialization). Tolerated (a newer
+    /// producer is allowed to write them) and counted.
     pub unknown_type_lines: usize,
     /// Non-empty lines that are not parseable JSON at all — a torn tail line
     /// after a crash, most often.

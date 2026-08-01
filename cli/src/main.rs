@@ -79,7 +79,7 @@ enum Command {
         #[arg(long = "all-files")]
         all_files: bool,
     },
-    /// Store size, recording gaps, and rich-rate health.
+    /// Store size, recording gaps (all kinds), daemon liveness, and rich-rate health.
     Status {
         /// Acknowledge and clear a DEGRADED snapshot-failure banner. Rejected
         /// together with `--json` (Phase 3, honesty-fixes round): the ack
