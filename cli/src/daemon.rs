@@ -1344,18 +1344,8 @@ impl SignalTailer {
             return vec![];
         };
         if len < self.offset {
-            eprintln!(
-                "agentrec: signal.jsonl truncated externally (was {} bytes, now {len}) — \
-                 resuming from the new end; any signals written during the gap are lost",
-                self.offset
-            );
+            resync_shrunk_signal_offset(root, self.offset, len, "mid-run");
             self.offset = len;
-            let mut state = read_state(root);
-            state.signal_offset = self.offset;
-            record_io_failure(&mut state, "signal.jsonl (truncated)");
-            if let Err(e) = write_state(root, &state) {
-                eprintln!("agentrec: warning: failed to persist signal offset: {e}");
-            }
             return vec![];
         }
         if len == self.offset {
@@ -1381,6 +1371,49 @@ impl SignalTailer {
             eprintln!("agentrec: warning: failed to persist signal offset: {e}");
         }
         events
+    }
+}
+
+/// Reconcile a persisted `signal_offset` that sits PAST the current end of
+/// `signal.jsonl`, and announce it. The single implementation behind both
+/// detection sites — `SignalTailer::poll` (a shrink that happens while the
+/// daemon runs) and `replay_pending_candidates` (a shrink that happened while
+/// no daemon was running, discovered at boot).
+///
+/// Red-team D1: the startup site did not exist. `replay_pending_candidates`
+/// returned the file length on `len <= start` without persisting anything,
+/// and daemon startup seeds the tailer from that return value — so `poll`'s
+/// shrink branch was unreachable at boot and a stale offset survived daemon
+/// run after daemon run. That made `purge --signals-consumed`'s documented
+/// remedy ("start `agentrec record` once, the daemon resyncs") false, with no
+/// other escape, and it dropped the unconsumed tail SILENTLY.
+///
+/// Three actions, and all three are load-bearing together — a resync that is
+/// not persisted is invisible to the next process, and a persist that is not
+/// counted is a silent data drop:
+///   1. log loudly on stderr,
+///   2. count an I/O failure so `status`/`doctor` render DEGRADED,
+///   3. rebase the offset to the real EOF and WRITE IT to `state.json`.
+///
+/// This announces the loss, it does not prevent it: whatever was written
+/// between the old offset and the shrink is gone either way. `len` is the
+/// only offset that can't replay consumed signals as duplicate turns.
+///
+/// Callers must only invoke this when the offset genuinely EXCEEDS the length
+/// (`len < offset`). `len == offset` is the ordinary fully-consumed steady
+/// state on every boot and must stay silent — see
+/// `startup_offset_exactly_at_eof_is_a_silent_no_op`.
+fn resync_shrunk_signal_offset(root: &Path, persisted: u64, len: u64, when: &str) {
+    eprintln!(
+        "agentrec: signal.jsonl is shorter than the consumed offset (offset {persisted}, \
+         file now {len} bytes) — detected {when}; resuming from the new end; any signals \
+         written during the gap are lost"
+    );
+    let mut state = read_state(root);
+    state.signal_offset = len;
+    record_io_failure(&mut state, "signal.jsonl (truncated)");
+    if let Err(e) = write_state(root, &state) {
+        eprintln!("agentrec: warning: failed to persist resynced signal offset: {e}");
     }
 }
 
@@ -1427,7 +1460,15 @@ impl SignalTailer {
 /// (dedup would no-op it, but advancing avoids the repeated work).
 fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
-        // No inbox yet — same starting point as the historical open() path.
+        // No inbox. Offset 0 is a fresh store (no hook has ever fired) and is
+        // silent. A NONZERO offset against an absent file is the same
+        // inconsistency as a shrink with length 0 — the inbox was deleted or
+        // moved out from under us — so it is announced and reconciled rather
+        // than left as a stale offset the next process would inherit.
+        let persisted = read_state(root).signal_offset;
+        if persisted > 0 {
+            resync_shrunk_signal_offset(root, persisted, 0, "at startup (inbox absent)");
+        }
         return 0;
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
@@ -1435,10 +1476,18 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     };
     let mut state = read_state(root);
     let start = state.signal_offset;
-    if len <= start {
-        // Nothing appended since the last consumed offset. (len < start is an
-        // external shrink we can't recover — sit at the new EOF, matching the
-        // historical open() behaviour of starting at the current end.)
+    // Split deliberately, and the boundary is exact. `len < start` is an
+    // external shrink discovered at boot: announce + reconcile + persist,
+    // identically to the mid-run branch (red-team D1 — this case previously
+    // returned here silently, leaving state.json stale forever).
+    if len < start {
+        resync_shrunk_signal_offset(root, start, len, "at startup");
+        return len;
+    }
+    // `len == start` is the ordinary fully-consumed steady state on every
+    // boot — nothing appended since the last session. It must stay SILENT;
+    // folding it into the branch above would fire DEGRADED on every start.
+    if len == start {
         return len;
     }
     if file.seek(SeekFrom::Start(start)).is_err() {
@@ -3328,6 +3377,144 @@ mod tests {
             mems2.len(),
             1,
             "a re-scanned/duplicate candidate dedups to a no-op: {mems2:?}"
+        );
+    }
+
+    // ---- red-team D1: startup shrink detection --------------------------------
+
+    /// The defect the skeptic refuted: a persisted `signal_offset` PAST the
+    /// end of `signal.jsonl` (the crash window `purge --signals-consumed`
+    /// documents between its rename and its offset rebase) survived a daemon
+    /// start untouched. `replay_pending_candidates` returned `len` on
+    /// `len <= start` WITHOUT persisting, and daemon startup seeds the tailer
+    /// with that return — so `SignalTailer::poll`'s `len < self.offset`
+    /// shrink branch was unreachable at boot and only ever fired on a
+    /// mid-run shrink. Net effect: `purge --signals-consumed` refused forever
+    /// (its remedy text says to run the daemon once), and the unconsumed tail
+    /// was dropped SILENTLY with no DEGRADED signal.
+    ///
+    /// Startup must now take the same action as the mid-run branch: loud log,
+    /// `record_io_failure` (DEGRADED-visible), resync to EOF, and PERSIST.
+    /// Neuter: restore `if len <= start { return len; }` -> RED.
+    #[test]
+    fn startup_offset_past_eof_resyncs_persists_and_degrades() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // Newline-terminated on purpose: this is the post-crash shape the
+        // skeptic's repro leaves behind, and it keeps the offset a line
+        // boundary so `purge --signals-consumed` is reachable afterwards.
+        let contents = "{\"v\":1,\"ts\":7,\"event\":\"stop\"}\n";
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let len = contents.len() as u64;
+
+        let mut st = read_state(root);
+        st.signal_offset = 9999;
+        write_state(root, &st).unwrap();
+
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(
+            consumed, len,
+            "the tailer must be seeded at the real EOF, never the stale offset"
+        );
+
+        let after = read_state(root);
+        assert_eq!(
+            after.signal_offset, len,
+            "the resynced offset must be PERSISTED — an in-memory-only resync is \
+             exactly the defect (state.json stayed at 9999 across daemon runs)"
+        );
+        assert_eq!(
+            after.snapshot_failures, 1,
+            "a startup shrink must count as an I/O failure so `status` renders DEGRADED"
+        );
+        assert!(
+            after.io_failed.iter().any(|p| p.contains("signal.jsonl")),
+            "the affected surface must be named in io_failed: {:?}",
+            after.io_failed
+        );
+    }
+
+    /// Guard on the one-character mistake that would make the fix worse than
+    /// the defect: `len == start` is the steady state on EVERY daemon boot
+    /// (the previous session consumed the whole inbox). Detecting on
+    /// `len <= start` instead of `len < start` would fire DEGRADED on every
+    /// single start. Neuter: widen the comparison to `<=` -> RED.
+    #[test]
+    fn startup_offset_exactly_at_eof_is_a_silent_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let contents = "{\"v\":1,\"ts\":7,\"event\":\"stop\"}\n";
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let len = contents.len() as u64;
+
+        let mut st = read_state(root);
+        st.signal_offset = len;
+        write_state(root, &st).unwrap();
+
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(consumed, len);
+
+        let after = read_state(root);
+        assert_eq!(after.signal_offset, len, "offset unchanged");
+        assert_eq!(
+            after.snapshot_failures, 0,
+            "a fully-consumed inbox is the NORMAL boot state — it must never \
+             count an I/O failure or the DEGRADED banner would be permanent"
+        );
+        assert!(after.io_failed.is_empty(), "{:?}", after.io_failed);
+    }
+
+    /// Same defect class, different early return: an ABSENT `signal.jsonl`
+    /// against a nonzero persisted offset. `File::open` failing returned 0
+    /// while `state.json` kept the stale offset, leaving the live tailer at 0
+    /// against a state that says otherwise — a missing file is "persisted
+    /// offset exceeds file length" with length 0, and is reconciled the same
+    /// way. (A missing file with offset 0 stays silent: that is a fresh
+    /// store, not a shrink.) Neuter: return 0 without reconciling -> RED.
+    #[test]
+    fn startup_missing_signal_file_with_stale_offset_resyncs_and_degrades() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        // No signal.jsonl at all.
+
+        let mut st = read_state(root);
+        st.signal_offset = 4242;
+        write_state(root, &st).unwrap();
+
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(consumed, 0, "no inbox means the only honest offset is 0");
+
+        let after = read_state(root);
+        assert_eq!(
+            after.signal_offset, 0,
+            "a stale offset against a missing inbox must be reconciled and persisted"
+        );
+        assert_eq!(after.snapshot_failures, 1);
+        assert!(after.io_failed.iter().any(|p| p.contains("signal.jsonl")));
+    }
+
+    /// The companion silence check for the case above: a fresh store (no
+    /// inbox yet, offset 0) is the normal pre-first-hook state and must not
+    /// degrade.
+    #[test]
+    fn startup_missing_signal_file_at_offset_zero_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        let consumed = replay_pending_candidates(root, None);
+        assert_eq!(consumed, 0);
+
+        let after = read_state(root);
+        assert_eq!(after.signal_offset, 0);
+        assert_eq!(
+            after.snapshot_failures, 0,
+            "a store that has never seen a hook is not degraded"
         );
     }
 

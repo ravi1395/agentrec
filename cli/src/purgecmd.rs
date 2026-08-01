@@ -13,7 +13,7 @@
 //! `readcmds::same_revert` dedup — see that module for the underlying bug).
 
 use crate::cmds::wall_now_ms;
-use crate::{agentrec_dir, log_path, objects_dir};
+use crate::{agentrec_dir, log_path, objects_dir, signal_path};
 use agentrec_core::memory::{memory_path, MemoryRecord};
 use agentrec_core::record::{LogRecord, TurnRecord};
 use agentrec_core::store::BlobStore;
@@ -32,6 +32,7 @@ pub fn run(
     memories_retracted: bool,
     log_duplicates: bool,
     orphans: bool,
+    signals_consumed: bool,
 ) -> Result<(), String> {
     let records = agentrec_core::record::load_log(&log_path(root));
     let turns: Vec<&TurnRecord> = owned_turns(&records);
@@ -49,6 +50,9 @@ pub fn run(
     }
     if orphans {
         purge_orphans(root)?;
+    }
+    if signals_consumed {
+        purge_signals_consumed(root)?;
     }
     Ok(())
 }
@@ -315,7 +319,8 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
 
     test_pause_before_memory_rewrite();
 
-    // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site.
+    // (c) atomic rewrite of memory.jsonl — the only sanctioned rewrite site
+    // for THIS file (the other two classes rewrite log.jsonl/signal.jsonl).
     rewrite_memory_atomic(&mem_path, &survivor_lines)?;
     agentrec_core::perms::lock_file(&mem_path);
 
@@ -483,8 +488,10 @@ fn create_tmp_file(path: &Path) -> std::io::Result<std::fs::File> {
 // rewrite it dropping only lines that are exact `same_revert` duplicates of
 // an earlier same-id record.
 
-/// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape (the
-/// only other sanctioned rewrite in this codebase) — daemon-liveness
+/// `purge --log-duplicates`: mirrors `purge_memories_retracted`'s shape — one
+/// of the three sanctioned rewrite classes in this codebase, in the order they
+/// landed: `--memories-retracted` (first), `--log-duplicates` (second, here),
+/// `--signals-consumed` (third, D48) — daemon-liveness
 /// refusal, archive-before-touch, atomic tmp+fsync+rename+dir-fsync. Two
 /// differences, both load-bearing:
 ///
@@ -578,7 +585,7 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
 
     // Archive the WHOLE original file, fsynced, BEFORE the source is touched.
     let archive_path = log_archive_path(root);
-    write_full_file_synced(&archive_path, &original)?;
+    write_full_file_synced(&archive_path, original.as_bytes())?;
     agentrec_core::perms::lock_file(&archive_path);
 
     test_pause_before_log_rewrite();
@@ -678,7 +685,13 @@ fn log_archive_path(root: &Path) -> PathBuf {
 /// returning — callers must be able to trust the archive is durable before
 /// the source rewrite starts. `path` is always a freshly-minted, per-run
 /// timestamped name, so truncate-on-open never discards a previous archive.
-fn write_full_file_synced(path: &Path, content: &str) -> Result<(), String> {
+///
+/// Takes raw BYTES, not `&str`: `purge --signals-consumed` archives a byte
+/// slice of `signal.jsonl` that must round-trip verbatim, and a prefix cut at
+/// a line boundary is still not guaranteed to be valid UTF-8 (a hook could
+/// have written invalid bytes; `String::from_utf8_lossy` would silently
+/// substitute replacement characters into the archive).
+fn write_full_file_synced(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -688,8 +701,7 @@ fn write_full_file_synced(path: &Path, content: &str) -> Result<(), String> {
         .truncate(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| e.to_string())?;
+    file.write_all(content).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -737,6 +749,320 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(format!("failed to rewrite log.jsonl: {e}"))
+        }
+    }
+}
+
+// ---- purge --signals-consumed (hook-inbox prefix truncation, D48) ----------
+//
+// `signal.jsonl` is the emitter -> recorder inbox. Every hook fire appends a
+// line carrying the SCRUBBED PROMPT TEXT, and nothing has ever removed one:
+// on the dogfood store the inbox reached 13.4 MB / 1932 lines against a 2.5 MB
+// `log.jsonl`. Retention (`purge` TTL, budget eviction, `--orphans`) covers
+// the object store only, so the inbox grew without bound.
+//
+// The consumed prefix is genuinely redundant, not merely old: the daemon
+// persists a signal's prompt text into the CAS (`daemon.rs`'s `persist`) and
+// cites it from the closed turn's `prompt_ref` at consumption time. So every
+// byte before `state.json`'s `signal_offset` has already been transcribed into
+// the two durable surfaces (`log.jsonl` + `objects/`) that every read verb
+// actually reads. Nothing in the codebase re-reads the inbox below
+// `signal_offset` — `SignalTailer::poll` and `replay_pending_candidates` both
+// start AT that offset and never read behind it. The offset itself moves
+// forward on every consumption; the ONE exception is a detected shrink, where
+// both sites resync it DOWN to the file's real EOF
+// (`daemon::resync_shrunk_signal_offset`). That is not a re-read of consumed
+// bytes — the bytes below it are gone from the file — so the redundancy
+// argument above is unaffected.
+//
+// This is the THIRD sanctioned rewrite class (D48). The full set, in landing
+// order: `purge --memories-retracted`, `purge --log-duplicates`, and this one.
+// What survives of "append-only": emitters only ever
+// append, no line is ever mutated, reordered, or rewritten in place, and only
+// WHOLE already-consumed lines leave the file. What changes: the file's byte
+// offsets are rebased, so `signal_offset` must be rebased in the same
+// operation or the daemon would either replay (offset too low) or resync-and-
+// drop (offset too high).
+//
+// CONCURRENCY — deliberately weaker than `purge --log-duplicates`, do not
+// copy that comment's confidence here. `log.jsonl` has exactly one non-daemon
+// writer (`undo --confirm`) and it takes `log.lock` blocking, so the
+// recheck->rename window is backstopped by a lock. `signal.jsonl` has TWO
+// non-daemon writers — `cmds::hook` (every prompt/stop, whether or not a
+// daemon is running) and `memorycmds`' candidate emitter — and NEITHER takes
+// any lock. A `signal.lock` was considered and rejected for now: the hook path
+// is the latency-critical surface guarded by the `hook_recall_hard_wall_
+// deadline` test (a blocking flock there could park a hook behind a
+// maintenance command), and covering only one of the two writers would buy a
+// false sense of closure. So the length recheck below is the ONLY guard, and
+// its residual is real and unbacked: an append landing in the microseconds
+// between the recheck and the rename is lost from the rewritten file, and the
+// archive holds only the consumed prefix, so it is not recoverable from there
+// either. It is a manual, human-invoked maintenance command on a stopped
+// daemon; the honest mitigation is that any growth detected before the rename
+// aborts the whole operation with a rerun instruction.
+
+/// `purge --signals-consumed` (D48): truncate `signal.jsonl` to its unconsumed
+/// tail. Mirrors `purge_log_duplicates`' shape — daemon-liveness refusal,
+/// archive-before-touch, length recheck, atomic tmp+fsync+rename+dir-fsync —
+/// with three differences, each load-bearing:
+///
+/// (a) It operates on BYTES, never lines. The unconsumed tail routinely ends
+///     mid-line (a hook is appending as we read), and both existing rewrite
+///     helpers take `&[&str]` and `writeln!` each element — which would append
+///     a newline to that torn final line, promoting a partial signal into one
+///     `SignalTailer::poll`'s `rposition(b'\n')` scan treats as complete and
+///     hands to `parse_signals`. The tail is copied verbatim.
+/// (b) It refuses rather than guesses on any inconsistency: a missing
+///     `state.json` (the only record of what was consumed), an offset past
+///     EOF, or an offset that does not land just after a `\n`. Ordinary
+///     consumption always leaves a line-boundary offset (both readers advance
+///     only to `rposition(b'\n') + 1`) — but the shrink resync in (c) is a
+///     legitimate producer of a mid-line offset: it lands at the file's real
+///     EOF, which sits mid-line whenever the last line was torn mid-write.
+///     That state self-resolves after the next hook fire (hooks append whole
+///     lines, so consumption advances back onto a boundary). The refusal is
+///     still right either way — truncating there would decapitate a signal
+///     line — but it is a wait-and-retry, not proof of corruption.
+/// (c) Ordering is rename-THEN-rebase, and that direction is load-bearing.
+///     A crash between them leaves a large `signal_offset` against a short
+///     file, which the daemon detects AT STARTUP OR MID-RUN and reconciles
+///     identically via `daemon::resync_shrunk_signal_offset`: it logs loudly,
+///     counts a DEGRADED I/O failure, and resyncs the offset to the new EOF
+///     *and persists it* — the unconsumed tail's bytes survive on disk, they
+///     are just never processed. Both sites matter here and the startup one
+///     is the one this command's own refusal text sends users to: red-team D1
+///     found only the mid-run site (`SignalTailer::poll`, `len < self.offset`)
+///     existed, so a crash in this window was never reconciled by restarting
+///     the daemon and this command refused forever with no escape.
+///     The reverse order (rebase first) would leave offset 0 against the
+///     full file — NOT duplicate turns (D7's replay discipline drops
+///     start/stop in the gap at any offset; probe-validated 2026-08-01):
+///     the daemon would silently advance the offset to EOF across the
+///     UNCONSUMED tail, and the next run of this command would archive-and-
+///     drop those never-processed signals as if consumed. Rename-first makes
+///     a crash announce itself (DEGRADED); rebase-first makes the same
+///     crash lose the tail silently. Announced loss over silent loss.
+fn purge_signals_consumed(root: &Path) -> Result<(), String> {
+    purge_signals_consumed_inner(root, None)
+}
+
+/// The body of [`purge_signals_consumed`], with the recheck-window widener as
+/// a PARAMETER rather than an env-var seam.
+///
+/// Deliberately NOT the `AGENTREC_TEST_PAUSE_BEFORE_*_MS` shape the memory and
+/// log rewrites use. Those are read by a spawned `CARGO_BIN_EXE_agentrec`
+/// subprocess (`cli/tests/hardening_cli.rs`), so the `set_var` happens in a
+/// parent that isn't itself multi-threaded over that variable. This function's
+/// race test lives in-process, where a debug-path `std::env::set_var` would
+/// run concurrently (`--test-threads=3`) with every other test calling
+/// `std::env::var` — the classic unsound set_var/var data race, for a seam no
+/// acceptance criterion requires to be externally injectable. A parameter also
+/// makes the fail-safe property STRONGER than the env seam's: a production
+/// binary has no code path that can sleep here at all, rather than one that is
+/// merely compiled out.
+fn purge_signals_consumed_inner(
+    root: &Path,
+    pause_before_recheck: Option<std::time::Duration>,
+) -> Result<(), String> {
+    // Same belt-and-suspenders posture as the other rewrites: the daemon both
+    // appends nothing here and advances `signal_offset` continuously, so a
+    // live daemon would race the rebase as well as the rewrite.
+    if crate::daemon::daemon_is_running(root) {
+        return Err(
+            "stop recording (agentrec is running) before truncating signal.jsonl — \
+             the daemon consumes the inbox and advances signal_offset concurrently"
+                .to_string(),
+        );
+    }
+
+    // `state.json` is the ONLY record of how much of the inbox was consumed.
+    // Missing means either "never recorded here" or "operational state was
+    // deleted"; both are cases where any offset we picked would be a guess,
+    // and guessing low replays signals while guessing high destroys them.
+    // Deliberately NOT gated on `state_parse_failures`: that is a persisted
+    // LIFETIME counter, so gating on it would refuse forever after a single
+    // historical corruption. A `signal_offset` that fails to parse degrades to
+    // 0 (state.rs' per-field fallback), which lands on the no-op path below —
+    // safe by construction.
+    if !crate::state_path(root).exists() {
+        return Err(
+            "no .agentrec/state.json — cannot tell which signal lines were already \
+             consumed; refusing to guess (start `agentrec record` once, then retry)"
+                .to_string(),
+        );
+    }
+    let offset = crate::state::read_state(root).signal_offset;
+
+    let path = signal_path(root);
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!("scanned 0 B of signal inbox — no signal.jsonl yet");
+        return Ok(());
+    };
+    let len = bytes.len() as u64;
+
+    if offset == 0 {
+        println!(
+            "signal inbox {} — 0 B consumed, nothing to reclaim",
+            human_bytes(len)
+        );
+        return Ok(());
+    }
+    if offset > len {
+        return Err(format!(
+            "state.json's signal_offset ({offset}) is past the end of signal.jsonl \
+             ({len} B) — the inbox was already truncated or rewritten externally; \
+             refusing to truncate against an inconsistent offset (start `agentrec \
+             record` once: the daemon detects the shrink at startup, resyncs the \
+             offset to the file's end and reports DEGRADED — any signals in the \
+             gap are already lost — then retry; if the file's last line is torn \
+             mid-write the retry refuses once more on the line boundary until one \
+             more hook fire completes that line)"
+        ));
+    }
+    // `offset` is a COUNT of consumed bytes, so `offset - 1` is the last
+    // consumed byte and MUST be the newline ending the last consumed line.
+    if bytes[offset as usize - 1] != b'\n' {
+        return Err(format!(
+            "state.json's signal_offset ({offset}) does not land on a line boundary \
+             — refusing to truncate through a partial signal line. Ordinary \
+             consumption always leaves a line-boundary offset; the usual cause here \
+             is a detected inbox shrink whose resync landed on a torn final line — \
+             that resolves itself after the next hook fire and one `agentrec record` \
+             cycle, then retry. Do NOT delete state.json — it is the only record \
+             of what was consumed. A daemon starting without it mints no turns \
+             from the backlog (start/stop signals in the gap are dropped by \
+             design) and silently advances the offset to end-of-file, after \
+             which this command archives and drops signals that were never \
+             processed as if they had been consumed. Only an offset that stays \
+             mid-line across new hook activity indicates a hand-edited or \
+             corrupt state.json"
+        ));
+    }
+    let (consumed, tail) = bytes.split_at(offset as usize);
+
+    // Archive the consumed prefix, fsynced, BEFORE the source is touched at
+    // all — "never delete user data" (house rule). Unlike
+    // `purge --log-duplicates` the archive holds the removed bytes rather than
+    // the whole file: the removed prefix here is the bulk of a multi-megabyte
+    // file, and the retained tail is untouched on disk, so prefix + live file
+    // still reconstructs the original exactly.
+    let archive_path = signal_archive_path(root);
+    write_full_file_synced(&archive_path, consumed)?;
+    agentrec_core::perms::lock_file(&archive_path);
+
+    if let Some(delay) = pause_before_recheck {
+        std::thread::sleep(delay);
+    }
+
+    // The only guard against the two unlocked appenders (see the section
+    // comment): `signal.jsonl` is append-only from every writer, so any
+    // concurrent write can only grow it. Any change in length since the read
+    // above means our captured `tail` is already stale — abort entirely rather
+    // than rewrite a file we no longer have the whole of.
+    //
+    // The archive written moments ago is REMOVED on this path, and that is not
+    // a "never delete user data" violation: nothing has been taken out of
+    // `signal.jsonl` yet, so at this instant the archive is a pure redundant
+    // copy of bytes still fully present in the live inbox. Leaving it would
+    // mean each aborted run mints another multi-megabyte
+    // `signal.archived.<ts>.jsonl` inside `.agentrec/` — the command whose
+    // whole purpose is bounding `.agentrec/` growth would grow it on failure,
+    // and the founder-pending manual-`rm` archive burden with it. Best-effort:
+    // a failed removal is not worth failing the (already failing) command over,
+    // and the leftover copy is harmless.
+    let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if current_len != len {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(
+            "signal.jsonl changed during truncation (a hook appended) — no changes \
+             made; rerun `agentrec purge --signals-consumed`"
+                .to_string(),
+        );
+    }
+
+    rewrite_signal_atomic(&path, tail)?;
+    agentrec_core::perms::lock_file(&path);
+
+    // (c) above: rebase AFTER the rename. The tail now starts at byte 0, so
+    // every consumed byte is gone and the new consumed count is exactly 0.
+    let mut state = crate::state::read_state(root);
+    state.signal_offset = 0;
+    crate::state::write_state(root, &state).map_err(|e| {
+        format!(
+            "signal.jsonl was truncated but rebasing signal_offset failed: {e} — \
+             start `agentrec record` to resync (the daemon detects the shrink at \
+             startup, resumes at the new end, and reports DEGRADED); the {} unconsumed \
+             byte(s) still in the inbox will be skipped",
+            tail.len()
+        )
+    })?;
+
+    println!(
+        "reclaimed {} of consumed signal inbox ({} unconsumed retained) — archived to {}",
+        human_bytes(offset),
+        human_bytes(tail.len() as u64),
+        archive_path.display()
+    );
+    Ok(())
+}
+
+/// `.agentrec/signal.archived.<unix_ts>.jsonl` — mirrors `log_archive_path`'s
+/// naming (whole-seconds unix timestamp).
+fn signal_archive_path(root: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    agentrec_dir(root).join(format!("signal.archived.{ts}.jsonl"))
+}
+
+/// Rewrite `signal.jsonl` to contain exactly `tail`'s bytes, atomically:
+/// per-process-unique tmp file in the same directory, fsync it, rename over
+/// `sig_path`, then fsync the parent dir — the same tmp+fsync+rename+dir-fsync
+/// shape as `rewrite_log_atomic`.
+///
+/// Byte-verbatim by signature (`&[u8]`, one `write_all`), never line-oriented:
+/// see difference (a) on `purge_signals_consumed`. Kept as a deliberate
+/// near-duplicate of `rewrite_log_atomic` for the same reason that one is not
+/// unified with `rewrite_memory_atomic` — three files with three different
+/// crash/concurrency stories, none of which should be able to change the
+/// others' rewrite shape without their own tests naming the coupling.
+///
+/// An empty `tail` (everything consumed — the steady state on a live store)
+/// writes a 0-byte file rather than removing it: `doctorcmd`'s signal-freshness
+/// check reads a MISSING `signal.jsonl` as the hooks-disconnected failure mode,
+/// so deleting it here would make a successful reclaim look like a broken
+/// install.
+fn rewrite_signal_atomic(sig_path: &Path, tail: &[u8]) -> Result<(), String> {
+    let parent = sig_path
+        .parent()
+        .ok_or_else(|| "signal.jsonl has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(
+        ".signal.jsonl.tmp.{}.{}",
+        std::process::id(),
+        wall_now_ms()
+    ));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut file = create_tmp_file(&tmp)?;
+        file.write_all(tail)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, sig_path)?;
+        Ok(())
+    })();
+
+    match write {
+        Ok(()) => {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("failed to rewrite signal.jsonl: {e}"))
         }
     }
 }
@@ -1143,6 +1469,387 @@ mod tests {
             store.contains(&pinned),
             "a memory-pinned blob must never be archived as an orphan"
         );
+    }
+
+    // ---- purge --signals-consumed (D48) -----------------------------------
+
+    /// A signal inbox whose first `consumed_lines` lines the daemon has
+    /// already eaten, plus a deliberately TORN final line (no trailing
+    /// newline) — the normal on-disk shape while a hook is mid-append, and
+    /// the shape a line-oriented rewrite would silently "repair" by adding a
+    /// newline. Writes `state.json` with the matching `signal_offset`.
+    /// Returns (root-owned tempdir, whole original bytes, consumed offset).
+    fn signal_fixture(consumed_lines: usize) -> (tempfile::TempDir, Vec<u8>, u64) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        for i in 0..4 {
+            bytes.extend_from_slice(
+                format!(
+                    "{{\"v\":1,\"ts\":{i},\"event\":\"stop\",\"prompt\":\"secret-ish {i}\"}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        // Torn tail: a partial line with NO trailing newline.
+        bytes.extend_from_slice(b"{\"v\":1,\"ts\":9,\"even");
+        std::fs::write(signal_path(root), &bytes).unwrap();
+
+        // Offset = end of the Nth complete line, exactly how the daemon
+        // advances it (`rposition(b'\n') + 1`).
+        let offset = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .map(|(i, _)| i as u64 + 1)
+            .nth(consumed_lines.saturating_sub(1))
+            .unwrap_or(0);
+
+        let state = crate::state::State {
+            signal_offset: offset,
+            ..Default::default()
+        };
+        crate::state::write_state(root, &state).unwrap();
+        (tmp, bytes, offset)
+    }
+
+    // AC3.1 core: exactly the consumed prefix leaves the file, the unconsumed
+    // tail survives BYTE-IDENTICALLY (including its torn, newline-less final
+    // line), and the archive holds the removed bytes verbatim. Neuter: rewrite
+    // the tail line-oriented (`for l in tail.lines() { writeln!(..) }`) → RED
+    // (the torn line gains a newline).
+    #[test]
+    fn signals_consumed_drops_exactly_the_consumed_prefix_and_keeps_the_tail_byte_identical() {
+        let (tmp, original, offset) = signal_fixture(3);
+        let root = tmp.path();
+        let expected_tail = original[offset as usize..].to_vec();
+
+        purge_signals_consumed(root).unwrap();
+
+        let after = std::fs::read(signal_path(root)).unwrap();
+        assert_eq!(
+            after, expected_tail,
+            "unconsumed tail must survive byte-identically (no added newline on the torn line)"
+        );
+        assert!(
+            !after.ends_with(b"\n"),
+            "the torn final line must NOT gain a trailing newline"
+        );
+
+        // The removed prefix is archived verbatim, never deleted.
+        let archive = std::fs::read_dir(agentrec_dir(root))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("signal.archived.")
+            })
+            .expect("archive file created");
+        assert_eq!(
+            std::fs::read(archive.path()).unwrap(),
+            &original[..offset as usize],
+            "archive must hold the removed prefix verbatim"
+        );
+    }
+
+    // AC3.1: the offset is rebased in the SAME operation — the tail now starts
+    // at byte 0, so a stale non-zero offset would make the next daemon start
+    // either skip live signals or (if past the new EOF) resync-and-drop them.
+    // Neuter: delete the `state.signal_offset = 0` write → RED.
+    #[test]
+    fn signals_consumed_rebases_the_offset_to_zero() {
+        let (tmp, _original, offset) = signal_fixture(3);
+        let root = tmp.path();
+        assert!(offset > 0, "fixture must have a consumed prefix");
+
+        purge_signals_consumed(root).unwrap();
+
+        let state = crate::state::read_state(root);
+        assert_eq!(
+            state.signal_offset, 0,
+            "offset must be rebased to the new file's start"
+        );
+        assert_eq!(
+            state.state_parse_failures, 0,
+            "the rebase must not corrupt state.json"
+        );
+    }
+
+    // Red-team D8: `signal_archive_path` stamps a WHOLE-SECOND timestamp, so
+    // two archives created inside the same second would collide on one name
+    // and the second would clobber the first — a silent loss of the very
+    // bytes the archive exists to preserve. The collision is argued
+    // unreachable (a second back-to-back run rebases to offset 0 first, and
+    // offset 0 short-circuits to the no-op BEFORE any archive is written),
+    // but "reasoned unreachable" was untested. This pins the reasoning.
+    //
+    // Asserts the archive COUNT, not just the first archive's bytes: a
+    // content-only check would pass even if a second archive file appeared
+    // alongside the first.
+    #[test]
+    fn signals_consumed_run_twice_in_one_second_no_ops_without_clobbering_the_archive() {
+        let (tmp, original, offset) = signal_fixture(3);
+        let root = tmp.path();
+        let expected_archive = original[..offset as usize].to_vec();
+        let expected_tail = original[offset as usize..].to_vec();
+
+        let archives = |root: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(agentrec_dir(root))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("signal.archived."))
+                        .unwrap_or(false)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        purge_signals_consumed(root).unwrap();
+        let first = archives(root);
+        assert_eq!(first.len(), 1, "first run archives once: {first:?}");
+
+        // Immediately again — same wall-clock second by construction (no
+        // sleep between them), which is exactly the collision window.
+        purge_signals_consumed(root).unwrap();
+
+        let second = archives(root);
+        assert_eq!(
+            second, first,
+            "the second run must not create, rename, or replace any archive — \
+             it short-circuits on offset 0 before reaching the archive step"
+        );
+        assert_eq!(
+            std::fs::read(&first[0]).unwrap(),
+            expected_archive,
+            "the first run's archive bytes must survive the second run untouched \
+             (a same-second name collision would have clobbered them)"
+        );
+        assert_eq!(
+            std::fs::read(signal_path(root)).unwrap(),
+            expected_tail,
+            "the second run is a no-op: the tail is unchanged and never re-truncated"
+        );
+        assert_eq!(
+            crate::state::read_state(root).signal_offset,
+            0,
+            "offset stays rebased at 0 after the no-op"
+        );
+    }
+
+    // AC3.1: everything consumed (the live 13.4 MB shape) is a SUCCESS that
+    // leaves a 0-byte file — not a refusal, and not a deleted file
+    // (`doctorcmd` reads a missing signal.jsonl as hooks-disconnected).
+    #[test]
+    fn signals_consumed_fully_consumed_inbox_leaves_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let body = b"{\"v\":1,\"ts\":1,\"event\":\"stop\"}\n";
+        std::fs::write(signal_path(root), body).unwrap();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: body.len() as u64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        purge_signals_consumed(root).unwrap();
+
+        assert!(
+            signal_path(root).exists(),
+            "the inbox file must remain (a missing one reads as hooks-disconnected)"
+        );
+        assert_eq!(std::fs::read(signal_path(root)).unwrap(), Vec::<u8>::new());
+        assert_eq!(crate::state::read_state(root).signal_offset, 0);
+    }
+
+    // AC3.1: refuses while the daemon holds `daemon.lock`. The lock is taken
+    // here with the same raw non-blocking flock `daemon::acquire_lock` uses,
+    // rather than a pid or a mock, so this exercises the real
+    // `daemon_is_running` probe. Neuter: drop the liveness check → RED.
+    #[test]
+    fn signals_consumed_refuses_while_the_daemon_holds_the_lock() {
+        use std::os::unix::io::AsRawFd;
+        let (tmp, original, _offset) = signal_fixture(3);
+        let root = tmp.path();
+
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(agentrec_dir(root).join("daemon.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let err = purge_signals_consumed(root).unwrap_err();
+        assert!(
+            err.contains("stop recording"),
+            "must refuse while recording: {err}"
+        );
+        assert_eq!(
+            std::fs::read(signal_path(root)).unwrap(),
+            original,
+            "a refused run must leave signal.jsonl untouched"
+        );
+        drop(lock);
+    }
+
+    // AC3.1: an offset that does not land just after a newline is refused —
+    // truncating there would decapitate a signal line. It is NOT proof of
+    // corruption: ordinary consumption always lands on `rposition('\n')+1`,
+    // but a shrink resync legitimately lands mid-line when the last line was
+    // torn (self-resolves on the next hook fire). Refuses and changes
+    // nothing either way. Neuter: drop the boundary check → RED.
+    #[test]
+    fn signals_consumed_refuses_a_mid_line_offset() {
+        let (tmp, original, offset) = signal_fixture(3);
+        let root = tmp.path();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: offset - 5, // mid-line by construction
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = purge_signals_consumed(root).unwrap_err();
+        assert!(
+            err.contains("line boundary"),
+            "must name the inconsistency: {err}"
+        );
+        assert_eq!(
+            std::fs::read(signal_path(root)).unwrap(),
+            original,
+            "a refused run must leave signal.jsonl untouched"
+        );
+        assert_eq!(
+            crate::state::read_state(root).signal_offset,
+            offset - 5,
+            "a refused run must not rebase the offset either"
+        );
+    }
+
+    // AC3.1: an offset PAST the end of the file means the inbox was already
+    // truncated/rewritten externally — refuse rather than slice out of bounds
+    // (the old `text[offset..]` shape panicked on exactly this).
+    #[test]
+    fn signals_consumed_refuses_an_offset_past_eof() {
+        let (tmp, original, _offset) = signal_fixture(3);
+        let root = tmp.path();
+        crate::state::write_state(
+            root,
+            &crate::state::State {
+                signal_offset: original.len() as u64 + 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = purge_signals_consumed(root).unwrap_err();
+        assert!(err.contains("past the end"), "must name the cause: {err}");
+        assert_eq!(std::fs::read(signal_path(root)).unwrap(), original);
+    }
+
+    // AC3.1: `state.json` is the only record of what was consumed. Missing
+    // means any offset would be a guess — a daemon rebuilding it starts at 0
+    // and silently advances to EOF over never-processed signals (D7 drops
+    // start/stop in the gap; probe-validated 2026-08-01), after which this
+    // command would archive-and-drop them as if consumed; guessing high
+    // destroys unconsumed ones directly.
+    #[test]
+    fn signals_consumed_refuses_without_state_json() {
+        let (tmp, original, _offset) = signal_fixture(3);
+        let root = tmp.path();
+        std::fs::remove_file(crate::state_path(root)).unwrap();
+
+        let err = purge_signals_consumed(root).unwrap_err();
+        assert!(err.contains("state.json"), "must name the cause: {err}");
+        assert_eq!(std::fs::read(signal_path(root)).unwrap(), original);
+    }
+
+    // AC3.1: offset 0 (nothing consumed) is a no-op success — never an empty
+    // rewrite, never an archive file.
+    #[test]
+    fn signals_consumed_is_a_noop_at_offset_zero() {
+        let (tmp, original, _offset) = signal_fixture(3);
+        let root = tmp.path();
+        crate::state::write_state(root, &crate::state::State::default()).unwrap();
+
+        purge_signals_consumed(root).unwrap();
+
+        assert_eq!(std::fs::read(signal_path(root)).unwrap(), original);
+        let archived = std::fs::read_dir(agentrec_dir(root))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("signal.archived.")
+            });
+        assert!(!archived, "a no-op must not write an archive");
+    }
+
+    // The unlocked-appender guard (see the section comment): `cmds::hook`
+    // appends with no lock even while the daemon is stopped. If one lands
+    // between our read and the rename, our captured tail is stale — the
+    // operation must ABORT with a rerun instruction, never rewrite a file it
+    // no longer has the whole of. The window is widened through the `_inner`
+    // PAUSE PARAMETER (never an env var — see `purge_signals_consumed_inner`'s
+    // doc for why a debug-path `set_var` would be unsound here). Neuter: drop
+    // the length recheck → RED (the append is silently clobbered).
+    #[test]
+    fn signals_consumed_aborts_when_a_hook_appends_during_the_rewrite() {
+        let (tmp, original, _offset) = signal_fixture(3);
+        let root = tmp.path().to_path_buf();
+        let appended = b"{\"v\":1,\"ts\":99,\"event\":\"stop\"}\n";
+
+        let sig = signal_path(&root);
+        let appender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let mut f = std::fs::OpenOptions::new().append(true).open(&sig).unwrap();
+            f.write_all(appended).unwrap();
+        });
+
+        let err = purge_signals_consumed_inner(&root, Some(std::time::Duration::from_millis(400)))
+            .unwrap_err();
+        appender.join().unwrap();
+
+        assert!(
+            err.contains("changed during truncation"),
+            "must abort and say so: {err}"
+        );
+        let mut expected = original.clone();
+        expected.extend_from_slice(appended);
+        assert_eq!(
+            std::fs::read(signal_path(&root)).unwrap(),
+            expected,
+            "the racing append must survive intact — nothing rewritten"
+        );
+        // The abort path removes its own archive: at that instant nothing had
+        // been taken out of the inbox, so the archive was a redundant copy —
+        // and an aborted reclaim must not GROW `.agentrec/`.
+        let archived = std::fs::read_dir(agentrec_dir(&root))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("signal.archived.")
+            });
+        assert!(!archived, "an aborted run must not leave a stray archive");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 stdout:
-{"budget":2147483648,"crash_gaps":1,"dedup_hits":0,"dedup_reread_bytes":0,"epoch_ignore_rebuilds":0,"epoch_ignore_rebuilds_stale":true,"ignore_rebuilds":0,"io_failed":[],"last_bad_field":null,"last_ignore_rebuild_ms":null,"over_budget":false,"prompt_put_failures":0,"snapshot_failures":0,"state_parse_failures":0,"store_bytes":307,"turn_count":8,"unknown_type_lines":0,"unparsed_lines":0}
+{"budget":2147483648,"crash_gaps":1,"dedup_hits":0,"dedup_reread_bytes":0,"epoch_ignore_rebuilds":0,"epoch_ignore_rebuilds_stale":true,"ignore_rebuilds":0,"io_failed":[],"last_bad_field":null,"last_ignore_rebuild_ms":null,"over_budget":false,"prompt_put_failures":0,"signal_bytes":0,"signal_consumed_bytes":0,"snapshot_failures":0,"state_parse_failures":0,"store_bytes":307,"turn_count":8,"unknown_type_lines":0,"unparsed_lines":0}
 
 --stderr--
 

@@ -1,5 +1,6 @@
 stdout:
 store:      307 B
+inbox:      0 B signal.jsonl
 turns:      7 (agent turns; git activity hidden)
 gaps:       1 recording gap(s)
 rich-rate:  83% over trailing 6 agent turn(s)

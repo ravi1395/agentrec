@@ -870,6 +870,80 @@ fn print_plan(target: &TurnRecord, plans: &[Plan]) {
             }
         }
     }
+    if let Some(caution) = window_caution(target, plans) {
+        println!("{caution}");
+    }
+}
+
+/// D6 honesty line. A rich turn's file list is an *activity window*, not an
+/// authorship record: while a bracket is open, every mutation in the root is
+/// folded into that one turn (D6, "one open turn per root"), so a human edit
+/// landing during the agent's bracket becomes one of the turn's files and the
+/// recorded `after` hash for it IS the human's own content. That makes the
+/// D30 modified-since rail structurally unable to fire for such a file — it
+/// is not modified-since, it is *mis-attributed*, and no post-hoc heuristic
+/// can separate the two. So undo states the limitation rather than guessing:
+/// a warning that is always true beats a detector that is sometimes a lie.
+/// "Always true" is load-bearing and was once violated: the sentence claimed
+/// "every file listed above is reverted", which is false on a MIXED plan where
+/// an `EXCLUDE`/`REFUSE` line is also listed. It now names only the files
+/// marked `revert`, the one set that is reverted under every flag combination
+/// (`--allow-modified` moves a file INTO that set, never out of it).
+///
+/// Deliberately NOT prefixed `WARNING:` — that token is already the per-file
+/// modified-since marker above, and conflating the two would make each one
+/// unreadable as evidence of the other. Turns with `tool: "agentrec"` are the
+/// one rich shape excluded: their file list is built from a revert plan (what
+/// this process itself wrote), not from a watch window. `tool: "git"` turns
+/// are deliberately INCLUDED — a checkout burst is a watch window like any
+/// other — which is why the wording says "the recorded tool's own writes"
+/// rather than "the agent's": the sentence has to stay true for every turn
+/// class the gate admits.
+///
+/// BARE turns get their own sentence (D49, founder decision 2026-08-01; this
+/// was an open residual until then). They are cautioned — the writes are as
+/// real and as irreversible-by-preview as a rich turn's — but not with the
+/// rich text, which names "the recorded tool" and D6: a bare turn has no
+/// recorded tool, so that sentence would fabricate the attribution the grade
+/// exists to withhold. "No recorded tool" is an invariant, not an observation:
+/// every bare close runs through `Source::Quiet`, whose `OpenTurn` is built
+/// `tool: None` (agentrec-core `engine.rs`), and crash recovery hard-codes
+/// `None` for a bare grade (`daemon.rs`) — a producer minting bare-with-tool
+/// would make this sentence false and must change it. The gate stays on
+/// `grade` alone (founder-specified), so that invariant is documented here
+/// rather than defensively re-checked at the call site.
+fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
+    let rich = target.grade == "rich" && target.tool.as_deref() != Some("agentrec");
+    let bare = target.grade == "bare";
+    if !rich && !bare {
+        return None;
+    }
+    if !plans
+        .iter()
+        .any(|p| matches!(p.kind, PlanKind::Revert { .. }))
+    {
+        return None; // nothing will be written; no scope to caution about
+    }
+    // One branch or the other, never a concatenation: that is what makes
+    // "the variants do not bleed" structural rather than test-enforced in
+    // both directions (only the bare-shows-no-rich-text direction is
+    // asserted; the reverse is closed here).
+    if bare {
+        return Some(
+            "  CAUTION: this is a bare turn — an unattributed activity window with no recorded \
+             tool; agentrec cannot say who or what made these writes, and every file marked \
+             `revert` above is reverted regardless of who or what wrote it. Review the list \
+             before confirming."
+                .to_string(),
+        );
+    }
+    Some(
+        "  CAUTION: this turn's file list is an activity window, not an authorship record — \
+         agentrec cannot distinguish the recorded tool's own writes from concurrent human \
+         edits made in the same window (D6), and every file marked `revert` above is \
+         reverted regardless of who wrote it. Review the list before confirming."
+            .to_string(),
+    )
 }
 
 /// Apply one file's revert and return the inverse `FileEntry` for the new

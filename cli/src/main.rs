@@ -191,6 +191,15 @@ enum Command {
         /// recording. This is the only path that reclaims that space.
         #[arg(long = "orphans")]
         orphans: bool,
+        /// Truncate the ALREADY-CONSUMED prefix of the hook inbox
+        /// (`signal.jsonl`) — every byte before `state.json`'s
+        /// `signal_offset`, whose prompts are already durable in `log.jsonl`
+        /// and the object store. Archives (never deletes) that prefix to
+        /// `.agentrec/signal.archived.<ts>.jsonl`, preserves the unconsumed
+        /// tail byte-identically, and rebases `signal_offset` in the same
+        /// operation. Refuses while the daemon is recording (D48).
+        #[arg(long = "signals-consumed")]
+        signals_consumed: bool,
     },
     /// Record a manual, human-authored pinned memory.
     Remember {
@@ -369,6 +378,7 @@ fn main() {
             memories_retracted,
             log_duplicates,
             orphans,
+            signals_consumed,
         } => purgecmd::run(
             &root,
             all_prompts,
@@ -376,6 +386,7 @@ fn main() {
             memories_retracted,
             log_duplicates,
             orphans,
+            signals_consumed,
         ),
         Command::Remember { fact, from } => memorycmds::remember(&root, &fact, &from),
         Command::Recall {

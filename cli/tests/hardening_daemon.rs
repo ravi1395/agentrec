@@ -1039,3 +1039,144 @@ fn dangling_source_turns_closed_by_pre_persist_journal_sync() {
          logged turn ids: {logged_ids:?}"
     );
 }
+
+// ---- red-team D1: the skeptic's crashtest chain, end to end ----------------
+
+/// The exact chain the skeptic ran to refute `purge --signals-consumed`'s
+/// remedy text, now as a regression test against the REAL binary.
+///
+/// Setup is the documented crash window of `purge --signals-consumed`
+/// (rename-then-rebase: a crash between them leaves a large `signal_offset`
+/// against a short `signal.jsonl`). Before the fix: `purge` refused (correctly)
+/// and pointed at "start `agentrec record` once: the daemon detects the shrink
+/// and resyncs, then retry" — but one `record` cycle left `state.json`
+/// UNCHANGED, printed nothing, and never went DEGRADED, so the retry hit the
+/// identical refusal forever with no documented escape, while the unconsumed
+/// tail was dropped silently.
+///
+/// Asserts the remedy text is now TRUE as written, in the skeptic's own order:
+///   1. purge refuses while the offset is past EOF (unchanged, correct),
+///   2. ONE `agentrec record` cycle rebases `signal_offset` to the file length
+///      and PERSISTS it,
+///   3. `status` reports DEGRADED (the loss is announced, never silent),
+///   4. the retried purge now SUCCEEDS instead of looping.
+#[test]
+fn crashtest_offset_past_eof_is_resynced_by_one_record_cycle_then_purge_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A short, newline-terminated inbox: newline-terminated because the
+    // resynced offset lands at EOF, and `purge --signals-consumed` refuses an
+    // offset that is not a line boundary. A torn tail here would make step 4
+    // unreachable by construction and prove nothing about this defect.
+    //
+    // COVERAGE LIMIT, stated rather than implied: this fixture therefore does
+    // NOT cover a crash that left the last line torn mid-write. In that shape
+    // steps 1-3 hold identically (offset reconciled, DEGRADED raised, no
+    // refusal loop), but step 4's retry refuses once more on the line-boundary
+    // check until one further hook fire completes the line — which is why the
+    // refusal text names that case explicitly instead of promising success.
+    let contents = "{\"v\":1,\"ts\":1,\"tool\":\"claude\",\"event\":\"stop\"}\n";
+    std::fs::write(root.join(".agentrec/signal.jsonl"), contents.as_bytes()).unwrap();
+    let len = contents.len() as u64;
+
+    // The crash window: offset far past EOF. (`init` writes no state.json —
+    // the daemon creates it on first persist — so seed it directly, in the
+    // same minimal shape the other state.json fixtures in this suite use.)
+    std::fs::write(
+        root.join(".agentrec/state.json"),
+        r#"{"pid":0,"signal_offset":9999,"snapshot_failures":0,"io_failed":[]}"#,
+    )
+    .unwrap();
+
+    let read_offset = |root: &Path| -> u64 {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["signal_offset"]
+            .as_u64()
+            .unwrap()
+    };
+
+    // 1. Purge refuses on the inconsistent offset, and names the remedy.
+    let refused = agentrec(root, &["purge", "--signals-consumed"]);
+    assert!(
+        !refused.status.success(),
+        "purge must refuse against an offset past EOF: {refused:?}"
+    );
+    let refusal = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        refusal.contains("past the end of signal.jsonl"),
+        "unexpected refusal text: {refusal}"
+    );
+    assert_eq!(
+        read_offset(root),
+        9999,
+        "the refusal must not itself mutate state"
+    );
+
+    // 2. ONE record cycle — exactly what the refusal instructs. stderr is
+    // captured to a file (rather than `spawn_record`'s /dev/null) so the
+    // "loud log" half of the claim is asserted as a real observable, not
+    // merely assumed from the state change.
+    let stderr_path = root.join("daemon-stderr.txt");
+    let mut daemon = Command::new(bin())
+        .args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .expect("spawn record");
+    let resynced = poll_until(Duration::from_secs(10), || {
+        (read_offset(root) == len).then_some(())
+    });
+    let observed = read_offset(root);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert!(
+        resynced.is_some(),
+        "state.json's signal_offset was still {observed} after a full `agentrec record` \
+         cycle (expected {len}, the real file length) — the daemon did NOT detect the \
+         shrink at startup, so purge's documented remedy is false and the user is stuck \
+         in the refusal loop with no escape"
+    );
+
+    // 3a. The loss is announced loudly on the daemon's own stderr — the
+    // skeptic's repro recorded "no log line" as part of the silence.
+    let logged = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        logged.contains("shorter than the consumed offset") && logged.contains("lost"),
+        "the daemon must log the shrink loudly at startup, and must keep saying the \
+         gap's signals are LOST (the fix announces the loss, it does not prevent \
+         it): {logged}"
+    );
+
+    // 3b. And on the status surface: DEGRADED.
+    let status = agentrec(root, &["status"]);
+    let status_out = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        status_out.contains("DEGRADED"),
+        "a resynced shrink drops the unconsumed tail — it must surface as DEGRADED, \
+         never silently: {status_out}"
+    );
+    assert!(
+        status_out.contains("signal.jsonl"),
+        "DEGRADED must name the affected surface: {status_out}"
+    );
+
+    // 4. The retry the refusal promised now actually works.
+    let retried = agentrec(root, &["purge", "--signals-consumed"]);
+    assert!(
+        retried.status.success(),
+        "after the resync the retried purge must succeed — an infinite refusal loop is \
+         the defect: {retried:?}"
+    );
+    assert_eq!(
+        read_offset(root),
+        0,
+        "a successful purge rebases the offset to 0"
+    );
+    assert!(
+        root.join(".agentrec/signal.jsonl").exists(),
+        "purge must leave a 0-byte file, never a deleted one (doctor reads a missing \
+         signal.jsonl as hooks-disconnected)"
+    );
+}

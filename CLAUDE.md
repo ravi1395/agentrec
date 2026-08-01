@@ -14,6 +14,29 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **Redteam remediation round (delivered 2026-08-01, extended by founder acceptance of all
+  recommendations; 7 skeptic rounds total) — branch `fix/redteam-immediate-actions`, 15
+  commits, unmerged.** Extension added: PROTOCOL §3 append-only definition + D48 reclaim
+  clause; D46→D48 renumber (collision with PR #10 resolved); D49 bare-turn caution; full
+  stale-claims verify (73 confirmed). Claim-authorship lesson recorded: 7 replay refutations
+  this round were all claim-cmd bugs (stale counts, overbroad greps, multi-filter cargo
+  invocations match only one name), zero code defects — superseded with corrected replays. External redteam (technical +
+  product) drove 4 immediate actions: (T1) README discloses D6 intra-bracket misattribution +
+  silent-undo consequence; (T2) E2E test pins the D6 data-loss chain against the real daemon,
+  `undo` gains a CAUTION activity-window line scoped to revert-marked files (mixed-plan-true;
+  bare turns get their own unattributed-window variant — D49, founder-directed 2026-08-01); (T3) `purge --signals-consumed` — third sanctioned rewrite class
+  (D48), inbox was 13.4 MB unbounded — plus `status` inbox accounting; (T4) memory 1-week
+  dogfood ledger row **CLOSED FAILED** with per-conjunct evidence (candidate emitter never
+  fired; hit-rate unfalsifiable as written). Gate found and fixed 2 REAL daemon defects: startup
+  never detected a shrunk/missing inbox against a stale persisted offset (silent tail loss, now
+  resync+persist+DEGRADED at both startup sites) — and 3 successive rounds of normative-text
+  falsity around state.json deletion, killed only by probe-first writing (deletion mints NO
+  duplicate turns — D7 drops start/stop in the gap; real loss is silent as-if-consumed drop).
+  Test baseline was **465 / 0 / 1** pre-merge; after `origin/main` (PR #10's squash,
+  `a90e9ff`) was merged into this branch the combined baseline is **666 / 0 / 3** —
+  status goldens regenerated additive-only (+1 inbox text line; +`signal_bytes`/
+  `signal_consumed_bytes` JSON keys, all pre-existing keys byte-identical), and this
+  branch's test fixtures gained PR #10's new `TurnRecord`/`FileEntry` fields as `None`.
 - **D46 SERVICE-LEAK FIX delivered (2026-07-31) on `feat/phase-2-0-view-completion`, after the
   Phase 2.0 plan exit. Not gated by a skeptic yet; not pushed; no PR.** Closes the *product-defect*
   half of the 40-orphaned-LaunchAgents founder-pending entry: `init` no longer installs a
@@ -391,6 +414,20 @@ carries only current state, what's next, and standing debts.
   in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
+- ~~PROTOCOL.md §3 amendment (D48 loose end)~~ **DONE 2026-08-01 (founder-directed):** §3 now
+  defines append-only precisely with a MAY-reclaim clause for consumed `signal.jsonl` lines
+  (D48). claimd doc-scope rule for PROTOCOL.md remains undecided (Stop hook fired, claim
+  declared covering the edit).
+- ~~CAUTION feature + bare-turn decision (re-gate N4)~~ **DONE 2026-08-01 (founder-directed):**
+  bare turns get their own unattributed-window caution; D49 + AC-CAUTION-1..4 registered, each
+  mapped to a named misattribution.rs test. Residual: a foreign L1+ producer emitting
+  `grade:"bare"` WITH a tool would falsify the "no recorded tool" clause — becomes live when
+  Phase 2 import lands (disclosed in code comment).
+- ~~Merge decision~~ **RESOLVED by events (2026-08-01):** PR #10 squash-merged to `main` as
+  `a90e9ff` first; `origin/main` then merged INTO this branch (conflicts resolved by union —
+  register order D46/D48/D49, `status --json` carries both `RepositoryHealth` flatten and the
+  D48 inbox fields). The D46 renumber to D48 predated the merge, so the register is
+  collision-free. PR #11 remains the merge vehicle for this branch.
 - Demand/launch gate (Show HN etc.) never run — ROADMAP Phase 0's 30-day kill criterion has
   no data; 2.2's post-ship evaluation row needs a probe repo picked + `agentrec init` there.
 - Plan open questions 2–3: memory-plan stale checkboxes; store-churn reclaim.
@@ -398,7 +435,7 @@ carries only current state, what's next, and standing debts.
 ### Standing debts & residuals (recorded, not blocking)
 
 - `log.jsonl` churn history (9602 `.remember` entries) still renders as churn blasts in
-  `log`/`show`; not byte-reclaimable without a third sanctioned rewrite class — deliberately
+  `log`/`show`; not byte-reclaimable without a fourth sanctioned rewrite class — deliberately
   not built.
 - claimd coverage debt rows: `cli/src/cmds.rs` (P3 residuals round) and `cli/src/purgecmd.rs`
   (honesty round) — touched-uncovered, retroactive declaration refused by design.
@@ -414,8 +451,17 @@ carries only current state, what's next, and standing debts.
   runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
   block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
   spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
-- Memory dogfood ladder effectively not started (store prepped 2026-07-17; clock never ran
-  clean).
+- Memory dogfood ladder: 1-week row **CLOSED FAILED 2026-07-31** (window expired dirty; 0
+  agent-origin candidates in 1944 signal lines — the SKILL emitter never fired once; hit-rate
+  unfalsifiable, stats log has no denominator). Rerun requires fresh T0, re-pinned baseline,
+  and FIRST an end-to-end proof the candidate path fires at all.
+- DEGRADED channel wording (re-gate N3): a signal-inbox shrink is counted via
+  `record_io_failure`, so the banner reads "snapshot write(s) failed … undo on affected files
+  has no snapshot" about a file that is neither a snapshot nor undoable. Pre-existing channel,
+  deliberately deferred.
+- `daemon.rs` resync helper doc: "len is the only offset that can't replay consumed signals as
+  duplicate turns" is true at the `poll` site, over-general at the startup site (startup replay
+  never feeds start/stop to the engine at any offset). Safe direction, text-only.
 
 ## Working method
 
@@ -459,7 +505,7 @@ Two crates in one cargo workspace: `agentrec-core` (lib: TurnEngine, BlobStore, 
 - **Bracketing (v0.2, load-bearing):** Claude Code integration installs `UserPromptSubmit` (start) + `Stop` (stop). Open bracket suppresses quiet-window closure; on stop, interim bare turns are retroactively merged into the rich turn. Start-without-stop = close at last mutation, `truncated: true`.
 - **Git turns:** mutation bursts coinciding with `.git/HEAD`/index/ref transitions are rich turns with `tool: "git"`; hidden from `log` by default. Never let a `git checkout` become a 400-file bare turn.
 - **Epochs & gaps:** daemon start/stop append `type:"epoch"` records; blame across an uncovered interval must say "attribution stale — recording gap", never guess.
-- **Append-only everything:** `log.jsonl` and `signal.jsonl` are never rewritten. History is corrected by appending. Signal consumption tracked by byte offset in `state.json`. Turn ids are machine-scoped ULIDs.
+- **Append-only everything:** `log.jsonl` and `signal.jsonl` are only ever appended to; no line is mutated, reordered, or rewritten in place. History is corrected by appending. Signal consumption tracked by byte offset in `state.json`. Turn ids are machine-scoped ULIDs. **Exactly three sanctioned rewrite classes exist, all manual `purge` sub-ops, all refusing while the daemon runs, all archive-before-touch + atomic tmp/fsync/rename:** (1) `--memories-retracted` — `memory.jsonl`, drops fully-retracted chains past TTL; (2) `--log-duplicates` — `log.jsonl`, drops same-id duplicate turns a pre-fix daemon wrote; (3) `--signals-consumed` (D48) — `signal.jsonl`, drops only WHOLE lines already consumed (strictly before `signal_offset`, whose prompts are already in `log.jsonl` + the CAS) and rebases `signal_offset` in the same operation. Nothing else may rewrite these files; adding a fourth class requires a decision-register entry.
 - **Two predicates, never conflated:** `modified-since` (hash ≠ turn's after) gates every destructive op; `human-edited-since` (modified AND not covered by any *rich* turn) is blame display only. Bare turns never count as coverage.
 - **Undo is a turn:** every revert (CLI or MCP) snapshots current state first and appends a new turn with `tool: "agentrec"`. Reverts are blame-able and re-revertible. `skipped` (over-cap) and `withheld` (secret-pattern) files are never revertible.
 - **Prompts and snapshots both scrubbed:** prompt scrub (secret regexes + entropy) runs *inside* the persistence function; secret-file patterns (`.env*`, `*.pem`, credentials) are never snapshotted (`withheld: true`). Local-only; no network code exists in v1–v2; never claim "provably" safe.
