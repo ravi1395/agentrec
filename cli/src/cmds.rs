@@ -991,6 +991,27 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // D6 (PROTOCOL §4): the emitter itself declares what it wrote. Stop-only;
+    // absolute paths verbatim from the transcript; scoped to the current turn
+    // by the parser. Best-effort — an unreadable transcript yields None
+    // ("did not declare"), never an empty assertion. An empty parse result is
+    // also None for the same reason: the recorder's fallback tier applies the
+    // identical rule, so the two tiers cannot disagree on emptiness.
+    let files_written = if event == "stop" {
+        transcript
+            .as_deref()
+            .and_then(|p| {
+                crate::daemon::read_transcript_capped(
+                    std::path::Path::new(p),
+                    crate::daemon::MAX_DECLARATION_TRANSCRIPT_BYTES,
+                )
+            })
+            .map(|text| crate::daemon::declared_writes_from_transcript(&text))
+            .filter(|w| !w.is_empty())
+    } else {
+        None
+    };
+
     let signal = SignalEvent {
         v: 1,
         ts: wall_now_ms(),
@@ -999,6 +1020,7 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         session,
         transcript,
         prompt,
+        files_written,
         kind: None,
         fact: None,
         pins: None,

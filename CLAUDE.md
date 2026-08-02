@@ -14,9 +14,29 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
-- **MVP periphery round (delivered 2026-08-01) — branch `fix/mvp-periphery`, 14 commits on
-  `origin/main` @ `08cf0d9`, unmerged, unpushed. Fable skeptic GATE PASS at `7dd764e` (3
-  rounds).** All ten BRANCH-SCOPE items landed: F24 launchd stdio→`.agentrec/daemon.log`; F1
+- **D6 attribution wedge, phases 1–2b (delivered 2026-08-01) — branch `feat/mvp-promise`, 15
+  commits, unmerged; FULLY GATED after two skeptic engagements (first gate on 2a+2b: PASS
+  9/9; scoped re-gate on the post-gate delta: 3 rounds, PASS at `94c3d59`).** Spike gate
+  (phase 1) measured declared-write coverage on the real dogfood corpus: work-file coverage
+  14.5–24.4%, precise-where-present (88% full-cover), hook-artifact false-match 0.1%, F4
+  measured live (739/803 joined sessions are hook-only stubs — correlation must key off the
+  CLOSING signal at Stop-time, never persisted `turn.session`). Founder ruled PROCEED as
+  option 1: additive `files_written` on stop signals (PROTOCOL §4, landed — freeze-critical),
+  emitter computes the list scoped to the last user prompt, daemon `resolve_declared` tier
+  ladder (SignalField → TranscriptFallback → None) landed dark. Suite 677/0/3 (base 666),
+  clippy debug+release + fmt clean. Value-set contract relayed to the periphery worktree
+  (`D6-ATTRIBUTION-CONTRACT.md`: "declared"/"undeclared"/absent — their `attribution` field,
+  our values). **The three-round re-gate found zero code defects; all three blockers were
+  confidently-false PROSE — signature-defect instances 6–8, one of them the skeptic's own
+  miscount copied verbatim (provenance recorded in docs/verify/d6-spike.md).** Phase 3
+  (producer at persist) gated on: periphery merge → rebase; its ACs now include wiring-proof,
+  out_of_root surfacing, and contract-pinned wire values. Open, recorded: >64 MiB cap path
+  never executed (tier-shift is inspection-only), 14-transcript cutoff base, no Linux leg,
+  `6c86e3a` AC-restatement awaiting founder ruling, 2b claims + 176-stale verify deferred at
+  founder direction.
+- **MVP periphery round (delivered 2026-08-01) — branch `fix/mvp-periphery`, merged to `main`
+  via PR #13 squash (`47799f4`, 2026-08-02; CI 5/5 green). Fable skeptic GATE PASS at
+  `7dd764e` (3 rounds).** All ten BRANCH-SCOPE items landed: F24 launchd stdio→`.agentrec/daemon.log`; F1
   README threat model (the redteam's §5-suppression mechanism claim was refuted in source and
   dropped); F8 undo-plan + turn-renderer sanitization; F11 purge liveness-before-delete +
   prompt archival; F27 schema-major enforcement (SCHEMA_MAJOR=1, every wire deser site, §10
@@ -39,7 +59,6 @@ carries only current state, what's next, and standing debts.
   normalization for `purge --path` patterns; `--allow-modified` vs derived-`after` on imported
   turns (pinned-as-observed, founder ruling candidate); F11's `--snapshots-before` still
   unarchived (scope call, disclosed).
-
 - **Redteam remediation round (delivered 2026-08-01, extended by founder acceptance of all
   recommendations; 7 skeptic rounds total) — branch `fix/redteam-immediate-actions`, 15
   commits, unmerged.** Extension added: PROTOCOL §3 append-only definition + D48 reclaim
