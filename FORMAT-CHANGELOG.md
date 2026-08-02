@@ -11,6 +11,58 @@ Conformance fixtures for these fields are **not** created yet — the
 protocol freeze is Phase 2.1 (spec decision 5). Until then, these fields
 are additive but UNFROZEN: their shape can still change before 2.1 locks it.
 
+## MVP periphery — `FileEntry.link_kind`, `FileEntry.attribution` (2026-08-01)
+
+Red team round 2, finding F2. Added to `FileEntry`, at the end, after
+`after_synthesized`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub link_kind: Option<String>,
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub attribution: Option<String>,
+```
+
+Additive, `v` stays `1`. Neither key appears on the wire when `None`, and
+`None` is what every pre-existing record parses to, so every existing
+`log.jsonl` line round-trips byte-identically
+(`record.rs::link_kind_and_attribution_absent_when_none`). Both are
+UNFROZEN until the Phase 2.1 protocol freeze, like every field above.
+
+**One coordinated change, two fields, deliberately.** `attribution` is
+declared here and written by nothing on this branch — the sibling
+`feat/mvp-promise` branch's D6 transcript-correlation work is its producer.
+Landing the pair together fixes the wire shape once rather than twice.
+
+- `link_kind` — open string enum (`agentrec_core::record::link_kind`). The
+  only value written today is `"symlink"`, meaning the path was a symbolic
+  link when it was snapshotted and the entry's `before`/`after` hashes
+  address the **link target string**, not the pointed-to file's content
+  (the recorder does not follow links — IMPLEMENTATION.md AC B5; probed,
+  not assumed, by
+  `daemon.rs::stage_symlink_records_link_kind_and_snapshots_target_string`).
+  Absent means "ordinary file, **or** unknown" — never "proven ordinary
+  file": records written before this field will never carry it.
+  - Writer: the daemon (`cli/src/daemon.rs`, `Recorder::stage` records the
+    kind, `Recorder::resolve` puts it on the entry). A `delete` observation
+    keeps the mark — the record is then the only surviving evidence that the
+    vanished path was a link.
+  - Consumers MUST refuse to **act** on any non-absent value, including
+    unrecognized future ones, and MUST still **parse** the line
+    (refuse-to-act, not refuse-to-parse). `cli/src/readcmds.rs::undo`
+    refuses such an entry with a `REFUSE` row before any working-tree write,
+    and independently refuses when the live path is a symbolic link by
+    `lstat` — the second check is the only guard for pre-`link_kind`
+    records. Neither refusal is overridable by `--allow-modified`, which
+    loosens *modified-since* and nothing else.
+- `attribution` — open string enum, **writer-optional and written by
+  nothing in this workspace**. Values are defined by the attribution
+  producer, not by PROTOCOL.md. Consumers MUST tolerate unknown values,
+  MUST read absence as "not attributed" rather than as any actor, and MUST
+  NOT gate a destructive operation on it.
+
+Specified in PROTOCOL.md §5 (`link_kind` / `attribution` paragraphs).
+
 ## Phase 2.0 P2 — `imported`, `files_complete` (2026-07-29)
 
 Added to `TurnRecord`, immediately after `merges` and before `files`:

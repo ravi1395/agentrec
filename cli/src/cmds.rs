@@ -231,8 +231,10 @@ fn format_turn(
     fmt::turn_list_line(t, &when, &files, color)
 }
 
-/// `status`: store size, recording gaps, and rich-rate (the health stat that
-/// catches silently broken hooks). `ack_degraded` clears a prior DEGRADED
+/// `status`: store size, recording gaps (every uncovered-interval kind, with
+/// the crash/restart/since-last-stop breakdown — F13), recorder liveness
+/// (F31), and rich-rate (the health stat that catches silently broken
+/// hooks). `ack_degraded` clears a prior DEGRADED
 /// snapshot-failure banner (D35) instead of printing status; clap rejects
 /// combining it with `json` (see `main.rs`'s `Status` variant) — the ack
 /// path is prose-on-success by design, and prose on stdout under a `--json`
@@ -265,7 +267,7 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
         println!("{}", status_json(root)?);
         return Ok(());
     }
-    print!("{}", status_report(root, effective_store_budget())?);
+    print!("{}", status_report(root, effective_store_budget(root))?);
     Ok(())
 }
 
@@ -290,7 +292,8 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
 ///
 /// Field order is flatten-then-literal: `RepositoryHealth`'s fields
 /// (`store_bytes`, `budget`, `over_budget`, `turn_count`, `crash_gaps`,
-/// `unknown_type_lines`, `unparsed_lines`) appear first, followed by the
+/// `restart_gaps`, `trailing_stop_gaps`, `unknown_type_lines`,
+/// `unparsed_lines`) appear first, followed by the
 /// operational fields below in their declared order — nothing pins this
 /// order as a contract (unlike `DiffResult`'s empty-case literal), so this
 /// is a legible default, not a promise.
@@ -370,7 +373,7 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         .unwrap_or(0);
     let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
     let health = view
-        .health(effective_store_budget())
+        .health(effective_store_budget(root))
         .map_err(|e| e.to_string())?;
     let payload = StatusJson {
         health,
@@ -428,12 +431,35 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         .map_err(|e| cursor_error_text(&e))?
         .items;
 
-    let gaps = health.crash_gaps;
+    // F13 (redteam round 2): this was `health.crash_gaps` — the crash shape
+    // ONLY — so the two other uncovered-interval kinds `view::recording_gaps`
+    // already tagged were rendered as no gap at all. `kill <daemon>` → damage
+    // → restart is a `Restart` gap and read `gaps: 0`; a cleanly stopped
+    // recorder (`TrailingStop`, everything from the stop to now uncovered)
+    // read `gaps: 0` too. Silent non-recording is the worst failure mode for a
+    // flight recorder, so the total is what leads and the kinds are broken out
+    // rather than collapsed — "the recorder crashed" and "the recorder was
+    // deliberately off" call for different responses.
+    let gap_counts = agentrec_core::view::GapCounts {
+        crash: health.crash_gaps,
+        restart: health.restart_gaps,
+        trailing_stop: health.trailing_stop_gaps,
+    };
+    let gaps = gap_counts.total();
 
     // Read once, reused below for the ignore-reload line and (further down)
     // the memory/DEGRADED sections — same single-read pattern those already
     // used, just hoisted so this line can consult it too.
     let state = read_state(root);
+
+    // F31 (redteam round 2): the recorder's own liveness, hoisted from the
+    // ignore-reload line below (which already gated on it) so the `daemon:`
+    // line can render it too. Deliberately the SAME primitive `doctor`'s
+    // `check_daemon` and `purge`'s refusal use — `daemon::daemon_is_running`,
+    // a non-blocking `flock` probe on `.agentrec/daemon.lock` (D2) — not a
+    // second liveness notion: a pid check false-passes on pid recycling, and
+    // two probes that can disagree would be worse than the missing line was.
+    let daemon_live = crate::daemon::daemon_is_running(root);
 
     // Rich-rate over the trailing 20 agent turns (E+): < 90 % warns. With zero
     // agent turns there is no rate to report — a computed 100% would be
@@ -473,7 +499,22 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     let signal_consumed = state.signal_offset.min(signal_bytes);
 
     let mut out = String::new();
-    out.push_str(&format!("store:      {}\n", human_bytes(size)));
+    // F26 (redteam round 2): this line used to render ONE number — every byte
+    // under `objects/` — while the budget it implied was enforced over a
+    // different, smaller set (the snapshot blobs turn records reference). A
+    // store can be far over budget on disk with nothing for the evictor to
+    // take, or evict aggressively while this figure barely moves; a single
+    // number cannot say which. Both are rendered unconditionally, including
+    // when they are equal — the same "a measurement is a fact about
+    // accounting, print it at 0 too" posture as the `inbox:` line, and the
+    // reason the two notice branches below can each name only their own
+    // remedy. `budgeted_bytes <= store_bytes` always, so the second figure
+    // never exceeds the first.
+    out.push_str(&format!(
+        "store:      {} on disk, {} counted toward the budget\n",
+        human_bytes(size),
+        human_bytes(health.budgeted_bytes)
+    ));
     out.push_str(&format!(
         "inbox:      {} signal.jsonl",
         human_bytes(signal_bytes)
@@ -489,7 +530,43 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         "turns:      {} (agent turns; git activity hidden)\n",
         turns.len()
     ));
-    out.push_str(&format!("gaps:       {gaps} recording gap(s)\n"));
+    out.push_str(&format!("gaps:       {gaps} recording gap(s)"));
+    // Breakdown only when there is something to break down: at zero every
+    // kind is zero and "0 recording gap(s)" already says so unambiguously, so
+    // a healthy repo's line stays exactly the bytes it has always been. (The
+    // inbox line's "0 B is a fact about accounting" argument does not carry
+    // here — that line reports a measurement, this one reports a census whose
+    // total already encodes the parts when it is 0.) "since last stop" rather
+    // than the type name `TrailingStop`: the human report should say what the
+    // interval IS (uncovered from the last stop until now), not name a
+    // variant.
+    if gaps > 0 {
+        out.push_str(&format!(
+            " ({} crash, {} restart, {} since last stop)",
+            gap_counts.crash, gap_counts.restart, gap_counts.trailing_stop
+        ));
+    }
+    out.push('\n');
+    // F31: a dead recorder was invisible here — worse, the inbox line above
+    // looks HEALTHIER the longer the outage runs (the hook keeps appending to
+    // signal.jsonl and succeeds whether or not anything consumes it, so
+    // nothing "unconsumed" accumulates in the human's field of view). Nothing
+    // in an agent session surfaces the recorder's absence, and `status` is one
+    // of only two verbs that could; it was reporting everything except whether
+    // recording is happening at all. Unconditional (both states rendered): a
+    // line that appears only when dead is a line a human learns to not look
+    // for. The warning row uses the rich-rate warning's shape, and its remedy
+    // is worded to match `doctor`'s `check_daemon` and the over-budget
+    // branch's "daemon not running — nothing is evicting" below, so a stopped
+    // recorder reads as one fact restated, not as separate claims.
+    if daemon_live {
+        out.push_str("daemon:     running\n");
+    } else {
+        out.push_str("daemon:     not running\n");
+        out.push_str(
+            "  ⚠ recorder not running — nothing is being recorded (run `agentrec record`)\n",
+        );
+    }
     // Only rendered once a rebuild has ever happened THIS DAEMON EPOCH — a
     // repo whose .gitignore never churned since the daemon last started has
     // nothing to report, and printing "0 reloads" would be exactly the
@@ -517,8 +594,10 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // can be nonzero for an epoch that is no longer running. The text line
     // is a daily-driver surface a human reads as "current" — so it is
     // gated on an actual liveness probe (the same non-blocking flock check
-    // `doctor`/`purge` already use), not just on the epoch-nonce match.
-    let daemon_live = crate::daemon::daemon_is_running(root);
+    // `doctor`/`purge` already use), not just on the epoch-nonce match. F31
+    // hoisted that probe above (the `daemon:` line needs the same bit); this
+    // gate is unchanged, it just reuses the one binding instead of probing a
+    // second time.
     if daemon_live && epoch_reloads > 0 {
         let when = fmt::relative_time(
             &agentrec_core::time::rfc3339(state.last_ignore_rebuild_ms),
@@ -611,7 +690,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // dry-run report, matching what the daemon would do on its next pass,
     // and deletes nothing. This is what makes AC2b.1 ("status performs zero
     // store writes") true by construction rather than by discipline.
-    if size > budget {
+    // F26: the gate is `health.over_budget` — `budgeted_bytes > budget`, which
+    // is provably the same condition as "`plan_eviction` has candidates" (see
+    // `retention::managed_bytes`) — NOT the old `size > budget`, which fired
+    // this eviction dry-run for stores the evictor could do nothing about and
+    // reported "over budget" forever while every tick freed nothing.
+    //
+    // AC I+ (perf-evidence round, Phase 2b, Decision 7 Q1=(a)): eviction
+    // itself now runs from a daemon tick (`daemon::run_eviction_pass`), NOT
+    // from this read verb — `status` renders `plan_eviction`'s read-only
+    // dry-run report, matching what the daemon would do on its next pass,
+    // and deletes nothing. This is what makes AC2b.1 ("status performs zero
+    // store writes") true by construction rather than by discipline.
+    if health.over_budget {
         let plan = eviction_plan(root, &store, &view, &ledger, budget)?;
         // Honesty (B): budget enforcement here only evicts turn-referenced
         // snapshot blobs. Most store bloat is usually ORPHANED blobs —
@@ -619,11 +710,14 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         // recovery that no committed turn references — which eviction can't
         // touch. Attribute that share explicitly and point at its only
         // reclaim path, instead of claiming "snapshots evicted" when the
-        // freed figure is ~0.
+        // freed figure is ~0. Still computed here (and not hoisted next to
+        // `size` above) because `orphan_bytes` re-walks the store AND
+        // re-reads `log.jsonl` raw — a cost neither notice branch's absence
+        // should make `status` pay.
         let orphans = crate::purgecmd::orphan_bytes(root, &store);
         out.push_str(&format!(
-            "store {} over {} budget — would free {}",
-            human_bytes(size),
+            "store {} counted toward budget, over {} — would free {}",
+            human_bytes(health.budgeted_bytes),
             human_bytes(budget),
             human_bytes(plan.freed_bytes_projected)
         ));
@@ -647,8 +741,40 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
         // #7) is accepted as rare/bounded, but must be self-announcing — a
         // human reading `status` on a stopped daemon must not be left
         // thinking eviction is happening when nothing is evicting anything.
-        if !crate::daemon::daemon_is_running(root) {
+        // F31: reuses the single `daemon_live` binding hoisted above rather
+        // than re-probing. Two flock probes in one report can disagree if the
+        // daemon exits between them — an over-budget store could otherwise
+        // render `daemon:     running` and "daemon not running — nothing is
+        // evicting" in the same output. Same value, one observation.
+        if !daemon_live {
             out.push_str("; daemon not running — nothing is evicting");
+        }
+        out.push('\n');
+    } else if size > budget {
+        // F26's actual failure state, which had no output of its own before:
+        // the store exceeds the budget ON DISK while the bytes the evictor
+        // ranges over do not, so every tick will free nothing no matter how
+        // long it runs. Previously this rendered the eviction dry-run — "over
+        // budget — would free 0 B" — which points a user at a mechanism that
+        // cannot help them. The remedy is `purge --orphans`, and naming it is
+        // the whole point of splitting this branch out.
+        //
+        // Deliberately does NOT contain "would free": nothing here is going
+        // to be freed by eviction, and
+        // `status_orphan_bloat_alone_names_purge_not_eviction` asserts that
+        // absence, not just the presence of the right words.
+        let orphans = crate::purgecmd::orphan_bytes(root, &store);
+        out.push_str(&format!(
+            "store {} on disk is over the {} budget, but only {} is subject to eviction — the evictor has no candidates and will free nothing",
+            human_bytes(size),
+            human_bytes(budget),
+            human_bytes(health.budgeted_bytes)
+        ));
+        if orphans > 0 {
+            out.push_str(&format!(
+                "; {} is unreferenced (superseded snapshots) — run `agentrec purge --orphans` to reclaim",
+                human_bytes(orphans)
+            ));
         }
         out.push('\n');
     }
@@ -904,14 +1030,56 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
 #[cfg(debug_assertions)]
 const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 
-/// [`agentrec_core::MAX_STORE_BYTES`] unless [`TEST_STORE_BUDGET_BYTES_VAR`]
-/// is set to a valid `u64`, in which case that value is used instead. The
-/// override is a no-op — the env is never read — in release builds.
-pub(crate) fn effective_store_budget() -> u64 {
+/// `.agentrec/config.toml` key holding the store budget, in bytes (F28,
+/// redteam round 2). Before this the budget was reachable ONLY through
+/// [`TEST_STORE_BUDGET_BYTES_VAR`], which is `#[cfg(debug_assertions)]` and
+/// therefore compiled out of every shipped binary — a release user had a
+/// non-negotiable 2 GiB per root, and the README's own remedy for D6 ("put
+/// concurrent work in a separate worktree") multiplies roots.
+pub(crate) const STORE_BUDGET_CONFIG_KEY: &str = "store_budget_bytes";
+
+/// Resolution order, highest first:
+///
+/// 1. [`TEST_STORE_BUDGET_BYTES_VAR`] — debug builds only, never present in a
+///    release binary (this repo audits release `strings` for exactly that).
+///    It stays highest so the existing integration seams keep driving a tiny
+///    budget in fixtures that also carry an `init`-written `config.toml`.
+/// 2. `store_budget_bytes` in `.agentrec/config.toml`, via the shared
+///    [`config_values`] scanner — same convention as `ttl_days`,
+///    `memory_enabled`, `memory_inject_max`.
+/// 3. [`agentrec_core::MAX_STORE_BYTES`].
+///
+/// Levels 2 and 3 are covered by `store_budget_is_settable_from_config_toml`;
+/// level 1 beating level 2 is a **control-flow** fact readable three lines
+/// below — the env arm `return`s before the config read is reached — and is
+/// deliberately NOT asserted by a test: `std::env::set_var` is process-global,
+/// and `status`/`status_json` in this same binary call this function, so such
+/// a test would race every one of them. Stated as mechanism rather than as a
+/// measured outcome on purpose. (`store_budget_override_is_a_no_op_in_release`
+/// does cover the release side, where level 1 does not exist at all.)
+///
+/// A missing file, a missing key, an unparseable value, and an explicit `0`
+/// all fall through to the default. The zero case is a deliberate extra
+/// condition rather than the bare `parse` other readers use: with F26's
+/// managed-byte semantics a budget of 0 makes every evictable snapshot a
+/// candidate on the daemon's next tick, so a stray `store_budget_bytes = 0`
+/// would be a silent history-wipe. Same protective class as A5 — refuse the
+/// value, keep the data. A user who really wants an aggressive budget can set
+/// a small non-zero one.
+pub(crate) fn effective_store_budget(root: &Path) -> u64 {
     #[cfg(debug_assertions)]
     if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
         if let Ok(n) = v.parse::<u64>() {
             return n;
+        }
+    }
+    if let Some(text) = read_config_text(root) {
+        for value in config_values(&text, STORE_BUDGET_CONFIG_KEY) {
+            if let Ok(n) = value.parse::<u64>() {
+                if n > 0 {
+                    return n;
+                }
+            }
         }
     }
     agentrec_core::MAX_STORE_BYTES
@@ -1234,14 +1402,35 @@ mod tests {
     /// under `cargo test --release` (the debug test build never exercises
     /// this arm at all). Same fail-safe class as
     /// `memory::slow_pin_read_delay_is_none_in_release_even_with_env_set`.
+    ///
+    /// F28 strengthening: the resolver now has a THIRD level between the env
+    /// seam and the default, so "release ignores the env" is asserted twice —
+    /// once against the default (no config) and once against a config value
+    /// that must win outright. The second half is what distinguishes "the env
+    /// read is compiled out" from "the env happened to parse to the default".
     #[test]
     #[cfg(not(debug_assertions))]
     fn store_budget_override_is_a_no_op_in_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
         std::env::set_var("AGENTREC_TEST_STORE_BUDGET_BYTES", "5");
         assert_eq!(
-            effective_store_budget(),
+            effective_store_budget(root),
             agentrec_core::MAX_STORE_BYTES,
             "release builds must never honor AGENTREC_TEST_STORE_BUDGET_BYTES"
+        );
+
+        std::fs::write(
+            crate::agentrec_dir(root).join("config.toml"),
+            "store_budget_bytes = 4096\n",
+        )
+        .unwrap();
+        assert_eq!(
+            effective_store_budget(root),
+            4096,
+            "with the env compiled out, config.toml is what a release user has"
         );
         std::env::remove_var("AGENTREC_TEST_STORE_BUDGET_BYTES");
     }
@@ -1273,6 +1462,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         }
     }
@@ -1380,9 +1571,22 @@ mod tests {
             "a blob referenced only by an unknown-type record must stay protected"
         );
 
+        // F26 follow-up: this fixture used to reach the eviction dry-run purely
+        // because `store_bytes > budget`, and a record this binary cannot parse
+        // contributes NOTHING to `budgeted_bytes` — so under the corrected
+        // predicate the eviction branch would no longer run at all and the
+        // survival assertion below would be vacuous. A real, parseable turn is
+        // added so the fixture still lands on the branch it is about.
+        let parseable = store.put(&[0xDDu8; 4_000]).unwrap();
+        let turn = turn_with_snapshot("t_UNKNOWNTYPEPEER00000001", "peer.bin", &parseable);
+        append_log(&log, &LogRecord::Turn(turn)).unwrap();
+
         // And it survives the real over-budget path, not just the harvest.
         let out = status_report(root, 100).unwrap();
-        assert!(out.contains("over"), "fixture must be over budget: {out}");
+        assert!(
+            out.contains("would free"),
+            "fixture must reach the eviction dry-run branch: {out}"
+        );
         assert!(
             store.contains(&referenced),
             "eviction dropped a blob referenced by a record it could not parse"
@@ -1405,8 +1609,17 @@ mod tests {
         let turn = turn_with_snapshot("t_ORPHANBLOAT0000000000001", "kept.bin", &kept);
         append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
 
-        // Budget below total (1000 B) so the notice fires.
-        let out = status_report(root, 500).unwrap();
+        // F26: the budget must be under the EVICTABLE bytes (400), not merely
+        // under the 1000 B on disk — the old `500` sat between the two, which
+        // is precisely the state this round proved the eviction dry-run must
+        // NOT claim (see `status_orphan_bloat_alone_names_purge_not_eviction`,
+        // which now owns that case). Tightening, not loosening: both
+        // assertions below are unchanged and still required.
+        let out = status_report(root, 300).unwrap();
+        assert!(
+            out.contains("would free"),
+            "fixture must reach the eviction dry-run branch: {out}"
+        );
         assert!(
             out.contains("unreferenced (superseded snapshots)"),
             "expected orphan attribution: {out}"
@@ -1414,6 +1627,75 @@ mod tests {
         assert!(
             out.contains("purge --orphans"),
             "expected the reclaim command named: {out}"
+        );
+    }
+
+    /// F26: a store over budget ON DISK whose evictable set is under it must
+    /// name `purge --orphans` and must NOT render the eviction dry-run. Before
+    /// this round `status` printed "over budget — would free 0 B" here forever,
+    /// pointing the user at the one mechanism that cannot help.
+    ///
+    /// The negative assertion is the one carrying the finding: "names purge"
+    /// was already true (the orphan clause hung off the eviction branch), so a
+    /// presence-only test would have passed before the fix too.
+    ///
+    /// Neuter: change `status_report`'s gate back to `size > budget` and the
+    /// `would free` assertion reds.
+    #[test]
+    fn status_orphan_bloat_alone_names_purge_not_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let kept = store.put(&[0xAAu8; 400]).unwrap();
+        let orphan = store.put(&[0xBBu8; 600]).unwrap();
+        let turn = turn_with_snapshot("t_ORPHANONLY00000000000001", "kept.bin", &kept);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        // 1000 B on disk, 400 B evictable, 500 B budget — over on disk, under
+        // on the set eviction ranges over.
+        let out = status_report(root, 500).unwrap();
+        assert!(
+            !out.contains("would free"),
+            "eviction cannot help here and must not be offered: {out}"
+        );
+        assert!(
+            out.contains("subject to eviction"),
+            "expected the disk-vs-evictable split to be named: {out}"
+        );
+        assert!(
+            out.contains("unreferenced (superseded snapshots)") && out.contains("purge --orphans"),
+            "expected the orphan attribution and its reclaim command: {out}"
+        );
+        assert!(store.contains(&orphan) && store.contains(&kept));
+    }
+
+    /// F26: the `store:` line renders BOTH figures, so a human can tell disk
+    /// pressure from evictor-reclaimable pressure without running `purge`.
+    ///
+    /// Neuter: drop the second figure from the format string and the
+    /// `counted toward the budget` assertion reds.
+    #[test]
+    fn status_store_line_shows_disk_and_budgeted_bytes_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+
+        let kept = store.put(&[0xAAu8; 400]).unwrap();
+        let _orphan = store.put(&[0xBBu8; 600]).unwrap();
+        let turn = turn_with_snapshot("t_STORELINE000000000000001", "kept.bin", &kept);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        let out = status_report(root, 1_000_000).unwrap();
+        assert!(
+            out.contains(&format!(
+                "store:      {} on disk, {} counted toward the budget",
+                human_bytes(1_000),
+                human_bytes(400)
+            )),
+            "expected both figures on the store line: {out}"
         );
     }
 
@@ -1429,11 +1711,71 @@ mod tests {
         append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
 
         let out = status_report(root, 1_000_000).unwrap();
-        assert!(
-            !out.contains("budget"),
-            "no over-budget notice expected: {out}"
-        );
+        // F26: this was a single `!out.contains("budget")`, which stopped being
+        // a valid proxy once the unconditional `store:` line began naming the
+        // budget it is measured against. Replaced by an assertion against every
+        // phrase either notice branch can emit — strictly more coverage than
+        // the one substring gave (it could not distinguish the two branches at
+        // all), not a narrowing.
+        for phrase in [
+            "would free",
+            "subject to eviction",
+            "purge --orphans",
+            "nothing is evicting",
+            "protected (pinned or in-flight",
+        ] {
+            assert!(
+                !out.contains(phrase),
+                "no over-budget notice expected, found {phrase:?}: {out}"
+            );
+        }
         assert!(store.contains(&hash));
+    }
+
+    /// F28: the budget is settable from `.agentrec/config.toml` in a RELEASE
+    /// build — before this it was reachable only through a
+    /// `#[cfg(debug_assertions)]` env var, i.e. not at all for a shipped
+    /// binary. Drives the resolver directly (not the env seam) so it proves
+    /// the config path, which is the half that ships.
+    #[test]
+    fn store_budget_is_settable_from_config_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // Absent file → documented default.
+        assert_eq!(
+            effective_store_budget(root),
+            agentrec_core::MAX_STORE_BYTES,
+            "no config.toml must fall back to the default"
+        );
+
+        let config = crate::agentrec_dir(root).join("config.toml");
+        std::fs::write(&config, "ttl_days = 90\nstore_budget_bytes = 1048576\n").unwrap();
+        assert_eq!(
+            effective_store_budget(root),
+            1_048_576,
+            "config.toml's store_budget_bytes must win over the default"
+        );
+
+        // Unparseable → default, same posture as `read_ttl_days`.
+        std::fs::write(&config, "store_budget_bytes = \"lots\"\n").unwrap();
+        assert_eq!(effective_store_budget(root), agentrec_core::MAX_STORE_BYTES);
+
+        // Zero → default. A 0 budget makes every evictable snapshot a
+        // candidate on the daemon's next tick; honoring it would turn one
+        // stray config line into a silent history wipe.
+        std::fs::write(&config, "store_budget_bytes = 0\n").unwrap();
+        assert_eq!(
+            effective_store_budget(root),
+            agentrec_core::MAX_STORE_BYTES,
+            "a zero budget must be refused, not honored"
+        );
+
+        // Prefix discipline inherited from `config_values`: a longer key that
+        // merely starts with ours must not match.
+        std::fs::write(&config, "store_budget_bytes_extra = 42\n").unwrap();
+        assert_eq!(effective_store_budget(root), agentrec_core::MAX_STORE_BYTES);
     }
 
     // Item 2 (non-UTF8 path handling): a persisted `non_utf8_path_skips`
@@ -2079,14 +2421,176 @@ mod tests {
         let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
         assert_eq!(
             out,
-            "store:      0 B\n\
+            // F26: the `store:` line gained its second figure. Both read 0 B
+            // on an empty store — rendered anyway, on the same "a measurement
+            // is a fact about accounting" ground as the `inbox:` line, so the
+            // line's shape does not change with the data.
+            "store:      0 B on disk, 0 B counted toward the budget\n\
              inbox:      0 B signal.jsonl\n\
              turns:      0 (agent turns; git activity hidden)\n\
              gaps:       0 recording gap(s)\n\
+             daemon:     not running\n\
+             \x20 ⚠ recorder not running — nothing is being recorded (run `agentrec record`)\n\
              rich-rate:  n/a (no agent turns yet)\n\
              memory:     0 fresh, 0 stale, 0 rejects, 0 injections, 0 failures\n",
             "healthy-store status output must be unchanged: {out}"
         );
+    }
+
+    /// F31, stated as the asymmetry that motivates the line: this fixture is
+    /// a repo where **nothing is recording** — no daemon holds the lock —
+    /// and every other line of the report is a clean bill of health,
+    /// `gaps: 0` included (there are no epoch records, so there is no
+    /// uncovered interval to name; the report cannot infer non-recording
+    /// from a ledger that was never written to). Before F31 that output had
+    /// no way to say so. Probed, not asserted from reasoning: the pinned
+    /// bytes above are what `status_report` actually emits for this fixture.
+    ///
+    /// Neuter (both directions): drop the `daemon:` line → RED here and in
+    /// the pinned test above; render it unconditionally as "running" → RED
+    /// on the dead half; render it unconditionally as "not running" → RED on
+    /// the live half.
+    #[test]
+    fn status_reports_daemon_liveness_both_ways() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+
+        let dead = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            dead.contains("daemon:     not running\n"),
+            "a repo with no recorder must say so: {dead}"
+        );
+        assert!(
+            dead.contains("⚠ recorder not running — nothing is being recorded"),
+            "the dead case must warn, not merely state: {dead}"
+        );
+
+        // Same real `libc::flock` probe `doctor`/`purge` use — `status` must
+        // not have grown a second liveness notion that can disagree with
+        // theirs.
+        let _guard = hold_daemon_lock(root);
+        let live = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            live.contains("daemon:     running\n"),
+            "a held daemon.lock must read as running: {live}"
+        );
+        assert!(
+            !live.contains("⚠ recorder not running"),
+            "a live daemon must not carry the dead-recorder warning: {live}"
+        );
+    }
+
+    /// F13: `status` rendered `health.crash_gaps`, so the `Restart` and
+    /// `TrailingStop` intervals `view::recording_gaps` already tagged were
+    /// reported as no gap at all — "kill the daemon, damage happens, restart"
+    /// read `gaps: 0`. This ledger holds 1 crash + 1 restart + 1 trailing;
+    /// the crash-only figure would be 1.
+    ///
+    /// The three kinds are asserted separately AND the total is asserted, so
+    /// a renderer that sums them into an opaque number, or one that keeps
+    /// rendering only the crash count, both go RED. Neuter: restore
+    /// `let gaps = health.crash_gaps;` → RED (total reads 1, breakdown gone).
+    #[test]
+    fn status_counts_restart_and_trailing_stop_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        for (event, ts) in [
+            ("start", "2026-01-01T00:00:00.000Z"),
+            ("start", "2026-01-01T01:00:00.000Z"), // crash
+            ("stop", "2026-01-01T02:00:00.000Z"),
+            ("start", "2026-01-01T03:00:00.000Z"), // restart
+            ("stop", "2026-01-01T04:00:00.000Z"),  // trailing
+        ] {
+            append_log(
+                &log_path(root),
+                &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                    v: 1,
+                    event: event.to_string(),
+                    ts: ts.to_string(),
+                }),
+            )
+            .unwrap();
+        }
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains(
+                "gaps:       3 recording gap(s) (1 crash, 1 restart, 1 since last stop)\n"
+            ),
+            "every uncovered-interval kind must be counted and stay \
+             distinguishable: {out}"
+        );
+
+        // The pre-F13 rendering, pinned as the thing that must NOT come back.
+        assert!(
+            !out.contains("gaps:       1 recording gap(s)"),
+            "crash-only gap reporting must not survive: {out}"
+        );
+    }
+
+    /// The zero case keeps its exact pre-F13 bytes: with no gaps at all there
+    /// is nothing to break down, and "(0 crash, 0 restart, 0 since last
+    /// stop)" would be the vacuous line the zero-turn `rich-rate: n/a`
+    /// precedent (D-PD3) refuses. Guards against the breakdown being made
+    /// unconditional later.
+    #[test]
+    fn status_gap_breakdown_is_omitted_at_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        // A single open `start` is coverage, not a gap (see
+        // `view::recording_gaps`).
+        append_log(
+            &log_path(root),
+            &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                v: 1,
+                event: "start".to_string(),
+                ts: "2026-01-01T00:00:00.000Z".to_string(),
+            }),
+        )
+        .unwrap();
+
+        let out = status_report(root, agentrec_core::MAX_STORE_BYTES).unwrap();
+        assert!(
+            out.contains("gaps:       0 recording gap(s)\n"),
+            "no gaps must render bare, with no breakdown: {out}"
+        );
+    }
+
+    /// F13's JSON half: `crash_gaps` keeps its established meaning and value
+    /// (a consumer already reading it sees no change), and the two other
+    /// kinds arrive as additive siblings rather than being folded into it.
+    /// Vacuity guard: distinct counts per kind (2/1/1).
+    #[test]
+    fn status_health_carries_every_gap_kind_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        for (event, ts) in [
+            ("start", "2026-01-01T00:00:00.000Z"),
+            ("start", "2026-01-01T01:00:00.000Z"), // crash
+            ("start", "2026-01-01T02:00:00.000Z"), // crash
+            ("stop", "2026-01-01T03:00:00.000Z"),
+            ("start", "2026-01-01T04:00:00.000Z"), // restart
+            ("stop", "2026-01-01T05:00:00.000Z"),  // trailing
+        ] {
+            append_log(
+                &log_path(root),
+                &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                    v: 1,
+                    event: event.to_string(),
+                    ts: ts.to_string(),
+                }),
+            )
+            .unwrap();
+        }
+
+        let payload = status_json(root).unwrap();
+        assert_eq!(payload["crash_gaps"], 2, "{payload}");
+        assert_eq!(payload["restart_gaps"], 1, "{payload}");
+        assert_eq!(payload["trailing_stop_gaps"], 1, "{payload}");
     }
 
     // AC3.2 (T3/D48): the hook inbox is the file that actually grew on the
@@ -2582,6 +3086,8 @@ mod tests {
                         baseline_unknown: false,
                         skipped_reason: None,
                         after_synthesized: None,
+                        link_kind: None,
+                        attribution: None,
                     }]
                 })
                 .unwrap_or_default(),

@@ -1770,6 +1770,8 @@ fn diff_text_modify_shows_unified() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "src/new.rs".into(),
@@ -1781,6 +1783,8 @@ fn diff_text_modify_shows_unified() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
         ],
     );
@@ -1821,6 +1825,8 @@ fn diff_binary_file_message() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1860,6 +1866,8 @@ fn diff_skipped_file_notice() {
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -1902,6 +1910,8 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::IO_FAILED.to_string()),
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "unreadable.rs".into(),
@@ -1913,6 +1923,8 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 baseline_unknown: false,
                 skipped_reason: Some(skip_reason::UNREADABLE.to_string()),
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "legacy.rs".into(),
@@ -1924,6 +1936,8 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 baseline_unknown: false,
                 skipped_reason: None, // pre-this-round log entry
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 // hash recorded, but no such blob was ever put in the store —
@@ -1937,6 +1951,8 @@ fn diff_names_the_real_skip_cause_and_unresolvable_blob() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
         ],
     );
@@ -2029,6 +2045,8 @@ fn diff_reports_corrupt_blob_distinctly_from_missing() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2110,6 +2128,8 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2131,6 +2151,8 @@ fn ghost_hash_from_over_cap_baseline_degrades_honestly_everywhere() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2704,6 +2726,8 @@ fn blame_file_reports_last_rich_turn() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -2724,6 +2748,8 @@ fn blame_file_reports_last_rich_turn() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -2792,6 +2818,8 @@ fn blame_bare_turn_no_fabrication() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2832,6 +2860,8 @@ fn blame_deleted_file_resolves() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     // z.rs is never written to disk — absent, as expected post-delete.
@@ -2873,6 +2903,8 @@ fn blame_line_level_added_and_predating() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2924,6 +2956,8 @@ fn blame_gap_is_stale() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -2977,6 +3011,8 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn1);
@@ -3007,6 +3043,8 @@ fn blame_line_unresolvable_before_does_not_credit_newer_turn() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -3069,6 +3107,8 @@ fn blame_line_create_turn_still_credited() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3120,6 +3160,8 @@ fn blame_line_unresolvable_after_not_false_predating() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3179,6 +3221,8 @@ fn undo_clean_revert_byte_exact() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3229,6 +3273,8 @@ fn undo_preview_does_not_mutate() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3277,6 +3323,8 @@ fn undo_file_subset() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "b.rs".into(),
@@ -3288,6 +3336,8 @@ fn undo_file_subset() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
         ],
     );
@@ -3331,6 +3381,8 @@ fn undo_modified_since_excluded_then_allowed() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3399,6 +3451,8 @@ fn undo_skipped_and_withheld_refused() {
                 baseline_unknown: false,
                 skipped_reason: Some(agentrec_core::record::skip_reason::IO_FAILED.to_string()),
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "w.rs".into(),
@@ -3410,6 +3464,8 @@ fn undo_skipped_and_withheld_refused() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
         ],
     );
@@ -3449,6 +3505,8 @@ fn undo_skipped_and_withheld_refused() {
             baseline_unknown: false,
             skipped_reason: Some(agentrec_core::record::skip_reason::OVER_CAP.to_string()),
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn2);
@@ -3462,6 +3520,161 @@ fn undo_skipped_and_withheld_refused() {
         !o_line.contains("write failed at record time"),
         "o.rs line: {o_line}"
     );
+}
+
+// F2a (red team round 2), end to end through the real binary. Undoing the
+// DELETION of a symlink used to call `restore_from_before` unconditionally
+// and write the link target string out as a text file — content that never
+// existed anywhere, reported as `reverted 1 file(s)`.
+//
+// This is also the case the on-disk `lstat` guard cannot reach: the link is
+// gone, so there is nothing to stat. The record's `link_kind` is the only
+// thing standing between this fixture and a fabricated 21-byte stub.
+#[test]
+#[cfg(unix)]
+fn undo_refuses_deleted_symlink_and_never_fabricates_a_text_file() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    // What the recorder stores for a link: the TARGET STRING, not content.
+    let target_string = store.put(b"../typescript/bin/tsc").unwrap();
+
+    let turn = base_turn(
+        "t_F2ADELETEDLINK000000000001",
+        vec![FileEntry {
+            path: "bin/tsc".into(),
+            before: Some(target_string),
+            after: None,
+            op: "delete".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: Some(agentrec_core::record::link_kind::SYMLINK.to_string()),
+            attribution: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let out = agentrec(root, &["undo", &turn.id, "--confirm"]);
+    assert!(out.status.success(), "undo failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.contains("bin/tsc")).unwrap_or("");
+    assert!(line.contains("REFUSE"), "line: {line}\nstdout: {stdout}");
+    assert!(
+        line.contains("recorded as a symlink"),
+        "the record-side trigger must be the one naming this: {line}"
+    );
+    // The exact false success the finding reports.
+    assert!(!stdout.contains("reverted 1 file(s)"), "stdout: {stdout}");
+    assert!(
+        !root.join("bin/tsc").exists(),
+        "no stub file may be fabricated at the link's path"
+    );
+    assert!(
+        !root.join("bin").exists(),
+        "not even the parent dir may be created"
+    );
+    assert!(
+        agentrec_turns(root).is_empty(),
+        "an all-refused plan must not record a turn"
+    );
+}
+
+// F2b, end to end: a LEGACY record (written before `link_kind` existed, so
+// it carries none) whose path is a symlink on disk. `fs::write` follows the
+// link and truncates the pointed-to file; the read-back verification
+// follows it too, so the corruption verified clean and undo printed
+// success. `--allow-modified` was the trigger, because a symlink is always
+// "modified since" — `read_current_hash` follows the link, comparing the
+// target's content hash against a target-string hash, which can never match.
+//
+// Asserted BOTH ways: without the flag and with it. The flag loosens
+// modified-since and must reach nothing else.
+#[test]
+#[cfg(unix)]
+fn undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let store = BlobStore::new(root.join(".agentrec/objects"));
+
+    std::fs::create_dir_all(root.join("configs")).unwrap();
+    let victim = root.join("configs/prod.yaml");
+    std::fs::write(&victim, b"replicas: 12\nregion: eu-west-1\n").unwrap();
+    std::os::unix::fs::symlink("configs/prod.yaml", root.join("config.yaml")).unwrap();
+
+    let before = store.put(b"configs/dev.yaml").unwrap();
+    let after = store.put(b"configs/prod.yaml").unwrap();
+    let turn = base_turn(
+        "t_F2BLIVELINK000000000000001",
+        vec![FileEntry {
+            path: "config.yaml".into(),
+            before: Some(before),
+            after: Some(after),
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            // Deliberately absent: this fixture is a pre-`link_kind` record.
+            link_kind: None,
+            attribution: None,
+        }],
+    );
+    seed_turn(root, &turn);
+
+    let original = std::fs::read(&victim).unwrap();
+    for args in [
+        vec!["undo", turn.id.as_str(), "--confirm"],
+        vec!["undo", turn.id.as_str(), "--allow-modified", "--confirm"],
+    ] {
+        let out = agentrec(root, &args);
+        assert!(out.status.success(), "undo {args:?} failed: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.contains("config.yaml"))
+            .unwrap_or("");
+        assert!(line.contains("REFUSE"), "{args:?} line: {line}");
+        assert!(
+            line.contains("path is a symlink on disk"),
+            "the ON-DISK trigger must be the one naming this (the record has \
+             no link_kind), {args:?} line: {line}"
+        );
+        assert!(
+            !line.contains("modified since"),
+            "the fabricated 'human or external edit' cause must not be shown \
+             for a link, {args:?} line: {line}"
+        );
+        assert!(!stdout.contains("reverted 1 file(s)"), "stdout: {stdout}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "{args:?}: a file that was never in the plan must not be truncated"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("config.yaml"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{args:?}: the link itself must survive"
+        );
+        assert!(
+            agentrec_turns(root).is_empty(),
+            "{args:?}: an all-refused plan must not record a turn"
+        );
+    }
 }
 
 // SR6: the `skipped` gate must stay ABOVE the modified-since check in
@@ -3520,6 +3733,8 @@ fn undo_skipped_entry_stays_refused_even_when_unmodified_since() {
             baseline_unknown: false,
             skipped_reason: Some(skip_reason::OVER_CAP.to_string()),
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3580,6 +3795,8 @@ fn undo_create_and_delete_inverse() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn_a);
@@ -3605,6 +3822,8 @@ fn undo_create_and_delete_inverse() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn_b);
@@ -3644,6 +3863,8 @@ fn undo_is_a_turn_and_reversible() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -3703,6 +3924,8 @@ fn panic_undo_targets_last_rich() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn1);
@@ -3723,6 +3946,8 @@ fn panic_undo_targets_last_rich() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn2);
@@ -3770,6 +3995,8 @@ fn panic_undo_targets_last_rich() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn_rich);
@@ -3790,6 +4017,8 @@ fn panic_undo_targets_last_rich() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn_bare);
@@ -4227,6 +4456,8 @@ fn panic_undo_skips_git_turn() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn_claude);
@@ -4250,6 +4481,8 @@ fn panic_undo_skips_git_turn() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "checkout_b.rs".into(),
@@ -4261,6 +4494,8 @@ fn panic_undo_skips_git_turn() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
             FileEntry {
                 path: "checkout_c.rs".into(),
@@ -4272,6 +4507,8 @@ fn panic_undo_skips_git_turn() {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             },
         ],
     );
@@ -4365,6 +4602,8 @@ fn purge_removes_expired_prompt_blob_keeps_shared() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     old_shared.started = days_ago_rfc3339(200);
@@ -4491,6 +4730,8 @@ fn purge_snapshots_before_date_respects_keepset() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     turn_old1.started = "2024-01-01T00:00:00.000Z".into();
@@ -4509,6 +4750,8 @@ fn purge_snapshots_before_date_respects_keepset() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     turn_old2.started = "2024-02-01T00:00:00.000Z".into();
@@ -4529,6 +4772,8 @@ fn purge_snapshots_before_date_respects_keepset() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     turn_new.started = "2024-06-01T00:00:00.000Z".into();
@@ -5679,6 +5924,8 @@ fn noise_turn(id: &str) -> agentrec_core::record::TurnRecord {
         baseline_unknown: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
     };
     base_turn(
         id,
@@ -5749,6 +5996,8 @@ fn nf_is_noise_does_not_panic_on_absolute_path() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5885,6 +6134,8 @@ fn nf5_blame_and_undo_unaffected_by_noise_globs() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -5930,6 +6181,8 @@ fn nf6_all_noise_turn_still_appears_and_rich_rate_unaffected() {
         baseline_unknown: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
     };
     let all_noise_turn = base_turn(
         "t_NF6ALLNOISE00000000000001",
@@ -7006,6 +7259,8 @@ fn memories_stale_shows_drifted_pin_and_when() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }],
     );
     seed_turn(root, &turn);
@@ -9432,6 +9687,8 @@ fn daemon_eviction_keeps_protected_refs() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -9577,6 +9834,8 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -9826,6 +10085,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);
@@ -9914,6 +10175,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);
@@ -10008,6 +10271,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);
@@ -10086,6 +10351,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);
@@ -10172,6 +10439,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);
@@ -10285,6 +10554,8 @@ mod json_contracts {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         seed_turn(root, &turn);

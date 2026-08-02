@@ -27,12 +27,59 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             .unwrap(),
             "private-key",
         ),
+        // F6 (red team round 2): the key-name side used to be `\b(...)\b`,
+        // which does NOT fire inside an underscore-joined name — `_` is a
+        // word character, so `\bsecret\b` never matches within
+        // `aws_secret_access_key`. Measured before changing it, not assumed:
+        // `scrub("aws_secret_access_key = <40 chars>")` came back byte-for-byte
+        // unredacted, as did the `AWS_SECRET_ACCESS_KEY=<40 chars>` env form.
+        // The word boundaries are therefore replaced by bounded runs of
+        // identifier punctuation on either side, so the credential word may sit
+        // anywhere inside the key name. `passphrase`/`credential` added at the
+        // same time; the pre-existing words are unchanged.
+        //
+        // Accepted over-redaction, stated because it is a real widening: a
+        // prose colon form whose value is 8+ non-space chars — `the token:
+        // abcdefghij` — now redacts. This function only ever runs on prompt
+        // text and memory facts, so the cost is display fidelity, never
+        // recovery; the safe direction.
         (
             Regex::new(
-                r#"(?i)\b(api[_-]?key|token|secret|password|passwd)\b\s*[=:]\s*(?:'[^']{4,}'|"[^"]{4,}"|[^\s'"]{8,})"#,
+                r#"(?i)[A-Za-z0-9_.\-]{0,40}(api[_-]?key|token|secret|password|passwd|passphrase|credential)[A-Za-z0-9_.\-]{0,40}\s*[=:]\s*(?:'[^']{4,}'|"[^"]{4,}"|[^\s'"]{8,})"#,
             )
             .unwrap(),
             "credential-assignment",
+        ),
+        // F6: credentials embedded in a URL authority —
+        // `scheme://user:password@host/...`. Both a `:` and an `@` must appear
+        // between `://` and the first `/` or whitespace, which is what keeps a
+        // password-less `postgres://db.internal:5432/prod` (host:port, no `@`)
+        // and a user-only `postgres://admin@db.internal/prod` (no `:` before
+        // the `@`) out. The whole URL is replaced, not just the password: the
+        // host and account name are part of what leaks.
+        (
+            Regex::new(r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s/@]+@[^\s]*").unwrap(),
+            "url-credential",
+        ),
+        // F6: OpenAI-style keys — `sk-` plus 20+ token chars, covering both the
+        // legacy flat form and the long `sk-proj-` form. Distinct from the
+        // Stripe rule above, which keys on `sk_` with an underscore. The `\b`
+        // is load-bearing: without it this fires inside ordinary kebab-case
+        // prose such as `risk-management-framework-review`, where the `sk-` is
+        // preceded by a word character and the boundary correctly fails.
+        (
+            Regex::new(r"\bsk-[A-Za-z0-9_-]{20,}").unwrap(),
+            "openai-key",
+        ),
+        // F6: `Authorization: Bearer <token>` / `Basic <base64>` headers. The
+        // 20-char floor is what separates a credential from prose — `Bearer
+        // token`, `Bearer <token>` and `basic authentication` all fall under
+        // it. A 20+ char word directly after the scheme name is still
+        // redactable prose in principle; accepted for the same reason as
+        // above (prompt text only, safe direction).
+        (
+            Regex::new(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{20,}").unwrap(),
+            "bearer-token",
         ),
         // Bare hex-shaped tokens (git SHAs, raw key material) — a dedicated
         // shape rule because narrow-alphabet tokens (hex maxes out at 4
@@ -42,6 +89,16 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             Regex::new(r"(?i)\b[0-9a-f]{40,}\b").unwrap(),
             "hex-token",
         ),
+        // NOT EXHAUSTIVE — one more shape rule lives outside this table:
+        // `is_aws_secret_shape`, the bare 40-char AWS *secret access key*
+        // (`[redacted:aws-secret-key]`), is applied per whitespace-delimited
+        // token in `push_token` rather than as a regex here. It cannot be a
+        // regex over the whole text without lookaround: the character class an
+        // AWS secret needs (`[A-Za-z0-9/+=]`, slashes included) matches runs
+        // *inside* ordinary paths — `Users/dev/projects/agentrec/agentrec-core`
+        // is a 41-char run of exactly those characters — so an unanchored
+        // `{40}` rule would redact file paths. Tokenizing first gives the
+        // anchoring for free.
     ]
 });
 
@@ -107,11 +164,77 @@ fn redact_entropy_preserving_whitespace(text: &str) -> String {
 }
 
 fn push_token(result: &mut String, token: &str) {
-    if !token.starts_with("[redacted:") && is_high_entropy_token(token) {
+    if token.starts_with("[redacted:") {
+        result.push_str(token);
+        return;
+    }
+    // F6: bare AWS secret access key, checked before the entropy fallback
+    // because entropy demonstrably does not catch it (see
+    // `is_aws_secret_shape`). Surrounding punctuation is split off and
+    // re-emitted so a secret at the end of a sentence still loses only the
+    // secret.
+    let (lead, core, tail) = split_edge_punctuation(token);
+    if is_aws_secret_shape(core) {
+        result.push_str(lead);
+        result.push_str("[redacted:aws-secret-key]");
+        result.push_str(tail);
+        return;
+    }
+    if is_high_entropy_token(token) {
         result.push_str("[redacted:high-entropy]");
     } else {
         result.push_str(token);
     }
+}
+
+/// Split a token into (leading punctuation, core, trailing punctuation) so a
+/// shape rule can be applied to the core alone. Only the characters that
+/// realistically wrap a pasted credential in prose or code are peeled; `/`,
+/// `+` and `=` are deliberately NOT in the set because they are part of the
+/// AWS secret alphabet itself.
+fn split_edge_punctuation(token: &str) -> (&str, &str, &str) {
+    const EDGE: &[char] = &[
+        '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '\'', '"',
+    ];
+    let core = token.trim_matches(EDGE);
+    let start = token.len() - token.trim_start_matches(EDGE).len();
+    (&token[..start], core, &token[start + core.len()..])
+}
+
+/// A bare AWS secret access key: exactly 40 characters from AWS's
+/// `[A-Za-z0-9/+=]` secret alphabet, carrying at least one upper, one lower
+/// and one digit.
+///
+/// This exists because the entropy fallback provably does not cover it, and
+/// the reason is distribution, not length. Measured on this file's own
+/// helpers before the rule was written, at the same 40-char length:
+///   * an all-distinct 40-char token scores 5.322 bits/char against a 4.466
+///     threshold -> `is_high_entropy_token` = true;
+///   * a 40-char token with a realistic repeat distribution scores 2.546 ->
+///     false;
+///   * the same with a `/` in it moves the alphabet ceiling to 95 and the
+///     threshold to 4.927 while scoring 2.732 -> false.
+///
+/// Real credentials sit in the second and third rows, so the entropy gate
+/// catches only the near-maximal-entropy tail. The exact-40 length is what
+/// makes the check safe to apply to bare tokens: file paths, base64 blobs and
+/// prose words are essentially never exactly 40 characters of that alphabet.
+/// A git SHA is 40 chars but lowercase-only (no upper, no mixed case) and is
+/// already redacted by the `hex-token` regex before tokenization.
+fn is_aws_secret_shape(token: &str) -> bool {
+    const AWS_SECRET_LEN: usize = 40;
+    if token.len() != AWS_SECRET_LEN || token.chars().count() != AWS_SECRET_LEN {
+        return false;
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '+' || c == '=')
+    {
+        return false;
+    }
+    token.chars().any(|c| c.is_ascii_uppercase())
+        && token.chars().any(|c| c.is_ascii_lowercase())
+        && token.chars().any(|c| c.is_ascii_digit())
 }
 
 fn is_high_entropy_token(token: &str) -> bool {
@@ -139,13 +262,64 @@ fn alphabet_size(token: &str) -> f64 {
     }
 }
 
+/// Directory components that make every file beneath them a secret (F7). The
+/// pre-F7 matcher looked at the basename only, so `secrets/prod.yaml` — where
+/// the credential word is in the *directory* and the basename `prod.yaml`
+/// matches nothing — was snapshotted in full.
+///
+/// Deliberately NOT in this list, because withholding is not free (a withheld
+/// file is never snapshotted, therefore never undoable — see the D-register's
+/// `withheld` semantics):
+///   * `credentials` / `.credentials` — a repo with `src/credentials/` holding
+///     *auth code* would have that source silently un-snapshotted. It stays a
+///     basename prefix rule only, which is where it already was.
+///   * `key` / `keys` — collides with `src/keys/keymap.ts`, i18n key tables.
+///   * `config` / `.config` — far too broad to be a credential signal.
+const SECRET_DIR_COMPONENTS: &[&str] = &[
+    ".aws", ".ssh", ".gnupg", ".kube", ".docker", "secrets", ".secrets",
+];
+
+/// Exact basenames that are credentials regardless of extension (F7). Every
+/// entry here was reported by the red team as accepted (i.e. snapshotted in
+/// full) by the pre-F7 matcher.
+const SECRET_BASENAMES: &[&str] = &[
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    ".htpasswd",
+    ".dockercfg",
+    "kubeconfig",
+    "terraform.tfstate",
+    "terraform.tfstate.backup",
+];
+
 /// Secret-file denylist (D31): matched files are never snapshotted.
+///
+/// Matches on the basename AND on the intermediate path components — callers
+/// pass either a root-relative path (`daemon.rs`, `memory.rs`) or an absolute
+/// one (`importcmd.rs` hands over the transcript's raw `filePath`), and both
+/// forms carry their directories, so component matching works on both.
 pub fn is_secret_path(path: &str) -> bool {
-    let name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path)
-        .to_lowercase();
+    let components: Vec<String> = path
+        .split(['/', '\\'])
+        .map(|c| c.to_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let name = components.last().cloned().unwrap_or_default();
+    if components
+        .iter()
+        .rev()
+        .skip(1)
+        .any(|c| SECRET_DIR_COMPONENTS.contains(&c.as_str()))
+    {
+        return true;
+    }
+    if SECRET_BASENAMES.contains(&name.as_str()) {
+        return true;
+    }
     // Config/data files whose name signals credentials — e.g.
     // `service-account-key.json`, `my-secrets.yaml`, `prod-credentials.toml`.
     // Gated on a structured extension so ordinary source (`keyboard.ts`,
@@ -155,8 +329,20 @@ pub fn is_secret_path(path: &str) -> bool {
     ]
     .iter()
     .any(|e| name.ends_with(e));
-    let credential_word =
-        name.contains("secret") || name.contains("credential") || name.contains("key");
+    // F7 additions: `password`/`passwd`, plus `auth` matched as an exact stem
+    // rather than a substring. `authors.json` is a real filename in real repos
+    // and holds no credential, so `name.contains("auth")` would withhold — and
+    // therefore make un-undoable — an ordinary data file. `token` was
+    // CONSIDERED AND REJECTED for the same class of reason: `tokens.json` is
+    // the conventional design-token filename, and withholding a design system's
+    // token file is a worse outcome than the leak it would prevent.
+    let stem = name.split('.').next().unwrap_or(&name);
+    let credential_word = name.contains("secret")
+        || name.contains("credential")
+        || name.contains("key")
+        || name.contains("password")
+        || name.contains("passwd")
+        || stem == "auth";
 
     name == ".env"
         || name == ".envrc"
@@ -167,9 +353,20 @@ pub fn is_secret_path(path: &str) -> bool {
         || name.ends_with(".pfx")
         || name.ends_with(".key")
         || name.ends_with(".keystore")
+        // F7: `AuthKey_ABC123.p8` (Apple), `keystore.jks` (Java), `.ppk`
+        // (PuTTY) — all private key material the pre-F7 suffix list missed.
+        || name.ends_with(".p8")
+        || name.ends_with(".jks")
+        || name.ends_with(".ppk")
         || name.starts_with("credentials")
         || name.contains("id_rsa")
         || name.contains("id_ed25519")
+        // F7: only `id_rsa`/`id_ed25519` were listed; the other two OpenSSH
+        // private-key names were snapshotted in full. `contains` (not equality)
+        // mirrors the two existing entries, so the `_sk` FIDO variants and the
+        // `.pub` companions are covered the same way they already were.
+        || name.contains("id_dsa")
+        || name.contains("id_ecdsa")
         || (config_ext && credential_word)
 }
 
@@ -398,6 +595,250 @@ mod tests {
         // substring or share a suffix fragment are not `.env` files.
         for p in ["environment.md", "src/env.rs", "envision.py"] {
             assert!(!is_secret_path(p), "{p} should not be withheld");
+        }
+    }
+
+    // ---- F6 (red team round 2): secret shapes the table used to pass ------
+    //
+    // FIXTURE DISCIPLINE, load-bearing: every literal below matches the
+    // REGEX SHAPE of a credential and nothing else. Secret material is always
+    // a run of `x` padded to the rule's minimum length, so no string here is
+    // or resembles a live key, and GitHub push protection (which rejected an
+    // earlier commit of the red-team doc for carrying real-shaped OpenAI
+    // literals, GH013) has nothing to detect. Do not "improve" these into
+    // realistic-looking tokens.
+    //
+    // Each positive assertion pins the SPECIFIC reason label, never a bare
+    // `contains("redacted")` — the entropy fallback can also fire on some of
+    // these inputs, and a reason-agnostic assertion would stay green with the
+    // regex row deleted.
+
+    #[test]
+    fn f6_aws_secret_access_key_redacted() {
+        // Bare 40-char secret (the `aws-secret-key` token rule).
+        let fake = "AWSxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01";
+        assert_eq!(fake.len(), 40, "fixture must be exactly AWS secret length");
+        let s = scrub(&format!("use {fake} for the upload"));
+        assert!(
+            s.contains("[redacted:aws-secret-key]"),
+            "bare AWS secret access key must be redacted: {s}"
+        );
+        assert!(!s.contains("xxxxxxxx"), "secret body must not survive: {s}");
+        // Trailing sentence punctuation must not defeat the shape check.
+        let punct = scrub(&format!("the key is {fake}."));
+        assert!(
+            punct.contains("[redacted:aws-secret-key]") && punct.ends_with('.'),
+            "trailing punctuation split off, secret still redacted: {punct}"
+        );
+        // Underscore-joined key names: the `\b` defect this fix removes.
+        for form in [
+            format!("aws_secret_access_key = {fake}"),
+            format!("AWS_SECRET_ACCESS_KEY={fake}"),
+        ] {
+            let s = scrub(&form);
+            assert!(
+                s.contains("[redacted:credential-assignment]"),
+                "underscore-joined credential name must redact: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_aws_secret_shape_does_not_eat_paths_or_shas() {
+        // A path is a long run of the same character class; the exact-40 gate
+        // is what keeps it out. This is the reason the rule is not a regex.
+        let path = scrub("open /Users/dev/projects/agentrec/agentrec-core/src/scrub.rs now");
+        assert!(!path.contains("aws-secret-key"), "path untouched: {path}");
+        // A 40-char git SHA is lowercase-only: no uppercase, so the AWS shape
+        // rejects it, and the pre-existing hex rule claims it instead.
+        let sha = scrub("commit 356a192b7913b04c54574d18c28d46e6395428ab done");
+        assert!(sha.contains("[redacted:hex-token]"), "sha stays hex: {sha}");
+        assert!(!sha.contains("aws-secret-key"));
+        // A 39- and a 41-char token of the same alphabet are not AWS secrets.
+        for n in [39usize, 41] {
+            let t = format!("Ab1{}", "x".repeat(n - 3));
+            let s = scrub(&format!("value {t} end"));
+            assert!(
+                !s.contains("aws-secret-key"),
+                "length {n} must not match the exact-40 shape: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_url_embedded_credentials_redacted() {
+        for url in [
+            "postgres://admin:xxxxxxxxxxxx@db.internal:5432/prod",
+            "mongodb+srv://root:xxxxxxxxxxxx@cluster0.example.net/admin",
+            "https://ci:xxxxxxxxxxxx@git.example.com/org/repo.git",
+        ] {
+            let s = scrub(&format!("connect to {url} please"));
+            assert!(
+                s.contains("[redacted:url-credential]"),
+                "URL credential must be redacted: {s}"
+            );
+            assert!(
+                !s.contains("xxxxxxxxxxxx"),
+                "password must not survive: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_urls_without_credentials_are_not_redacted() {
+        // The negative half of the URL rule — over-redacting these would make
+        // ordinary connection strings and doc links unreadable in every prompt.
+        for url in [
+            "postgres://db.internal:5432/prod",
+            "postgres://admin@db.internal:5432/prod",
+            "https://example.com/docs/getting-started/installation",
+            "redis://cache.internal:6379/0",
+            "git@github.com:user/repo.git",
+        ] {
+            let s = scrub(&format!("see {url} for details"));
+            assert!(
+                !s.contains("redacted"),
+                "credential-free URL must survive verbatim: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_openai_style_key_redacted() {
+        for key in [
+            format!("sk-proj-{}", "x".repeat(48)),
+            format!("sk-{}", "x".repeat(48)),
+        ] {
+            let s = scrub(&format!("export OPENAI_KEY {key} now"));
+            assert!(
+                s.contains("[redacted:openai-key]"),
+                "OpenAI-shaped key must be redacted: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn f6_openai_rule_does_not_fire_on_kebab_prose() {
+        // `\b` is what stops `risk-`/`task-` style prose from matching.
+        for text in [
+            "risk-management-framework-review is scheduled",
+            "the task-oriented-development-workflow doc",
+            "rename sk-1 to sk-2",
+        ] {
+            let s = scrub(text);
+            assert!(!s.contains("openai-key"), "prose must survive: {s}");
+        }
+    }
+
+    #[test]
+    fn f6_bearer_and_basic_auth_headers_redacted() {
+        for header in [
+            format!("Authorization: Bearer {}", "x".repeat(40)),
+            format!("authorization: basic {}", "x".repeat(24)),
+        ] {
+            let s = scrub(&format!("send {header} with the request"));
+            assert!(
+                s.contains("[redacted:bearer-token]"),
+                "auth header token must be redacted: {s}"
+            );
+            assert!(!s.contains("xxxxxxxxxxxxxxxxxxxxxxxx"));
+        }
+    }
+
+    #[test]
+    fn f6_bearer_in_prose_is_not_redacted() {
+        for text in [
+            "send a Bearer token with the request",
+            "Authorization: Bearer <token>",
+            "we use basic authentication here",
+        ] {
+            let s = scrub(text);
+            assert!(!s.contains("redacted"), "prose must survive: {s}");
+        }
+    }
+
+    #[test]
+    fn f6_credential_assignment_still_ignores_plain_prose() {
+        // The key-name widening removed `\b`; it must not have turned every
+        // sentence containing a credential word into a redaction. The rule
+        // still requires a `=`/`:` AND an 8+ char value.
+        for text in [
+            "update the token handling in auth",
+            "rotate the password next week",
+            "the api_key argument is optional",
+        ] {
+            let s = scrub(text);
+            assert!(!s.contains("redacted"), "prose must survive: {s}");
+        }
+    }
+
+    // ---- F7: secret-FILE denylist misses ---------------------------------
+
+    #[test]
+    fn f7_credential_filenames_withheld() {
+        for p in [
+            ".netrc",
+            "_netrc",
+            ".git-credentials",
+            ".pgpass",
+            ".npmrc",
+            ".pypirc",
+            ".htpasswd",
+            ".dockercfg",
+            "kubeconfig",
+            "deploy/kubeconfig",
+            "infra/terraform.tfstate",
+            "infra/terraform.tfstate.backup",
+            "/home/u/.ssh/id_dsa",
+            "/home/u/.ssh/id_ecdsa",
+            "keys/id_ecdsa_sk",
+            "certs/AuthKey_ABC123.p8",
+            "certs/keystore.jks",
+            "certs/session.ppk",
+            "config/auth.json",
+            "config/passwords.yaml",
+        ] {
+            assert!(is_secret_path(p), "{p} should be withheld");
+        }
+    }
+
+    #[test]
+    fn f7_directory_components_are_consulted() {
+        // The sharpest pre-F7 miss: the credential word lives in the
+        // DIRECTORY and the basename alone matches nothing.
+        for p in [
+            "secrets/prod.yaml",
+            "app/secrets/database.yml",
+            ".secrets/token",
+            "/home/u/.aws/config",
+            "/home/u/.ssh/known_hosts",
+            "/home/u/.kube/config",
+            "/home/u/.docker/config.json",
+            "/home/u/.gnupg/gpg.conf",
+            // Windows-style separators reach this function too.
+            "app\\secrets\\database.yml",
+        ] {
+            assert!(is_secret_path(p), "{p} should be withheld (directory)");
+        }
+    }
+
+    #[test]
+    fn f7_directory_matching_does_not_over_withhold() {
+        // Withheld == never snapshotted == never undoable, so the component
+        // set is deliberately narrow. These must all still be recorded.
+        for p in [
+            "src/credentials/oauth_client.rs",
+            "src/keys/keymap.ts",
+            "src/config/routes.rs",
+            ".config/nvim/init.lua",
+            "docs/secrets-management.md",
+            "tokens.json",
+            "design/tokens.json",
+            "authors.json",
+            "migrations/0001_init.sql",
+            "certs/server.crt",
+        ] {
+            assert!(!is_secret_path(p), "{p} should NOT be withheld");
         }
     }
 }

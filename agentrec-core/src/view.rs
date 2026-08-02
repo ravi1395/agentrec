@@ -86,13 +86,56 @@ pub fn has_crash_gap(records: &[LogRecord]) -> bool {
         .any(|g| g.kind == GapKind::Crash)
 }
 
-/// How many times (E2 crash shape only — `status` reports crashes, not
-/// deliberate restarts).
+/// How many times (E2 crash shape only). Kept as the crash-specific
+/// primitive; `status` no longer reports ONLY this — see [`gap_counts`].
 pub fn crash_gap_count(records: &[LogRecord]) -> usize {
     recording_gaps(records)
         .iter()
         .filter(|g| g.kind == GapKind::Crash)
         .count()
+}
+
+/// Every uncovered interval, counted per kind (redteam round 2, F13).
+///
+/// `status` previously surfaced [`crash_gap_count`] alone, so the intervals
+/// [`recording_gaps`] tags [`GapKind::Restart`] and [`GapKind::TrailingStop`]
+/// were reported as no gap at all — a daemon killed, damage done, daemon
+/// restarted read `gaps: 0` on the one verb README advertises as reporting
+/// recording gaps. The kinds stay separate rather than collapsing into one
+/// number: "the recorder crashed" and "the recorder was deliberately off"
+/// are different facts about the same missing coverage, and the callers that
+/// legitimately want only one shape ([`has_crash_gap`]) keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GapCounts {
+    /// A `start` while one was already open ([`GapKind::Crash`]).
+    pub crash: usize,
+    /// A clean `stop` later followed by a `start` ([`GapKind::Restart`]).
+    pub restart: usize,
+    /// A trailing `stop` with no `start` after it — everything from that
+    /// stop onward is uncovered ([`GapKind::TrailingStop`]). This is the
+    /// shape a stopped recorder leaves behind.
+    pub trailing_stop: usize,
+}
+
+impl GapCounts {
+    /// Uncovered intervals of any kind.
+    pub fn total(&self) -> usize {
+        self.crash + self.restart + self.trailing_stop
+    }
+}
+
+/// Count [`recording_gaps`] by kind — one walk of the already-parsed
+/// records per call.
+pub fn gap_counts(records: &[LogRecord]) -> GapCounts {
+    let mut c = GapCounts::default();
+    for g in recording_gaps(records) {
+        match g.kind {
+            GapKind::Crash => c.crash += 1,
+            GapKind::Restart => c.restart += 1,
+            GapKind::TrailingStop => c.trailing_stop += 1,
+        }
+    }
+    c
 }
 
 /// Was any interval after `since` uncovered, of any shape? RFC 3339 strings
@@ -225,8 +268,10 @@ impl std::error::Error for RepoError {}
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
     pub records: Vec<LogRecord>,
-    /// Well-formed JSON objects carrying a `type` this binary does not know.
-    /// Tolerated (a newer producer is allowed to write them) and counted.
+    /// Well-formed JSON objects this binary does not implement: a `type` it
+    /// does not know, or a known `type` at an unimplemented schema major
+    /// (record.rs refuses those at deserialization). Tolerated (a newer
+    /// producer is allowed to write them) and counted.
     pub unknown_type_lines: usize,
     /// Non-empty lines that are not parseable JSON at all — a torn tail line
     /// after a crash, most often.
@@ -267,13 +312,46 @@ pub fn load_ledger(path: &std::path::Path) -> Ledger {
 /// call for `skip_serializing_if`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryHealth {
+    /// Every byte under `.agentrec/objects/`, orphans included — a `read_dir`
+    /// walk ([`crate::store::BlobStore::total_bytes`]). Unchanged meaning; it
+    /// is simply no longer what `over_budget` compares (F26).
+    ///
+    /// Scope note (F24): this walks `objects/` only, so `.agentrec/daemon.log`
+    /// — where the launchd unit now routes the daemon's stdio — is a sibling
+    /// of the store and invisible to both this figure and `budgeted_bytes`.
     pub store_bytes: u64,
+    /// The bytes `budget` is actually enforced against:
+    /// [`crate::retention::managed_bytes`] over every turn record in the
+    /// ledger — the unique snapshot blobs `retention::plan_eviction`
+    /// accumulates. Strictly `<= store_bytes`; the difference is orphans,
+    /// prompt-only blobs, and anything else the evictor cannot reclaim.
+    ///
+    /// F26 (redteam round 2): `over_budget` used to be `store_bytes > budget`,
+    /// so a store whose orphan share alone exceeded the budget sat
+    /// permanently "over budget" while every eviction tick freed nothing. The
+    /// two figures are now both reported rather than one silently standing in
+    /// for the other — a consumer that wants disk pressure reads
+    /// `store_bytes`, one that wants "will eviction help" reads this.
+    pub budgeted_bytes: u64,
     pub budget: u64,
+    /// `budgeted_bytes > budget` — equivalently (see
+    /// [`crate::retention::managed_bytes`]'s proof) "the evictor has
+    /// candidates". NOT "eviction will free bytes": A2/A5/protected/freshness
+    /// can spare every candidate. NOT "the store is over budget on disk"
+    /// either — that is `store_bytes > budget`, a strictly weaker condition
+    /// this field deliberately no longer answers.
     pub over_budget: bool,
     /// Turns as recorded, before any superseded/git filtering.
     pub turn_count: usize,
     /// Crash-shaped recording gaps ([`GapKind::Crash`]).
     pub crash_gaps: usize,
+    /// Restart-shaped recording gaps ([`GapKind::Restart`]) — F13. Additive
+    /// sibling of `crash_gaps`, never a replacement: `crash_gaps` keeps its
+    /// established meaning and value for every consumer already reading it.
+    pub restart_gaps: usize,
+    /// Trailing-stop recording gaps ([`GapKind::TrailingStop`]) — F13. At
+    /// most 1 by construction (only the last unmatched `stop` produces one).
+    pub trailing_stop_gaps: usize,
     pub unknown_type_lines: usize,
     pub unparsed_lines: usize,
 }
@@ -750,17 +828,36 @@ impl RepositoryView {
     pub fn health_of(&self, ledger: &Ledger, budget: u64) -> Result<RepositoryHealth, RepoError> {
         let store = crate::store::BlobStore::new(self.objects_dir());
         let store_bytes = store.total_bytes();
-        let turn_count = ledger
+        // F26: the turn set fed to `managed_bytes` must be the UNFILTERED one
+        // — every `LogRecord::Turn` in ledger order, no git/superseded
+        // narrowing — because that is exactly what both eviction call sites
+        // pass to `plan_eviction` (`cmds::eviction_plan` uses
+        // `TurnQuery { include_all: true }`; `daemon::run_eviction_pass` uses
+        // a raw `load_log`). Narrowing here would silently break the
+        // `managed_bytes > budget` <-> "the evictor has candidates"
+        // equivalence that makes `over_budget` meaningful.
+        let turns: Vec<&TurnRecord> = ledger
             .records
             .iter()
-            .filter(|r| matches!(r, LogRecord::Turn(_)))
-            .count();
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+        let budgeted_bytes = crate::retention::managed_bytes(&store, turns.iter().copied());
+        // One walk, three fields (residual handed over from the F13 wave:
+        // this was three `gap_counts(&ledger.records)` calls, i.e. three full
+        // passes over every record to answer one census).
+        let gaps = gap_counts(&ledger.records);
         Ok(RepositoryHealth {
             store_bytes,
+            budgeted_bytes,
             budget,
-            over_budget: store_bytes > budget,
-            turn_count,
-            crash_gaps: crash_gap_count(&ledger.records),
+            over_budget: budgeted_bytes > budget,
+            turn_count: turns.len(),
+            crash_gaps: gaps.crash,
+            restart_gaps: gaps.restart,
+            trailing_stop_gaps: gaps.trailing_stop,
             unknown_type_lines: ledger.unknown_type_lines,
             unparsed_lines: ledger.unparsed_lines,
         })
@@ -1526,6 +1623,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -1580,10 +1679,48 @@ mod tests {
         let gaps = recording_gaps(&recs);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].kind, GapKind::Restart);
-        // The distinction is load-bearing: `status` counts crashes only, so a
-        // deliberate restart must not inflate its gap count.
+        // The distinction is load-bearing for the CRASH-shaped predicates —
+        // `has_crash_gap` and `crash_gap_count` must not count a deliberate
+        // restart. It is NOT a licence to drop the interval from the total:
+        // F13 found `status` doing exactly that, so `gap_counts` sees it.
+        // (This comment previously read "`status` counts crashes only"; that
+        // stopped being true when F13 was fixed.)
         assert_eq!(crash_gap_count(&recs), 0);
         assert!(!has_crash_gap(&recs));
+        assert_eq!(gap_counts(&recs).restart, 1);
+        assert_eq!(gap_counts(&recs).total(), 1);
+    }
+
+    /// F13: every kind [`recording_gaps`] can tag is counted, and the total
+    /// is their sum — the property `status` violated by reporting
+    /// `crash_gaps` alone. One ledger carrying all three shapes at once:
+    /// start, start (crash), stop, start (restart), stop (trailing).
+    ///
+    /// Neuter (both directions): make `gap_counts` filter to
+    /// `GapKind::Crash` — the pre-F13 behavior — and `restart`/
+    /// `trailing_stop`/`total` all go RED. Make it count every gap as
+    /// `crash` and the per-kind asserts go RED. Vacuity guard: the three
+    /// kinds carry DISTINCT counts (2/1/1), so a renderer that reads one
+    /// field where it means another cannot pass by coincidence.
+    #[test]
+    fn gap_counts_counts_every_kind_not_just_crash() {
+        let recs = vec![
+            epoch("start", "2026-01-01T00:00:00Z"),
+            epoch("start", "2026-01-01T01:00:00Z"), // crash 1
+            epoch("start", "2026-01-01T02:00:00Z"), // crash 2
+            epoch("stop", "2026-01-01T03:00:00Z"),
+            epoch("start", "2026-01-01T04:00:00Z"), // restart 1
+            epoch("stop", "2026-01-01T05:00:00Z"),  // trailing 1
+        ];
+        let counts = gap_counts(&recs);
+        assert_eq!(counts.crash, 2, "{counts:?}");
+        assert_eq!(counts.restart, 1, "{counts:?}");
+        assert_eq!(counts.trailing_stop, 1, "{counts:?}");
+        assert_eq!(counts.total(), 4, "{counts:?}");
+        // The pre-F13 figure, retained as the contrast: crash-only reporting
+        // hid 2 of these 4 uncovered intervals.
+        assert_eq!(crash_gap_count(&recs), 2);
+        assert_eq!(counts.total(), recording_gaps(&recs).len());
     }
 
     #[test]
@@ -1982,6 +2119,52 @@ mod tests {
         assert_eq!(h.turn_count, 0);
         assert_eq!(h.crash_gaps, 0);
         assert!(!h.over_budget);
+        assert_eq!(h.budgeted_bytes, 0);
+    }
+
+    /// F26 at the health level: `over_budget` must key on the bytes eviction
+    /// ranges over, not on disk bytes. The fixture is the failure state the
+    /// redteam measured — a store dominated by blobs no turn references —
+    /// with a budget deliberately between the two figures, so the OLD
+    /// predicate (`store_bytes > budget`) and the new one disagree and only
+    /// one of them can pass.
+    ///
+    /// Neuter: restore `over_budget: store_bytes > budget` and the third
+    /// assertion reds.
+    #[test]
+    fn over_budget_keys_on_evictable_bytes_not_disk_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_log(root, &[]);
+        let store = crate::store::BlobStore::new(root.join(".agentrec").join("objects"));
+
+        let referenced = store.put(&[0xAAu8; 20]).unwrap();
+        // No turn cites this: on disk, ineligible as an eviction victim.
+        store.put(&[0xBBu8; 180]).unwrap();
+
+        // Written as a wire line rather than a constructed `FileEntry` so this
+        // fixture does not have to be edited every time PROTOCOL gains an
+        // additive optional field — `#[serde(default)]` on the optionals is
+        // what makes the short form legal, and exercising it here is a small
+        // bonus check of that tolerance.
+        let line = format!(
+            r#"{{"type":"turn","v":1,"id":"t_F26HEALTH","grade":"rich","started":"2026-01-01T00:00:00Z","ended":"2026-01-01T00:00:00Z","root":"/repo","files":[{{"path":"x.bin","after":"{referenced}","op":"create"}}]}}"#
+        );
+        write_log(root, &[&line]);
+
+        let h = RepositoryView::open(root).unwrap().health(100).unwrap();
+        assert_eq!(h.store_bytes, 200, "disk bytes still include the orphan");
+        assert_eq!(h.budgeted_bytes, 20, "only the referenced snapshot counts");
+        assert!(
+            !h.over_budget,
+            "200 B on disk over a 100 B budget must NOT read as over-budget \
+             when only 20 B of it is evictable — that is the permanent \
+             'over budget, evicting nothing' state F26 describes"
+        );
+
+        // And the predicate still fires when the evictable set really is over.
+        let h2 = RepositoryView::open(root).unwrap().health(19).unwrap();
+        assert!(h2.over_budget, "20 B evictable against a 19 B budget");
     }
     #[test]
     fn a_known_type_written_malformed_is_unparsed_not_an_unknown_kind() {
@@ -2267,6 +2450,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         );
         t.prompt_ref = Some("sha256:bb".to_string());

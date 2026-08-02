@@ -19,6 +19,7 @@ ttl_days = 90
 mcp_destructive = \"off\"   # off | confirm | auto (used from v2)
 memory_enabled = true      # inject recalled memories into UserPromptSubmit hooks
 memory_inject_max = 5      # max facts injected per hook call
+# store_budget_bytes = 2147483648  # snapshot-store budget in bytes (default 2 GiB); the daemon's eviction tick enforces it
 # noise_globs = [\".remember/**\"]  # fold matching file entries out of log/show (see README); --all-files to reveal
 ";
 

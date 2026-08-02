@@ -294,6 +294,8 @@ fn fe(path: &str, before: Option<String>, after: Option<String>, op: &str) -> Fi
         baseline_unknown: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
     }
 }
 

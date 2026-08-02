@@ -701,6 +701,31 @@ fn build_plan(
             }
         }
 
+        // F2 (red team round 2). This gate is FIRST, above every other
+        // refusal, because it is the only one whose failure mode writes to a
+        // file that was never in the plan: `std::fs::write` follows a
+        // symlink and truncates its target, and the post-write read-back
+        // follows it too, so the corruption verifies clean and reports
+        // success. It is also unconditional w.r.t. `--allow-modified` — it
+        // sits above the modified-since gate below, so that flag never
+        // reaches it.
+        //
+        // TWO INDEPENDENT triggers, each sufficient on its own:
+        //   1. the record says the path was a link when it was snapshotted;
+        //   2. the path IS a link on disk right now.
+        // (1) does not cover records written before `link_kind` existed —
+        // they carry no such field and never will, so (2) is the ONLY guard
+        // for the entire pre-existing log. (2) does not cover a link that
+        // has since been deleted (nothing to lstat), which is exactly the
+        // F2a delete-restore case — so (1) is the only guard there. Neither
+        // subsumes the other; both stay.
+        if let Some(kind) = symlink_refusal(root, entry) {
+            plans.push(Plan {
+                entry: entry.clone(),
+                kind,
+            });
+            continue;
+        }
         if entry.withheld {
             plans.push(Plan {
                 entry: entry.clone(),
@@ -809,6 +834,55 @@ fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
     std::fs::read(root.join(rel)).ok().map(|b| hash_bytes(&b))
 }
 
+/// True when `path` is itself a symbolic link. `symlink_metadata` is an
+/// lstat: it describes the link, where `metadata`/`Path::exists` would
+/// describe (and a write would hit) the pointed-to file. A metadata error —
+/// absent path, permission denied — is `false`: this predicate answers only
+/// "is there a link here", and the absent case is handled by the record-side
+/// trigger instead.
+fn is_symlink_on_disk(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
+/// be reverted because a link is involved, `None` otherwise.
+///
+/// The two triggers produce DELIBERATELY DIFFERENT text. They are different
+/// facts — "the record says this was a link" vs "there is a link here now" —
+/// and only distinct wording lets a reader (or a test) tell which one fired;
+/// identical text would let the legacy-record path pass a test for the wrong
+/// reason.
+///
+/// `entry.link_kind` is matched on `is_some()`, never against the known
+/// value: an unrecognized future kind is still not an ordinary file, so
+/// refusing to act on it is the correct degradation (PROTOCOL §5,
+/// refuse-to-act-not-refuse-to-parse). Never make this an equality test
+/// against [`link_kind::SYMLINK`].
+fn symlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
+    if let Some(kind) = entry.link_kind.as_deref() {
+        // `link_kind` is wire data on an OPEN enum — a foreign producer can
+        // put any bytes here, and this string reaches the pre-confirm plan
+        // the user reads (F8's exact surface). Sanitized at the one
+        // interpolation site so `render_plan`'s every-reason-is-safe
+        // invariant holds by construction.
+        let kind = fmt::sanitize_terminal(kind);
+        return Some(PlanKind::Refused {
+            reason: format!(
+                "recorded as a {kind} — its snapshot is the link target, not file content"
+            ),
+        });
+    }
+    if is_symlink_on_disk(&root.join(&entry.path)) {
+        return Some(PlanKind::Refused {
+            reason: "path is a symlink on disk — reverting would write through the link"
+                .to_string(),
+        });
+    }
+    None
+}
+
 /// Best-effort explanation for why a path is modified-since the target turn:
 /// a later rich turn touching the same path outranks an uncovered recording
 /// gap, which outranks the default "some edit we can't otherwise explain".
@@ -842,37 +916,71 @@ fn modified_cause(
     "human or external edit".to_string()
 }
 
-fn print_plan(target: &TurnRecord, plans: &[Plan]) {
-    println!(
-        "undo {} ({})",
-        fmt::short_id(&target.id),
-        target.tool.as_deref().unwrap_or("—")
-    );
+/// The exact bytes of the pre-`--confirm` undo plan, one `\n`-terminated line
+/// per emitted row. Split out of [`print_plan`] so the text a user reads
+/// before authorizing a destructive op is unit-testable as a value; the
+/// printer is a thin wrapper and nothing else builds this text.
+///
+/// Every WIRE-SOURCED field interpolated here — `target.tool`, `entry.path`,
+/// `entry.op` — passes through [`fmt::sanitize_terminal`] (redteam round 2,
+/// F8). A filename is attacker-controllable (nothing stops an agent or a
+/// postinstall script creating `"\x1b[1A\x1b[2Ksrc/decoy.rs"` — all legal
+/// bytes), and cursor-up + erase-line reaching a real terminal would wipe the
+/// `revert` line printed above it from the display while `--confirm` reverts
+/// that file anyway, rewriting the one human checkpoint this destructive op
+/// has. `sanitize_terminal` needed no extension for this: ESC is `0x1b`, so
+/// its existing `cp >= 0x20` filter already dropped it — `fmt.rs`'s
+/// `sanitize_terminal_strips_f8_cursor_up_erase_line` and
+/// `render_plan_neutralizes_f8_erase_line_payload` below pin that rather
+/// than assuming it.
+///
+/// `cause` and `reason` are NOT sanitized at this render site, and that was
+/// probed rather than reasoned: every value able to reach them is either a
+/// fixed literal built in [`build_plan`], [`modified_cause`], or
+/// [`fmt::skip_reason_text`], or — the one wire interpolation, added by F2
+/// after this comment first claimed there were none — `entry.link_kind` in
+/// [`symlink_refusal`], which sanitizes it at the interpolation site.
+/// Adding another wire interpolation requires sanitizing it where it is
+/// built, or this render site stops being safe. `target.id` is
+/// likewise left as-is: it is reachable only under a different (hostile
+/// log-writer) threat model, and [`fmt::turn_list_line`] renders the same id
+/// unsanitized, so treating it here alone would split the treatment without
+/// closing anything.
+fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
+    let mut out = String::new();
+    let tool = fmt::sanitize_terminal(target.tool.as_deref().unwrap_or("—"));
+    out.push_str(&format!("undo {} ({tool})\n", fmt::short_id(&target.id)));
     for p in plans {
+        let path = fmt::sanitize_terminal(&p.entry.path);
         match &p.kind {
             PlanKind::Revert { warn } => {
-                println!("  revert  {} ({})", p.entry.path, p.entry.op);
+                let op = fmt::sanitize_terminal(&p.entry.op);
+                out.push_str(&format!("  revert  {path} ({op})\n"));
                 if let Some(cause) = warn {
-                    println!(
-                        "    WARNING: {} modified since ({cause}) — reverting anyway (--allow-modified)",
-                        p.entry.path
-                    );
+                    out.push_str(&format!(
+                        "    WARNING: {path} modified since ({cause}) — reverting anyway (--allow-modified)\n"
+                    ));
                 }
             }
             PlanKind::Excluded { cause } => {
-                println!(
-                    "  EXCLUDE {} — modified since ({cause}); --allow-modified to include",
-                    p.entry.path
-                );
+                out.push_str(&format!(
+                    "  EXCLUDE {path} — modified since ({cause}); --allow-modified to include\n"
+                ));
             }
             PlanKind::Refused { reason } => {
-                println!("  REFUSE  {} — {reason}", p.entry.path);
+                out.push_str(&format!("  REFUSE  {path} — {reason}\n"));
             }
         }
     }
     if let Some(caution) = window_caution(target, plans) {
-        println!("{caution}");
+        out.push_str(&caution);
+        out.push('\n');
     }
+    out
+}
+
+fn print_plan(target: &TurnRecord, plans: &[Plan]) {
+    print!("{}", render_plan(target, plans));
 }
 
 /// D6 honesty line. A rich turn's file list is an *activity window*, not an
@@ -1007,6 +1115,8 @@ fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<F
         baseline_unknown: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
     })
 }
 
@@ -1018,6 +1128,20 @@ fn restore_from_before(
     store: &BlobStore,
     entry: &FileEntry,
 ) -> Result<String, String> {
+    // F2, second gate. `build_plan::symlink_refusal` already keeps every
+    // link-involved entry out of the revert set; this repeats the check at
+    // the write primitive itself so no future caller of `restore_from_before`
+    // can reach `fs::write` on a link by skipping the planner. The `create`
+    // arm's `remove_file` is covered by the planner gate only — `remove_file`
+    // unlinks the link rather than following it, so it destroys a link but
+    // cannot truncate a file outside the plan.
+    if entry.link_kind.is_some() || is_symlink_on_disk(path) {
+        return Err(format!(
+            "{}: symlink — refusing to restore (writing here would replace the link or \
+             truncate its target)",
+            entry.path
+        ));
+    }
     let before_hash = entry
         .before
         .as_deref()
@@ -1091,4 +1215,335 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, op: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: Some("a".repeat(64)),
+            after: Some("b".repeat(64)),
+            op: op.to_string(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    fn turn(grade: &str, tool: Option<&str>) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            id: "t_ABCD00000000000000EFGH".to_string(),
+            grade: grade.to_string(),
+            truncated: false,
+            started: "2026-01-01T00:00:00.000Z".into(),
+            ended: "2026-01-01T00:00:01.000Z".into(),
+            tool: tool.map(String::from),
+            model: None,
+            session: None,
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: None,
+            files_complete: None,
+            files: vec![],
+        }
+    }
+
+    // Byte-exact shape of every plan row on clean input. There is no `undo`
+    // golden file (checked: `cli/tests/fixtures/golden/` has none), so this
+    // stands in for one — sanitizing an already-clean path/tool/op MUST be
+    // the identity, and a stray extra or missing `\n` from the
+    // `println!`-per-row → single-`String` refactor reds here. `tool:
+    // "agentrec"` keeps `window_caution` out of the expected text (its own
+    // tests own that line).
+    #[test]
+    fn render_plan_clean_input_is_byte_exact() {
+        let t = turn("rich", Some("agentrec"));
+        let plans = vec![
+            Plan {
+                entry: entry("src/app.rs", "modify"),
+                kind: PlanKind::Revert { warn: None },
+            },
+            Plan {
+                entry: entry("src/b.rs", "modify"),
+                kind: PlanKind::Excluded {
+                    cause: "later agent turn".to_string(),
+                },
+            },
+            Plan {
+                entry: entry("src/c.rs", "modify"),
+                kind: PlanKind::Refused {
+                    reason: "no prior snapshot to restore".to_string(),
+                },
+            },
+        ];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (agentrec)\n\
+             \x20 revert  src/app.rs (modify)\n\
+             \x20 EXCLUDE src/b.rs — modified since (later agent turn); --allow-modified to include\n\
+             \x20 REFUSE  src/c.rs — no prior snapshot to restore\n"
+        );
+    }
+
+    // F8 (redteam round 2), the attack as reported: a second file named
+    // `"\x1b[1A\x1b[2Ksrc/decoy.rs"` (cursor-up + erase-line) whose EXCLUDE
+    // row, rendered raw, erases the `revert src/prod_config.rs` row above it
+    // from the display — while `--confirm` reverts prod_config.rs anyway.
+    // Asserting only "no 0x1b in output" is too weak (a fix that swapped ESC
+    // for another active introducer would pass it), so this pins the
+    // structural property the attack needs: both rows survive, on separate
+    // lines, with the hostile filename still readable as inert literal text.
+    // RED before the fix: `p.entry.path`/`target.tool` were interpolated raw.
+    #[test]
+    fn render_plan_neutralizes_f8_erase_line_payload() {
+        let t = turn("rich", Some("\x1b[2Kclaude"));
+        let plans = vec![
+            Plan {
+                entry: entry("src/prod_config.rs", "modify"),
+                kind: PlanKind::Revert { warn: None },
+            },
+            Plan {
+                entry: entry("\x1b[1A\x1b[2Ksrc/decoy.rs", "modify"),
+                kind: PlanKind::Excluded {
+                    cause: "later agent turn".to_string(),
+                },
+            },
+        ];
+        let out = render_plan(&t, &plans);
+        assert!(!out.contains('\x1b'), "raw ESC reached the plan: {out:?}");
+        assert!(!out.chars().any(|c| {
+            let cp = c as u32;
+            cp < 0x20 && c != '\n' || cp == 0x7f || (0x80..=0x9f).contains(&cp)
+        }));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "undo t_ABCD…EFGH ([2Kclaude)");
+        assert_eq!(lines[1], "  revert  src/prod_config.rs (modify)");
+        assert_eq!(
+            lines[2],
+            "  EXCLUDE [1A[2Ksrc/decoy.rs — modified since (later agent turn); --allow-modified to include"
+        );
+    }
+
+    // The same vector on the two remaining wire fields this row can carry:
+    // `entry.op` (interpolated beside the path on a revert row) and the path
+    // repeated in the `--allow-modified` WARNING row. Both are attacker-
+    // reachable on an imported or foreign-written log, and the WARNING row is
+    // the one that says a modified file is being clobbered anyway.
+    #[test]
+    fn render_plan_sanitizes_op_and_warning_row() {
+        let t = turn("rich", None);
+        let plans = vec![Plan {
+            entry: entry("\u{9b}2Ksrc/evil.rs", "mod\x1b[1Aify"),
+            kind: PlanKind::Revert {
+                warn: Some("human or external edit".to_string()),
+            },
+        }];
+        let out = render_plan(&t, &plans);
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\u{9b}'));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "undo t_ABCD…EFGH (—)");
+        assert_eq!(lines[1], "  revert  2Ksrc/evil.rs (mod[1Aify)");
+        assert_eq!(
+            lines[2],
+            "    WARNING: 2Ksrc/evil.rs modified since (human or external edit) — reverting anyway (--allow-modified)"
+        );
+    }
+
+    // ---- F2 (red team round 2): symlink refusals -------------------------
+
+    fn plan_for(
+        root: &Path,
+        entries: Vec<FileEntry>,
+        allow_modified: bool,
+    ) -> (TurnRecord, Vec<Plan>) {
+        let store = BlobStore::new(objects_dir(root));
+        let mut t = turn("rich", Some("claude"));
+        t.files = entries;
+        let turns = vec![&t];
+        let plans = build_plan(root, &store, &t, 0, &turns, &[], &[], allow_modified);
+        (t.clone(), plans)
+    }
+
+    fn refusal_reason(plans: &[Plan]) -> String {
+        match &plans[0].kind {
+            PlanKind::Refused { reason } => reason.clone(),
+            PlanKind::Excluded { cause } => panic!("expected REFUSE, got EXCLUDE ({cause})"),
+            PlanKind::Revert { .. } => panic!("expected REFUSE, got revert"),
+        }
+    }
+
+    // Trigger 1, record side. An UNKNOWN `link_kind` value must refuse to
+    // ACT while still having parsed fine (the parse half is
+    // `record.rs::link_kind_unknown_value_round_trips`) — refuse-to-act,
+    // never refuse-to-parse. If this ever becomes an `== "symlink"` equality
+    // test, this reds.
+    #[test]
+    fn build_plan_refuses_unknown_link_kind_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut e = entry("mnt/j", "modify");
+        e.link_kind = Some("junction".to_string());
+        let (_, plans) = plan_for(root, vec![e], false);
+        assert_eq!(
+            refusal_reason(&plans),
+            "recorded as a junction — its snapshot is the link target, not file content"
+        );
+    }
+
+    // Skeptic-gate blocker (2026-08-01): `link_kind` is wire data on an open
+    // enum, and its value is interpolated into the REFUSE row the user reads
+    // before `--confirm` — F8's exact surface, reachable by a hostile log
+    // writer or a future importer. The kind must render inert.
+    #[test]
+    fn refusal_reason_sanitizes_a_hostile_link_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut e = entry("mnt/evil", "modify");
+        e.link_kind = Some("\x1b[1A\x1b[2Ksymlink".to_string());
+        let (_, plans) = plan_for(root, vec![e], false);
+        let reason = refusal_reason(&plans);
+        assert!(!reason.contains('\x1b'), "reason leaked ESC: {reason:?}");
+        assert_eq!(
+            reason,
+            "recorded as a [1A[2Ksymlink — its snapshot is the link target, not file content"
+        );
+        let rendered = render_plan(&turn("rich", Some("claude")), &plans);
+        assert!(!rendered.contains('\x1b'), "plan leaked ESC: {rendered:?}");
+    }
+
+    // Trigger 2, the LEGACY-RECORD guard: the entry carries no `link_kind`
+    // (it predates the field), so only the on-disk lstat can save it. The
+    // distinct wording is what proves this branch fired rather than trigger
+    // 1 — identical text would let this test pass for the wrong reason.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_on_disk_symlink_for_legacy_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.yaml"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.yaml", root.join("cfg.yaml")).unwrap();
+
+        let e = entry("cfg.yaml", "modify");
+        assert_eq!(e.link_kind, None, "fixture must be a pre-link_kind entry");
+        let (_, plans) = plan_for(root, vec![e], false);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link"
+        );
+    }
+
+    // `--allow-modified` overrides the modified-since EXCLUDE and nothing
+    // else. Both triggers are asserted under the flag, because the flag is
+    // exactly the path F2b weaponized.
+    #[test]
+    #[cfg(unix)]
+    fn allow_modified_never_overrides_a_symlink_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.yaml"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.yaml", root.join("cfg.yaml")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("cfg.yaml", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link"
+        );
+
+        let mut e = entry("nowhere/link", "delete");
+        e.link_kind = Some(agentrec_core::record::link_kind::SYMLINK.to_string());
+        let (_, plans) = plan_for(root, vec![e], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "recorded as a symlink — its snapshot is the link target, not file content"
+        );
+    }
+
+    // Byte-exact REFUSE row, same standing-in-for-a-golden role as
+    // `render_plan_clean_input_is_byte_exact` (there is still no `undo`
+    // golden file).
+    #[test]
+    fn render_plan_symlink_refusal_row_is_byte_exact() {
+        let t = turn("rich", Some("agentrec"));
+        let plans = vec![Plan {
+            entry: entry("cfg.yaml", "modify"),
+            kind: PlanKind::Refused {
+                reason: "path is a symlink on disk — reverting would write through the link"
+                    .to_string(),
+            },
+        }];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (agentrec)\n\
+             \x20 REFUSE  cfg.yaml — path is a symlink on disk — reverting would write through \
+             the link\n"
+        );
+    }
+
+    // F2b at the write primitive itself (the second gate). The pointed-to
+    // file must survive byte-identical — that is the whole finding: today
+    // `fs::write` truncates it and the read-back verification passes.
+    #[test]
+    #[cfg(unix)]
+    fn restore_from_before_refuses_symlink_and_leaves_target_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = BlobStore::new(objects_dir(root));
+        let target = root.join("prod.yaml");
+        std::fs::write(&target, b"PRODUCTION CONFIG\n").unwrap();
+        let link = root.join("cfg.yaml");
+        std::os::unix::fs::symlink("prod.yaml", &link).unwrap();
+
+        let mut e = entry("cfg.yaml", "modify");
+        e.before = Some(store.put(b"dev.yaml").unwrap());
+
+        let err = restore_from_before(&link, &store, &e).unwrap_err();
+        assert!(err.contains("symlink — refusing to restore"), "err: {err}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"PRODUCTION CONFIG\n",
+            "a file that was never in the plan must not be touched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive"
+        );
+    }
+
+    // The one op path `restore_from_before`'s second gate does NOT cover:
+    // reverting a `create` deletes rather than writes, so it never reaches
+    // `restore_from_before` at all and the planner gate is the only thing
+    // standing between an on-disk link and `remove_file`. That is exactly
+    // what the comment on `restore_from_before` claims, so it is pinned here
+    // rather than left as an assertion nobody measured. `remove_file`
+    // unlinks the link (it does not follow it), so the pointed-to file would
+    // survive — but the LINK would not, and undo never recorded it.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_create_op_when_path_is_an_on_disk_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", root.join("made.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("made.txt", "create")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link",
+            "a create-revert must not unlink a symlink undo never recorded"
+        );
+    }
 }

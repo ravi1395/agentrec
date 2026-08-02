@@ -243,6 +243,62 @@ pub fn enforce_budget(
     )
 }
 
+/// The byte set the budget is actually enforced over: the sum of the
+/// **unique** snapshot-blob (`FileEntry.before`/`after`) sizes referenced by
+/// `entries`. This is, by construction, the same accumulation
+/// [`plan_eviction`] runs against `budget` — same `turn_snapshot_hashes`
+/// dedup, same `store.size(..).unwrap_or(0)` lookup — which is the whole
+/// point of it living here rather than being re-derived by a caller.
+///
+/// **The equivalence this exists to make true (F26, redteam round 2):**
+/// `managed_bytes(store, entries) > budget` ⟺ `plan_eviction(store, entries,
+/// budget, _)` sets its boundary, i.e. produces a non-empty candidate set.
+/// Forward: `plan_eviction`'s `running` only ever grows by a hash's size the
+/// first time that hash is seen, so `running <= managed_bytes` at every step
+/// — if `managed_bytes <= budget` the guard `running + new_bytes > budget` can
+/// never fire and nothing is ever a candidate. Reverse: the `new_bytes` summed
+/// across a full boundary-free walk is exactly `managed_bytes`, so a walk that
+/// never trips the guard ends with `running == managed_bytes <= budget`;
+/// `managed_bytes > budget` therefore contradicts a boundary-free walk. (A5's
+/// `protect_newest` only suppresses the guard at `i == 0`, so it can delay the
+/// boundary by one turn but never prevent it.) Pinned both directions by
+/// `managed_bytes_at_or_under_budget_means_no_candidates` /
+/// `managed_bytes_over_budget_means_candidates_even_with_a_huge_orphan`.
+///
+/// **What this does NOT promise:** that being over budget frees anything. A2
+/// (prompt-shared), A5 (newest turn), `extra_protected`, and the A3(c)
+/// freshness guard can each spare a candidate, so `freed_bytes_projected` may
+/// legitimately be 0 on a genuinely over-budget store — which is why
+/// [`EvictionPlan::protected_bytes`] exists and why `status` renders it.
+///
+/// **What is outside this set, deliberately:** orphaned blobs (on disk,
+/// referenced by no turn — reclaimable only by `purge --orphans`), blobs
+/// referenced *only* as a `prompt_ref` (disjoint TTL policy, `purge`), and
+/// anything under `.agentrec/` that is not in `objects/` at all. That last
+/// class now includes the daemon's own `daemon.log`: the launchd unit routes
+/// `StandardOutPath`/`StandardErrorPath` to `<root>/.agentrec/daemon.log`
+/// (`cli/src/service.rs::daemon_log_path`), a sibling of `objects/`, and
+/// [`BlobStore::total_bytes`] walks `objects/` only — so neither this figure
+/// nor `store_bytes` sees it grow (F24 disclosure; unbounded, not fixed here).
+///
+/// Cost: one `fs::metadata` per unique referenced hash, on top of the
+/// `total_bytes` walk a caller computing both already pays.
+pub fn managed_bytes<'a>(
+    store: &BlobStore,
+    entries: impl IntoIterator<Item = &'a TurnRecord>,
+) -> u64 {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut total = 0u64;
+    for turn in entries {
+        for h in turn_snapshot_hashes(turn) {
+            if seen.insert(h.clone()) {
+                total += store.size(&h).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
 /// Unique snapshot-blob hashes (`before` + `after`) referenced by one turn.
 fn turn_snapshot_hashes(turn: &TurnRecord) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -297,6 +353,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         }
     }
 
@@ -823,5 +881,113 @@ mod tests {
         );
         assert!(store.contains(&x), "X survives execute");
         assert!(store.contains(&y));
+    }
+
+    /// F26, forward direction. `managed_bytes <= budget` must mean
+    /// `plan_eviction` has nothing to do — asserted at the boundary
+    /// (`managed == budget`, the tightest under-budget case) rather than
+    /// comfortably below it, so an off-by-one in the guard reds.
+    ///
+    /// Neuter: change `managed_bytes`' dedup to count `shared` twice (drop the
+    /// `seen.insert` guard) and `managed` reads 25 > 20, contradicting the
+    /// empty victim set this asserts alongside it.
+    #[test]
+    fn managed_bytes_at_or_under_budget_means_no_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+
+        let a = store.put(&[0xAAu8; 8]).unwrap();
+        let shared = store.put(&[0xBBu8; 5]).unwrap();
+        let b = store.put(&[0xCCu8; 7]).unwrap();
+
+        let t1 = turn(
+            "t_MB0000000000000000000001",
+            "2026-01-01T00:00:00.000Z",
+            vec![entry("x", None, Some(&a), "create")],
+        );
+        let t2 = turn(
+            "t_MB0000000000000000000002",
+            "2026-01-02T00:00:00.000Z",
+            // `shared` appears as this turn's `after` AND the next turn's
+            // `before` — counted once, which is what makes 20 the right
+            // figure rather than 25.
+            vec![entry("x", Some(&a), Some(&shared), "modify")],
+        );
+        let t3 = turn(
+            "t_MB0000000000000000000003",
+            "2026-01-03T00:00:00.000Z",
+            vec![entry("x", Some(&shared), Some(&b), "modify")],
+        );
+        let entries = vec![t1, t2, t3];
+
+        let managed = managed_bytes(&store, entries.iter());
+        assert_eq!(managed, 20, "8 + 5 + 7, `shared` counted once");
+
+        let plan = plan_eviction(&store, &entries, managed, &HashSet::new());
+        assert!(
+            plan.victims.is_empty(),
+            "managed_bytes == budget must leave nothing to evict: {:?}",
+            plan.victims
+        );
+        assert_eq!(plan.freed_bytes_projected, 0);
+    }
+
+    /// F26, reverse direction AND the defect itself. A store whose *disk*
+    /// bytes are dominated by an orphan the evictor can never touch must not
+    /// be judged over budget by those bytes — while a store whose *managed*
+    /// bytes exceed the budget must always yield candidates.
+    ///
+    /// The orphan here is 10x the referenced bytes, which is the shape F26
+    /// measured (43.4% orphaned, measured then on the dogfood store — not
+    /// re-measured here, and not a claim about any store's state now).
+    ///
+    /// Neuter: point `managed_bytes` at `store.total_bytes()` instead of the
+    /// referenced set and the first assertion reds (200 != 20).
+    #[test]
+    fn managed_bytes_over_budget_means_candidates_even_with_a_huge_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(tmp.path());
+
+        let a = store.put(&[0xAAu8; 10]).unwrap();
+        let b = store.put(&[0xCCu8; 10]).unwrap();
+        // Referenced by nothing: ineligible as a victim, yet on disk.
+        let orphan = store.put(&[0xDDu8; 180]).unwrap();
+
+        let t1 = turn(
+            "t_MB0000000000000000000011",
+            "2026-01-01T00:00:00.000Z",
+            vec![entry("x", None, Some(&a), "create")],
+        );
+        let t2 = turn(
+            "t_MB0000000000000000000012",
+            "2026-01-02T00:00:00.000Z",
+            vec![entry("y", None, Some(&b), "create")],
+        );
+        let entries = vec![t1, t2];
+
+        assert_eq!(store.total_bytes(), 200, "disk bytes include the orphan");
+        assert_eq!(
+            managed_bytes(&store, entries.iter()),
+            20,
+            "the budget's byte set excludes the orphan the evictor cannot reclaim"
+        );
+
+        // A budget between the two: over budget on disk, under it on the set
+        // eviction actually ranges over. This is exactly F26's permanent
+        // "over budget, evicting nothing" state — the evictor must be idle.
+        let idle = plan_eviction(&store, &entries, 100, &HashSet::new());
+        assert!(
+            idle.victims.is_empty(),
+            "disk-only over-budget must not produce victims: {:?}",
+            idle.victims
+        );
+        assert!(store.contains(&orphan), "the orphan is never a victim");
+
+        // And above the managed figure the boundary really does trip.
+        let busy = plan_eviction(&store, &entries, 19, &HashSet::new());
+        assert!(
+            !busy.victims.is_empty(),
+            "managed_bytes > budget must yield candidates"
+        );
     }
 }

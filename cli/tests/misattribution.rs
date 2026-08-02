@@ -363,6 +363,8 @@ fn agentrec_own_turn_carries_no_window_caution() {
             skipped: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
             withheld: false,
             baseline_unknown: false,
         }],
@@ -405,6 +407,8 @@ fn modify_entry(
         skipped: false,
         skipped_reason: None,
         after_synthesized: None,
+        link_kind: None,
+        attribution: None,
         withheld: false,
         baseline_unknown: false,
     }

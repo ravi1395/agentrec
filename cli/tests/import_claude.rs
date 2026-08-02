@@ -1704,6 +1704,8 @@ mod persist {
                     baseline_unknown: true,
                     skipped_reason: None,
                     after_synthesized: None,
+                    link_kind: None,
+                    attribution: None,
                 }],
             }),
         )

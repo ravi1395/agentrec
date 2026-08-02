@@ -8,10 +8,48 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
+/// The schema major this binary implements, for both wire schemas the
+/// protocol defines (PROTOCOL §4 signal `v`, §5 record `v`).
+///
+/// `v` is a bare integer with no minor component, so every distinct `v` IS a
+/// distinct major: PROTOCOL §10 says "a major bump is a new schema", which
+/// makes any other value a schema this binary does not implement rather than
+/// an additive extension of this one. Additive change within the major is
+/// carried by new *fields*, which serde's defaults tolerate — that half is
+/// unaffected by this constant.
+pub const SCHEMA_MAJOR: u32 = 1;
+
+/// Deserializer for the `v` field of every wire type in this module. Refuses
+/// any major other than [`SCHEMA_MAJOR`], so a record or signal from a
+/// producer this binary predates can never be parsed *as if* it were v1 and
+/// have its fields silently reinterpreted. These records gate `undo`, so a
+/// misread future record is a wrong-bytes revert source.
+///
+/// Refusal is an ordinary serde error, deliberately: it lands in the same
+/// channel every other unparseable line already uses, so no caller gains a
+/// new error path to forget to handle. [`parse_log_line`] then separates the
+/// two *causes* for the census (see [`ParsedLine::UnknownType`]).
+fn de_schema_major<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = u32::deserialize(d)?;
+    if v != SCHEMA_MAJOR {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported schema major v={v} (this binary implements v={SCHEMA_MAJOR})"
+        )));
+    }
+    Ok(v)
+}
+
 /// Emitter → recorder signal line (PROTOCOL §4). `ts` is unix milliseconds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignalEvent {
-    #[serde(default = "one")]
+    /// Absent `v` defaults to [`SCHEMA_MAJOR`]: §4 makes `v` a writer MUST,
+    /// but §10 constrains writers only and says nothing about a consumer
+    /// meeting an absent one — §1's graceful degradation, and the legacy
+    /// lines this default has always accepted, settle it as major 1.
+    #[serde(default = "one", deserialize_with = "de_schema_major")]
     pub v: u32,
     pub ts: u64,
     pub tool: String,
@@ -94,6 +132,45 @@ pub struct FileEntry {
     /// `after` to "human or external edit" — see `readcmds::modified_cause`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_synthesized: Option<bool>,
+    /// Kind of the filesystem object at `path` AT SNAPSHOT TIME, when it is
+    /// something other than an ordinary file (PROTOCOL §5, additive, open
+    /// string enum — see [`link_kind`]). `None` on every ordinary-file entry
+    /// and on every entry written before this field existed, so the wire
+    /// shape of those stays byte-identical.
+    ///
+    /// The only value this implementation writes is [`link_kind::SYMLINK`]
+    /// (writer: the daemon, `cli/src/daemon.rs`). It means the entry's
+    /// `before`/`after` hashes address the **link target string**, not file
+    /// content — the recorder deliberately does not follow symlinks
+    /// (IMPLEMENTATION.md AC B5).
+    ///
+    /// Consumers MUST refuse to *act* on an entry carrying any non-`None`
+    /// value, including an unknown future one — refuse-to-act, never
+    /// refuse-to-parse. Treating a target string as content replaces the
+    /// link with a text file, and writing to the path follows the link and
+    /// truncates a file that was never in the plan (red team round 2, F2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_kind: Option<String>,
+    /// Per-file attribution (PROTOCOL §5, additive, open string enum).
+    /// **Writer-optional, and never written by this code** — reserved for
+    /// the D6 transcript-correlation producer, which defines the value set.
+    /// Every entry this workspace constructs leaves it `None`, so it is
+    /// absent from the wire and existing records are unaffected. Consumers
+    /// MUST tolerate any value (including unknown ones) and MUST NOT derive
+    /// undo safety from it — undo safety keys on `modified-since`
+    /// (PROTOCOL §5) and on the refusal gates, never on attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
+}
+
+/// Open string enum of [`FileEntry::link_kind`] values (PROTOCOL §5).
+/// Unknown/future values MUST make a consumer refuse to ACT on the entry,
+/// never refuse to parse the line — so never match exhaustively on these,
+/// and never gate a destructive operation on recognizing one.
+pub mod link_kind {
+    /// The path was a symbolic link at snapshot time; the entry's hashes
+    /// address the link target string, not file content.
+    pub const SYMLINK: &str = "symlink";
 }
 
 /// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
@@ -125,7 +202,9 @@ pub enum LogRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TurnRecord {
-    #[serde(default = "one")]
+    /// Absent `v` defaults to [`SCHEMA_MAJOR`] — same reading as
+    /// [`SignalEvent::v`], and the same legacy lines depend on it.
+    #[serde(default = "one", deserialize_with = "de_schema_major")]
     pub v: u32,
     pub id: String,
     pub grade: String, // "rich" | "bare"
@@ -165,7 +244,8 @@ pub struct TurnRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EpochRecord {
-    #[serde(default = "one")]
+    /// Absent `v` defaults to [`SCHEMA_MAJOR`] — see [`SignalEvent::v`].
+    #[serde(default = "one", deserialize_with = "de_schema_major")]
     pub v: u32,
     pub event: String, // "start" | "stop"
     pub ts: String,    // RFC 3339
@@ -236,8 +316,16 @@ pub const KNOWN_RECORD_TYPES: [&str; 2] = ["turn", "epoch"];
 #[derive(Debug)]
 pub enum ParsedLine {
     Record(LogRecord),
-    /// Well-formed JSON tagged with a `type` this binary does not know. A
-    /// newer producer is allowed to write these; consumers tolerate them.
+    /// Well-formed JSON declaring a schema this binary does not implement:
+    /// either a `type` tag it does not know, or a `v` major other than
+    /// [`SCHEMA_MAJOR`] (PROTOCOL §10). A newer producer is allowed to write
+    /// both; consumers tolerate them. The variant name predates the version
+    /// half and is kept because [`crate::view::Ledger`] surfaces its count as
+    /// a public field.
+    ///
+    /// This bucket, not [`ParsedLine::Unparsed`], because the two counters
+    /// prescribe different user actions: an unimplemented schema means
+    /// "upgrade agentrec", torn JSON means "your log took damage".
     UnknownType,
     /// Not interpretable at all — a torn tail line after a crash, or a
     /// known record kind written malformed.
@@ -266,6 +354,22 @@ pub fn parse_log_line(line: &str) -> ParsedLine {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return ParsedLine::Unparsed;
     };
+    // A line declaring a schema major this binary does not implement was
+    // already refused above by `de_schema_major` — it is not a Record and
+    // never will be. All that is decided here is WHICH census it joins, and
+    // it is the newer-producer one, not corruption (see `UnknownType`).
+    //
+    // Keyed on `as_u64` specifically. `v` is an int in both §4 and §5, so a
+    // string/float/negative/null `v` declares no version at all; such a line
+    // falls through to the `type` match below and lands in `Unparsed` — the
+    // same rule, for the same reason, as the non-string `type` tag directly
+    // below: a malformed field is evidence of corruption, never evidence
+    // that a producer exists.
+    if let Some(major) = value.get("v").and_then(|x| x.as_u64()) {
+        if major != u64::from(SCHEMA_MAJOR) {
+            return ParsedLine::UnknownType;
+        }
+    }
     // Keyed on PRESENCE of `type`, not on it being a string: a line tagged
     // `"type": 5` is still a line that carries a type, and coercing it into a
     // turn is exactly the misparse this guard exists to prevent.
@@ -304,6 +408,13 @@ pub fn load_log(path: &Path) -> Vec<LogRecord> {
 
 /// Parse signal-file text from an offset; skips garbage lines (PROTOCOL §4
 /// tolerance). Returns events in file order.
+///
+/// A line declaring a `v` major other than [`SCHEMA_MAJOR`] is skipped here
+/// too (`de_schema_major`). Skipping is the conservative direction: a signal
+/// is a turn *boundary*, so misreading a future one mis-cuts a turn and
+/// mis-attributes every file in it. The recorder falls back to its
+/// quiet-window heuristic, which produces an honestly-unattributed `bare`
+/// turn instead of a confidently wrong `rich` one.
 pub fn parse_signals(text: &str) -> Vec<SignalEvent> {
     text.lines()
         .filter_map(|line| {
@@ -365,6 +476,8 @@ mod tests {
                 baseline_unknown: false,
                 skipped_reason: None,
                 after_synthesized: None,
+                link_kind: None,
+                attribution: None,
             }],
         };
         append_log(&path, &LogRecord::Turn(turn)).unwrap();
@@ -404,6 +517,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("skipped"));
@@ -438,6 +553,8 @@ mod tests {
             baseline_unknown: false,
             skipped_reason: None,
             after_synthesized: None,
+            link_kind: None,
+            attribution: None,
         };
         let json = serde_json::to_string(&entry_none).unwrap();
         assert_eq!(
@@ -457,6 +574,52 @@ mod tests {
         );
         let back: FileEntry = serde_json::from_str(&json2).unwrap();
         assert_eq!(back.skipped_reason.as_deref(), Some(skip_reason::OVER_CAP));
+    }
+
+    // F2 wire shape, half 1: BOTH new fields absent from the wire when
+    // `None`, so every record written before they existed is byte-identical
+    // — and an old-shape line still parses with both defaulting to `None`.
+    #[test]
+    fn link_kind_and_attribution_absent_when_none() {
+        let old_shape =
+            r#"{"path":"a.rs","before":null,"after":null,"op":"modify","skipped":true}"#;
+        let entry: FileEntry = serde_json::from_str(old_shape).unwrap();
+        assert_eq!(entry.link_kind, None);
+        assert_eq!(entry.attribution, None);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            json, old_shape,
+            "None link_kind/attribution must not appear on the wire"
+        );
+        assert!(!json.contains("link_kind"));
+        assert!(!json.contains("attribution"));
+    }
+
+    // Half 2: `Some` values survive a full round trip, including a value
+    // this binary never writes and does not recognize. Parsing MUST succeed
+    // — the refusal is the consumer's job (refuse-to-act, not
+    // refuse-to-parse); the acting half is
+    // `readcmds::build_plan_refuses_unknown_link_kind_value`.
+    #[test]
+    fn link_kind_and_attribution_round_trip_including_unknown_values() {
+        let wire = r#"{"path":"a.rs","before":null,"after":null,"op":"modify","link_kind":"junction","attribution":"agent:claude/tool-call-7"}"#;
+        let entry: FileEntry = serde_json::from_str(wire).unwrap();
+        assert_eq!(entry.link_kind.as_deref(), Some("junction"));
+        assert_eq!(
+            entry.attribution.as_deref(),
+            Some("agent:claude/tool-call-7")
+        );
+        assert_eq!(serde_json::to_string(&entry).unwrap(), wire);
+
+        let sym = FileEntry {
+            link_kind: Some(link_kind::SYMLINK.to_string()),
+            ..entry
+        };
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(json.contains(r#""link_kind":"symlink""#), "json: {json}");
+        let back: FileEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.link_kind.as_deref(), Some(link_kind::SYMLINK));
     }
 
     #[test]
@@ -637,5 +800,170 @@ mod tests {
             merges_pos < imported_pos && imported_pos < complete_pos && complete_pos < files_pos,
             "expected order ...merges, imported, files_complete, files...: {json}"
         );
+    }
+
+    // ---- F27 (redteam round 2): schema-major enforcement, PROTOCOL §10 ----
+    //
+    // These fixtures are wire literals, not struct literals, on purpose:
+    // F27 is about what a line DECLARES, and a `TurnRecord { v: 2, .. }`
+    // literal could not express a major this binary refuses to deserialize
+    // in the first place.
+
+    /// Turn-shaped JSON carrying `v_json` verbatim as its `v` value, and
+    /// `type` only when `typed`. Every other field is a real required one.
+    fn turn_wire(v_json: &str, typed: bool, id: &str) -> String {
+        let tag = if typed { r#""type":"turn","# } else { "" };
+        format!(
+            concat!(
+                "{{{}\"v\":{},\"id\":\"{}\",\"grade\":\"rich\",",
+                "\"started\":\"2026-07-05T00:00:00.000Z\",",
+                "\"ended\":\"2026-07-05T00:00:01.000Z\",",
+                "\"root\":\"/repo\",\"files\":[]}}"
+            ),
+            tag, v_json, id
+        )
+    }
+
+    // The load-bearing probe: `LogRecord` is an internally-tagged enum, so
+    // the `v` field's `deserialize_with` runs against serde's buffered
+    // `ContentDeserializer` rather than serde_json's own. If that path
+    // silently accepted, the enforcement would have a hole exactly where the
+    // finding lives — every real `log.jsonl` turn goes through it.
+    #[test]
+    fn future_major_is_refused_by_every_wire_type_including_the_tagged_enum() {
+        assert!(
+            serde_json::from_str::<LogRecord>(&turn_wire("2", true, "t_V2")).is_err(),
+            "tagged LogRecord::Turn at v=2 must not deserialize"
+        );
+        assert!(
+            serde_json::from_str::<TurnRecord>(&turn_wire("2", false, "t_V2")).is_err(),
+            "bare TurnRecord at v=2 must not deserialize"
+        );
+        assert!(
+            serde_json::from_str::<EpochRecord>(
+                r#"{"v":2,"event":"start","ts":"2026-07-05T00:00:00.000Z"}"#
+            )
+            .is_err(),
+            "EpochRecord at v=2 must not deserialize"
+        );
+        assert!(
+            serde_json::from_str::<SignalEvent>(r#"{"v":2,"ts":5000,"tool":"claude-code"}"#)
+                .is_err(),
+            "SignalEvent at v=2 must not deserialize"
+        );
+        // v=0 is equally unimplemented: `v` has no minor component, so any
+        // value other than SCHEMA_MAJOR is a different schema, not an older
+        // point release of this one.
+        assert!(serde_json::from_str::<LogRecord>(&turn_wire("0", true, "t_V0")).is_err());
+    }
+
+    // The classification half: a refused line is a NEWER PRODUCER, counted
+    // as `UnknownType`, not corruption. `view::Ledger` surfaces the two as
+    // separate counters and they prescribe different actions (upgrade vs.
+    // check for a torn log).
+    #[test]
+    fn future_major_record_classifies_as_unknown_type_not_unparsed() {
+        for typed in [true, false] {
+            assert!(
+                matches!(
+                    parse_log_line(&turn_wire("2", typed, "t_V2")),
+                    ParsedLine::UnknownType
+                ),
+                "typed={typed}: a v=2 turn must be counted as a newer producer"
+            );
+        }
+        assert!(matches!(
+            parse_log_line(r#"{"type":"epoch","v":7,"event":"start","ts":"2026-07-05T00:00:00Z"}"#),
+            ParsedLine::UnknownType
+        ));
+    }
+
+    // A non-integer `v` declares no version at all — it is a malformed field
+    // on a known record kind, i.e. corruption. Same rule, same reason, as the
+    // `"type": 5` guard: never assert a producer exists on evidence of
+    // damage. (Probed, not assumed: `u32::deserialize` rejects each of these,
+    // so none reaches `Record` either.)
+    #[test]
+    fn a_non_integer_v_is_corruption_not_a_version_declaration() {
+        for bad_v in [r#""2""#, "2.5", "-1", "null"] {
+            let line = turn_wire(bad_v, true, "t_BAD");
+            assert!(
+                matches!(parse_log_line(&line), ParsedLine::Unparsed),
+                "v={bad_v} is a malformed field, not an unknown schema: {line}"
+            );
+        }
+    }
+
+    // The supported major, and the absent-`v` legacy shape, both still parse.
+    // Absent `v` is read as SCHEMA_MAJOR: §4/§5 make `v` a writer MUST, but
+    // §10 constrains writers only and is silent on a consumer meeting an
+    // absent one, so §1 graceful degradation governs.
+    #[test]
+    fn supported_major_and_absent_v_both_still_parse() {
+        assert!(matches!(
+            parse_log_line(&turn_wire("1", true, "t_V1")),
+            ParsedLine::Record(LogRecord::Turn(_))
+        ));
+        let no_v = concat!(
+            "{\"type\":\"turn\",\"id\":\"t_NOV\",\"grade\":\"rich\",",
+            "\"started\":\"2026-07-05T00:00:00.000Z\",",
+            "\"ended\":\"2026-07-05T00:00:01.000Z\",\"root\":\"/repo\",\"files\":[]}"
+        );
+        match parse_log_line(no_v) {
+            ParsedLine::Record(LogRecord::Turn(t)) => assert_eq!(t.v, SCHEMA_MAJOR),
+            other => panic!("absent v must default to the supported major: {other:?}"),
+        }
+        // Unknown FIELDS within the supported major stay tolerated — that is
+        // the additive half of §10 and this change must not touch it.
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&turn_wire("1", true, "t_EXTRA")).unwrap();
+        extra["field_from_a_later_v1_release"] = serde_json::json!("hello");
+        assert!(matches!(
+            parse_log_line(&extra.to_string()),
+            ParsedLine::Record(LogRecord::Turn(_))
+        ));
+    }
+
+    // End to end on the real read path: a future-major record never reaches
+    // a consumer as a record. These records gate `undo`, so a misread future
+    // record is a wrong-bytes revert source — that is why refusal, and not
+    // best-effort interpretation, is the right default.
+    #[test]
+    fn future_major_records_never_reach_load_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let lines = [
+            turn_wire("1", true, "t_OK"),
+            turn_wire("2", true, "t_FUTURE_TAGGED"),
+            turn_wire("2", false, "t_FUTURE_LEGACY"),
+            r#"{"type":"epoch","v":2,"event":"start","ts":"2026-07-05T00:00:00Z"}"#.into(),
+        ];
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let records = load_log(&path);
+        assert_eq!(records.len(), 1, "only the v=1 turn may be delivered");
+        match &records[0] {
+            LogRecord::Turn(t) => assert_eq!(t.id, "t_OK"),
+            LogRecord::Epoch(_) => panic!("expected the v=1 turn"),
+        }
+    }
+
+    // Signals are turn BOUNDARIES: misreading a future one mis-cuts a turn
+    // and mis-attributes every file in it. Dropped like any other
+    // uninterpretable line, leaving the quiet-window heuristic to produce an
+    // honestly-unattributed bare turn.
+    #[test]
+    fn future_major_signal_is_dropped_while_supported_and_absent_v_survive() {
+        let text = concat!(
+            "{\"v\":2,\"ts\":5000,\"tool\":\"future-tool\",\"event\":\"start\"}\n",
+            "{\"v\":1,\"ts\":6000,\"tool\":\"claude-code\",\"event\":\"start\"}\n",
+            "{\"ts\":7000,\"tool\":\"codex\"}\n",
+            "{\"v\":\"1\",\"ts\":8000,\"tool\":\"stringly-typed\"}\n",
+        );
+        let sigs = parse_signals(text);
+        assert_eq!(sigs.len(), 2, "v=2 and a non-integer v are both dropped");
+        assert_eq!(sigs[0].tool, "claude-code");
+        assert_eq!(sigs[1].tool, "codex");
+        assert_eq!(sigs[1].v, SCHEMA_MAJOR);
     }
 }

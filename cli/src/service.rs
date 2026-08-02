@@ -92,6 +92,30 @@ fn xml_escape(s: &str) -> String {
 /// what makes the two distinguishable. Read as "no respawn observed in that
 /// window", not "every restart blocked forever": it is ONE load cycle whose
 /// duration went unrecorded.
+///
+/// **F24: `StandardOutPath`/`StandardErrorPath` both point at
+/// `<root>/.agentrec/daemon.log`.** Without them a launchd job's stdio goes to
+/// `/dev/null`, which discarded the daemon's whole diagnostic channel on
+/// macOS — including the single stderr line that is the only record eviction
+/// deleted snapshot blobs (`daemon.rs`'s eviction tick has no persistent
+/// counter). Linux needs no counterpart: systemd defaults
+/// `StandardError=journal`, so this stays macOS-only by design.
+///
+/// The destination is inside the recorded root on purpose, so a repo's
+/// diagnostics travel with the repo and `uninstall`-ing one root cannot
+/// orphan another's log. It does NOT feed the watcher back into itself:
+/// `daemon::classify` returns `Class::Ignore` for any path with a
+/// `.agentrec` component (`daemon.rs`, the built-in denylist arm), and
+/// `daemon::prune_git_and_agentrec` prunes the directory out of both
+/// `IgnoreSet::build`'s and `Recorder::scan`'s one-shot walks — so writes here
+/// open no turns and land in no `known` set. Both were read in source, not
+/// assumed.
+///
+/// Two consequences, disclosed rather than fixed: nothing rotates this file
+/// (no rotation code exists in this repo, and launchd does not rotate a
+/// `StandardErrorPath`), and it is invisible to the store budget —
+/// `BlobStore::total_bytes` walks `objects/` only, and `daemon.log` is a
+/// sibling of that directory.
 pub fn launchd_plist(exec: &Path, root: &Path) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -117,12 +141,26 @@ pub fn launchd_plist(exec: &Path, root: &Path) -> String {
 \t\t\t<true/>\n\
 \t\t</dict>\n\
 \t</dict>\n\
+\t<key>StandardOutPath</key>\n\
+\t<string>{log}</string>\n\
+\t<key>StandardErrorPath</key>\n\
+\t<string>{log}</string>\n\
 </dict>\n\
 </plist>\n",
         slug = slug(root),
         exec = xml_escape(&exec.display().to_string()),
         root = xml_escape(&root.display().to_string()),
+        log = xml_escape(&daemon_log_path(root).display().to_string()),
     )
+}
+
+/// Where the launchd unit routes the daemon's stdout/stderr (F24). Derived
+/// through `crate::agentrec_dir` — the same helper `daemon.rs`/`main.rs` use
+/// for `log.jsonl`/`signal.jsonl`/`objects/` — so the log cannot drift away
+/// from the repo's `.agentrec` layout. Pure: no filesystem access, and the
+/// `root` reaching it from `install` has already been through `resolve_root`.
+fn daemon_log_path(root: &Path) -> PathBuf {
+    crate::agentrec_dir(root).join("daemon.log")
 }
 
 /// D5: quote+escape a value for embedding as one `ExecStart=` command-line
@@ -692,6 +730,66 @@ mod tests {
         assert!(plist.contains("<string>--root</string>"));
         assert!(plist.contains("<string>/repo</string>"));
         assert!(plist.contains(&format!("com.agentrec.{}", slug(root))));
+    }
+
+    // F24: with no `StandardOutPath`/`StandardErrorPath`, launchd sends the
+    // job's stdio to `/dev/null` and every daemon `eprintln!` — including the
+    // only record that eviction deleted snapshot blobs — is discarded on
+    // macOS. Both keys must be present AND must name the log inside the
+    // recorded root's `.agentrec`, which the watcher denylists.
+    #[test]
+    fn launchd_plist_routes_stdio_to_the_repo_daemon_log() {
+        let root = Path::new("/repo");
+        let plist = launchd_plist(Path::new("/usr/local/bin/agentrec"), root);
+        let expected = root.join(".agentrec").join("daemon.log");
+        let expected = expected.display().to_string();
+        assert!(
+            plist.contains("<key>StandardOutPath</key>"),
+            "stdout must be routed: {plist}"
+        );
+        assert!(
+            plist.contains("<key>StandardErrorPath</key>"),
+            "stderr must be routed: {plist}"
+        );
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            let after = plist
+                .split(&format!("<key>{key}</key>"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{key} section missing: {plist}"));
+            let value = after
+                .split("<string>")
+                .nth(1)
+                .and_then(|c| c.split("</string>").next())
+                .unwrap_or_else(|| panic!("{key} has no <string> value: {plist}"));
+            assert_eq!(value.trim(), expected, "{key} must name the repo log");
+        }
+        // The two stdio keys sit alongside the existing ones, not instead of
+        // them: a regression that replaced the exec-discovery surface would
+        // silently blind `doctor`'s vanished-exec check.
+        assert_eq!(
+            parse_unit_exec(&plist).as_deref(),
+            Some(Path::new("/usr/local/bin/agentrec"))
+        );
+        assert_eq!(parse_unit_root(&plist).as_deref(), Some(root));
+    }
+
+    // D5 applies to the new value too: an `&` in the repo path reaches the log
+    // path as well, and an unescaped one makes the plist invalid XML — so
+    // `launchctl load` fails while `init` already claimed success.
+    #[test]
+    fn launchd_plist_escapes_the_daemon_log_path() {
+        let root = Path::new("/repo/AT&T");
+        let plist = launchd_plist(Path::new("/usr/local/bin/agentrec"), root);
+        let expected = root.join(".agentrec").join("daemon.log");
+        let escaped = xml_escape(&expected.display().to_string());
+        assert!(
+            plist.contains(&format!("<string>{escaped}</string>")),
+            "escaped log path missing: {plist}"
+        );
+        assert!(
+            !plist.contains(&format!("<string>{}</string>", expected.display())),
+            "raw ampersand leaked into the plist: {plist}"
+        );
     }
 
     #[test]
