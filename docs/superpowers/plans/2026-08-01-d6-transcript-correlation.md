@@ -115,6 +115,10 @@ against phase 2b's larger surface.
 - [x] Conformance coverage via `signal_stream_with_files_written_keeps_existing_routing` — NOTE:
       the original text named "PROTOCOL conformance fixtures", a corpus that does not exist in
       this repo (skeptic-verified); satisfied as restated, recorded rather than quietly reworded.
+      **Founder-ratified 2026-08-02** — the restatement (commit `6c86e3a`) is a legitimate
+      correction, not an AC weakening; both skeptic engagements verified its factual premises
+      (30 golden files; no conformance-fixture corpus anywhere; the named test exists), closing
+      re-gate residual 4.
 - [ ] Zero behavior change: daemon ignores the field at this phase; all goldens byte-identical.
 - [ ] claimd doc-scope note: PROTOCOL.md is not lint-ignored — declare the doc-edit claim before
       the edit (the Stop hook WILL fire; the undecided doc-scope rule is a known repo debt, not a
