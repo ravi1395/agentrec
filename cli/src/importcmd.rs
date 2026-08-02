@@ -1430,6 +1430,21 @@ mod persist {
         dirs.sort();
 
         let mut appended = 0usize;
+        // Ids appended by THIS run, kept separate from `existing_ids` on
+        // purpose. Turn ids are `hash(session_id:turn_index)`, so two
+        // session files carrying the same `sessionId` (one copy per project
+        // dir, as a worktree-resumed session produces — the real corpus
+        // holds such a pair) mint identical ids. `existing_ids` is built
+        // once before this loop and never learns what the loop appends, so
+        // both used to pass the check below and `log.jsonl` gained two turns
+        // under one id with different `files` — which makes `diff`/`show`/
+        // `undo <id>` fail as ambiguous. Merging the two sets would be
+        // wrong: a hit on `existing_ids` is the normal, silent
+        // idempotent-resume path (it is what `appended: 0` on a re-run
+        // means), while a hit here is real data going unimported and must
+        // be counted.
+        let mut run_ids: HashSet<String> = HashSet::new();
+        let mut skipped_duplicate_turn_id = 0usize;
         for project_dir in dirs {
             let mut session_files: Vec<PathBuf> = fs::read_dir(&project_dir)
                 .into_iter()
@@ -1473,6 +1488,10 @@ mod persist {
                         if existing_ids.contains(&t.id) {
                             continue; // idempotent resume/re-run
                         }
+                        if !run_ids.insert(t.id.clone()) {
+                            skipped_duplicate_turn_id += 1;
+                            continue;
+                        }
                     }
                     crate::loglock::append_log_locked(&log_path, &record)?;
                     appended += 1;
@@ -1504,6 +1523,11 @@ mod persist {
                 // entry not lexically under its session's `cwd` used to
                 // silently vanish; now counted (never recovered/imported).
                 "skipped_out_of_cwd": scope.skipped_out_of_cwd,
+                // Turns dropped because an earlier session file in this same
+                // run already appended their deterministic id (same
+                // `sessionId` across two project dirs). Counted, never
+                // silent — the dropped turn's `files` are NOT imported.
+                "skipped_duplicate_turn_id": skipped_duplicate_turn_id,
             });
             if oracle_on {
                 obj["t2_oracle"] = serde_json::json!({
@@ -1544,6 +1568,7 @@ mod persist {
                 t15.rejected_unverifiable
             );
             println!("skipped_out_of_cwd: {}", scope.skipped_out_of_cwd);
+            println!("skipped_duplicate_turn_id: {skipped_duplicate_turn_id}");
             if oracle_on {
                 println!(
                     "t2_oracle (AC5b, T1 entries only): mismatches={} of {} both-resolved",

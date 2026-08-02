@@ -1225,6 +1225,124 @@ mod persist {
         );
     }
 
+    // ---- Intra-run id collision (clm_7VYKN2SDTGENZEMXMT4BNXJACP): turn ids
+    // are `hash(session_id:turn_index)`, so two session files carrying the
+    // SAME `sessionId` (a worktree-resumed session lands one copy per
+    // project dir — the real corpus holds such a pair) mint identical ids.
+    // `existing_ids` is built once before the loop and never learned ids
+    // appended during the run, so both used to append: two `log.jsonl`
+    // turns under one id, which makes `diff`/`show`/`undo <id>` ambiguous.
+    // The second is now skipped and COUNTED (never silently dropped).
+
+    fn dup_session_lines(cwd: &str, sid: &str, file: &str) -> Vec<String> {
+        vec![
+            format!(
+                r#"{{"type":"user","uuid":"u_{file}","timestamp":"2026-06-12T09:00:00.000Z","sessionId":"{sid}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"edit {file}"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a_{file}","timestamp":"2026-06-12T09:00:05.000Z","sessionId":"{sid}","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"tu_{file}","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/{file}","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ]
+    }
+
+    #[test]
+    fn intra_run_duplicate_session_id_appends_one_turn_and_counts_the_skip() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let cwd = root.path().to_string_lossy().to_string();
+
+        // Same `sessionId`, two project dirs, DIFFERENT touched files — so a
+        // duplicate append would be two same-id turns disagreeing on `files`.
+        write_session(
+            source.path(),
+            "projA",
+            "s_dup",
+            &dup_session_lines(&cwd, "s_dup", "a.txt"),
+        );
+        write_session(
+            source.path(),
+            "projB",
+            "s_dup",
+            &dup_session_lines(&cwd, "s_dup", "b.txt"),
+        );
+
+        let out = run_persist(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("appended: 1"),
+            "one id must yield one turn, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("skipped_duplicate_turn_id: 1"),
+            "the dropped turn must be counted in text output, got: {stdout}"
+        );
+
+        let turns = turn_lines(root.path());
+        assert_eq!(turns.len(), 1, "exactly one turn on the wire: {turns:?}");
+
+        // JSON report carries the same counter under the same key.
+        let root2 = tempfile::tempdir().unwrap();
+        init_repo(root2.path());
+        let cwd2 = root2.path().to_string_lossy().to_string();
+        let source2 = tempfile::tempdir().unwrap();
+        write_session(
+            source2.path(),
+            "projA",
+            "s_dup2",
+            &dup_session_lines(&cwd2, "s_dup2", "a.txt"),
+        );
+        write_session(
+            source2.path(),
+            "projB",
+            "s_dup2",
+            &dup_session_lines(&cwd2, "s_dup2", "b.txt"),
+        );
+        let out_json = run_persist_json(source2.path(), root2.path());
+        assert!(out_json.status.success(), "{out_json:?}");
+        let report: Value = serde_json::from_slice(&out_json.stdout).unwrap();
+        assert_eq!(report["appended"], 1, "report: {report}");
+        assert_eq!(report["skipped_duplicate_turn_id"], 1, "report: {report}");
+    }
+
+    /// Guard: the intra-run set must only ever collide across DISTINCT
+    /// logical turns. A single session file yielding several turns has a
+    /// distinct `turn_index` per turn, so all of them must still append —
+    /// every other persist test in this file is one-turn-per-file and so
+    /// cannot catch an over-eager skip.
+    #[test]
+    fn multi_turn_session_file_still_appends_every_turn() {
+        let source = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let cwd = root.path().to_string_lossy().to_string();
+
+        let mut lines = dup_session_lines(&cwd, "s_multi", "a.txt");
+        lines.extend(vec![
+            format!(
+                r#"{{"type":"user","uuid":"u2_multi","timestamp":"2026-06-12T10:00:00.000Z","sessionId":"s_multi","cwd":"{cwd}","isSidechain":false,"message":{{"role":"user","content":"now edit b.txt"}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","uuid":"a2_multi","timestamp":"2026-06-12T10:00:05.000Z","sessionId":"s_multi","cwd":"{cwd}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"tool_use","id":"tu2_multi","name":"Edit","input":{{}}}}]}},"toolUseResult":{{"type":"update","filePath":"{cwd}/b.txt","oldString":"one","newString":"ONE","originalFile":"one\ntwo\n"}}}}"#
+            ),
+        ]);
+        write_session(source.path(), "proj", "s_multi", &lines);
+
+        let out = run_persist(source.path(), root.path());
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("appended: 2"),
+            "two prompts in one file are two distinct turns: {stdout}"
+        );
+        assert!(
+            stdout.contains("skipped_duplicate_turn_id: 0"),
+            "no collision here: {stdout}"
+        );
+        assert_eq!(turn_lines(root.path()).len(), 2);
+    }
+
     // ---- AC4 (clm_6TEDAJ0DE6S93FAQ7BYQPRE1WE): import-missing-`before`
     // entries have `baseline_unknown == false`, asserted on the wire. ------
 

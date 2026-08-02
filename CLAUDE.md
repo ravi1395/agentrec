@@ -302,16 +302,22 @@ carries only current state, what's next, and standing debts.
    **Remaining on this branch: open a PR.** Nothing is merged to `main` yet.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1,
    which is still unanswered.
-2. **NOT DONE — plan exit was reached without it, deliberately and on the record.** It was
-   never a plan-exit checkbox, so doing it would have been scope the exit did not authorize;
-   saying so beats letting a "recommended before plan exit" line rot into a false implication
-   that it happened. Still owed, still cheap. Original note follows verbatim.
-   **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
-   `existing_ids` never gains ids appended during the current run, so two session files sharing a
-   `sessionId` in one run would append two turns with the same id and different `files`, making
-   `diff`/`show`/`undo <id>` error "ambiguous". The shape is real, not hypothetical — the corpus
-   holds one such `sessionId` across two project dirs (worktree-resumed session), inert today only
-   because one copy is a 1-line cwd-less stub.
+2. ~~import's `existing_ids` intra-run staleness~~ **DONE 2026-08-03 on
+   `fix/import-existing-ids-staleness` (unmerged, no PR yet; NOT skeptic-gated).** The defect was
+   real and reproduced before the fix: a two-project-dir fixture sharing one `sessionId` printed
+   `appended: 2` and wrote two `log.jsonl` turns under one id (ids are
+   `hash(session_id:turn_index)`), which is what makes `diff`/`show`/`undo <id>` ambiguous.
+   Semantics chosen (founder-approved): **skip the second, count it** — no new id-derivation rule,
+   so PROTOCOL turn-id semantics are untouched. `existing_ids` (prior runs) stays a SILENT skip —
+   it is what `appended: 0` on a re-run means — and a separate `run_ids` set counts intra-run
+   collisions as `skipped_duplicate_turn_id`, surfaced in BOTH the text and `--json` reports
+   (mirrors `skipped_out_of_cwd`). The dropped turn's `files` are not imported; that loss is
+   countable, not silent. Two new tests: the collision case, plus a guard that a single session
+   file yielding two turns still appends both (every other persist test is one-turn-per-file, so
+   the suite could not have caught an over-eager skip). Suite **751 / 0 / 3** (base 749/0/3);
+   clippy `-D warnings` + fmt clean. **Deliberately not done:** dry-run's report gains no
+   equivalent counter — dry-run appends nothing and its classifier counts entries, not appended
+   turns, so persist may now report one fewer turn than dry-run predicts for a colliding corpus.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
@@ -337,21 +343,12 @@ carries only current state, what's next, and standing debts.
     from which labels disappeared, not proof, and it is recorded as inference.
   - **The product defect that produced all 40 is fixed (D46)** — see Current state. `init` under a
     temp root installs no unit, so this cannot silently re-accumulate; `doctor` reports any that do.
-- **BLOCKS/AFFECTS A PUBLIC PHASE 2: `init` bakes a CANONICALIZED exec path, which breaks every
-  Homebrew user on upgrade.** `initcmd::current_exe()` does `current_exe().canonicalize()`;
-  canonicalize fully resolves symlinks, and Homebrew installs binaries as symlinks into
-  version-pinned Cellar paths (verified on this machine: `/opt/homebrew/bin/rg ->
-  ../Cellar/ripgrep/15.2.0/bin/rg`). README.md:51 documents `brew install
-  ravi1395/agentrec/agentrec` as a supported path, so a brew user's unit records
-  `…/Cellar/agentrec/<version>/bin/agentrec`. Two consequences — **(1) certain: after `brew
-  upgrade` the service keeps running the OLD binary forever** (user upgrades, recorder doesn't);
-  (2) once the old Cellar version is cleaned up, the unit becomes a launchd status-78 respawn loop
-  on the user's machine — exactly the failure this repo just cleaned 39 of. Fix is small and does
-  not need canonicalize: record the INVOCATION path (`/opt/homebrew/bin/agentrec`), which is stable
-  across upgrades. Canonicalizing is correct for the **root** (dedupes `.` vs absolute, D5) and
-  wrong for the **exec**. NOT BUILT — found 2026-07-31 while root-causing the 40 orphans. No brew
-  formula exists in this repo (`find` for `*.rb` → none), so the tap was not inspected; the claim
-  is about the documented install path plus the verified symlink layout.
+- ~~**`init` bakes a CANONICALIZED exec path, breaking every Homebrew user on upgrade**~~ **FIXED
+  and this bullet was STALE — retired 2026-08-03 after re-reading the source, not the record.**
+  `initcmd::service_exec_path()` is deliberately non-canonicalized and documents exactly why (brew
+  symlink → Cellar version pin → status-78 respawn loop); both call sites use it. **Residual, stated
+  in that doc comment and NOT fixed because it cannot be:** on Linux `std::env::current_exe()` reads
+  `/proc/self/exe`, already kernel-resolved, so a symlinked Linux install still records the target.
 - **The 40 orphans' root cause — this bullet was itself wrong once, and the correction of the
   correction is the load-bearing part.** The original recorded cause was "`init` in a temp dir
   without a matching uninstall". This bullet then "corrected" it to *build trees, **not** temp
