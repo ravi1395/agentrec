@@ -313,11 +313,44 @@ carries only current state, what's next, and standing debts.
    collisions as `skipped_duplicate_turn_id`, surfaced in BOTH the text and `--json` reports
    (mirrors `skipped_out_of_cwd`). The dropped turn's `files` are not imported; that loss is
    countable, not silent. Two new tests: the collision case, plus a guard that a single session
-   file yielding two turns still appends both (every other persist test is one-turn-per-file, so
-   the suite could not have caught an over-eager skip). Suite **751 / 0 / 3** (base 749/0/3);
-   clippy `-D warnings` + fmt clean. **Deliberately not done:** dry-run's report gains no
-   equivalent counter — dry-run appends nothing and its classifier counts entries, not appended
-   turns, so persist may now report one fewer turn than dry-run predicts for a colliding corpus.
+   file yielding two turns still appends both. Suite **751 / 0 / 3** (base 749/0/3); clippy
+   `-D warnings` + fmt clean. Skeptic gate in an isolated worktree: **round 1 GATE FAIL on the
+   RECORD, not the code** — AC1–AC7/AC8(b)/AC9 all PASS on evidence the skeptic generated itself
+   (it neutered the guard and reproduced the two-same-id log plus live `ambiguous turn id` errors
+   from `show`/`diff`/`undo`, and mutation-probed the guard test in both directions). The four
+   record defects below are its findings, now fixed:
+   - **Forward-only, and NO rewrite class repairs the damage.** A log already carrying a same-id
+     pair from a pre-fix import stays ambiguous forever: `purge --log-duplicates` keys on
+     `view::same_revert`, which requires equal `files`, and these duplicates differ in `files` by
+     construction. Skeptic-measured on such a log: `0 duplicate(s) removed`, `show <id>` still
+     ambiguous. `import claude` is already on `main` (`a90e9ff`), so this is a live user-visible
+     consequence. A repair needs a **fourth sanctioned rewrite class** (decision-register entry) —
+     deliberately NOT built; also unmeasured: nobody knows how many repos already hold such a pair,
+     and no verb detects it.
+   - **Corpus grounding corrected — signature-defect instance #9, caught by the gate.** The
+     replaced text carried a measured caveat ("inert today only because one copy is a 1-line
+     cwd-less stub"); this round deleted it while re-asserting "the real corpus holds such a pair"
+     in two NEW code comments. Skeptic re-measured read-only over 2,134 session files: exactly ONE
+     `sessionId` spans two project dirs, one copy a 1-line `bridge-session` stub with no `cwd`, so
+     the real pair mints **zero** colliding turns (`sessions_importable: 1 (50.0%)`, `appended:
+     0`). Caveat restored in both comments. **The shape is real; the live corpus is not evidence
+     the guard fires.**
+   - **The skip leaves no durable wire trace.** The counter is run-scoped stdout, so re-importing
+     the same colliding corpus prints `skipped_duplicate_turn_id: 0` while the collision persists.
+     `skipped_out_of_cwd` at least marks the surviving turn `files_complete: Some(false)`; this has
+     no analogue. Recorded, not built.
+   - **Which copy survives is lexical** (`dirs.sort()` then `session_files.sort()`) — deterministic
+     but unrelated to richness, so the kept copy may be the poorer one.
+   - Commit-message inference trimmed: "every other persist test is one-turn-per-file" is true, but
+     the skeptic's coarse `[..6]` key mutation also reds `ac2_resume_…`. Its own caveat kept: that
+     mutation is coarser than a realistic per-session over-eager skip, which `ac2_resume` would NOT
+     catch, so the new guard test still earns its place.
+   **Deliberately not done:** dry-run's report gains no equivalent counter — dry-run appends
+   nothing and its classifier counts entries, not appended turns (its JSON has no turn-count key at
+   all, so "one fewer turn than dry-run predicts" is loose wording for a comparison dry-run never
+   emits; the substance — no dedupe, no collide count — is skeptic-verified).
+   **Unverified by anyone:** the Linux `/proc/self/exe` residual in `service_exec_path` (needs a
+   Linux symlinked install + `init --dry-run`, unrunnable on darwin).
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 

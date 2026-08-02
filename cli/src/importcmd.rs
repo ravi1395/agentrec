@@ -1433,8 +1433,17 @@ mod persist {
         // Ids appended by THIS run, kept separate from `existing_ids` on
         // purpose. Turn ids are `hash(session_id:turn_index)`, so two
         // session files carrying the same `sessionId` (one copy per project
-        // dir, as a worktree-resumed session produces — the real corpus
-        // holds such a pair) mint identical ids. `existing_ids` is built
+        // dir, as a worktree-resumed session produces) mint identical ids.
+        // Corpus grounding, measured read-only on 2,134 session files under
+        // `~/.claude/projects` on ONE machine (2026-08-03, under a <=30-day
+        // rolling backfill — not a population): exactly ONE `sessionId`
+        // appears in more than one project dir, and one of its two copies is
+        // a 1-line `bridge-session` stub with no `cwd`, so importing that
+        // real pair mints ZERO colliding turns today (`sessions_importable:
+        // 1 (50.0%)`, `appended: 0`). The shape is real and the guard is
+        // cheap; the live corpus is NOT evidence that it fires. Two rich
+        // copies of one resumed session would, and nothing rules that out.
+        // `existing_ids` is built
         // once before this loop and never learns what the loop appends, so
         // both used to pass the check below and `log.jsonl` gained two turns
         // under one id with different `files` — which makes `diff`/`show`/
@@ -1443,6 +1452,24 @@ mod persist {
         // idempotent-resume path (it is what `appended: 0` on a re-run
         // means), while a hit here is real data going unimported and must
         // be counted.
+        //
+        // Two bounded, deliberate residuals of this shape, both verified:
+        // (1) FORWARD-ONLY. A log already carrying a same-id pair from a
+        //     pre-fix import is NOT repaired here, and no sanctioned rewrite
+        //     class repairs it either: `purge --log-duplicates` keys on
+        //     `view::same_revert`, which requires equal `files`, and these
+        //     duplicates differ in `files` by construction. Measured on such
+        //     a log: "0 duplicate(s) removed", and `show <id>` stays
+        //     ambiguous. Repairing it needs a fourth rewrite class (a
+        //     decision-register entry), deliberately not built.
+        // (2) The skip leaves NO durable trace on the wire — the counter is
+        //     run-scoped stdout, so re-importing the same colliding corpus
+        //     prints `skipped_duplicate_turn_id: 0` while the collision
+        //     persists. `skipped_out_of_cwd` at least marks the surviving
+        //     turn `files_complete: Some(false)`; this has no analogue.
+        // Which copy survives is `dirs.sort()` then `session_files.sort()` —
+        // deterministic lexical order, NOT a richness comparison, so the
+        // kept copy may be the poorer one.
         let mut run_ids: HashSet<String> = HashSet::new();
         let mut skipped_duplicate_turn_id = 0usize;
         for project_dir in dirs {

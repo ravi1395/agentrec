@@ -1228,7 +1228,11 @@ mod persist {
     // ---- Intra-run id collision (clm_7VYKN2SDTGENZEMXMT4BNXJACP): turn ids
     // are `hash(session_id:turn_index)`, so two session files carrying the
     // SAME `sessionId` (a worktree-resumed session lands one copy per
-    // project dir — the real corpus holds such a pair) mint identical ids.
+    // project dir) mint identical ids. These fixtures are SYNTHETIC and the
+    // live corpus does not currently exercise this — see the measurement in
+    // `importcmd.rs`'s `run_ids` comment: the one real cross-dir `sessionId`
+    // on the measured machine has a 1-line stub as its second copy and mints
+    // zero colliding turns. Guard, not a reproduction of observed damage.
     // `existing_ids` is built once before the loop and never learned ids
     // appended during the run, so both used to append: two `log.jsonl`
     // turns under one id, which makes `diff`/`show`/`undo <id>` ambiguous.
