@@ -1430,6 +1430,57 @@ mod persist {
         dirs.sort();
 
         let mut appended = 0usize;
+        // Ids appended by THIS run, kept separate from `existing_ids` on
+        // purpose. Turn ids are `hash(session_id:turn_index)`, so two
+        // session files carrying the same `sessionId` (one copy per project
+        // dir, as a worktree-resumed session produces) mint identical ids.
+        // Corpus grounding, measured read-only on 2,134 session files under
+        // `~/.claude/projects` on ONE machine (2026-08-03, under a <=30-day
+        // rolling backfill — not a population): exactly ONE `sessionId`
+        // appears in more than one project dir, and one of its two copies is
+        // a 1-line `bridge-session` stub with no `cwd`, so importing that
+        // real pair mints ZERO colliding turns today (`sessions_importable:
+        // 1 (50.0%)`, `appended: 0`). The shape is real and the guard is
+        // cheap; the live corpus is NOT evidence that it fires. Two rich
+        // copies of one resumed session would, and nothing rules that out.
+        // `existing_ids` is built
+        // once before this loop and never learns what the loop appends, so
+        // both used to pass the check below and `log.jsonl` gained two turns
+        // under one id with different `files` — which makes `diff`/`show`/
+        // `undo <id>` fail as ambiguous. Merging the two sets would be
+        // wrong: a hit on `existing_ids` is the normal, silent
+        // idempotent-resume path (it is what `appended: 0` on a re-run
+        // means), while a hit here is real data going unimported and must
+        // be counted.
+        //
+        // Two bounded, deliberate residuals of this shape, both verified:
+        // (1) FORWARD-ONLY. A log already carrying a same-id pair from a
+        //     pre-fix import is NOT repaired here, and no sanctioned rewrite
+        //     class repairs it either: `purge --log-duplicates` keys on
+        //     `view::same_revert`, which requires equal `files`. A same-id
+        //     pair with EQUAL `files` is repairable (and never surfaces as
+        //     ambiguous — `view::resolve_turn` collapses it); the harmful
+        //     pair, the one whose copies touched different files, is exactly
+        //     the one `same_revert` refuses. Measured on such a log: "0
+        //     duplicate(s) removed", and `show <id>` stays ambiguous.
+        //     Repairing it needs a fourth rewrite class (a decision-register
+        //     entry), deliberately not built.
+        // (2) The skip leaves NO durable trace on the wire — the counter is
+        //     run-scoped stdout, so re-importing the same colliding corpus
+        //     prints `skipped_duplicate_turn_id: 0` while the collision
+        //     persists. Neither skip has a discriminating marker:
+        //     `files_complete: Some(false)` is set UNCONDITIONALLY on every
+        //     imported turn (single assignment site, in this file's
+        //     `persist_session_file`; `fmt.rs` renders it as the blanket
+        //     "partial file list (imported)" AC7 marker), so it says
+        //     "imported", never "entries were dropped here". Verified: a
+        //     repo with `skipped_out_of_cwd: 0` and one with
+        //     `skipped_out_of_cwd: 2` render identically.
+        // Which copy survives is `dirs.sort()` then `session_files.sort()` —
+        // deterministic lexical order, NOT a richness comparison, so the
+        // kept copy may be the poorer one.
+        let mut run_ids: HashSet<String> = HashSet::new();
+        let mut skipped_duplicate_turn_id = 0usize;
         for project_dir in dirs {
             let mut session_files: Vec<PathBuf> = fs::read_dir(&project_dir)
                 .into_iter()
@@ -1473,6 +1524,10 @@ mod persist {
                         if existing_ids.contains(&t.id) {
                             continue; // idempotent resume/re-run
                         }
+                        if !run_ids.insert(t.id.clone()) {
+                            skipped_duplicate_turn_id += 1;
+                            continue;
+                        }
                     }
                     crate::loglock::append_log_locked(&log_path, &record)?;
                     appended += 1;
@@ -1504,6 +1559,11 @@ mod persist {
                 // entry not lexically under its session's `cwd` used to
                 // silently vanish; now counted (never recovered/imported).
                 "skipped_out_of_cwd": scope.skipped_out_of_cwd,
+                // Turns dropped because an earlier session file in this same
+                // run already appended their deterministic id (same
+                // `sessionId` across two project dirs). Counted, never
+                // silent — the dropped turn's `files` are NOT imported.
+                "skipped_duplicate_turn_id": skipped_duplicate_turn_id,
             });
             if oracle_on {
                 obj["t2_oracle"] = serde_json::json!({
@@ -1544,6 +1604,7 @@ mod persist {
                 t15.rejected_unverifiable
             );
             println!("skipped_out_of_cwd: {}", scope.skipped_out_of_cwd);
+            println!("skipped_duplicate_turn_id: {skipped_duplicate_turn_id}");
             if oracle_on {
                 println!(
                     "t2_oracle (AC5b, T1 entries only): mismatches={} of {} both-resolved",

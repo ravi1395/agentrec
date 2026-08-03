@@ -302,16 +302,141 @@ carries only current state, what's next, and standing debts.
    **Remaining on this branch: open a PR.** Nothing is merged to `main` yet.
    Wave 2 (aider import, trailers + shim, npm/mise) after or parallel per open question 1,
    which is still unanswered.
-2. **NOT DONE — plan exit was reached without it, deliberately and on the record.** It was
-   never a plan-exit checkbox, so doing it would have been scope the exit did not authorize;
-   saying so beats letting a "recommended before plan exit" line rot into a false implication
-   that it happened. Still owed, still cheap. Original note follows verbatim.
-   **One-line fix recommended before plan exit** (skeptic-flagged, non-blocking): import's
-   `existing_ids` never gains ids appended during the current run, so two session files sharing a
-   `sessionId` in one run would append two turns with the same id and different `files`, making
-   `diff`/`show`/`undo <id>` error "ambiguous". The shape is real, not hypothetical — the corpus
-   holds one such `sessionId` across two project dirs (worktree-resumed session), inert today only
-   because one copy is a 1-line cwd-less stub.
+2. ~~import's `existing_ids` intra-run staleness~~ **DONE 2026-08-03 on
+   `fix/import-existing-ids-staleness` (unmerged, no PR yet; NOT skeptic-gated).** The defect was
+   real and reproduced before the fix: a two-project-dir fixture sharing one `sessionId` printed
+   `appended: 2` and wrote two `log.jsonl` turns under one id (ids are
+   `hash(session_id:turn_index)`), which is what makes `diff`/`show`/`undo <id>` ambiguous.
+   Semantics chosen (founder-approved): **skip the second, count it** — no new id-derivation rule,
+   so PROTOCOL turn-id semantics are untouched. `existing_ids` (prior runs) stays a SILENT skip —
+   it is what `appended: 0` on a re-run means — and a separate `run_ids` set counts intra-run
+   collisions as `skipped_duplicate_turn_id`, surfaced in BOTH the text and `--json` reports
+   (mirrors `skipped_out_of_cwd`). The dropped turn's `files` are not imported; that loss is
+   countable, not silent. Two new tests: the collision case, plus a guard that a single session
+   file yielding two turns still appends both. Suite **751 / 0 / 3** (base 749/0/3); clippy
+   `-D warnings` + fmt clean. Skeptic gate in an isolated worktree: **round 1 GATE FAIL on the
+   RECORD, not the code** — AC1–AC7/AC8(b)/AC9 all PASS on evidence the skeptic generated itself
+   (it neutered the guard and reproduced the two-same-id log plus live `ambiguous turn id` errors
+   from `show`/`diff`/`undo`, and mutation-probed the guard test in both directions). **AC8(a) —
+   "the new CLAUDE.md item text is true" — was the single blocking FAIL**; it is the only AC not
+   listed as passing above. Its five findings, now fixed. **Round 2 (scoped to the record fix) also
+   GATE FAILED and is fixed below too — the fix-commit itself shipped signature-defect instance
+   #10.**
+   - **Forward-only, and NO rewrite class repairs the damage.** A log already carrying a same-id
+     pair from a pre-fix import stays ambiguous forever: `purge --log-duplicates` keys on
+     `view::same_revert`, which requires equal `files`. Round 2 sharpened this: an equal-`files`
+     same-id pair IS repairable (and never surfaces as ambiguous — `view::resolve_turn` collapses
+     it); `same_revert` refuses exactly the harmful pair, the one whose copies touched different
+     files. Skeptic-measured on such a log, against an equal-`files` control that repairs cleanly:
+     `0 duplicate(s) removed`, `show <id>` still ambiguous. `import claude` is already on `main` (`a90e9ff`), so this is a live user-visible
+     consequence. A repair needs a **fourth sanctioned rewrite class** (decision-register entry) —
+     deliberately NOT built; also unmeasured: nobody knows how many repos already hold such a pair,
+     and no verb detects it.
+   - **Corpus grounding corrected — signature-defect instance #9, caught by the gate.** The
+     replaced text carried a measured caveat ("inert today only because one copy is a 1-line
+     cwd-less stub"); this round deleted it while re-asserting "the real corpus holds such a pair"
+     in two NEW code comments. Caveat restored in both comments. Round 2 **re-measured this
+     independently** rather than taking round 1's word (two channels, agreeing): ~2,134 distinct
+     `sessionId`s over 2,136 depth-2 session files, exactly ONE spanning two project dirs, its
+     second copy a 1-line `bridge-session` stub with no `cwd`, so the real pair mints **zero**
+     colliding turns (`sessions_importable: 1 (50.0%)`, `appended: 0`, and
+     `skipped_duplicate_turn_id: 0` at BOTH roots — the last figure is what actually establishes
+     "zero colliding", since `appended` is root-dependent). Hedges checked and accurate: one
+     machine; ≤30-day backfill confirmed (`-mtime +30` → 0 files, 30.03-day span). The file count
+     drifted 2136→2146 within an hour of probing, so **the absolute is not a gradeable figure**.
+     **The shape is real; the live corpus is not evidence the guard fires.**
+   - **The skip leaves no durable wire trace — and round 2 falsified this round's first attempt at
+     saying why (signature-defect instance #10, written into BOTH records, copied verbatim from
+     round 1's report without checking source).** The false sentence was "`skipped_out_of_cwd` at
+     least marks the surviving turn `files_complete: Some(false)`; this has no analogue".
+     `files_complete: Some(false)` is set **unconditionally on every imported turn** (single
+     assignment site in `importcmd.rs::persist_session_file`; `fmt.rs` renders it as the blanket
+     AC7 "partial file list (imported)" marker), so it discriminates nothing — a repo with
+     `skipped_out_of_cwd: 0` renders identically to one with `skipped_out_of_cwd: 2`, and the
+     dup-skip survivor carries the same flag. Corrected statement: the counter is run-scoped stdout
+     (re-importing the same colliding corpus prints `skipped_duplicate_turn_id: 0` while the
+     collision persists — verified), and **neither** skip has a discriminating durable marker.
+     Recorded, not built.
+   - **Which copy survives is lexical** (`dirs.sort()` then `session_files.sort()`) — deterministic
+     but unrelated to richness, so the kept copy may be the poorer one.
+   - Commit-message inference trimmed: "every other persist test is one-turn-per-file" is true, but
+     the skeptic's coarse `[..6]` key mutation also reds `ac2_resume_…`. Its own caveat was
+     **probed and holds** in round 2: a realistic per-session over-eager skip
+     (`run_ids.insert(t.session…)`) reds ONLY the new guard test (1 failure, not 2), so the guard
+     earns its place.
+   **Deliberately not done:** dry-run's report gains no equivalent counter — dry-run appends
+   nothing and its classifier counts entries, not appended turns (its JSON has no turn-count key at
+   all — key set enumerated by the gate — so "one fewer turn than dry-run predicts" is loose
+   wording for a comparison dry-run never emits; the substance — no dedupe, no collide count — is
+   skeptic-verified).
+   **Round-2 residuals, recorded not fixed:** (a) `files_complete` cannot distinguish "import
+   dropped entries from this turn" from "complete but imported" — pre-existing, and it is what
+   falsified the text above; (b) the claim's `evidence` event is pinned to `2a60395` while later
+   commits edit both its `stale_on` files — the re-evidence event at `306c26d` was left UNCOMMITTED
+   for a round (the gate correctly read the claim STALE at HEAD from the committed ledger while the
+   working tree read EVIDENCED), now committed; (c) **the repo's recorded "multi-filter `cargo
+   test` matches only one TESTNAME" lesson does not hold on `cargo 1.97.1 (Homebrew, darwin)` —
+   for EITHER flavor.** Positional: two test-name args → `2 passed; 35 filtered out` (measured
+   three times). `--test`: `--test import_claude --test golden -- --list` runs BOTH binaries (37
+   and 33 tests; each alone gives its own count, so the two-flag run is their union). An earlier
+   version of this bullet asserted the restriction "holds for `--test`, not for test-name
+   arguments" — false, and self-contradictory with its own first clause; it was written without a
+   command behind it and the gate killed it (see the recurrence note below). Whether the P1-era
+   REFUTED claims were correct on their contemporaneous cargo is untested and unrecoverable
+   without that version; those claims are founder-owned and untouched here. (d) **Stale-build
+   hazard the gate hit:** editing only
+   `cli/src/importcmd.rs` and re-running `cargo test --test import_claude` can execute a STALE
+   `target/debug/agentrec` and pass under a mutation that demonstrably breaks — `cargo build` (or
+   touch the test source) before any mutation probe against the binary.
+   **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
+   `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
+   (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
+   **Every gate round up to the passing one FAILED, and every blocker was in the RECORD — never
+   once in the code.** No round count is stated here on purpose: a tally embedded in the text being
+   gated is undercounted by one on every next verdict, which is how the earlier "five" went stale
+   the moment round 6 closed. Round 1: the item's own text (AC8(a); resting on round 1's per-AC
+   table, which was never persisted — see the rider below). Round 2: the `files_complete` sentence
+   (defect #10). Round 3: the `cargo
+   --test` clause. Round 4: a paragraph, written here, generalizing rounds 1–3 into a lesson — *"the
+   failure mode is asserting without a command behind it when the subject isn't code"*. **False,
+   and DELETED rather than reworded:** #3 (`strip_prefix(cwd).ok()?` beside a comment claiming cwd
+   "is lexically a prefix in every real transcript" — 507/2,170 entries dropped) and #4
+   (`parse_log_line`'s string-tag guard beside a comment promising no coercion), both recorded
+   above in this file, are code-subject assertions made without a command. (Bare `#n` here means a
+   signature-defect instance; gate rounds are written "round n".) Round 5: three clauses inside
+   the paragraph that deleted round 4's lesson — a misstated provenance, a count of "ten recorded
+   instances" when only **8 are recorded anywhere** (#1 and #2 exist solely as an implication of
+   the ordinal in "the third instance"; `git log -S` finds nothing), and a miscitation of this
+   file's own "instances 6–8" bullet, which says **one of them** was a copied miscount, not all
+   three.
+   **No replacement lesson is offered, and none should be written from this sample.** The
+   numbering is also not one series: the P2 gate bullet says "the third instance of this **plan's**
+   signature defect", the D46 AC-S2 bullet says "fifth instance of this **repo's**". Reconciling or
+   reconstructing #1–#2 is founder-owned; until then any sentence counting the series is
+   unverifiable. **Anchors, not line numbers, deliberately** — the round-6 gate caught this very
+   sentence citing "line 535" for text that this commit's own +6 shift had already moved to 541,
+   which is the exact rot this file records against itself ("F1's line-number citations rotted by
+   later same-branch commits — now file:symbol").
+   **Provenance of round 4's blocker, corrected — it ran the other way from what this file said
+   one round ago.** The tooling-vs-source partition was written by the round-3 SKEPTIC, unprompted,
+   in that report's Remaining risk; this file then hardened it into the absolute "never about this
+   repo's own source" and cited the gate as its authority. The prior wording ("supplied by the
+   agent to its own gate") took blame the agent had not earned, and the round-5 gate refused it.
+   What the agent did own is the hardening and the citation.
+   The base figure is no longer a restatement: `769560d` re-measured after `cargo build` →
+   **749 passed / 0 failed / 3 ignored**, twice and independently — once by the orchestrator in a
+   detached worktree, once by the round-4 gate via `git archive` extraction (it is barred from
+   `git worktree add`, which writes into the production repo's `.git`). Same figure on both
+   channels, so the +2 delta is measured at both ends. Residual as the gate stated it: neither
+   channel rules out a test whose behavior depends on being inside a git repo shifting BOTH
+   endpoints equally; a `git clone --local` re-run would. The gate noted its own residual is
+   conservative — the two channels differ precisely on the `.git` property and agree at 749, which
+   is itself evidence against git-dependence.
+   **Still unverifiable, and the rider must travel with the sentence:** "AC8(a) was round 1's
+   single blocking FAIL" — round 1's per-AC verdict table was never persisted (gate confirmed:
+   nothing in `docs/verify/`, no `VERIFY-LEDGER.md` row, `AC8(a)` appears only here), so restating
+   it without this rider would let it rot into fact. Also unaudited: whether signature-defect
+   instances 1, 2 and 5–8 share any category at all.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
@@ -337,21 +462,12 @@ carries only current state, what's next, and standing debts.
     from which labels disappeared, not proof, and it is recorded as inference.
   - **The product defect that produced all 40 is fixed (D46)** — see Current state. `init` under a
     temp root installs no unit, so this cannot silently re-accumulate; `doctor` reports any that do.
-- **BLOCKS/AFFECTS A PUBLIC PHASE 2: `init` bakes a CANONICALIZED exec path, which breaks every
-  Homebrew user on upgrade.** `initcmd::current_exe()` does `current_exe().canonicalize()`;
-  canonicalize fully resolves symlinks, and Homebrew installs binaries as symlinks into
-  version-pinned Cellar paths (verified on this machine: `/opt/homebrew/bin/rg ->
-  ../Cellar/ripgrep/15.2.0/bin/rg`). README.md:51 documents `brew install
-  ravi1395/agentrec/agentrec` as a supported path, so a brew user's unit records
-  `…/Cellar/agentrec/<version>/bin/agentrec`. Two consequences — **(1) certain: after `brew
-  upgrade` the service keeps running the OLD binary forever** (user upgrades, recorder doesn't);
-  (2) once the old Cellar version is cleaned up, the unit becomes a launchd status-78 respawn loop
-  on the user's machine — exactly the failure this repo just cleaned 39 of. Fix is small and does
-  not need canonicalize: record the INVOCATION path (`/opt/homebrew/bin/agentrec`), which is stable
-  across upgrades. Canonicalizing is correct for the **root** (dedupes `.` vs absolute, D5) and
-  wrong for the **exec**. NOT BUILT — found 2026-07-31 while root-causing the 40 orphans. No brew
-  formula exists in this repo (`find` for `*.rb` → none), so the tap was not inspected; the claim
-  is about the documented install path plus the verified symlink layout.
+- ~~**`init` bakes a CANONICALIZED exec path, breaking every Homebrew user on upgrade**~~ **FIXED
+  and this bullet was STALE — retired 2026-08-03 after re-reading the source, not the record.**
+  `initcmd::service_exec_path()` is deliberately non-canonicalized and documents exactly why (brew
+  symlink → Cellar version pin → status-78 respawn loop); both call sites use it. **Residual, stated
+  in that doc comment and NOT fixed because it cannot be:** on Linux `std::env::current_exe()` reads
+  `/proc/self/exe`, already kernel-resolved, so a symlinked Linux install still records the target.
 - **The 40 orphans' root cause — this bullet was itself wrong once, and the correction of the
   correction is the load-bearing part.** The original recorded cause was "`init` in a temp dir
   without a matching uninstall". This bullet then "corrected" it to *build trees, **not** temp
@@ -453,10 +569,18 @@ carries only current state, what's next, and standing debts.
   (15 MiB) — reversible-until-deleted, disk-only.
 - 13 stale local branches (git-guardrails hook blocks agent `branch -D`; command was handed
   over 2026-07-28).
-- 5 claimd claims DECLARED awaiting manual attestation (never self-attested).
-- **66 claimd claims STALE on scope-drift** after the PR #8 merge brought the round's file
-  content onto `main` (`claimd status`, 2026-07-30). Re-confirmation is owed and was NOT done
-  in the merge — same shape as the prior rounds' "re-confirm N stale claims" commits.
+- **17 claimd claims DECLARED awaiting manual attestation** (never self-attested; both
+  branches' queues combined by the merge union).
+- ~~66 claimd claims STALE (PR #8 scope-drift)~~ **mechanically re-confirmed 2026-08-01**
+  (full `verify --all-stale` batches during the redteam round). Post-merge-union state
+  (`claimd status`, 2026-08-01 02:20): **211 claims — 163 confirmed, 5 stale
+  (deferred/missing replay specs, cannot replay), 26 refuted, 17 declared.** Of the 26
+  refuted: this round's 9 are all claim-cmd authoring bugs, each superseded by a CONFIRMED
+  replacement (incl. 2 refuted only by the merge legitimately bringing PR #10's D46 comments
+  into cli/src — superseded by `clm_7W9107CC`); the remaining ~17 are **PR #10's round
+  claims broken by the squash + this branch's additive golden keys** (byte-identical-golden
+  and worktree-pinned replays) — re-declaration of that round's claims is owed and was NOT
+  done here (not this round's evidence to rewrite); same shape as the PR #8 debt above.
 - Undecided claimd doc-scope rule: `PROTOCOL.md` is not lint-ignored — next normative-doc
   edit fires the Stop hook again.
 - ~~PROTOCOL.md §3 amendment (D48 loose end)~~ **DONE 2026-08-01 (founder-directed):** §3 now

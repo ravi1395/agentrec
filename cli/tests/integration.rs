@@ -9388,18 +9388,56 @@ fn hook_corrupt_store_safe_under_concurrent_append() {
         }
     }
 
-    // Every hook attempt against the still-corrupt store recorded exactly
-    // one failure stat — the corrupt line was seeded once and never healed,
-    // so `iterations` calls means `iterations` failure lines.
+    // Every hook attempt records exactly one stat, and against a store that
+    // was seeded corrupt and never healed the only two shapes it may take
+    // are a `store_corrupt` failure or an abandonment at the hard wall.
+    //
+    // This deliberately does NOT assert `failures == iterations`. That was
+    // the original form and it is false by design on a slow runner: the
+    // hook's contract is that it ABANDONS work at its time budget, and an
+    // attempt that hits the wall before reaching the store records
+    // `budget_exceeded` instead of a failure. Observed on ubuntu-22.04 in CI
+    // (run 30856992210): 19 `store_corrupt` + 1 `{"budget_exceeded": true,
+    // "elapsed_ms": 50}` = 20 attempts, a correct run failing a wrong
+    // assertion. Same runner-coupling class as
+    // `hook_recall_hard_wall_deadline`.
+    //
+    // The ratchet is kept by three conjuncts rather than one: no stat may go
+    // missing or be duplicated (count), no stat may take a third shape
+    // (e.g. a failure with some other `reason`, or a silent success against
+    // a corrupt store), and the corrupt path must actually have been
+    // exercised at least once — without that last clause a run where every
+    // attempt timed out would pass while proving nothing.
     let stats = memory_stats_lines(&root);
     let failures = stats
         .iter()
         .filter(|s| s.get("failure").and_then(|f| f.as_bool()) == Some(true))
         .count();
+    let abandoned = stats
+        .iter()
+        .filter(|s| s.get("budget_exceeded").and_then(|b| b.as_bool()) == Some(true))
+        .count();
+
     assert_eq!(
-        failures as u64, iterations,
-        "expected one failure stat per hook attempt against the permanently corrupt \
+        stats.len() as u64,
+        iterations,
+        "expected exactly one stat per hook attempt against the permanently corrupt \
          store: {stats:?}"
+    );
+    for s in &stats {
+        let corrupt_failure = s.get("failure").and_then(|f| f.as_bool()) == Some(true)
+            && s.get("reason").and_then(|r| r.as_str()) == Some("store_corrupt");
+        let hit_the_wall = s.get("budget_exceeded").and_then(|b| b.as_bool()) == Some(true);
+        assert!(
+            corrupt_failure || hit_the_wall,
+            "a stat against a permanently corrupt store must be either a \
+             store_corrupt failure or a hard-wall abandonment, got: {s:?}"
+        );
+    }
+    assert!(
+        failures >= 1,
+        "the corrupt path was never exercised — all {abandoned} attempt(s) hit the \
+         hard wall, so this run proves nothing about corrupt-store handling: {stats:?}"
     );
 }
 
