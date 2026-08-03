@@ -391,17 +391,37 @@ carries only current state, what's next, and standing debts.
    **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
    `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
    (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
-   **The recurrence's actual shape, named by the round-3 gate and worth more than the individual
-   fixes:** three consecutive commits each shipped a NEW unverified assertion, and all three were
-   about **tooling or another agent's report** (`files_complete` copied verbatim from a skeptic
-   report; the `cargo --test` clause; "re-evidenced at HEAD"), never about this repo's own source —
-   every source claim in this round held up under adversarial probing. The failure mode is not hard
-   facts; it is asserting without a command behind it *when the subject isn't code*. Rounds: 1 FAIL
-   (record), 2 FAIL (defect #10), 3 FAIL (this bullet's own earlier text).
-   The base figure is no longer a restatement: `769560d` re-measured in a detached worktree after
-   `cargo build` → **749 passed / 0 failed / 3 ignored**, so the +2 delta is measured at both ends.
-   **Still unverifiable:** "AC8(a) was round 1's single blocking FAIL" — round 1's verdict table
-   was not persisted.
+   **Four gate rounds, every one a FAIL, and every blocker in the RECORD rather than the code —
+   which is itself the round's most important fact.** 1: the item's own text (AC8(a)). 2: the
+   `files_complete` sentence (defect #10). 3: the `cargo --test` clause. 4: a paragraph, written
+   here, generalizing rounds 1–3 into a lesson — *"the failure mode is asserting without a command
+   behind it when the subject isn't code"*. **That lesson was false and is deleted, not reworded.**
+   Two instances recorded ABOVE IN THIS FILE refute it: #3 (`strip_prefix(cwd).ok()?` beside a
+   comment claiming cwd "is lexically a prefix in every real transcript" — 507/2,170 entries
+   dropped) and #4 (`parse_log_line`'s string-tag guard beside a comment promising no coercion) are
+   both code-subject assertions made without a command. The paragraph also could not keep its own
+   arithmetic straight (three assertions spanning two commits, or three commits including #9's
+   real-corpus claim, which is neither tooling nor another agent's report — either way it was
+   wrong), and it filed defect #10 under provenance ("copied from a skeptic report") when its
+   SUBJECT was this repo's source, which is what made the partition look clean.
+   **No replacement lesson is offered here.** A pattern derived from a sample chosen after the fact
+   is what failed; deriving a new one from the same sample would repeat it. Any real lesson has to
+   come from all ten recorded instances at once, and nobody has done that audit. What survives is
+   narrow and mechanical: **the round-3 framing this paragraph hardened was supplied by the agent
+   to its own gate and then cited back as the gate's authority** — the same shape CLAUDE.md already
+   records for instances 6–8 ("the skeptic's own miscount copied verbatim").
+   The base figure is no longer a restatement: `769560d` re-measured after `cargo build` →
+   **749 passed / 0 failed / 3 ignored**, twice and independently — once by the orchestrator in a
+   detached worktree, once by the round-4 gate via `git archive` extraction (it is barred from
+   `git worktree add`, which writes into the production repo's `.git`). Same figure on both
+   channels, so the +2 delta is measured at both ends. Residual the gate stated: neither channel
+   rules out a test whose behavior depends on being inside a git repo shifting BOTH endpoints
+   equally; a `git clone --local` re-run would.
+   **Still unverifiable, and the rider must travel with the sentence:** "AC8(a) was round 1's
+   single blocking FAIL" — round 1's per-AC verdict table was never persisted (gate confirmed:
+   nothing in `docs/verify/`, no `VERIFY-LEDGER.md` row, `AC8(a)` appears only here), so restating
+   it without this rider would let it rot into fact. Also unaudited: whether signature-defect
+   instances 1, 2 and 5–8 share any category at all.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
