@@ -372,17 +372,36 @@ carries only current state, what's next, and standing debts.
    **Round-2 residuals, recorded not fixed:** (a) `files_complete` cannot distinguish "import
    dropped entries from this turn" from "complete but imported" — pre-existing, and it is what
    falsified the text above; (b) the claim's `evidence` event is pinned to `2a60395` while later
-   commits edit both its `stale_on` files — re-evidenced at HEAD, bookkeeping only; (c) **the
-   repo's recorded "multi-filter `cargo test` matches only one TESTNAME" lesson is wrong for
-   POSITIONAL filters** — measured twice on this toolchain (`2 passed; 35 filtered out`); it holds
-   for `--test`, not for test-name arguments. The two REFUTED P1 claims blamed on it are founder-
-   owned and untouched here. (d) **Stale-build hazard the gate hit:** editing only
+   commits edit both its `stale_on` files — the re-evidence event at `306c26d` was left UNCOMMITTED
+   for a round (the gate correctly read the claim STALE at HEAD from the committed ledger while the
+   working tree read EVIDENCED), now committed; (c) **the repo's recorded "multi-filter `cargo
+   test` matches only one TESTNAME" lesson does not hold on `cargo 1.97.1 (Homebrew, darwin)` —
+   for EITHER flavor.** Positional: two test-name args → `2 passed; 35 filtered out` (measured
+   three times). `--test`: `--test import_claude --test golden -- --list` runs BOTH binaries (37
+   and 33 tests; each alone gives its own count, so the two-flag run is their union). An earlier
+   version of this bullet asserted the restriction "holds for `--test`, not for test-name
+   arguments" — false, and self-contradictory with its own first clause; it was written without a
+   command behind it and the gate killed it (see the recurrence note below). Whether the P1-era
+   REFUTED claims were correct on their contemporaneous cargo is untested and unrecoverable
+   without that version; those claims are founder-owned and untouched here. (d) **Stale-build
+   hazard the gate hit:** editing only
    `cli/src/importcmd.rs` and re-running `cargo test --test import_claude` can execute a STALE
    `target/debug/agentrec` and pass under a mutation that demonstrably breaks — `cargo build` (or
    touch the test source) before any mutation probe against the binary.
    **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
    `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
    (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
+   **The recurrence's actual shape, named by the round-3 gate and worth more than the individual
+   fixes:** three consecutive commits each shipped a NEW unverified assertion, and all three were
+   about **tooling or another agent's report** (`files_complete` copied verbatim from a skeptic
+   report; the `cargo --test` clause; "re-evidenced at HEAD"), never about this repo's own source —
+   every source claim in this round held up under adversarial probing. The failure mode is not hard
+   facts; it is asserting without a command behind it *when the subject isn't code*. Rounds: 1 FAIL
+   (record), 2 FAIL (defect #10), 3 FAIL (this bullet's own earlier text).
+   The base figure is no longer a restatement: `769560d` re-measured in a detached worktree after
+   `cargo build` → **749 passed / 0 failed / 3 ignored**, so the +2 delta is measured at both ends.
+   **Still unverifiable:** "AC8(a) was round 1's single blocking FAIL" — round 1's verdict table
+   was not persisted.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
