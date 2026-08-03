@@ -391,10 +391,13 @@ carries only current state, what's next, and standing debts.
    **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
    `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
    (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
-   **Five gate rounds, every one a FAIL, and every blocker in the RECORD — never once in the
-   code.** 1: the item's own text (AC8(a); resting on round 1's per-AC table, which was never
-   persisted — see the rider below). 2: the `files_complete` sentence (defect #10). 3: the `cargo
-   --test` clause. 4: a paragraph, written here, generalizing rounds 1–3 into a lesson — *"the
+   **Every gate round up to the passing one FAILED, and every blocker was in the RECORD — never
+   once in the code.** No round count is stated here on purpose: a tally embedded in the text being
+   gated is undercounted by one on every next verdict, which is how the earlier "five" went stale
+   the moment round 6 closed. Round 1: the item's own text (AC8(a); resting on round 1's per-AC
+   table, which was never persisted — see the rider below). Round 2: the `files_complete` sentence
+   (defect #10). Round 3: the `cargo
+   --test` clause. Round 4: a paragraph, written here, generalizing rounds 1–3 into a lesson — *"the
    failure mode is asserting without a command behind it when the subject isn't code"*. **False,
    and DELETED rather than reworded:** #3 (`strip_prefix(cwd).ok()?` beside a comment claiming cwd
    "is lexically a prefix in every real transcript" — 507/2,170 entries dropped) and #4
