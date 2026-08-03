@@ -399,15 +399,21 @@ carries only current state, what's next, and standing debts.
    and DELETED rather than reworded:** #3 (`strip_prefix(cwd).ok()?` beside a comment claiming cwd
    "is lexically a prefix in every real transcript" — 507/2,170 entries dropped) and #4
    (`parse_log_line`'s string-tag guard beside a comment promising no coercion), both recorded
-   above in this file, are code-subject assertions made without a command. 5: three clauses inside
-   the paragraph that deleted #4's lesson — a misstated provenance, a count of "ten recorded
+   above in this file, are code-subject assertions made without a command. (Bare `#n` here means a
+   signature-defect instance; gate rounds are written "round n".) Round 5: three clauses inside
+   the paragraph that deleted round 4's lesson — a misstated provenance, a count of "ten recorded
    instances" when only **8 are recorded anywhere** (#1 and #2 exist solely as an implication of
    the ordinal in "the third instance"; `git log -S` finds nothing), and a miscitation of this
-   file's own line 30, which says one of instances 6–8 was a copied miscount, not all three.
+   file's own "instances 6–8" bullet, which says **one of them** was a copied miscount, not all
+   three.
    **No replacement lesson is offered, and none should be written from this sample.** The
-   numbering is also not one series: line 182 says "this **plan's** signature defect", line 535
-   says "this **repo's**". Reconciling or reconstructing #1–#2 is founder-owned; until then any
-   sentence counting the series is unverifiable.
+   numbering is also not one series: the P2 gate bullet says "the third instance of this **plan's**
+   signature defect", the D46 AC-S2 bullet says "fifth instance of this **repo's**". Reconciling or
+   reconstructing #1–#2 is founder-owned; until then any sentence counting the series is
+   unverifiable. **Anchors, not line numbers, deliberately** — the round-6 gate caught this very
+   sentence citing "line 535" for text that this commit's own +6 shift had already moved to 541,
+   which is the exact rot this file records against itself ("F1's line-number citations rotted by
+   later same-branch commits — now file:symbol").
    **Provenance of round 4's blocker, corrected — it ran the other way from what this file said
    one round ago.** The tooling-vs-source partition was written by the round-3 SKEPTIC, unprompted,
    in that report's Remaining risk; this file then hardened it into the absolute "never about this
