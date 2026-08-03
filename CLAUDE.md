@@ -391,32 +391,38 @@ carries only current state, what's next, and standing debts.
    **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
    `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
    (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
-   **Four gate rounds, every one a FAIL, and every blocker in the RECORD rather than the code —
-   which is itself the round's most important fact.** 1: the item's own text (AC8(a)). 2: the
-   `files_complete` sentence (defect #10). 3: the `cargo --test` clause. 4: a paragraph, written
-   here, generalizing rounds 1–3 into a lesson — *"the failure mode is asserting without a command
-   behind it when the subject isn't code"*. **That lesson was false and is deleted, not reworded.**
-   Two instances recorded ABOVE IN THIS FILE refute it: #3 (`strip_prefix(cwd).ok()?` beside a
-   comment claiming cwd "is lexically a prefix in every real transcript" — 507/2,170 entries
-   dropped) and #4 (`parse_log_line`'s string-tag guard beside a comment promising no coercion) are
-   both code-subject assertions made without a command. The paragraph also could not keep its own
-   arithmetic straight (three assertions spanning two commits, or three commits including #9's
-   real-corpus claim, which is neither tooling nor another agent's report — either way it was
-   wrong), and it filed defect #10 under provenance ("copied from a skeptic report") when its
-   SUBJECT was this repo's source, which is what made the partition look clean.
-   **No replacement lesson is offered here.** A pattern derived from a sample chosen after the fact
-   is what failed; deriving a new one from the same sample would repeat it. Any real lesson has to
-   come from all ten recorded instances at once, and nobody has done that audit. What survives is
-   narrow and mechanical: **the round-3 framing this paragraph hardened was supplied by the agent
-   to its own gate and then cited back as the gate's authority** — the same shape CLAUDE.md already
-   records for instances 6–8 ("the skeptic's own miscount copied verbatim").
+   **Five gate rounds, every one a FAIL, and every blocker in the RECORD — never once in the
+   code.** 1: the item's own text (AC8(a); resting on round 1's per-AC table, which was never
+   persisted — see the rider below). 2: the `files_complete` sentence (defect #10). 3: the `cargo
+   --test` clause. 4: a paragraph, written here, generalizing rounds 1–3 into a lesson — *"the
+   failure mode is asserting without a command behind it when the subject isn't code"*. **False,
+   and DELETED rather than reworded:** #3 (`strip_prefix(cwd).ok()?` beside a comment claiming cwd
+   "is lexically a prefix in every real transcript" — 507/2,170 entries dropped) and #4
+   (`parse_log_line`'s string-tag guard beside a comment promising no coercion), both recorded
+   above in this file, are code-subject assertions made without a command. 5: three clauses inside
+   the paragraph that deleted #4's lesson — a misstated provenance, a count of "ten recorded
+   instances" when only **8 are recorded anywhere** (#1 and #2 exist solely as an implication of
+   the ordinal in "the third instance"; `git log -S` finds nothing), and a miscitation of this
+   file's own line 30, which says one of instances 6–8 was a copied miscount, not all three.
+   **No replacement lesson is offered, and none should be written from this sample.** The
+   numbering is also not one series: line 182 says "this **plan's** signature defect", line 535
+   says "this **repo's**". Reconciling or reconstructing #1–#2 is founder-owned; until then any
+   sentence counting the series is unverifiable.
+   **Provenance of round 4's blocker, corrected — it ran the other way from what this file said
+   one round ago.** The tooling-vs-source partition was written by the round-3 SKEPTIC, unprompted,
+   in that report's Remaining risk; this file then hardened it into the absolute "never about this
+   repo's own source" and cited the gate as its authority. The prior wording ("supplied by the
+   agent to its own gate") took blame the agent had not earned, and the round-5 gate refused it.
+   What the agent did own is the hardening and the citation.
    The base figure is no longer a restatement: `769560d` re-measured after `cargo build` →
    **749 passed / 0 failed / 3 ignored**, twice and independently — once by the orchestrator in a
    detached worktree, once by the round-4 gate via `git archive` extraction (it is barred from
    `git worktree add`, which writes into the production repo's `.git`). Same figure on both
-   channels, so the +2 delta is measured at both ends. Residual the gate stated: neither channel
-   rules out a test whose behavior depends on being inside a git repo shifting BOTH endpoints
-   equally; a `git clone --local` re-run would.
+   channels, so the +2 delta is measured at both ends. Residual as the gate stated it: neither
+   channel rules out a test whose behavior depends on being inside a git repo shifting BOTH
+   endpoints equally; a `git clone --local` re-run would. The gate noted its own residual is
+   conservative — the two channels differ precisely on the `.git` property and agree at 749, which
+   is itself evidence against git-dependence.
    **Still unverifiable, and the rider must travel with the sentence:** "AC8(a) was round 1's
    single blocking FAIL" — round 1's per-AC verdict table was never persisted (gate confirmed:
    nothing in `docs/verify/`, no `VERIFY-LEDGER.md` row, `AC8(a)` appears only here), so restating
