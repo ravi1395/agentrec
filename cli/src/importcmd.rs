@@ -1457,16 +1457,25 @@ mod persist {
         // (1) FORWARD-ONLY. A log already carrying a same-id pair from a
         //     pre-fix import is NOT repaired here, and no sanctioned rewrite
         //     class repairs it either: `purge --log-duplicates` keys on
-        //     `view::same_revert`, which requires equal `files`, and these
-        //     duplicates differ in `files` by construction. Measured on such
-        //     a log: "0 duplicate(s) removed", and `show <id>` stays
-        //     ambiguous. Repairing it needs a fourth rewrite class (a
-        //     decision-register entry), deliberately not built.
+        //     `view::same_revert`, which requires equal `files`. A same-id
+        //     pair with EQUAL `files` is repairable (and never surfaces as
+        //     ambiguous — `view::resolve_turn` collapses it); the harmful
+        //     pair, the one whose copies touched different files, is exactly
+        //     the one `same_revert` refuses. Measured on such a log: "0
+        //     duplicate(s) removed", and `show <id>` stays ambiguous.
+        //     Repairing it needs a fourth rewrite class (a decision-register
+        //     entry), deliberately not built.
         // (2) The skip leaves NO durable trace on the wire — the counter is
         //     run-scoped stdout, so re-importing the same colliding corpus
         //     prints `skipped_duplicate_turn_id: 0` while the collision
-        //     persists. `skipped_out_of_cwd` at least marks the surviving
-        //     turn `files_complete: Some(false)`; this has no analogue.
+        //     persists. Neither skip has a discriminating marker:
+        //     `files_complete: Some(false)` is set UNCONDITIONALLY on every
+        //     imported turn (single assignment site, in this file's
+        //     `persist_session_file`; `fmt.rs` renders it as the blanket
+        //     "partial file list (imported)" AC7 marker), so it says
+        //     "imported", never "entries were dropped here". Verified: a
+        //     repo with `skipped_out_of_cwd: 0` and one with
+        //     `skipped_out_of_cwd: 2` render identically.
         // Which copy survives is `dirs.sort()` then `session_files.sort()` —
         // deterministic lexical order, NOT a richness comparison, so the
         // kept copy may be the poorer one.

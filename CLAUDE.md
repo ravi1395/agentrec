@@ -317,40 +317,72 @@ carries only current state, what's next, and standing debts.
    `-D warnings` + fmt clean. Skeptic gate in an isolated worktree: **round 1 GATE FAIL on the
    RECORD, not the code** — AC1–AC7/AC8(b)/AC9 all PASS on evidence the skeptic generated itself
    (it neutered the guard and reproduced the two-same-id log plus live `ambiguous turn id` errors
-   from `show`/`diff`/`undo`, and mutation-probed the guard test in both directions). The four
-   record defects below are its findings, now fixed:
+   from `show`/`diff`/`undo`, and mutation-probed the guard test in both directions). **AC8(a) —
+   "the new CLAUDE.md item text is true" — was the single blocking FAIL**; it is the only AC not
+   listed as passing above. Its five findings, now fixed. **Round 2 (scoped to the record fix) also
+   GATE FAILED and is fixed below too — the fix-commit itself shipped signature-defect instance
+   #10.**
    - **Forward-only, and NO rewrite class repairs the damage.** A log already carrying a same-id
      pair from a pre-fix import stays ambiguous forever: `purge --log-duplicates` keys on
-     `view::same_revert`, which requires equal `files`, and these duplicates differ in `files` by
-     construction. Skeptic-measured on such a log: `0 duplicate(s) removed`, `show <id>` still
-     ambiguous. `import claude` is already on `main` (`a90e9ff`), so this is a live user-visible
+     `view::same_revert`, which requires equal `files`. Round 2 sharpened this: an equal-`files`
+     same-id pair IS repairable (and never surfaces as ambiguous — `view::resolve_turn` collapses
+     it); `same_revert` refuses exactly the harmful pair, the one whose copies touched different
+     files. Skeptic-measured on such a log, against an equal-`files` control that repairs cleanly:
+     `0 duplicate(s) removed`, `show <id>` still ambiguous. `import claude` is already on `main` (`a90e9ff`), so this is a live user-visible
      consequence. A repair needs a **fourth sanctioned rewrite class** (decision-register entry) —
      deliberately NOT built; also unmeasured: nobody knows how many repos already hold such a pair,
      and no verb detects it.
    - **Corpus grounding corrected — signature-defect instance #9, caught by the gate.** The
      replaced text carried a measured caveat ("inert today only because one copy is a 1-line
      cwd-less stub"); this round deleted it while re-asserting "the real corpus holds such a pair"
-     in two NEW code comments. Skeptic re-measured read-only over 2,134 session files: exactly ONE
-     `sessionId` spans two project dirs, one copy a 1-line `bridge-session` stub with no `cwd`, so
-     the real pair mints **zero** colliding turns (`sessions_importable: 1 (50.0%)`, `appended:
-     0`). Caveat restored in both comments. **The shape is real; the live corpus is not evidence
-     the guard fires.**
-   - **The skip leaves no durable wire trace.** The counter is run-scoped stdout, so re-importing
-     the same colliding corpus prints `skipped_duplicate_turn_id: 0` while the collision persists.
-     `skipped_out_of_cwd` at least marks the surviving turn `files_complete: Some(false)`; this has
-     no analogue. Recorded, not built.
+     in two NEW code comments. Caveat restored in both comments. Round 2 **re-measured this
+     independently** rather than taking round 1's word (two channels, agreeing): ~2,134 distinct
+     `sessionId`s over 2,136 depth-2 session files, exactly ONE spanning two project dirs, its
+     second copy a 1-line `bridge-session` stub with no `cwd`, so the real pair mints **zero**
+     colliding turns (`sessions_importable: 1 (50.0%)`, `appended: 0`, and
+     `skipped_duplicate_turn_id: 0` at BOTH roots — the last figure is what actually establishes
+     "zero colliding", since `appended` is root-dependent). Hedges checked and accurate: one
+     machine; ≤30-day backfill confirmed (`-mtime +30` → 0 files, 30.03-day span). The file count
+     drifted 2136→2146 within an hour of probing, so **the absolute is not a gradeable figure**.
+     **The shape is real; the live corpus is not evidence the guard fires.**
+   - **The skip leaves no durable wire trace — and round 2 falsified this round's first attempt at
+     saying why (signature-defect instance #10, written into BOTH records, copied verbatim from
+     round 1's report without checking source).** The false sentence was "`skipped_out_of_cwd` at
+     least marks the surviving turn `files_complete: Some(false)`; this has no analogue".
+     `files_complete: Some(false)` is set **unconditionally on every imported turn** (single
+     assignment site in `importcmd.rs::persist_session_file`; `fmt.rs` renders it as the blanket
+     AC7 "partial file list (imported)" marker), so it discriminates nothing — a repo with
+     `skipped_out_of_cwd: 0` renders identically to one with `skipped_out_of_cwd: 2`, and the
+     dup-skip survivor carries the same flag. Corrected statement: the counter is run-scoped stdout
+     (re-importing the same colliding corpus prints `skipped_duplicate_turn_id: 0` while the
+     collision persists — verified), and **neither** skip has a discriminating durable marker.
+     Recorded, not built.
    - **Which copy survives is lexical** (`dirs.sort()` then `session_files.sort()`) — deterministic
      but unrelated to richness, so the kept copy may be the poorer one.
    - Commit-message inference trimmed: "every other persist test is one-turn-per-file" is true, but
-     the skeptic's coarse `[..6]` key mutation also reds `ac2_resume_…`. Its own caveat kept: that
-     mutation is coarser than a realistic per-session over-eager skip, which `ac2_resume` would NOT
-     catch, so the new guard test still earns its place.
+     the skeptic's coarse `[..6]` key mutation also reds `ac2_resume_…`. Its own caveat was
+     **probed and holds** in round 2: a realistic per-session over-eager skip
+     (`run_ids.insert(t.session…)`) reds ONLY the new guard test (1 failure, not 2), so the guard
+     earns its place.
    **Deliberately not done:** dry-run's report gains no equivalent counter — dry-run appends
    nothing and its classifier counts entries, not appended turns (its JSON has no turn-count key at
-   all, so "one fewer turn than dry-run predicts" is loose wording for a comparison dry-run never
-   emits; the substance — no dedupe, no collide count — is skeptic-verified).
-   **Unverified by anyone:** the Linux `/proc/self/exe` residual in `service_exec_path` (needs a
-   Linux symlinked install + `init --dry-run`, unrunnable on darwin).
+   all — key set enumerated by the gate — so "one fewer turn than dry-run predicts" is loose
+   wording for a comparison dry-run never emits; the substance — no dedupe, no collide count — is
+   skeptic-verified).
+   **Round-2 residuals, recorded not fixed:** (a) `files_complete` cannot distinguish "import
+   dropped entries from this turn" from "complete but imported" — pre-existing, and it is what
+   falsified the text above; (b) the claim's `evidence` event is pinned to `2a60395` while later
+   commits edit both its `stale_on` files — re-evidenced at HEAD, bookkeeping only; (c) **the
+   repo's recorded "multi-filter `cargo test` matches only one TESTNAME" lesson is wrong for
+   POSITIONAL filters** — measured twice on this toolchain (`2 passed; 35 filtered out`); it holds
+   for `--test`, not for test-name arguments. The two REFUTED P1 claims blamed on it are founder-
+   owned and untouched here. (d) **Stale-build hazard the gate hit:** editing only
+   `cli/src/importcmd.rs` and re-running `cargo test --test import_claude` can execute a STALE
+   `target/debug/agentrec` and pass under a mutation that demonstrably breaks — `cargo build` (or
+   touch the test source) before any mutation probe against the binary.
+   **Unverified by anyone (belongs to the D46/brew item, not this fix):** the Linux
+   `/proc/self/exe` residual in `service_exec_path`; the only test is `#[cfg(target_os = "macos")]`
+   (`cli/tests/integration.rs`), so no Linux CI leg covers it either.
 3. Then: Codex 2.1 → Protocol 1.0 freeze → MCP read 2.2 (unconditional, thin adapter over
    P5's serializer). 2.3 stays evidence-gated.
 
