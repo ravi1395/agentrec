@@ -1,5 +1,0 @@
-error: unexpected argument 'records_rich_turn' found
-
-Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
-
-For more information, try '--help'.
