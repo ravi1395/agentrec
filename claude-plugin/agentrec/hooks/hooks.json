@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c '[ -d .agentrec ] && command -v agentrec >/dev/null 2>&1 && exec agentrec hook claude; exit 0'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c '[ -d .agentrec ] && command -v agentrec >/dev/null 2>&1 && exec agentrec hook claude; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}

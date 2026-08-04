@@ -3,6 +3,9 @@ name = "agentrec-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["coding-agents", "provenance", "blame", "undo"]
+categories = ["development-tools"]
 description = "Core engine for agentrec: turn boundaries, snapshot store, records, scrub."
 
 [dependencies]
