@@ -60,6 +60,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Both ubuntu legs report runner OS "Linux" with an identical rustc
+          # host triple, so without this they share one cache key — a build
+          # script compiled on 24.04 (GLIBC 2.39) restores onto 22.04 (2.35)
+          # and dies with "GLIBC_2.39 not found" (first hit: zmij, PR #17).
+          key: ${{ matrix.os }}
       - name: cargo test --workspace
         # Excludes #[ignore]d torture heavy run; torture_smoke still runs here.
         # On Ubuntu legs this also compiles + runs the Linux-only doctor paths
