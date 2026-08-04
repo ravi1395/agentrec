@@ -14,6 +14,39 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **Release-version gate + `agentrec-release` skill (delivered 2026-08-04, UNCOMMITTED on
+  `main`, not gated by a skeptic, never exercised by a real tag).** Closes the
+  "4 files bumped by hand, no CI enforcement of match" gap recorded at v0.2.0. Three
+  pieces: (1) `.github/scripts/check-versions.sh X.Y.Z` asserts **eight fields across six
+  files** — both workspace crate versions, the `cli/Cargo.toml` → `agentrec-core` dep pin,
+  both `Cargo.lock` entries, `npm/package.json`, `.claude-plugin/marketplace.json`
+  **`.metadata.version`** (NOT `.plugins[0].version` — that is claude-mem's layout, not
+  ours), and the plugin manifest; (2) a `verify-version` job that `build` now `needs`, so
+  drift fails in ~30s before four matrix builds burn, plus `--locked` on the release build
+  so a stale lockfile is a hard CI failure (verified clean at `v0.2.0` BEFORE being added);
+  (3) `claude-setup/skills/agentrec-release/SKILL.md`, which the global `ship` skill's
+  step-0 deferral hands off to. **Fields are read structurally (`cargo metadata` / `jq`),
+  never by grepping the version string** — `cli/Cargo.toml` carries `regex = "1"` beside
+  our pin, so a string grep false-matches the day a dep version collides with ours.
+  **Founder decisions taken here:** CI verifies, the skill bumps (no CI commits, no CI
+  write to `main`); registry publishing stays a human hand-off (agent holds no tokens).
+  Evidence, all run: gate green at HEAD (8/8 `ok`); **per-site mutation probes on five
+  sites** (`npm/package.json`, `marketplace.json`, `plugin.json`, the `cli/Cargo.toml`
+  pin, `Cargo.lock`) each producing exactly ONE `MISMATCH` naming that site — an
+  all-sites-fail probe alone cannot distinguish a wired gate from one that ignores files;
+  wrong-version → exit 1, non-semver arg → exit 2; ref-shape guard rejects `main`, `v0.2`,
+  and a branch name; `actionlint` clean. The count is measured repo-wide
+  (`git grep -n '0\.2\.0' | grep -v CHANGELOG`), not from the scoped grep that found the
+  sites — earlier prose saying "seven places" was imprecise and is corrected.
+  **The script is invoked as `bash .github/scripts/check-versions.sh` deliberately**, in
+  the workflow and the skill both, so the gate cannot depend on git recording mode
+  `100755`. **Residuals, recorded:** never run against a real tag (first exercise is the
+  next release, and the workflow edit + script MUST land in one commit — a commit carrying
+  the workflow without the script fails `verify-version` on every tag); `.claude/` is
+  gitignored, so the installed skill copy is machine-local and `claude-setup/skills/` is
+  the tracked source; the skill relaxes `ship`'s VERIFY-LEDGER precondition to rows scoped
+  to the version being cut, because this repo's long-lived recorded-not-blocking debts
+  would otherwise block every release forever.
 - **D6 attribution wedge, phases 1–2b (delivered 2026-08-01) — branch `feat/mvp-promise`, 15
   commits, unmerged; FULLY GATED after two skeptic engagements (first gate on 2a+2b: PASS
   9/9; scoped re-gate on the post-gate delta: 3 rounds, PASS at `94c3d59`).** Spike gate
@@ -690,6 +723,25 @@ cargo test --test integration # drives the real binary against tempdir fixtures
 cargo clippy && cargo fmt     # CI-enforced
 agentrec init && agentrec record   # dogfood in this repo itself
 ```
+
+## Releases
+
+**Use the `agentrec-release` skill** (`claude-setup/skills/agentrec-release/SKILL.md`;
+install into `.claude/skills/`). It overrides the global `ship` skill for this repo.
+Never hand-roll a release: the version lives in **six files / eight checked fields**
+(measured repo-wide, not by a scoped grep: `git grep -n '0\.2\.0' | grep -v CHANGELOG`
+at `d4b2576` surfaces exactly these and no eighth file), and two of them fail only
+downstream — `cli/Cargo.toml`'s `agentrec-core` pin (breaks `cargo publish`, which
+resolves it against the registry not the path) and `Cargo.lock` (breaks the `--locked`
+release build). The release workflow's `verify-version` job asserts all eight fields
+against the tag before anything is built; run the identical check locally first:
+
+```bash
+bash .github/scripts/check-versions.sh X.Y.Z
+```
+
+Registry publishing (crates.io, npm) is a **human hand-off** — the agent never holds
+registry tokens. Runbook: `docs/launch/distribution-publish-runbook.md`.
 
 ## Conventions
 

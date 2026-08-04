@@ -9397,17 +9397,36 @@ fn hook_corrupt_store_safe_under_concurrent_append() {
     // hook's contract is that it ABANDONS work at its time budget, and an
     // attempt that hits the wall before reaching the store records
     // `budget_exceeded` instead of a failure. Observed on ubuntu-22.04 in CI
-    // (run 30856992210): 19 `store_corrupt` + 1 `{"budget_exceeded": true,
-    // "elapsed_ms": 50}` = 20 attempts, a correct run failing a wrong
-    // assertion. Same runner-coupling class as
-    // `hook_recall_hard_wall_deadline`.
+    // (run 30856992210, ATTEMPT 1 — a rerun of the same commit went green,
+    // so the failure survives only in that attempt's log): 19
+    // `store_corrupt` + 1 `{"budget_exceeded": true, "elapsed_ms": 50}` = 20
+    // attempts, a correct run failing a wrong assertion. Runner-coupled like
+    // `hook_recall_hard_wall_deadline`, though that one was a too-tight
+    // bound on an invariant that held (remedied by raising the bound) and
+    // this one was an assertion wrong in principle (remedied by changing its
+    // shape).
     //
-    // The ratchet is kept by three conjuncts rather than one: no stat may go
-    // missing or be duplicated (count), no stat may take a third shape
-    // (e.g. a failure with some other `reason`, or a silent success against
-    // a corrupt store), and the corrupt path must actually have been
-    // exercised at least once — without that last clause a run where every
-    // attempt timed out would pass while proving nothing.
+    // Three conjuncts replace the one. **This is not a strict tightening,
+    // and the loss is measured, not hand-waved:** a regression in which the
+    // corrupt path degrades into `budget_exceeded` for 19 of 20 attempts
+    // PASSES here (20 stats, all legal shapes, `failures == 1`) and would
+    // have RED'd under `failures == iterations`. Verified by mutation, not
+    // argued. The trade is forced — the old form is unsatisfiable whenever
+    // any attempt hits the wall — but it is a trade. What is genuinely
+    // tightened: no stat may go missing or be duplicated (conjunct 1), and
+    // no stat may take a third shape, e.g. a failure with some other
+    // `reason` or a silent success against a corrupt store (conjunct 2).
+    //
+    // The corrupt-path guarantee is conjuncts 2 AND 3 jointly, never 3
+    // alone: conjunct 3 is `failures >= 1` with no `reason` check, so it is
+    // conjunct 2 foreclosing every other reason that makes that one failure
+    // necessarily a `store_corrupt` one.
+    //
+    // Do NOT try to close the gap by asserting the abandonment shape carries
+    // `elapsed_ms >= RECALL_BUDGET_MS`. That is the obvious tightening and it
+    // is unsound: `inject_memory`'s thread-spawn-failure path emits the same
+    // `budget_exceeded` shape with a ~0ms elapsed, so the assertion would be
+    // false by design on exactly the axis this comment exists to warn about.
     let stats = memory_stats_lines(&root);
     let failures = stats
         .iter()

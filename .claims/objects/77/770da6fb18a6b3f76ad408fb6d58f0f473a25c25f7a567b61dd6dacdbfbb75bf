@@ -1,4 +1,0 @@
-awk: syntax error at source line 1
- context is
-	/^#\[cfg\(test\)\]/{exit} /load_log\(/ >>>  \ <<< &\& $0 !~ /^[[:space:]]*\/\// {c++} END{if(c>0) exit 1}
-awk: bailing out at source line 1

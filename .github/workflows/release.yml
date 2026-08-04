@@ -17,8 +17,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fails in ~30s, before four matrix builds burn, if any version-carrying
+  # manifest disagrees with the tag. The bump itself stays local (agentrec-release
+  # skill) — CI never commits; the tag is the single source of truth and this job
+  # is what makes drift unshippable.
+  verify-version:
+    name: verify manifest versions match tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: parse
+        name: parse version from ref
+        # workflow_dispatch can be fired on a branch, where `ref_name` is e.g.
+        # `main`. Reject anything that is not a vX.Y.Z tag with a message that
+        # says what to do, rather than comparing manifests against "main".
+        run: |
+          ref="${{ github.ref_name }}"
+          if ! printf '%s' "$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::ref '$ref' is not a vX.Y.Z tag. On a manual re-run, pick the tag as the ref." >&2
+            exit 1
+          fi
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: check every manifest against ${{ steps.parse.outputs.version }}
+        # Invoked via `bash` deliberately: the gate must not depend on git having
+        # recorded mode 100755, nor on the checkout filesystem preserving it.
+        run: bash .github/scripts/check-versions.sh "${{ steps.parse.outputs.version }}"
+
   build:
     name: build (${{ matrix.asset }})
+    needs: verify-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -41,7 +71,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
-        run: cargo build --release -p agentrec
+        # --locked: a Cargo.lock that disagrees with the manifests is a hard
+        # failure here rather than a silently-regenerated lockfile. Verified
+        # clean at v0.2.0 before being added.
+        run: cargo build --release --locked -p agentrec
       - name: stage asset + checksum
         run: |
           mkdir -p dist
