@@ -19,7 +19,7 @@ No GUI (Sutra is the reference client). No cloud sync, dashboard, or telemetry �
 Install, initialize, forget:
 
 ```
-curl -fsSL https://agentrec.dev/install.sh | sh   # or: brew install agentrec · npx agentrec (v1.x) · cargo install agentrec
+curl -fsSL https://raw.githubusercontent.com/ravi1395/agentrec/main/install.sh | sh   # or: brew install ravi1395/agentrec/agentrec · npm i -g agentrec · cargo install agentrec
 cd myrepo && agentrec init        # one command: writes .agentrec/ + gitignore entry, detects Claude Code, installs UserPromptSubmit + Stop hooks (idempotent merge), registers + starts the service unit, begins recording — and prints how to reverse all of it
 agentrec doctor                   # optional: verifies the whole chain end-to-end (hooks · daemon · signals · store), pass/fail with remedies
 ```
@@ -146,7 +146,7 @@ A flight recorder that can lose the flight is not a flight recorder. These are v
 | `undo [turn]` | Revert a turn's changes, per file | interactive checklist; excludes modified-since files by default; refuses skipped/withheld. Bare `undo` = panic mode: targets the last non-git rich turn, preview-first (D42) |
 | `status` | Health + store report | store size, TTL/eviction eligibility, gaps, rich-rate %, DEGRADED banner on snapshot write failures |
 
-Setup commands (not query verbs): `init`, `service`, `uninstall`, and `doctor` — the last runs a full-chain diagnosis (hooks, daemon, signal freshness, store health, watch limits, permissions) with pass/fail and a one-line remedy per check (D41). Read-verb output uses relative times and TTY color by default, with `--utc`, `--json`, `NO_COLOR`, and `--explain` for glossary annotations (D43).
+Setup commands (not query verbs): `init`, `uninstall`, and `doctor` — the last runs a full-chain diagnosis (hooks, daemon, signal freshness, store health, watch limits, permissions) with pass/fail and a one-line remedy per check (D41). Read-verb output uses relative times and TTY color by default, with `--utc`, `--json`, `NO_COLOR`, and `--explain` for glossary annotations (D43).
 
 `undo` semantics mirror Sutra's rollback dialog: per-file selection, exclusion of modified-since files unless explicitly overridden, refusal of skipped/withheld files, never a silent bulk revert. `blame` at line granularity is computed by diffing the turn's before/after snapshots and **ships in v1** — the launch gif is a line-level query, so the launch build answers it (REVIEW.md S5).
 

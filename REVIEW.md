@@ -2,6 +2,12 @@
 
 *Skeptical review of PROBLEM.md and SPEC.md, consistency-checked against PROTOCOL.md, CLAUDE.md, ROADMAP.md, IMPLEMENTATION.md, and Sutra's `turns.rs`. Preserved unedited below.*
 
+> **Reader note:** this is an internal design artifact — a deliberately adversarial review of the
+> *original* (pre-v0.2) design, kept verbatim because other docs cite its findings (F1–F4, S1–S9)
+> by id. It reads harsh because it was supposed to. Every FATAL/SERIOUS finding below was accepted
+> and addressed by the v0.2 capture redesign; the disposition table immediately following is the
+> current status. For what actually shipped, see the README and SPEC.md.
+
 ## Disposition (v0.2 revision, applied across the suite)
 
 | Finding | Status | Where |
