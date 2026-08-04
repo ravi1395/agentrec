@@ -1,0 +1,13 @@
+{
+  "name": "agentrec",
+  "version": "0.2.0",
+  "description": "Flight recorder for coding agents — records every Claude Code turn locally, answers 'who broke my repo?' via blame/diff/undo. Bundles the lifecycle hooks; /agentrec:setup wires a repo in one step.",
+  "author": {
+    "name": "Ravi C",
+    "url": "https://github.com/ravi1395"
+  },
+  "homepage": "https://github.com/ravi1395/agentrec",
+  "repository": "https://github.com/ravi1395/agentrec",
+  "license": "Apache-2.0",
+  "keywords": ["provenance", "blame", "undo", "flight-recorder"]
+}

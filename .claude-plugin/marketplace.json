@@ -1,0 +1,23 @@
+{
+  "name": "agentrec",
+  "owner": {
+    "name": "Ravi C",
+    "url": "https://github.com/ravi1395"
+  },
+  "metadata": {
+    "description": "agentrec — local-first flight recorder for coding agents",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "agentrec",
+      "source": "./claude-plugin/agentrec",
+      "description": "Records every Claude Code turn locally; blame/diff/undo over agent history. Bundles lifecycle hooks + one-step repo setup.",
+      "author": {
+        "name": "Ravi C"
+      },
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/ravi1395/agentrec"
+    }
+  ]
+}

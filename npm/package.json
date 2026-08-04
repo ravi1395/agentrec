@@ -1,0 +1,42 @@
+{
+  "name": "agentrec",
+  "version": "0.2.0",
+  "description": "Local-first flight recorder for coding agents: who broke my repo — me or the agent? npm wrapper that installs the prebuilt agentrec binary.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ravi1395/agentrec.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/ravi1395/agentrec#readme",
+  "bugs": "https://github.com/ravi1395/agentrec/issues",
+  "keywords": [
+    "coding-agents",
+    "claude-code",
+    "provenance",
+    "blame",
+    "undo",
+    "flight-recorder"
+  ],
+  "bin": {
+    "agentrec": "bin/agentrec.js"
+  },
+  "files": [
+    "bin/agentrec.js",
+    "install.js"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

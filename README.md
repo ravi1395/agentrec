@@ -51,6 +51,27 @@ Or via Homebrew:
 brew install ravi1395/agentrec/agentrec
 ```
 
+Or via npm (wrapper that fetches the same checksum-verified release binary):
+
+```sh
+npm install -g agentrec    # or: npx agentrec status
+```
+
+Or via cargo (builds from source):
+
+```sh
+cargo install agentrec
+```
+
+Or as a **Claude Code plugin** — bundles the lifecycle hooks and a one-step repo setup command (binary still required; `/agentrec:setup` installs it if missing):
+
+```
+/plugin marketplace add ravi1395/agentrec
+/plugin install agentrec@agentrec
+```
+
+Plugin users: run `agentrec init --no-hook` (or just `/agentrec:setup`) — the plugin already provides the hooks globally, and repo-local hooks on top would emit every signal twice. Details: [claude-plugin/agentrec/README.md](claude-plugin/agentrec/README.md).
+
 Building an already-checked-out binary locally instead of downloading a release:
 
 ```sh
