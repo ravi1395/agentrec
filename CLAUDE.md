@@ -14,6 +14,25 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **User-onboarding docs round (delivered 2026-08-04, branch `docs/user-onboarding`).** README
+  restructured for new users: quickstart (`init` → `import claude` → `doctor` → read verbs),
+  mermaid architecture diagram, How-it-works glossary (rich/bare, bracketing, epochs, git turns),
+  config reference covering exactly the 5 keys the hand-rolled parser reads, troubleshooting,
+  docs index + versioning note; the long skeptic-gated command-table cells were preserved
+  verbatim inside `<details>` blocks, not rewritten. Install paths re-verified live before
+  keeping them: npm 0.2.0, crates.io `agentrec`+`agentrec-core` (both published 2026-08-04),
+  brew tap 0.2.0. `import` help de-jargoned ((P1)/(P2) removed; 36/0/1 import tests green, no
+  golden asserts help text). ROADMAP got a status note (import/npm/crates/plugin shipped ahead
+  of phase labels); SPEC's stale `agentrec.dev` install line and phantom `service` verb fixed;
+  REVIEW.md gained a reader note (it stays at root — too widely cited to move);
+  `HANDOFF.md`+`HANDOVER-PD-FIXES.md` → `docs/internal/`; SECURITY.md added.
+  **Found+fixed: today's squash `23a2e0d` (via f6cadea's untrack of `docs/`) had removed
+  `docs/blame-demo.gif` from the remote, breaking README's demo image on GitHub — the three
+  demo files are re-tracked; the rest of `docs/` stays local per the untrack decision.**
+  Recorded, NOT fixed (founder-owned normative doc): IMPLEMENTATION.md ACs J1/J2/I3 claim
+  config behavior that does not exist — `mcp_destructive` is written by `init` but read by
+  nothing, invalid TOML is silently tolerated (no "hard error with line number"), no
+  user-supplied scrub-rule key exists.
 - **Release-version gate + `agentrec-release` skill (delivered 2026-08-04, UNCOMMITTED on
   `main`, not gated by a skeptic, never exercised by a real tag).** Closes the
   "4 files bumped by hand, no CI enforcement of match" gap recorded at v0.2.0. Three

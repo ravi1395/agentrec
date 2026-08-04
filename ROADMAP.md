@@ -2,6 +2,12 @@
 
 *Companions: PROBLEM.md (why), SPEC.md (v1 what), PROTOCOL.md (the format everything rides on).*
 
+> **Status (2026-08-04):** Phase 0 shipped as releases 0.1.0–0.2.0 (see the
+> [releases page](https://github.com/ravi1395/agentrec/releases)). A few items listed under
+> later phases have already shipped ahead of schedule: `agentrec import claude` (Phase 1),
+> the npm and crates.io distribution wrappers (Phase 1), and the Claude Code plugin
+> (Phase 2, D44). Phase labels are design language, not release numbers.
+
 ## Operating principles
 
 These govern every phase and every cut decision:
