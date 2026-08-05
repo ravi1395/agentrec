@@ -1532,3 +1532,41 @@ acceptance criterion rests on the automated suite plus two independent adversari
 implementers), and on **no** claimd replay. Nothing here is claim-attested. A future round
 that wants claim coverage over this surface must declare fresh claims against live code, not
 backfill these.
+
+### CORRECTION 2026-08-05 — `3c4f598`'s commit message asserted an unmeasured live fact, now falsified
+
+Recorded because this repo's signature defect is exactly this shape, and this instance was
+written by the orchestrating agent into a commit message that cannot be amended.
+
+`3c4f598` (the hook-root walk-up fix) justified covering `hook claude` with:
+
+> "`hook claude`'s defect was **latent rather than observed**: identical bare-command shape,
+> escaping the bug **only because Claude Code happens to set cwd to the project root**, which
+> is an undocumented behavior not worth depending on silently."
+
+The bolded clause was never measured. It was inference presented as fact, in the same commit
+that fixed a defect found by refusing to accept exactly that kind of inference.
+
+**It is false.** The O5 Claude-leg round measured it directly, using the Codex leg's own
+wrapper-substitution method (substitute a wrapper for the installed hook command; capture the
+hook subprocess's real `pwd -P`, plus the payload's own `"cwd"` JSON field as an independent
+second channel). Launched from a subdirectory, both channels agree on both firings:
+
+```
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"UserPromptSubmit",...}
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"Stop",...}
+```
+
+Claude Code does **not** pin hook cwd to the project root; it inherits the launch directory,
+same as Codex. So the `hook claude` defect was **real and live, not latent** — a user running
+`claude` from a subdirectory of an agentrec repo was losing signals silently, exactly as Codex
+users were. The fix in `3c4f598` is correct and is load-bearing for both emitters; only its
+stated *reason* for covering claude was wrong, and it was wrong in the direction that
+understated the bug.
+
+Worth keeping for the pattern: the first attempt at this measurement was itself
+non-discriminating (it measured Claude Code's *Bash-tool* cwd, not the hook subprocess's), and
+was caught in review rather than by the agent that ran it — corrected in `1b34f5b`. Two
+successive measurements of the same fact, the first wrong, before the record was right.
