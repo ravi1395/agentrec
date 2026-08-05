@@ -11068,3 +11068,523 @@ mod service_leak_guard {
         );
     }
 }
+
+/// C2: `agentrec hook codex`, fixture-driven against the REAL, COMMITTED
+/// payloads in `docs/fixtures/codex/` (captured live against Codex CLI
+/// 0.146.0 — see `docs/verify/codex-spike.md`). These tests pipe the
+/// committed fixture BYTES verbatim wherever a single self-consistent event
+/// is under test; the one exception (`full_turn_...`, documented at its
+/// definition) needs a `Stop` payload whose `session_id`/`turn_id` matches
+/// the committed `PostToolUse` pair, which no two committed fixtures share
+/// (each was captured from a separate live run) — that test starts from the
+/// real `stop.json` fixture's bytes and overrides only those two id fields,
+/// never inventing a payload shape the spike didn't observe.
+mod codex_hook {
+    use super::*;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs/fixtures/codex")
+            .join(name)
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(fixture_path(name))
+            .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+    }
+
+    /// Same shape as `send_hook_capture` but for `hook codex` — captures
+    /// stdout/stderr/status so the stdout-silence assertions have something
+    /// to check.
+    fn send_hook_codex(root: &Path, payload: &str) -> Output {
+        let mut child = Command::new(bin())
+            .args(["hook", "codex", "--root", root.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook codex");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn scratch_entries(root: &Path) -> Vec<serde_json::Value> {
+        let text =
+            std::fs::read_to_string(root.join(".agentrec/codex-scratch.jsonl")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// `cwd` in every committed fixture — `apply_patch` paths are relative
+    /// to it, and the emitter absolutizes against it before the path ever
+    /// reaches scratch or `signal.jsonl` (see `hookcmds::absolutize`).
+    const FIXTURE_CWD: &str = "/REDACTED/scratch-repo";
+
+    #[test]
+    fn user_prompt_submit_fixture_produces_scrubbed_start_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let payload = fixture("user_prompt_submit.json");
+        let out = send_hook_codex(root, &payload);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "UserPromptSubmit must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["tool"], "codex");
+        assert_eq!(sig["event"], "start");
+        assert_eq!(sig["session"], "019fd1b4-aa34-7721-8d1d-fb198c45ecd6");
+        assert_eq!(sig["emitter_turn"], "019fd1b4-aa71-7a41-a9b2-fa189d8689e8");
+        assert_eq!(
+            sig["prompt"], "Say hello. Do not run any commands or edit any files.",
+            "harmless prompt must survive scrub unchanged: {sig:?}"
+        );
+        assert!(
+            sig.get("files_written").is_none(),
+            "a start signal must never carry files_written: {sig:?}"
+        );
+    }
+
+    /// Proves the emitter reuses `agentrec_core::scrub::scrub` (constraint:
+    /// "do not write a second scrubber") rather than passing the prompt
+    /// through untouched — a fixture-derived payload with a fake AWS key
+    /// spliced into the real prompt text must come out redacted.
+    #[test]
+    fn user_prompt_submit_prompt_is_scrubbed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("user_prompt_submit.json")).unwrap();
+        let secret = "AKIAABCDEFGHIJKLMNOP"; // AWS-key shape scrub.rs matches.
+        payload["prompt"] = serde_json::Value::String(format!("here is a key: {secret}"));
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "UserPromptSubmit must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        let prompt = events[0]["prompt"].as_str().unwrap();
+        assert!(
+            !prompt.contains(secret),
+            "raw secret must not reach signal.jsonl: {prompt}"
+        );
+    }
+
+    #[test]
+    fn post_tool_use_fixture_appends_scratch_and_writes_no_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let payload = fixture("post_tool_use_apply_patch.json");
+        let out = send_hook_codex(root, &payload);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "PostToolUse must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        assert!(
+            signal_events(root).is_empty(),
+            "PostToolUse must never append to signal.jsonl"
+        );
+
+        let entries = scratch_entries(root);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0]["session_id"],
+            "019fd1b5-83e9-7300-bc21-b79f709bb12c"
+        );
+        assert_eq!(
+            entries[0]["turn_id"],
+            "019fd1b5-8445-7f91-b3bf-2d5092cd1e3c"
+        );
+        assert_eq!(
+            entries[0]["paths"],
+            serde_json::json!([
+                format!("{FIXTURE_CWD}/hello.txt"),
+                format!("{FIXTURE_CWD}/second.txt"),
+                format!("{FIXTURE_CWD}/to_delete.txt"),
+            ]),
+            "one Update + two Add ops, absolutized against the fixture's cwd: {entries:?}"
+        );
+    }
+
+    /// Full turn: two REAL committed `PostToolUse` fixtures (they share one
+    /// `session_id`/`turn_id` — captured as two separate `apply_patch`
+    /// calls in the same live turn, per the spike) accumulate into scratch,
+    /// then a `Stop` for that same turn drains it. No committed `Stop`
+    /// fixture shares this pair's ids (each fixture is an independent live
+    /// capture), so the `Stop` payload here is the real `stop.json`
+    /// fixture's bytes with ONLY `session_id`/`turn_id` overridden to match
+    /// — every other field, and the overall shape, is exactly what the
+    /// spike observed for a real `Stop` event.
+    #[test]
+    fn full_turn_stop_drains_scratch_into_files_written_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let session_id = "019fd1b5-83e9-7300-bc21-b79f709bb12c";
+        let turn_id = "019fd1b5-8445-7f91-b3bf-2d5092cd1e3c";
+
+        for name in [
+            "post_tool_use_apply_patch.json",
+            "post_tool_use_apply_patch_delete.json",
+        ] {
+            let out = send_hook_codex(root, &fixture(name));
+            assert!(out.status.success(), "{name}: {out:?}");
+            assert!(
+                out.stdout.is_empty(),
+                "{name}: PostToolUse must write nothing to stdout: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        assert_eq!(scratch_entries(root).len(), 2, "both firings recorded");
+        assert!(signal_events(root).is_empty());
+
+        let mut stop_payload: serde_json::Value =
+            serde_json::from_str(&fixture("stop.json")).unwrap();
+        stop_payload["session_id"] = serde_json::Value::String(session_id.to_string());
+        stop_payload["turn_id"] = serde_json::Value::String(turn_id.to_string());
+
+        let out = send_hook_codex(root, &stop_payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "Stop must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["tool"], "codex");
+        assert_eq!(sig["event"], "stop");
+        assert_eq!(sig["session"], session_id);
+        assert_eq!(sig["emitter_turn"], turn_id);
+        assert_eq!(
+            sig["files_written"],
+            serde_json::json!([
+                format!("{FIXTURE_CWD}/hello.txt"),
+                format!("{FIXTURE_CWD}/second.txt"),
+                format!("{FIXTURE_CWD}/to_delete.txt"),
+            ]),
+            "union across both PostToolUse firings (absolutized), deduped on to_delete.txt: {sig:?}"
+        );
+
+        assert!(
+            scratch_entries(root).is_empty(),
+            "drain must remove the consumed entries: {:?}",
+            scratch_entries(root)
+        );
+
+        // Same Stop payload again: drain-once semantics — nothing left to
+        // redeliver, so files_written is ABSENT (not an empty array) on
+        // this second stop signal.
+        let out2 = send_hook_codex(root, &stop_payload.to_string());
+        assert!(out2.status.success(), "{out2:?}");
+        assert!(out2.stdout.is_empty());
+        let events2 = signal_events(root);
+        assert_eq!(events2.len(), 2, "{events2:?}");
+        assert!(
+            events2[1].get("files_written").is_none(),
+            "a second identical Stop must not redeliver the drained files: {:?}",
+            events2[1]
+        );
+    }
+
+    #[test]
+    fn stop_fixture_with_no_scratch_has_files_written_absent_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        // stop.json's own session/turn never had any PostToolUse firing —
+        // piped completely unmodified.
+        let out = send_hook_codex(root, &fixture("stop.json"));
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["event"], "stop");
+        assert!(
+            sig.get("files_written").is_none(),
+            "no scratch for this turn -> files_written must be ABSENT, not []: {sig:?}"
+        );
+        // The literal serialized line must not contain the key at all.
+        let raw = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap();
+        assert!(
+            !raw.contains("files_written"),
+            "absent means the key itself is missing from the wire line: {raw}"
+        );
+    }
+
+    #[test]
+    fn stop_with_corrupt_scratch_file_has_files_written_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            root.join(".agentrec/codex-scratch.jsonl"),
+            "not valid json at all\n{\"also\": \"not an entry\"}\n",
+        )
+        .unwrap();
+
+        let out = send_hook_codex(root, &fixture("stop.json"));
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "Stop must write nothing to stdout even with corrupt scratch: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].get("files_written").is_none(),
+            "corrupt scratch must degrade to absent, never fabricate []: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn malformed_stdin_is_a_loud_nonzero_exit_with_no_partial_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = send_hook_codex(root, "{ this is not valid json {{{");
+        assert!(
+            !out.status.success(),
+            "malformed stdin must be a nonzero exit: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "even on failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "no partial signal line may be written on a parse failure"
+        );
+        assert!(
+            !root.join(".agentrec/codex-scratch.jsonl").exists(),
+            "no partial scratch line may be written on a parse failure"
+        );
+    }
+
+    /// CI canary (AC-C2): a required field deliberately removed from a real
+    /// fixture must fail LOUDLY, never silently degrade (e.g. Claude's arm
+    /// defaults a missing `hook_event_name` to `"Stop"` — Codex's arm must
+    /// not do the equivalent). Built by mutating the real fixture's parsed
+    /// JSON, since by definition no committed fixture is missing a field.
+    #[test]
+    fn missing_required_field_is_a_loud_failure_not_silent_degradation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("user_prompt_submit.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("session_id")
+            .expect("fixture must have session_id to remove");
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(
+            !out.status.success(),
+            "a required field missing must be a nonzero exit, not a silent default: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("session_id"),
+            "the error should name the missing field: {stderr}"
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "nothing should have been written for a rejected payload"
+        );
+    }
+
+    /// Same canary shape, for `hook_event_name` specifically: Claude's arm
+    /// treats an absent `hook_event_name` as an implicit `"Stop"` — Codex's
+    /// arm must not silently reclassify a payload this way.
+    #[test]
+    fn missing_hook_event_name_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value = serde_json::from_str(&fixture("stop.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("hook_event_name")
+            .unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "must not silently treat a missing hook_event_name as Stop"
+        );
+    }
+
+    #[test]
+    fn post_tool_use_missing_tool_input_command_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tool_input")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("command")
+            .unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(scratch_entries(root).is_empty());
+    }
+
+    /// Finding from review: extracted `apply_patch` paths are relative
+    /// (spike: `hello.txt`, no leading `/`) but `files_written` and the
+    /// daemon's `normalize_declared` both require absolute paths — without
+    /// `cwd` to join against, a declaration would be silently unusable
+    /// downstream rather than merely absent. `cwd` is therefore required
+    /// (loud failure), not best-effort.
+    #[test]
+    fn post_tool_use_missing_cwd_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload.as_object_mut().unwrap().remove("cwd").unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(scratch_entries(root).is_empty());
+    }
+
+    /// Finding from review: a `PostToolUse` firing whose patch contains only
+    /// unparsed op kinds (here: `Move to:`, deliberately not read by
+    /// `apply_patch_paths` — see its doc comment) must extract zero paths
+    /// and, critically, must NOT store an empty scratch entry — that would
+    /// let a later `Stop` drain it into `files_written: []`, an affirmative
+    /// "wrote nothing" that would be false for a file the parser simply
+    /// couldn't see. Hand-crafted: no committed fixture exercises `Move
+    /// to:` (the spike never observed it live), so this starts from the
+    /// real `post_tool_use_apply_patch.json` fixture's bytes with only
+    /// `tool_input.command` replaced.
+    #[test]
+    fn post_tool_use_move_only_patch_extracts_nothing_and_stays_undeclared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        let session_id = payload["session_id"].as_str().unwrap().to_string();
+        let turn_id = payload["turn_id"].as_str().unwrap().to_string();
+        payload["tool_input"]["command"] = serde_json::Value::String(
+            "*** Begin Patch\n*** Move to: new_name.txt\n*** End Patch".to_string(),
+        );
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+        assert!(
+            scratch_entries(root).is_empty(),
+            "a zero-path extraction must not be stored at all"
+        );
+
+        // Confirm end-to-end: a Stop for this exact turn finds nothing to
+        // drain and reports files_written ABSENT, not [].
+        let mut stop_payload: serde_json::Value =
+            serde_json::from_str(&fixture("stop.json")).unwrap();
+        stop_payload["session_id"] = serde_json::Value::String(session_id);
+        stop_payload["turn_id"] = serde_json::Value::String(turn_id);
+        let stop_out = send_hook_codex(root, &stop_payload.to_string());
+        assert!(stop_out.status.success(), "{stop_out:?}");
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].get("files_written").is_none(),
+            "a Move-only patch must never surface as a false empty declaration: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn post_tool_use_non_apply_patch_tool_is_a_silent_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload["tool_name"] = serde_json::Value::String("shell".to_string());
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+        assert!(
+            scratch_entries(root).is_empty(),
+            "a non-apply_patch PostToolUse must not be accumulated"
+        );
+        assert!(signal_events(root).is_empty());
+    }
+}

@@ -6,6 +6,7 @@ mod config;
 mod daemon;
 mod doctorcmd;
 mod fmt;
+mod hookcmds;
 mod importcmd;
 mod initcmd;
 mod loglock;
@@ -143,7 +144,7 @@ enum Command {
     /// Internal: invoked by agent lifecycle hooks; reads the hook payload on stdin.
     #[command(hide = true)]
     Hook {
-        /// Tool identity, e.g. "claude".
+        /// Tool identity, e.g. "claude" or "codex".
         tool: String,
     },
     /// Remove agentrec from this repo: hooks, service unit, and archive

@@ -962,11 +962,22 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     out
 }
 
-/// `hook`: invoked by a Claude Code lifecycle hook with the JSON payload on
+/// `hook`: invoked by an agent lifecycle hook with the JSON payload on
 /// stdin. Maps the hook event to a start/stop signal and appends it to the
 /// inbox. Prompt text is scrubbed HERE — `signal.jsonl` is on disk, so no
 /// pre-scrub prompt may ever reach it (AC I4).
+///
+/// `codex` is routed to its own module (`hookcmds::hook_codex`) rather than
+/// handled inline below: Codex's payload shapes, its three-event
+/// (`UserPromptSubmit`/`PostToolUse`/`Stop`) structure, and its stdout/
+/// validation posture all differ enough from Claude's that sharing this
+/// function's body would mean branching almost every line — see
+/// `hookcmds.rs`'s module doc for exactly how and why they diverge. Every
+/// other `tool` value (today: `"claude"`) keeps the body below unchanged.
 pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
+    if tool == "codex" {
+        return crate::hookcmds::hook_codex(root);
+    }
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
     let payload: serde_json::Value =
