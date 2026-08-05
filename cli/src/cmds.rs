@@ -1024,6 +1024,9 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         transcript,
         prompt,
         files_written,
+        // C1: Claude Code's hook emitter has no equivalent stable upstream
+        // turn id today — see `SignalEvent::emitter_turn`'s doc.
+        emitter_turn: None,
         kind: None,
         fact: None,
         pins: None,

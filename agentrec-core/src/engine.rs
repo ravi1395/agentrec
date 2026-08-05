@@ -56,6 +56,13 @@ struct OpenTurn {
     /// across turns, only shifts one id's embedded timestamp a few seconds
     /// earlier; every record still carries explicit `started`/`ended`.
     id: String,
+    /// The `start` signal's PROTOCOL §4 `emitter_turn`, when the opening
+    /// signal carried one (Phase 2 tail C1). `None` for every non-bracket
+    /// open (`observe_changes`'s Quiet/Git opens have no start signal at
+    /// all) and for a bracket opened by a start with no `emitter_turn`
+    /// (Claude Code today). Compared only by `stop_mismatches_open_bracket`;
+    /// never written to a closed turn's record (signal-only field).
+    emitter_turn: Option<String>,
 }
 
 /// A closed turn, engine-level (unix-ms times; persistence converts).
@@ -189,6 +196,7 @@ impl TurnEngine {
                 opened_at: now,
                 files: vec![],
                 id: (self.id_gen)(),
+                emitter_turn: None,
             });
         }
         let open = self.open.as_mut().expect("just ensured");
@@ -247,12 +255,20 @@ impl TurnEngine {
     /// Start signal (e.g. Claude Code UserPromptSubmit): opens a bracket.
     /// Any open non-bracket turn closes first (pre-agent activity); an open
     /// bracket from any tool closes truncated (one open turn per root, D6).
+    /// `emitter_turn` (PROTOCOL §4 additive, C1) is stored on the new
+    /// bracket for `stop_mismatches_open_bracket` to compare later; it is
+    /// never itself deduped or compared here — restart-safe dedup of a
+    /// resent start is the caller's (daemon's) job, keyed on
+    /// `(tool, event, session, emitter_turn)` in `state.json`, because a
+    /// resent start's effect (the earlier bracket) may already be closed
+    /// and gone from this in-memory engine by the time it arrives.
     pub fn observe_start(
         &mut self,
         now: u64,
         tool: &str,
         prompt: Option<String>,
         session: Option<String>,
+        emitter_turn: Option<String>,
     ) -> Vec<ClosedTurn> {
         let mut closed = vec![];
         if let Some(open) = self.open.take() {
@@ -271,8 +287,36 @@ impl TurnEngine {
             opened_at: now,
             files: vec![],
             id: (self.id_gen)(),
+            emitter_turn,
         });
         closed
+    }
+
+    /// True when a stop signal from `tool` carrying `emitter_turn` would NOT
+    /// close the currently-open bracket, because both sides carry an
+    /// `emitter_turn` (PROTOCOL §4 additive, C1) and they differ. Callers
+    /// (the daemon) MUST check this before invoking `observe_stop` for a
+    /// signal that carries `emitter_turn`: a mismatch means the stop is not
+    /// speaking of this bracket, and the bracket MUST stay open exactly as
+    /// it is — `observe_stop` itself is never called for such a signal, so
+    /// its existing tool-matching/timeout logic is untouched by this check.
+    /// Always `false` when no bracket is open, when the open turn isn't a
+    /// bracket, when the tool differs (existing tool-mismatch handling
+    /// inside `observe_stop` already covers that case), or when either side
+    /// lacks `emitter_turn` — the last of these is the fallback that keeps
+    /// Claude Code's emitter_turn-less signals byte-identical to before this
+    /// field existed.
+    pub fn stop_mismatches_open_bracket(&self, tool: &str, emitter_turn: Option<&str>) -> bool {
+        let Some(open) = &self.open else {
+            return false;
+        };
+        if open.source != Source::Bracket || open.tool.as_deref() != Some(tool) {
+            return false;
+        }
+        matches!(
+            (open.emitter_turn.as_deref(), emitter_turn),
+            (Some(a), Some(b)) if a != b
+        )
     }
 
     /// Stop signal. Bracketed: closes the bracket rich, folding any bare turns
@@ -531,7 +575,7 @@ mod tests {
     #[test]
     fn bracket_suppresses_quiet_window() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", Some("fix auth".into()), None);
+        e.observe_start(0, "claude-code", Some("fix auth".into()), None, None);
         e.observe_changes(1_000, &[obs("a.rs")]);
         assert!(e.tick(75_000).is_empty()); // 74s of silence: still open
         e.observe_changes(80_000, &[obs("b.rs")]);
@@ -543,6 +587,59 @@ mod tests {
         assert_eq!(t.prompt.as_deref(), Some("fix auth"));
         assert_eq!(t.files.len(), 2);
         assert!(!t.truncated);
+    }
+
+    // C1: a stop whose emitter_turn differs from the open bracket's own
+    // mismatches — the caller (daemon) must not treat it as this bracket's
+    // close.
+    #[test]
+    fn stop_mismatches_open_bracket_when_both_present_and_differ() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(e.stop_mismatches_open_bracket("claude-code", Some("et-2")));
+    }
+
+    // C1: equal emitter_turn on both sides is an ordinary match, not a
+    // mismatch.
+    #[test]
+    fn stop_matches_open_bracket_when_emitter_turn_equal() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(!e.stop_mismatches_open_bracket("claude-code", Some("et-1")));
+    }
+
+    // C1: either side lacking emitter_turn falls back to today's behavior —
+    // never a mismatch on that basis alone (Claude Code carries none today).
+    #[test]
+    fn stop_mismatches_open_bracket_false_when_either_side_absent() {
+        let mut e = TurnEngine::new();
+        e.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(!e.stop_mismatches_open_bracket("claude-code", None));
+
+        let mut e2 = TurnEngine::new();
+        e2.observe_start(0, "claude-code", None, None, None);
+        assert!(!e2.stop_mismatches_open_bracket("claude-code", Some("et-2")));
+
+        let mut e3 = TurnEngine::new();
+        e3.observe_start(0, "claude-code", None, None, None);
+        assert!(!e3.stop_mismatches_open_bracket("claude-code", None));
+    }
+
+    // C1: no open bracket (nothing open, or an open Quiet/Git turn, or a
+    // bracket for a different tool) never mismatches — those are the
+    // existing paths inside `observe_stop` and stay untouched by this check.
+    #[test]
+    fn stop_mismatches_open_bracket_false_when_no_matching_bracket() {
+        let e = TurnEngine::new();
+        assert!(!e.stop_mismatches_open_bracket("claude-code", Some("et-1")));
+
+        let mut e2 = TurnEngine::new();
+        e2.observe_changes(0, &[obs("a.rs")]); // opens a Quiet turn, not a bracket
+        assert!(!e2.stop_mismatches_open_bracket("claude-code", Some("et-1")));
+
+        let mut e3 = TurnEngine::new();
+        e3.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(!e3.stop_mismatches_open_bracket("codex", Some("et-2")));
     }
 
     // F1 fix: human editor-save bursts outside any bracket close as bare —
@@ -608,7 +705,7 @@ mod tests {
     #[test]
     fn git_change_leaves_bracket_alone() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", None, None);
+        e.observe_start(0, "claude-code", None, None, None);
         e.observe_changes(10, &[obs("a.rs")]);
         e.observe_git_change(20);
         let closed = e.observe_stop(1_000, "claude-code", None, None);
@@ -621,7 +718,7 @@ mod tests {
     fn start_closes_prior_quiet_as_bare() {
         let mut e = TurnEngine::new();
         e.observe_changes(0, &[obs("human.md")]);
-        let closed = e.observe_start(5_000, "claude-code", Some("go".into()), None);
+        let closed = e.observe_start(5_000, "claude-code", Some("go".into()), None, None);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].grade, "bare");
         let stop = e.observe_stop(9_000, "claude-code", None, None);
@@ -633,7 +730,7 @@ mod tests {
     #[test]
     fn bracket_timeout_closes_truncated_rich() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", Some("long job".into()), None);
+        e.observe_start(0, "claude-code", Some("long job".into()), None, None);
         e.observe_changes(10, &[obs("a.rs")]);
         assert!(e.tick(MAX_BRACKET_MS).is_empty());
         let closed = e.tick(MAX_BRACKET_MS + 1);
@@ -647,9 +744,9 @@ mod tests {
     #[test]
     fn second_start_closes_first_bracket_truncated() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", None, None);
+        e.observe_start(0, "claude-code", None, None, None);
         e.observe_changes(10, &[obs("a.rs")]);
-        let closed = e.observe_start(1_000, "codex", None, None);
+        let closed = e.observe_start(1_000, "codex", None, None, None);
         assert_eq!(closed.len(), 1);
         assert!(closed[0].truncated);
         assert_eq!(closed[0].tool.as_deref(), Some("claude-code"));
@@ -670,7 +767,7 @@ mod tests {
     #[test]
     fn before_captured_once_per_turn() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", None, None);
+        e.observe_start(0, "claude-code", None, None, None);
         let first = ChangeObs {
             before_hash: Some("sha256:v0".into()),
             ..obs("a.rs")
@@ -697,6 +794,7 @@ mod tests {
             "claude-code",
             Some("fix auth".into()),
             Some("s1".into()),
+            None,
         );
         e.observe_changes(1_500, &[obs("a.rs")]);
         let snap = e.snapshot_open().expect("turn is open");
@@ -723,7 +821,7 @@ mod tests {
         let mut e = TurnEngine::new();
         assert_eq!(e.open_turn_id(), None, "nothing open yet");
 
-        e.observe_start(1_000, "claude-code", None, Some("s1".into()));
+        e.observe_start(1_000, "claude-code", None, Some("s1".into()), None);
         let reserved = e.open_turn_id().expect("bracket is open").to_string();
         assert!(!reserved.is_empty());
 
@@ -759,7 +857,7 @@ mod tests {
         let bare = e.tick(21_000);
         assert_eq!(bare[0].grade, "bare");
         // agent bracket starts well after the bare closed
-        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None);
+        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None, None);
         e.observe_changes(70_000, &[obs("b.rs")]);
         let closed = e.observe_stop(120_000, "claude-code", None, None);
         let t = &closed[0];
@@ -783,7 +881,7 @@ mod tests {
         assert_eq!(bare[0].grade, "bare");
         assert_eq!(bare[0].closed_at, 75_000);
         let bare_id = bare[0].id.clone();
-        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None);
+        e.observe_start(60_000, "claude-code", Some("fix auth".into()), None, None);
         e.observe_changes(70_500, &[obs("b.rs")]);
         let closed = e.observe_stop(80_000, "claude-code", None, None);
         let t = &closed[0];
@@ -902,7 +1000,7 @@ mod tests {
     #[test]
     fn dedup_updates_terminal_flags_from_latest_observation() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", None, None);
+        e.observe_start(0, "claude-code", None, None, None);
         let del = ChangeObs {
             path: "a.rs".into(),
             before_hash: Some("sha256:v0".into()),
@@ -936,7 +1034,7 @@ mod tests {
     #[test]
     fn bracket_timeout_closes_at_last_mutation_not_tick_time() {
         let mut e = TurnEngine::new();
-        e.observe_start(0, "claude-code", Some("long job".into()), None);
+        e.observe_start(0, "claude-code", Some("long job".into()), None, None);
         e.observe_changes(500, &[obs("a.rs")]); // last real mutation at t=500
         assert!(e.tick(MAX_BRACKET_MS).is_empty());
         let closed = e.tick(MAX_BRACKET_MS + 1);

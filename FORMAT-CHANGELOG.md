@@ -11,6 +11,58 @@ Conformance fixtures for these fields are **not** created yet — the
 protocol freeze is Phase 2.1 (spec decision 5). Until then, these fields
 are additive but UNFROZEN: their shape can still change before 2.1 locks it.
 
+## Phase 2 tail C1 — `SignalEvent.emitter_turn` (2026-08-05)
+
+Added to `SignalEvent`, after `files_written`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub emitter_turn: Option<String>,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `None`, and
+`None` is what every pre-existing signal line parses to, so every existing
+`signal.jsonl` line round-trips byte-identically
+(`record.rs::signal_emitter_turn_roundtrips_and_absence_stays_absent`).
+UNFROZEN until the Phase 2.1 protocol freeze, like every field above.
+
+An open string carrying a stable turn identity the **emitter** assigns,
+present on `start`/`stop` signals only (PROTOCOL §4). Motivating producer:
+Codex's own hook `turn_id` (see `docs/verify/codex-spike.md`) — Task C2
+(`agentrec hook codex`, not built in this round) is its intended writer.
+Claude Code's hook emitter has no equivalent stable id today and omits the
+field entirely; `None` means "emitter did not declare", never "no upstream
+turn".
+
+- **Reader: `agentrec-core::engine::TurnEngine`.** `observe_start` gained a
+  fifth parameter, `emitter_turn: Option<String>`, stored on the newly
+  opened bracket. A new query method,
+  `TurnEngine::stop_mismatches_open_bracket(tool, emitter_turn)`, reports
+  whether a stop's `emitter_turn` differs from the open bracket's own
+  (both present) — `observe_stop`'s own signature and matching logic are
+  untouched; a caller that gets `true` back is expected to skip calling
+  `observe_stop` for that signal entirely, leaving the bracket open.
+- **Writer/consumer: `cli/src/daemon.rs`.** `handle_emitter_turn_signal`
+  (called from the poll loop before `apply_signal`, gated on
+  `sig.kind.is_none()` so an unrecognized future `type` never enters it)
+  does two things for a signal that carries `emitter_turn`: (1) restart-safe
+  dedup — a resend of the immediately-previous processed
+  `(tool, event, session, emitter_turn)` tuple is dropped, counted in
+  `state.json`'s new `duplicate_emitter_turn_signals`, and never reaches the
+  engine; (2) a mismatched stop (per `stop_mismatches_open_bracket`) is
+  likewise dropped and counted in `mismatched_stop_emitter_turns`, leaving
+  the bracket open. Both counters, plus the dedup key itself
+  (`last_emitter_turn_key`), are additive `#[serde(default)]` fields on
+  `state.json`'s `State` — itself operational, off-wire, per PROTOCOL §5's
+  note — so a pre-C1 `state.json` still parses with zero counted failures
+  (`state::tests::pre_c1_state_json_without_emitter_turn_fields_parses_cleanly`).
+  A signal with no `emitter_turn` never enters either check: zero extra
+  `state.json` reads or writes.
+- Single-slot dedup, deliberately: `last_emitter_turn_key` holds only the
+  most-recently-processed key, so it catches an immediately-following
+  resend, not an arbitrary-history duplicate — a different signal arriving
+  in between clears the slot (state.rs doc comment on the field).
+
 ## MVP periphery — `FileEntry.link_kind`, `FileEntry.attribution` (2026-08-01)
 
 Red team round 2, finding F2. Added to `FileEntry`, at the end, after

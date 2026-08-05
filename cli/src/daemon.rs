@@ -399,6 +399,21 @@ pub fn run(root: &Path) -> Result<(), String> {
                 ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
                 continue;
             }
+            // C1 (PROTOCOL §4 additive): a start/stop signal carrying
+            // `emitter_turn` participates in restart-safe dedup + the
+            // bracket-mismatch check. Gated on `sig.kind.is_none()` — the
+            // same "genuinely start/stop-shaped, no `type`" test
+            // `apply_signal` itself uses for its stop arm — so a signal with
+            // an unrecognized future `type` is never touched here; it still
+            // reaches `apply_signal`'s own `record_unknown_signal` counting
+            // unperturbed, never miscounted as an emitter_turn resend. A
+            // signal with no `emitter_turn` at all (every Claude Code hook
+            // payload today) is a no-op inside the helper: zero extra
+            // `state.json` reads/writes, byte-identical to before this
+            // field existed (AC-C1).
+            if sig.kind.is_none() && handle_emitter_turn_signal(&root, &engine, &sig) {
+                continue;
+            }
             let (prompt, model, transcript_raw) = signal_context(&sig);
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
@@ -1713,6 +1728,85 @@ fn reject_candidate(root: &Path, state: &mut State) {
     }
 }
 
+/// C1 dedup key for a start/stop signal carrying `emitter_turn` (PROTOCOL §4
+/// additive): `(tool, event, session, emitter_turn)`, joined on a control
+/// byte that cannot appear in any of the four components as parsed JSON
+/// string content — unlike `\u{1}` inside a Rust string literal, this is a
+/// raw byte, not an escapable delimiter a crafted `tool`/`session` value
+/// could inject to collide two distinct tuples onto the same key. Returns
+/// `None` when `emitter_turn` itself is absent (every Claude Code hook
+/// payload today) — callers must treat that as "does not participate",
+/// never as a key that legitimately equals another `None`-keyed signal's.
+fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
+    let et = sig.emitter_turn.as_deref()?;
+    let event = sig.event.as_deref().unwrap_or("stop");
+    let session = sig.session.as_deref().unwrap_or("");
+    Some(format!("{}\u{1}{event}\u{1}{session}\u{1}{et}", sig.tool))
+}
+
+/// C1: emitter_turn restart-safe dedup + bracket-mismatch check for a
+/// signal already known to be start/stop-shaped (`sig.kind.is_none()` at
+/// the caller). Returns `true` when the signal was fully handled HERE (a
+/// resend of the previous processed signal, or a stop mismatched against
+/// the open bracket) and must not reach `apply_signal` at all; `false`
+/// means normal processing continues unchanged. Split out from the poll
+/// loop so both branches are unit-testable without spinning up the
+/// blocking `run()` loop — see `cli/tests/emitter_turn.rs` for the
+/// real-daemon-restart integration coverage this alone can't provide.
+fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEvent) -> bool {
+    if let Some(key) = emitter_turn_dedup_key(sig) {
+        let mut state = read_state(root);
+        if state.last_emitter_turn_key.as_deref() == Some(key.as_str()) {
+            // A resend of the immediately-previous processed signal
+            // (emitter retry, or a resend racing a daemon restart):
+            // counted, not silently dropped (the `memory_rejects`/
+            // `unknown_signal_ignored` honesty pattern), and never applied
+            // — applying it again would open (or wrongly close) a second
+            // bracket for a turn that already happened.
+            state.duplicate_emitter_turn_signals += 1;
+            if let Err(e) = write_state(root, &state) {
+                eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+            }
+            return true;
+        }
+        // Mark-before-apply, mirroring `SignalTailer::poll`'s own
+        // `signal_offset` posture (see that fn's doc comment): a crash
+        // between this write and `apply_signal` (called by our caller,
+        // after this returns `false`) can LOSE this one signal's effect if
+        // it's never resent, but can never cause it to be DOUBLE-applied
+        // on the next restart — the same never-duplicate-over-never-lose
+        // tradeoff `resync_shrunk_signal_offset` already makes for
+        // `signal_offset` itself.
+        state.last_emitter_turn_key = Some(key);
+        if let Err(e) = write_state(root, &state) {
+            eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+        }
+    }
+    // A stop whose emitter_turn doesn't match the currently open bracket's
+    // own is not this bracket's close (C1): leave the bracket exactly as it
+    // is (never call `observe_stop` for it — that would fall into its
+    // tool-matching/timeout logic, which is not what a mismatch means),
+    // counted rather than silently dropped. A resent MISMATCHED stop that
+    // also collides with `last_emitter_turn_key` is caught by the dedup
+    // branch above first and never reaches here a second time — this only
+    // sees the FIRST mismatched stop for a given key.
+    if !sig.is_start() {
+        if let Some(et) = sig.emitter_turn.as_deref() {
+            if engine.stop_mismatches_open_bracket(&sig.tool, Some(et)) {
+                let mut state = read_state(root);
+                state.mismatched_stop_emitter_turns += 1;
+                if let Err(e) = write_state(root, &state) {
+                    eprintln!(
+                        "agentrec: warning: failed to persist emitter_turn mismatch state: {e}"
+                    );
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn apply_signal(
     root: &Path,
     engine: &mut TurnEngine,
@@ -1723,7 +1817,13 @@ fn apply_signal(
     // `prompt` is already resolved (hook-provided or transcript-extracted);
     // persist() scrubs before anything reaches disk (idempotent, AC I4).
     if sig.is_start() {
-        return engine.observe_start(now, &sig.tool, prompt, sig.session.clone());
+        return engine.observe_start(
+            now,
+            &sig.tool,
+            prompt,
+            sig.session.clone(),
+            sig.emitter_turn.clone(),
+        );
     }
     // F5 / PROTOCOL §10 additive-versioning: a signal carrying a `type` this
     // consumer doesn't recognize MUST be tolerated, never reinterpreted as a
@@ -2552,10 +2652,215 @@ mod tests {
             transcript: transcript.map(String::from),
             prompt: None,
             files_written,
+            emitter_turn: None,
             kind: None,
             fact: None,
             pins: None,
         }
+    }
+
+    // ---- C1: emitter_turn dedup key + restart-safe dedup / mismatch -------
+
+    #[allow(clippy::too_many_arguments)]
+    fn et_sig(
+        tool: &str,
+        event: Option<&str>,
+        session: Option<&str>,
+        emitter_turn: Option<&str>,
+    ) -> SignalEvent {
+        SignalEvent {
+            v: 1,
+            ts: 1000,
+            tool: tool.to_string(),
+            event: event.map(String::from),
+            session: session.map(String::from),
+            transcript: None,
+            prompt: None,
+            files_written: None,
+            emitter_turn: emitter_turn.map(String::from),
+            kind: None,
+            fact: None,
+            pins: None,
+        }
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_none_when_absent() {
+        assert_eq!(
+            emitter_turn_dedup_key(&et_sig("claude-code", Some("stop"), None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_distinguishes_every_component() {
+        let base = emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et1")))
+            .unwrap();
+        let diff_tool = emitter_turn_dedup_key(&et_sig(
+            "claude-code",
+            Some("start"),
+            Some("s1"),
+            Some("et1"),
+        ))
+        .unwrap();
+        let diff_event =
+            emitter_turn_dedup_key(&et_sig("codex", Some("stop"), Some("s1"), Some("et1")))
+                .unwrap();
+        let diff_session =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s2"), Some("et1")))
+                .unwrap();
+        let diff_et =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et2")))
+                .unwrap();
+        for other in [diff_tool, diff_event, diff_session, diff_et] {
+            assert_ne!(base, other);
+        }
+        // Identical tuples produce identical keys — required for the dedup
+        // comparison to ever match at all.
+        let repeat =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et1")))
+                .unwrap();
+        assert_eq!(base, repeat);
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_missing_event_defaults_to_stop_like_the_engine_does() {
+        // `sig.event: None` is the "stop" shape (`is_start()` false) —
+        // the dedup key's `event` component must agree with that default,
+        // or a start's key and an absent-event stop's key could collide.
+        let explicit =
+            emitter_turn_dedup_key(&et_sig("codex", Some("stop"), Some("s1"), Some("et1")))
+                .unwrap();
+        let implicit =
+            emitter_turn_dedup_key(&et_sig("codex", None, Some("s1"), Some("et1"))).unwrap();
+        assert_eq!(explicit, implicit);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_noop_and_zero_writes_when_emitter_turn_absent() {
+        // AC-C1 byte-identical claim, at the daemon layer: a signal with no
+        // emitter_turn (every Claude Code hook payload today) must not read
+        // OR write state.json at all — not even to leave it unchanged.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        assert!(!crate::state_path(root).exists());
+
+        let start = et_sig("claude-code", Some("start"), Some("s1"), None);
+        assert!(!handle_emitter_turn_signal(root, &engine, &start));
+        assert!(
+            !crate::state_path(root).exists(),
+            "an emitter_turn-less start must write nothing to state.json"
+        );
+
+        let stop = et_sig("claude-code", Some("stop"), Some("s1"), None);
+        assert!(!handle_emitter_turn_signal(root, &engine, &stop));
+        assert!(
+            !crate::state_path(root).exists(),
+            "an emitter_turn-less stop must write nothing to state.json either"
+        );
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_dedups_resent_start_after_simulated_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        let start = et_sig("codex", Some("start"), Some("s1"), Some("et-abc"));
+
+        // First delivery: not a resend, marks the key, lets the caller
+        // proceed to `apply_signal`.
+        assert!(!handle_emitter_turn_signal(root, &engine, &start));
+        let after_first = read_state(root);
+        assert_eq!(
+            after_first.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}start\u{1}s1\u{1}et-abc")
+        );
+        assert_eq!(after_first.duplicate_emitter_turn_signals, 0);
+
+        // Simulated restart: a fresh TurnEngine (exactly what `run()` starts
+        // with after a crash — any prior open bracket is closed by
+        // `recover_orphan` before the engine is ever constructed, never
+        // resurrected into it), same `root`/state.json. The emitter resends
+        // the identical start signal (its own retry, or a resend racing the
+        // restart).
+        let restarted_engine = TurnEngine::new();
+        assert!(
+            handle_emitter_turn_signal(root, &restarted_engine, &start),
+            "a resend of the exact previous signal must be swallowed, not reopen a bracket"
+        );
+        let after_resend = read_state(root);
+        assert_eq!(
+            after_resend.duplicate_emitter_turn_signals, 1,
+            "the resend must be counted, not silently dropped"
+        );
+        assert_eq!(
+            after_resend.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}start\u{1}s1\u{1}et-abc"),
+            "the dedup key itself is unchanged by a swallowed resend"
+        );
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_a_different_signal_in_between_is_not_a_resend() {
+        // Single-slot dedup, deliberately (state.rs doc comment): a
+        // genuinely different signal arriving in between clears the slot,
+        // so the SAME start signal sent a second time afterward is treated
+        // as new again, not as a resend of the original.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        let start_a = et_sig("codex", Some("start"), Some("s1"), Some("et-a"));
+        let start_b = et_sig("codex", Some("start"), Some("s2"), Some("et-b"));
+
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_a));
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_b));
+        // start_a again: NOT a resend, because start_b's key overwrote the
+        // slot in between.
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_a));
+        assert_eq!(read_state(root).duplicate_emitter_turn_signals, 0);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_mismatched_stop_leaves_bracket_open_and_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(engine.has_open_turn());
+
+        let mismatched_stop = et_sig("claude-code", Some("stop"), None, Some("et-2"));
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &mismatched_stop),
+            "a mismatched stop must be swallowed here, never reach apply_signal"
+        );
+        assert!(
+            engine.has_open_turn(),
+            "handle_emitter_turn_signal takes &TurnEngine and never calls observe_stop \
+             itself — the bracket is untouched by construction"
+        );
+        let state = read_state(root);
+        assert_eq!(state.mismatched_stop_emitter_turns, 1);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_matching_stop_is_not_swallowed() {
+        // Positive control: equal emitter_turn on both sides must let the
+        // stop proceed to `apply_signal` (which will close the bracket) —
+        // the mismatch check must not over-fire on a genuine match.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+
+        let matching_stop = et_sig("claude-code", Some("stop"), None, Some("et-1"));
+        assert!(!handle_emitter_turn_signal(root, &engine, &matching_stop));
+        assert_eq!(read_state(root).mismatched_stop_emitter_turns, 0);
     }
 
     const FIXTURE_TRANSCRIPT: &str = concat!(

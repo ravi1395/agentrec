@@ -161,6 +161,37 @@ pub struct State {
     /// see `agentrec_core::store::PutResult::Stored`'s doc).
     #[serde(default)]
     pub dedup_reread_bytes: u64,
+    /// Dedup key of the most recently PROCESSED start/stop signal that
+    /// carried a PROTOCOL §4 `emitter_turn` (Phase 2 tail C1):
+    /// `"{tool}\u{1}{event}\u{1}{session}\u{1}{emitter_turn}"`. `None` when
+    /// no such signal has been processed yet — including every daemon that
+    /// predates this field, and every repo whose emitter never sets
+    /// `emitter_turn` (Claude Code today), which never writes this field at
+    /// all. Restart-safe by construction (persisted in `state.json`, not
+    /// engine memory): the emitter can resend the exact signal it already
+    /// sent (its own retry, or a resend racing a daemon restart) and the
+    /// daemon recognizes the repeat by this key rather than reopening a
+    /// second bracket for it. Single-slot, deliberately: this catches an
+    /// immediately-following resend of the last processed signal, not an
+    /// arbitrary-history duplicate — a genuinely different signal arriving
+    /// in between clears the slot. Mirrors `SignalTailer::poll`'s own
+    /// mark-before-apply posture (this key is written as soon as a signal is
+    /// recognized as new, before `apply_signal` runs) — never-duplicate over
+    /// never-lose, the same tradeoff `resync_shrunk_signal_offset`'s doc
+    /// comment already makes for `signal_offset`.
+    #[serde(default)]
+    pub last_emitter_turn_key: Option<String>,
+    /// Count of start/stop signals dropped as a resend of
+    /// `last_emitter_turn_key` (Phase 2 tail C1) — the `memory_rejects`
+    /// honesty pattern: a dropped resend leaves no trace in `log.jsonl`, so
+    /// this counter is the only visible evidence it happened.
+    #[serde(default)]
+    pub duplicate_emitter_turn_signals: u64,
+    /// Count of stop signals whose `emitter_turn` mismatched the currently
+    /// open bracket's own (Phase 2 tail C1) — the bracket was left open
+    /// rather than closed; same honesty pattern as every counter above.
+    #[serde(default)]
+    pub mismatched_stop_emitter_turns: u64,
 }
 
 /// Sentinel `last_bad_field` value for a file that could not be parsed as a
@@ -240,6 +271,9 @@ pub fn read_state(root: &Path) -> State {
         watcher_armed_nonce: field!("watcher_armed_nonce"),
         dedup_hits: field!("dedup_hits"),
         dedup_reread_bytes: field!("dedup_reread_bytes"),
+        last_emitter_turn_key: field!("last_emitter_turn_key"),
+        duplicate_emitter_turn_signals: field!("duplicate_emitter_turn_signals"),
+        mismatched_stop_emitter_turns: field!("mismatched_stop_emitter_turns"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -633,5 +667,47 @@ mod tests {
             text_before, text_after,
             "a healthy state.json must round-trip byte-identically"
         );
+    }
+
+    // C1 (verification item 6): a state.json written before
+    // `last_emitter_turn_key`/`duplicate_emitter_turn_signals`/
+    // `mismatched_stop_emitter_turns` existed — carrying only pre-C1 keys —
+    // must still parse cleanly. The new fields must default (never a parse
+    // failure): a MISSING key is not corruption, only a present key of the
+    // wrong type is. Neuter: swap any of the three `#[serde(default)]`s for
+    // a bare (non-defaulted) field -> RED (struct-level deserialize fails
+    // outright the instant a present sibling key exists without it).
+    #[test]
+    fn pre_c1_state_json_without_emitter_turn_fields_parses_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        // Exactly the field set a pre-C1 daemon would have written — no
+        // emitter_turn keys anywhere.
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":42,"signal_offset":777,"snapshot_failures":0,"io_failed":[],
+               "memory_rejects":0,"unknown_signal_ignored":0,"non_utf8_path_skips":0,
+               "prompt_put_failures":0,"ignore_rebuilds":0,"last_ignore_rebuild_ms":0,
+               "epoch_ignore_rebuilds":0,"epoch_nonce":"","epoch_reload_nonce":"",
+               "state_parse_failures":0,"last_bad_field":null,"watcher_armed_nonce":"",
+               "dedup_hits":0,"dedup_reread_bytes":0}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.state_parse_failures, 0,
+            "a missing (not wrong-typed) new field must never be counted as corruption"
+        );
+        assert_eq!(state.last_bad_field, None);
+        assert_eq!(state.pid, 42);
+        assert_eq!(
+            state.signal_offset, 777,
+            "sibling fields must survive intact"
+        );
+        assert_eq!(state.last_emitter_turn_key, None);
+        assert_eq!(state.duplicate_emitter_turn_signals, 0);
+        assert_eq!(state.mismatched_stop_emitter_turns, 0);
     }
 }

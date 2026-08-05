@@ -68,6 +68,19 @@ pub struct SignalEvent {
     /// consumers must not infer authorship for paths absent from the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_written: Option<Vec<String>>,
+    /// PROTOCOL §4 additive (Phase 2 tail C1): a stable turn identity the
+    /// EMITTER assigns, present on `start`/`stop` only. Motivating producer:
+    /// Codex's own hook `turn_id` (docs/verify/codex-spike.md) — the daemon
+    /// uses it to detect an emitter-resent start/stop (retry, or a daemon
+    /// restart racing the emitter's own retry) by
+    /// `(tool, event, session, emitter_turn)` instead of timing heuristics.
+    /// Claude Code's hook emitter has no equivalent stable id today and
+    /// omits this field entirely; `None` means "emitter did not declare",
+    /// never "no upstream turn" — a recorder MUST fall back to today's
+    /// existing start/stop matching whenever either side of a comparison
+    /// lacks it (see `cli/src/daemon.rs`'s dedup + mismatch handling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitter_turn: Option<String>,
     /// Signal variant discriminator (PROTOCOL §4, additive). Absent/`None` on
     /// every existing turn-boundary signal (`start`/`stop`, keyed by `event`
     /// instead). Currently the only non-`None` value is `"memory-candidate"`
@@ -480,6 +493,30 @@ mod tests {
         let empty = "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"files_written\":[]}";
         let sig: SignalEvent = serde_json::from_str(empty).unwrap();
         assert_eq!(sig.files_written.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn signal_emitter_turn_roundtrips_and_absence_stays_absent() {
+        // Pre-field line (every Claude Code hook payload today): parses with
+        // None, and re-serializing does NOT mint the key — this is the wire
+        // half of AC-C1's byte-identical claim (the daemon-side half is in
+        // `cli/tests/emitter_turn.rs`).
+        let old = "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\"}";
+        let sig: SignalEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(sig.emitter_turn, None);
+        let re = serde_json::to_string(&sig).unwrap();
+        assert!(!re.contains("emitter_turn"));
+
+        // Field-carrying line round-trips intact.
+        let new = concat!(
+            "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"event\":\"start\",",
+            "\"emitter_turn\":\"turn_abc123\"}"
+        );
+        let sig: SignalEvent = serde_json::from_str(new).unwrap();
+        assert_eq!(sig.emitter_turn.as_deref(), Some("turn_abc123"));
+        let re = serde_json::to_string(&sig).unwrap();
+        let back: SignalEvent = serde_json::from_str(&re).unwrap();
+        assert_eq!(back.emitter_turn, sig.emitter_turn);
     }
 
     #[test]
