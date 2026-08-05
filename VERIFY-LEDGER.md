@@ -1570,3 +1570,55 @@ Worth keeping for the pattern: the first attempt at this measurement was itself
 non-discriminating (it measured Claude Code's *Bash-tool* cwd, not the hook subprocess's), and
 was caught in review rather than by the agent that ran it — corrected in `1b34f5b`. Two
 successive measurements of the same fact, the first wrong, before the record was right.
+
+### CORRECTION 2026-08-05 (b) — conflicting provenance for the non-discriminating-probe catch
+
+A gate round found three mutually incompatible statements, across three gated commits, about
+who caught the first (non-discriminating) Claude hook-cwd probe:
+
+- `1b34f5b` commit message: "Caught before being relied on further **(not by a second party)**"
+- this ledger, above (`### ... (a)` section's neighbourhood, the O5 Claude-leg row): "**a
+  self-caught gap, not found by a second party**"
+- `ecd09bc`'s appendix: "was **caught in review rather than by the agent that ran it**"
+- `docs/verify/o5-two-tool-session.md`: "it was caught **(not by this round)**"
+
+"Self-caught, not by a second party" and "caught in review rather than by the agent that ran
+it" are direct negations. At least one gated commit carries a false sentence. This matters
+because this repo's honesty machinery explicitly tracks whether self-correction fires WITHOUT
+a reviewer — that datum is the whole point of distinguishing the two (cf. `f8d8f75`, labelled
+"advisor-caught" precisely to avoid claiming an unearned self-catch).
+
+**No account is endorsed here, because the artifacts cannot settle it.** What CAN be
+established, and is the only new fact this correction adds: the implementing agent gave the
+orchestrator a completion report stating the probe was "caught during review, not by me" —
+which contradicts that same agent's own commit message (`1b34f5b`) claiming a self-catch not
+found by a second party. The agent's two accounts of its own work disagree. `ecd09bc`'s
+sentence is traceable: the orchestrator transcribed the agent's completion report without
+reconciling it against the commit message the same agent had already written — a transcription
+of an unverified claim, which is its own instance of the pattern this file keeps recording.
+
+Disposition: the substantive conclusion is untouched by any of this — the redone probe's
+measurement stands (two agreeing channels, both firings), and `3c4f598`'s falsified claim
+stays falsified. Only the catch-provenance is unresolved, and it is left unresolved on the
+record rather than settled by picking the flattering account.
+
+### RE-RECORDED 2026-08-05 — the "offline bracket anomaly" is D7-by-design, not an anomaly
+
+The O5 Claude-leg round recorded, as an undiagnosed anomaly for founder disposition, that a
+bracket whose entire lifetime elapsed while the daemon was offline left `signal_offset` fully
+consumed but produced zero turn record. A gate round then reproduced it **deterministically**
+(signals appended with no daemon → fresh daemon start → `signal_offset` = exact file length,
+zero turns, epoch start/stop only) and found the mechanism, which is not a mystery at all:
+`cli/src/daemon.rs::replay_pending_candidates` drops start/stop in the pre-daemon window **by
+design**, with a comment saying so ("D7 preserved: ... never fed to the engine, so no phantom
+turn can be minted here"). This repo's own CLAUDE.md already records the same fact ("startup
+replay never feeds start/stop to the engine at any offset").
+
+The original round's trace of `apply_signal`/`observe_*`/`persist` was literally accurate but
+missed the startup site, so it reported a mystery where the answer was a documented decision.
+
+**Re-framed, because the framing changes what the founder actually owns:** this is not a
+diagnosis round to commission. It is a product-posture call on D7 — any tool session whose
+FULL bracket elapses while the daemon is down is silently dropped as-if-consumed, prompt
+included. That is the known D7 tradeoff (never mint a phantom turn) doing exactly what it was
+built to do, at a cost that is now measured rather than theoretical.
