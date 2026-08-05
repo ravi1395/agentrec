@@ -192,6 +192,29 @@ pub struct State {
     /// rather than closed; same honesty pattern as every counter above.
     #[serde(default)]
     pub mismatched_stop_emitter_turns: u64,
+    /// Content fingerprint of the signal `last_emitter_turn_key` was last
+    /// set for (Phase 2 tail, C1 fix 1 — content-aware dedup). Identity
+    /// alone (`last_emitter_turn_key`) cannot distinguish a genuine emitter
+    /// RETRY (byte-identical resend) from a genuine SECOND firing that
+    /// happens to share the same `(tool, event, session, emitter_turn)`
+    /// tuple: Codex's `Stop` hook fires twice for one `turn_id` on a
+    /// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
+    /// "Continuation semantics"), and the second firing can carry
+    /// genuinely NEW `files_written` from `apply_patch` calls made during
+    /// the continuation. `daemon.rs::emitter_turn_content_fingerprint`
+    /// computes what this holds for each event kind. `None` when no key
+    /// has been recorded yet, OR when the currently-stored key predates
+    /// this field (every pre-fix `state.json`, which has
+    /// `last_emitter_turn_key` but never wrote this one): a key match
+    /// against a `None` fingerprint is treated the same as the pre-fix
+    /// behavior — identity alone means duplicate — rather than risk
+    /// double-applying a genuine crash-restart resend in the one-time
+    /// window right after a binary upgrade. That comparison ALSO stamps
+    /// this field with the incoming signal's fingerprint before returning
+    /// (see `handle_emitter_turn_signal`), so the gap self-heals on this
+    /// exact occurrence, not just on some later non-duplicate signal.
+    #[serde(default)]
+    pub last_emitter_turn_fingerprint: Option<String>,
 }
 
 /// Sentinel `last_bad_field` value for a file that could not be parsed as a
@@ -274,6 +297,7 @@ pub fn read_state(root: &Path) -> State {
         last_emitter_turn_key: field!("last_emitter_turn_key"),
         duplicate_emitter_turn_signals: field!("duplicate_emitter_turn_signals"),
         mismatched_stop_emitter_turns: field!("mismatched_stop_emitter_turns"),
+        last_emitter_turn_fingerprint: field!("last_emitter_turn_fingerprint"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -709,5 +733,43 @@ mod tests {
         assert_eq!(state.last_emitter_turn_key, None);
         assert_eq!(state.duplicate_emitter_turn_signals, 0);
         assert_eq!(state.mismatched_stop_emitter_turns, 0);
+    }
+
+    // C1 fix 1: the specific transitional shape this fix must tolerate — a
+    // state.json written by a binary that HAD `last_emitter_turn_key` but
+    // predates `last_emitter_turn_fingerprint`. Missing (not wrong-typed)
+    // must default to None, never a parse failure — same posture as the
+    // test above, scoped to the one new field this fix adds. Neuter: swap
+    // the field's `#[serde(default)]` for a bare one -> RED.
+    #[test]
+    fn state_json_with_key_but_no_fingerprint_parses_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        // The delimiter inside `last_emitter_turn_key` is U+0001, a JSON
+        // control character that MUST be `\u0001`-escaped to be valid
+        // JSON (exactly what `serde_json::to_string` always emits for it)
+        // -- a raw unescaped control byte here would make the whole file
+        // fail to parse as JSON at all, a different (irrelevant) failure
+        // mode than the one this test targets.
+        std::fs::write(
+            state_path(root),
+            "{\"pid\":9,\"signal_offset\":5,\
+             \"last_emitter_turn_key\":\"codex\\u0001stop\\u0001s1\\u0001et-1\",\
+             \"duplicate_emitter_turn_signals\":0,\"mismatched_stop_emitter_turns\":0}",
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.state_parse_failures, 0,
+            "a missing (not wrong-typed) new field must never be counted as corruption"
+        );
+        assert_eq!(
+            state.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}stop\u{1}s1\u{1}et-1"),
+            "the pre-fix key must survive intact"
+        );
+        assert_eq!(state.last_emitter_turn_fingerprint, None);
     }
 }

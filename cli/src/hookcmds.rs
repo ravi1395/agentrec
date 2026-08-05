@@ -30,42 +30,54 @@
 //! difference for this emitter, not an oversight or a claim that Claude's
 //! arm should change.
 //!
-//! **`model` is dropped — escalated, not decided here.** The spike's field
-//! inventory shows `model` present on all three Codex events, but
-//! `SignalEvent` has no field for it and this task's constraints forbid
-//! adding one unilaterally ("no new protocol/wire fields... STOP and
-//! report"). Unlike Claude (whose model comes from a daemon-side transcript
-//! parse, a separate mechanism this module doesn't touch), a Codex rich
-//! turn produced by this emitter carries no model attribution at all today.
-//! Founder call: add a wire field, or accept the gap.
+//! **`model` (C2 fix 2, founder-ratified): wired on `UserPromptSubmit`
+//! only.** The spike's field inventory shows `model` present on all three
+//! Codex events (`docs/verify/codex-spike.md`), but only
+//! `UserPromptSubmit`'s copy is ever sent on the wire — mirroring
+//! `prompt`'s existing start-only posture, not `emitter_turn`'s
+//! carried-on-both-signals posture: `emitter_turn` is carried on both
+//! because the DAEMON'S dedup/mismatch logic needs it at both ends (see
+//! the fix-1 paragraph below); `model` is purely descriptive attribution
+//! and needs no re-assertion at stop time. `daemon.rs::signal_context`
+//! reads `sig.model` first, falling back to (Claude-only) transcript
+//! parsing, and stamps `Recorder.models[session]` for whichever signal
+//! resolves one — the same session-keyed, in-memory mechanism Claude's
+//! transcript-derived model attribution already uses (Claude signals never
+//! set `model`, so that path is unchanged). Residual, same class as an
+//! existing accepted one: `Recorder.models` is in-memory, so a daemon
+//! RESTART strictly between a session's `start` and `stop` loses the model
+//! for that one turn — no different from a restart losing `prompt`.
 //!
-//! **Known interaction with C1's resend dedup, not fixed here (would need
-//! a daemon-side or wire change, both out of this task's file scope).** The
-//! spike's block-continuation finding (`docs/verify/codex-spike.md`,
-//! "Continuation semantics") measured `turn_id` staying IDENTICAL across a
-//! blocked `Stop` firing twice for one turn (`stop_hook_active: false` then
-//! `true`). Both firings therefore produce the exact same C1 dedup key
-//! `(tool, event="stop", session, emitter_turn)` in `daemon.rs::
-//! emitter_turn_dedup_key`. If `apply_patch` runs during the continuation
-//! (between the two `Stop`s), this module correctly drains those NEW paths
-//! into the second `Stop` signal's `files_written` — but the daemon's
-//! `handle_emitter_turn_signal` sees a repeat of the immediately-previous
-//! key and treats the second signal as a resend, dropping it unapplied.
-//! The continuation's declared writes are lost, with no recovery: scratch
-//! was already drained by the (correct, from this module's point of view)
-//! first drain. `docs/fixtures/codex/stop_continuation_first_block.json` /
-//! `_second_after_block.json` are the live evidence for the shared-`turn_id`
-//! premise; neither is exercised by this module's tests, since the fix
-//! belongs to C1's dedup key or a wire sequence field, not to this emitter.
-//!
-//! **This paragraph is derived by reading `daemon.rs::
-//! handle_emitter_turn_signal` and `emitter_turn_dedup_key`, not reproduced
-//! by a test** — no signal sits between the two `Stop`s to intervene (this
-//! module's `PostToolUse` handler never writes to `signal.jsonl`), so
-//! `state.last_emitter_turn_key` is still `Stop` #1's key when `Stop` #2
-//! arrives, which is what makes #2 read as a resend. A future change to
-//! either side of that gap could invalidate this reasoning; treat it as a
-//! traced claim, not a measured one.
+//! **Known interaction with C1's resend dedup — FIXED at the dedup layer
+//! by Phase 2 tail's fix 1, NOT fully closed end-to-end.** The spike's
+//! block-continuation finding (`docs/verify/codex-spike.md`, "Continuation
+//! semantics") measured `turn_id` staying IDENTICAL across a blocked
+//! `Stop` firing twice for one turn (`stop_hook_active: false` then
+//! `true`), and confirmed `UserPromptSubmit` never re-fires for the
+//! synthetic continuation prompt. Both `Stop` firings therefore produce
+//! the exact same C1 dedup key `(tool, event="stop", session,
+//! emitter_turn)` in `daemon.rs::emitter_turn_dedup_key`. If `apply_patch`
+//! runs during the continuation (between the two `Stop`s), this module
+//! correctly drains those NEW paths into the second `Stop` signal's
+//! `files_written`. Before fix 1, `daemon.rs::handle_emitter_turn_signal`
+//! saw a repeat of the immediately-previous key and silently dropped the
+//! second signal — the NEW `files_written` never reached the engine at
+//! all. **Fix 1 (`daemon.rs::emitter_turn_content_fingerprint`) closes
+//! that: the second Stop's DIFFERENT `files_written` gives it a different
+//! content fingerprint, so it is no longer read as a resend and reaches
+//! `apply_signal`.** It still does not reach a PERSISTED turn record,
+//! though: `apply_signal` finds the bracket the first `Stop` already
+//! closed and — since nothing is open to fold into — mints the second
+//! `Stop` its own near-empty turn instead (no open bracket for
+//! `stop_mismatches_open_bracket` to even compare against); `files_written`
+//! itself is still discarded before persistence regardless
+//! (`daemon.rs`'s `_declared` — D6 phase 3, unbuilt, is what would
+//! eventually thread it into a record). So: the signal is no longer
+//! silently swallowed before the engine sees it, but nothing downstream
+//! folds its declared paths into the FIRST `Stop`'s turn yet. See
+//! `daemon.rs::tests::
+//! handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped`
+//! for the exact, measured behavior this produces today.
 
 use crate::cmds::wall_now_ms;
 use crate::{agentrec_dir, signal_path};
@@ -350,6 +362,18 @@ pub fn hook_codex(root: &Path) -> Result<(), String> {
         "UserPromptSubmit" => {
             let prompt_raw = require_str(&payload, "prompt")?;
             let prompt = scrub::scrub(prompt_raw);
+            // C2 fix 2: `model` is present on every observed Codex event
+            // (spike field inventory), but only the start signal carries it
+            // on the wire — see the module doc's "model" paragraph for why
+            // this mirrors `prompt`'s start-only posture rather than
+            // `emitter_turn`'s carried-on-both one. Best-effort like
+            // `transcript_path` above, not `require_str`: a payload missing
+            // `model` should still open a bracket, just without model
+            // attribution, not fail the whole hook.
+            let model = payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let signal = SignalEvent {
                 v: 1,
                 ts: now_ms,
@@ -360,6 +384,7 @@ pub fn hook_codex(root: &Path) -> Result<(), String> {
                 prompt: Some(prompt),
                 files_written: None,
                 emitter_turn: Some(turn_id),
+                model,
                 kind: None,
                 fact: None,
                 pins: None,
@@ -417,6 +442,9 @@ pub fn hook_codex(root: &Path) -> Result<(), String> {
                 prompt: None,
                 files_written,
                 emitter_turn: Some(turn_id),
+                // Not re-sent: the start signal already carried it (or
+                // didn't) — see the module doc's "model" paragraph.
+                model: None,
                 kind: None,
                 fact: None,
                 pins: None,

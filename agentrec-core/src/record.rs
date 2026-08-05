@@ -81,6 +81,22 @@ pub struct SignalEvent {
     /// lacks it (see `cli/src/daemon.rs`'s dedup + mismatch handling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitter_turn: Option<String>,
+    /// PROTOCOL §4 additive (Phase 2 tail C2 fix 2): the model the emitting
+    /// tool was running, when the emitter has it. Motivating producer:
+    /// Codex's hook payload carries `model` on all three of its lifecycle
+    /// events (`docs/verify/codex-spike.md`'s field inventory); `cli/src/
+    /// hookcmds.rs::hook_codex` sets it on `UserPromptSubmit` only —
+    /// mirroring `prompt`'s start-only posture, not `emitter_turn`'s
+    /// carried-on-both one (see that module's doc for why). Claude Code's
+    /// hook emitter has no such field and omits this entirely; its model
+    /// attribution is a SEPARATE, pre-existing mechanism
+    /// (`cli/src/daemon.rs::parse_transcript`, daemon-side transcript
+    /// parsing) that this field does not replace. `None` means "emitter
+    /// did not declare", never "no model" — a recorder falling back to
+    /// transcript-derived attribution whenever this is absent is the
+    /// existing, unchanged behavior (`cli/src/daemon.rs::signal_context`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Signal variant discriminator (PROTOCOL §4, additive). Absent/`None` on
     /// every existing turn-boundary signal (`start`/`stop`, keyed by `event`
     /// instead). Currently the only non-`None` value is `"memory-candidate"`
@@ -517,6 +533,29 @@ mod tests {
         let re = serde_json::to_string(&sig).unwrap();
         let back: SignalEvent = serde_json::from_str(&re).unwrap();
         assert_eq!(back.emitter_turn, sig.emitter_turn);
+    }
+
+    #[test]
+    fn signal_model_roundtrips_and_absence_stays_absent() {
+        // Pre-field line (every existing signal, and every Claude Code hook
+        // payload today): parses with None, and re-serializing does NOT mint
+        // the key.
+        let old = "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\"}";
+        let sig: SignalEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(sig.model, None);
+        let re = serde_json::to_string(&sig).unwrap();
+        assert!(!re.contains("\"model\""));
+
+        // Field-carrying line round-trips intact.
+        let new = concat!(
+            "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"event\":\"start\",",
+            "\"model\":\"gpt-5.6-terra\"}"
+        );
+        let sig: SignalEvent = serde_json::from_str(new).unwrap();
+        assert_eq!(sig.model.as_deref(), Some("gpt-5.6-terra"));
+        let re = serde_json::to_string(&sig).unwrap();
+        let back: SignalEvent = serde_json::from_str(&re).unwrap();
+        assert_eq!(back.model, sig.model);
     }
 
     #[test]

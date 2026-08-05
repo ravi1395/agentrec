@@ -11157,6 +11157,12 @@ mod codex_hook {
             sig.get("files_written").is_none(),
             "a start signal must never carry files_written: {sig:?}"
         );
+        // Fix 2: the committed fixture's own `model` field must reach the
+        // wire on the start signal.
+        assert_eq!(
+            sig["model"], "gpt-5.6-terra",
+            "UserPromptSubmit's model must reach signal.jsonl: {sig:?}"
+        );
     }
 
     /// Proves the emitter reuses `agentrec_core::scrub::scrub` (constraint:
@@ -11291,6 +11297,12 @@ mod codex_hook {
                 format!("{FIXTURE_CWD}/to_delete.txt"),
             ]),
             "union across both PostToolUse firings (absolutized), deduped on to_delete.txt: {sig:?}"
+        );
+        // Fix 2: model is deliberately NOT re-sent on stop — see the
+        // module doc's "model" paragraph (start-only, mirroring `prompt`).
+        assert!(
+            sig.get("model").is_none(),
+            "a stop signal must never carry model: {sig:?}"
         );
 
         assert!(

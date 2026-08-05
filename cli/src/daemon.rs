@@ -1754,6 +1754,47 @@ fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
     Some(format!("{}\u{1}{event}\u{1}{session}\u{1}{et}", sig.tool))
 }
 
+/// C1 fix 1 (content-aware dedup): what varies, per event kind, between two
+/// signals that share one `emitter_turn_dedup_key`. Identity alone cannot
+/// tell a genuine emitter RETRY (byte-identical resend, e.g. racing a
+/// daemon restart) apart from a real SECOND firing under the same key —
+/// Codex's `Stop` hook fires twice for one `turn_id` on a
+/// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
+/// "Continuation semantics"), and the second firing can carry genuinely
+/// NEW `files_written` from `apply_patch` calls made during the
+/// continuation. Two signals with the same key AND the same fingerprint
+/// are a genuine resend; same key, different fingerprint, is real new
+/// data.
+///
+/// **Starts get a constant fingerprint, deliberately.** The same spike
+/// confirmed (answer 2, "Continuation semantics") that `UserPromptSubmit`
+/// fires exactly ONCE per turn — never resent with different content for
+/// one `emitter_turn`, even across a `Stop` block-continuation. A start's
+/// content is therefore already fully determined by its identity tuple
+/// (all of which is already in the dedup key), so a constant fingerprint
+/// reproduces the pre-fix identity-only verdict for starts exactly,
+/// without a start-side carve-out.
+///
+/// **Stops hash `files_written`** — the only `SignalEvent` field that can
+/// vary between two `Stop` firings sharing a key (`session`/`tool`/
+/// `event`/`emitter_turn` are already in the key; `prompt` is always
+/// `None` on a Codex stop). The `"-"` / `"+"` prefix discriminates an
+/// undeclared list (`None`) from a declared-but-empty one
+/// (`Some(vec![])`) — `record.rs` pins that distinction as meaningful on
+/// the wire (`signal_files_written_roundtrips_and_absence_stays_absent`),
+/// and collapsing the two here would let a `(None, then Some([]))` pair
+/// (or the reverse) wrongly compare equal.
+fn emitter_turn_content_fingerprint(sig: &SignalEvent) -> String {
+    if sig.is_start() {
+        String::new()
+    } else {
+        match &sig.files_written {
+            Some(paths) => format!("+{}", paths.join("\u{1}")),
+            None => "-".to_string(),
+        }
+    }
+}
+
 /// C1: emitter_turn restart-safe dedup + bracket-mismatch check for a
 /// signal already known to be start/stop-shaped (`sig.kind.is_none()` at
 /// the caller). Returns `true` when the signal was fully handled HERE (a
@@ -1763,21 +1804,47 @@ fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
 /// loop so both branches are unit-testable without spinning up the
 /// blocking `run()` loop — see `cli/tests/emitter_turn.rs` for the
 /// real-daemon-restart integration coverage this alone can't provide.
+///
+/// C1 fix 1: dedup is now content-aware, not identity-only — see
+/// `emitter_turn_content_fingerprint`'s doc for the motivating bug and the
+/// per-event-kind fingerprint it computes.
 fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEvent) -> bool {
     if let Some(key) = emitter_turn_dedup_key(sig) {
         let mut state = read_state(root);
+        let content_fp = emitter_turn_content_fingerprint(sig);
         if state.last_emitter_turn_key.as_deref() == Some(key.as_str()) {
-            // A resend of the immediately-previous processed signal
-            // (emitter retry, or a resend racing a daemon restart):
-            // counted, not silently dropped (the `memory_rejects`/
-            // `unknown_signal_ignored` honesty pattern), and never applied
-            // — applying it again would open (or wrongly close) a second
-            // bracket for a turn that already happened.
-            state.duplicate_emitter_turn_signals += 1;
-            if let Err(e) = write_state(root, &state) {
-                eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+            let is_genuine_resend = match &state.last_emitter_turn_fingerprint {
+                Some(prev_fp) => *prev_fp == content_fp,
+                // Legacy/first-sighting state.json for this key (see
+                // `State::last_emitter_turn_fingerprint`'s doc): fall back
+                // to the pre-fix, identity-only verdict rather than risk
+                // double-applying a genuine crash-restart resend.
+                None => true,
+            };
+            if is_genuine_resend {
+                // A resend of the immediately-previous processed signal
+                // (emitter retry, or a resend racing a daemon restart):
+                // counted, not silently dropped (the `memory_rejects`/
+                // `unknown_signal_ignored` honesty pattern), and never
+                // applied — applying it again would open (or wrongly
+                // close) a second bracket for a turn that already
+                // happened.
+                state.duplicate_emitter_turn_signals += 1;
+                // Heal a missing/legacy fingerprint on this exact
+                // occurrence (see the field's doc) — the key is unchanged
+                // either way, only the fingerprint needs stamping.
+                state.last_emitter_turn_fingerprint = Some(content_fp);
+                if let Err(e) = write_state(root, &state) {
+                    eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+                }
+                return true;
             }
-            return true;
+            // Key matches but content differs (fix 1: e.g. a Stop
+            // block-continuation's second firing carrying NEW
+            // files_written) — this is NOT a duplicate. Fall through to
+            // the mark-and-continue path below so the caller applies it,
+            // and so a genuine resend of THIS signal is still caught next
+            // time.
         }
         // Mark-before-apply, mirroring `SignalTailer::poll`'s own
         // `signal_offset` posture (see that fn's doc comment): a crash
@@ -1788,6 +1855,7 @@ fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEven
         // tradeoff `resync_shrunk_signal_offset` already makes for
         // `signal_offset` itself.
         state.last_emitter_turn_key = Some(key);
+        state.last_emitter_turn_fingerprint = Some(content_fp);
         if let Err(e) = write_state(root, &state) {
             eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
         }
@@ -1869,16 +1937,20 @@ fn record_unknown_signal(root: &Path) {
     }
 }
 
-/// Resolve a signal's effective prompt + model. Prompt prefers the hook-provided
-/// value, falling back to the transcript's last real user message (Q+). Model is
-/// read from the transcript's assistant messages. Extraction is best-effort and
-/// tolerant: a parse failure yields None rather than a wrong attribution.
-/// Also returns the raw transcript text so downstream consumers (declared-write
-/// fallback, D6 phase 2b) reuse this single read — the transcript is read at
-/// most once per signal.
+/// Resolve a signal's effective prompt + model. Both prefer the
+/// hook-provided value (`sig.prompt` / `sig.model` — C2 fix 2 added the
+/// latter), falling back to the transcript's last real user message /
+/// assistant model (Q+) respectively when the emitter didn't declare one.
+/// Extraction is best-effort and tolerant: a parse failure yields None
+/// rather than a wrong attribution. Claude Code signals never set
+/// `sig.model` today, so for them this is byte-identical to the
+/// transcript-only behavior that predates fix 2. Also returns the raw
+/// transcript text so downstream consumers (declared-write fallback, D6
+/// phase 2b) reuse this single read — the transcript is read at most once
+/// per signal.
 fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>, Option<String>) {
     let mut prompt = sig.prompt.clone();
-    let mut model = None;
+    let mut model = sig.model.clone();
     let mut transcript = None;
     if let Some(path) = &sig.transcript {
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -1886,7 +1958,9 @@ fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>, Option<
             if prompt.is_none() {
                 prompt = tp;
             }
-            model = tm;
+            if model.is_none() {
+                model = tm;
+            }
             transcript = Some(text);
         }
     }
@@ -2663,6 +2737,7 @@ mod tests {
             prompt: None,
             files_written,
             emitter_turn: None,
+            model: None,
             kind: None,
             fact: None,
             pins: None,
@@ -2687,6 +2762,7 @@ mod tests {
             prompt: None,
             files_written: None,
             emitter_turn: emitter_turn.map(String::from),
+            model: None,
             kind: None,
             fact: None,
             pins: None,
@@ -2870,6 +2946,117 @@ mod tests {
         let matching_stop = et_sig("claude-code", Some("stop"), None, Some("et-1"));
         assert!(!handle_emitter_turn_signal(root, &engine, &matching_stop));
         assert_eq!(read_state(root).mismatched_stop_emitter_turns, 0);
+    }
+
+    // C1 fix 1 (content-aware dedup) — the load-bearing test for the fix.
+    // Reproduces the exact bug: Codex's Stop fires twice for one turn_id on
+    // a decision:"block" continuation (docs/verify/codex-spike.md), sharing
+    // the identical C1 dedup key, but the second firing carries genuinely
+    // NEW files_written from apply_patch calls made during the
+    // continuation. Pre-fix, identity-only dedup silently dropped the
+    // second Stop; this proves it through the REAL engine, not just the
+    // dedup key.
+    #[test]
+    fn handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "codex", None, Some("s1".into()), Some("et-block".into()));
+        assert!(engine.has_open_turn());
+
+        // (a) the first Stop must be applied: not swallowed by dedup, and
+        // it closes the open bracket through the real engine.
+        let mut first_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
+        first_stop.files_written = Some(vec!["/repo/a.rs".to_string()]);
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &first_stop),
+            "(a) the first Stop must not be swallowed"
+        );
+        let closed_first = apply_signal(root, &mut engine, &first_stop, None, 1_000);
+        assert_eq!(
+            closed_first.len(),
+            1,
+            "(a) the first Stop closes the open bracket"
+        );
+        assert!(!engine.has_open_turn());
+
+        // (b) a second Stop sharing the IDENTICAL dedup key but carrying
+        // NEW files_written must ALSO be applied — this is the bug.
+        let mut second_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
+        second_stop.files_written = Some(vec!["/repo/a.rs".to_string(), "/repo/b.rs".to_string()]);
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &second_stop),
+            "(b) a second Stop sharing the same key but carrying DIFFERENT \
+             files_written must not be treated as a duplicate — dropping it \
+             would silently lose the continuation's real file-attribution data"
+        );
+        let closed_second = apply_signal(root, &mut engine, &second_stop, None, 1_000);
+        assert_eq!(
+            closed_second.len(),
+            1,
+            "(b) once not dropped by dedup, the second Stop reaches the engine \
+             (today's architecture mints it as its own stop-only turn rather \
+             than folding into the first, since no bracket is left open to \
+             fold into — D6 phase 3 is what would eventually thread \
+             files_written into a persisted record; this assertion only \
+             proves the signal is no longer silently discarded before the \
+             engine ever sees it)"
+        );
+        assert_eq!(
+            read_state(root).duplicate_emitter_turn_signals,
+            0,
+            "neither firing is a genuine duplicate"
+        );
+
+        // (c) a genuine identical resend (same key, same content) of the
+        // last processed signal IS still dropped — the crash-restart
+        // guarantee C1 was built for must survive this fix.
+        let resend = second_stop.clone();
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &resend),
+            "(c) an exact resend (same key, same content) must still be \
+             recognized as a duplicate and dropped"
+        );
+        assert_eq!(read_state(root).duplicate_emitter_turn_signals, 1);
+    }
+
+    // Backward-compat companion to the fix-1 test above: a legacy
+    // state.json that has `last_emitter_turn_key` but predates
+    // `last_emitter_turn_fingerprint` (see that field's doc) must still
+    // dedup a resend by identity alone, exactly like pre-fix behavior — and
+    // must heal the missing fingerprint on this exact occurrence.
+    #[test]
+    fn handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+
+        let stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-legacy"));
+        write_state(
+            root,
+            &State {
+                last_emitter_turn_key: Some(
+                    emitter_turn_dedup_key(&stop).expect("stop carries emitter_turn"),
+                ),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_state(root).last_emitter_turn_fingerprint, None);
+
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &stop),
+            "identity match against a missing (legacy) fingerprint must \
+             still be treated as a duplicate"
+        );
+        let state = read_state(root);
+        assert_eq!(state.duplicate_emitter_turn_signals, 1);
+        assert!(
+            state.last_emitter_turn_fingerprint.is_some(),
+            "the gap must self-heal on this exact occurrence"
+        );
     }
 
     const FIXTURE_TRANSCRIPT: &str = concat!(
@@ -3172,6 +3359,45 @@ mod tests {
         // last real user text wins; the tool_result turn is skipped
         assert_eq!(prompt.as_deref(), Some("now add tests"));
         assert_eq!(model.as_deref(), Some("claude-fable-5"));
+    }
+
+    // C2 fix 2: `signal_context` must prefer the hook-provided `sig.model`
+    // over transcript-parsed attribution — the exact same precedence
+    // `sig.prompt` already had. Neuter: drop the `if model.is_none()`
+    // guard (always overwrite with the transcript's model) -> RED, this
+    // would silently clobber a Codex-declared model with a differently
+    // (or un-)attributed transcript reading.
+    #[test]
+    fn signal_context_prefers_hook_provided_model_over_transcript() {
+        let transcript_sample = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","model":"transcript-model","content":[{"type":"text","text":"ok"}]}}"#,
+            "\n",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        std::fs::write(&path, transcript_sample).unwrap();
+
+        let mut sig = et_sig("codex", Some("start"), Some("s1"), Some("et-1"));
+        sig.model = Some("hook-declared-model".to_string());
+        sig.transcript = Some(path.to_str().unwrap().to_string());
+        let (_, model, _) = signal_context(&sig);
+        assert_eq!(
+            model.as_deref(),
+            Some("hook-declared-model"),
+            "the hook-declared model must win over the transcript's own"
+        );
+
+        // Falls back to the transcript's model when the emitter didn't
+        // declare one — the pre-fix-2 behavior for every Claude signal.
+        sig.model = None;
+        let (_, model, _) = signal_context(&sig);
+        assert_eq!(
+            model.as_deref(),
+            Some("transcript-model"),
+            "with no hook-provided model, the transcript reading must survive"
+        );
     }
 
     #[test]

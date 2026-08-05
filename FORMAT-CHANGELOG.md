@@ -63,6 +63,67 @@ turn".
   resend, not an arbitrary-history duplicate — a different signal arriving
   in between clears the slot (state.rs doc comment on the field).
 
+## Phase 2 tail C1 fix 1 — content-aware `emitter_turn` dedup (2026-08-05)
+
+Not a wire change (`state.json` is operational, off-wire per PROTOCOL §5) —
+recorded here for continuity with the C1 entry above, which this directly
+amends. Bug: Codex's `Stop` hook fires twice for one `turn_id` on a
+`decision:"block"` continuation (`docs/verify/codex-spike.md`,
+"Continuation semantics"), so both firings share the identical
+`(tool, event, session, emitter_turn)` dedup key — identity-only dedup
+silently dropped the second firing even when it carried genuinely NEW
+`files_written` from `apply_patch` calls made during the continuation.
+
+`cli/src/daemon.rs::handle_emitter_turn_signal` now additionally compares a
+content fingerprint (`emitter_turn_content_fingerprint`: constant for
+`start` — spike-confirmed `UserPromptSubmit` never re-fires mid-turn — and
+`files_written`-keyed for `stop`) before treating a key match as a
+duplicate. `state.json`'s `State` gained one more additive
+`#[serde(default)]` field, `last_emitter_turn_fingerprint`, alongside
+`last_emitter_turn_key`; a pre-fix `state.json` (key present, fingerprint
+absent) falls back to the original identity-only verdict and self-heals on
+that exact read (`state::tests::state_json_with_key_but_no_fingerprint_parses_cleanly`,
+`daemon::tests::handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing`).
+Load-bearing test:
+`daemon::tests::handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped`.
+
+## Phase 2 tail C2 fix 2 — `SignalEvent.model` (2026-08-05)
+
+Added to `SignalEvent`, after `emitter_turn`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub model: Option<String>,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `None`,
+and `None` is what every pre-existing signal line parses to, so every
+existing `signal.jsonl` line round-trips byte-identically
+(`record.rs::signal_model_roundtrips_and_absence_stays_absent`). UNFROZEN
+until the Phase 2.1 protocol freeze, like every field above.
+
+The model the emitting tool was running, when the emitter has it.
+Motivating producer: Codex's hook payload carries `model` on all three of
+its lifecycle events (`docs/verify/codex-spike.md`'s field inventory);
+`cli/src/hookcmds.rs::hook_codex` sets it on `UserPromptSubmit` only,
+mirroring `prompt`'s existing start-only posture rather than
+`emitter_turn`'s carried-on-both-signals one (`emitter_turn` is carried on
+both because the daemon's dedup/mismatch logic needs it at both ends;
+`model` is purely descriptive and needs no re-assertion at stop time).
+Claude Code's hook emitter has no such field and omits it entirely; `None`
+means "emitter did not declare", never "no model".
+
+- **Reader/consumer: `cli/src/daemon.rs::signal_context`.** Now seeds
+  `model` from `sig.model` first (mirroring the existing `prompt`
+  precedence exactly), falling back to the pre-existing transcript-parse
+  extraction (`parse_transcript`) only when the signal didn't declare one.
+  Claude signals never set `model`, so this path is unchanged for them
+  (`daemon::tests::signal_context_prefers_hook_provided_model_over_transcript`
+  pins both the override and the fallback). Residual: `Recorder.models` is
+  in-memory and session-keyed, so a daemon restart strictly between a
+  session's `start` and `stop` loses the model for that one turn — the
+  same residual class an existing restart already has for `prompt`.
+
 ## MVP periphery — `FileEntry.link_kind`, `FileEntry.attribution` (2026-08-01)
 
 Red team round 2, finding F2. Added to `FileEntry`, at the end, after
