@@ -1376,3 +1376,52 @@ Part-0 baseline.
 Plan's O5 exit criterion: **DONE, with the two disclosures above carried forward as OPEN, not
 silently closed** — the live/direct-invocation split on the Claude leg, and the confirmed
 subdirectory-cwd defect now escalated rather than papered over.
+
+### APPENDED 2026-08-05 — the subdirectory-cwd defect above is CLOSED
+
+The finding above stands as written; this records its fix, it does not amend it. Founder
+ruled (2026-08-05) on the escalation: resolve the hook's root by **walking up from cwd to the
+nearest ancestor carrying `.agentrec/`**, git-style, for **both** emitters — explicitly chosen
+over baking an absolute `--root` into the installed hook command, because a baked path is a
+snapshot and this repo already carries the scar of that failure mode (the 39 orphaned
+LaunchAgents, all from a stale baked `--root`). Walking up also survives repo moves/renames.
+`hook claude` was fixed alongside `hook codex` although its defect was latent, not observed:
+it shares the identical bare-command shape and only escapes the bug because Claude Code
+happens to set cwd to the project root — an undocumented behavior worth not depending on.
+
+Fix commit: see `main.rs::resolve_hook_root` / `discover_agentrec_root`. Scoped to the `hook`
+verb alone; every other subcommand's root resolution is byte-identical to before. An explicit
+`--root` still wins outright — discovery is the default for an ABSENT root, never an override
+of a supplied one. Discovery failure falls back to cwd rather than erroring, deliberately:
+INV-M4 pins the hook path as fail-open (always append, always exit 0), and cwd is exactly what
+happened unconditionally before this change.
+
+**Re-measured, same method that found it** (debug binary, scratch repo, hook invoked two
+levels below the root with a committed fixture on stdin, no `--root`):
+
+```
+--- cwd for hook invocation: /private/var/folders/.../T/tmp.XXXX/sub/deeper
+--- exit=0
+--- sub/.agentrec exists? (defect shape; must be NO)
+NO
+deeper: NO
+--- root signal.jsonl:
+       1
+{"v":1,"ts":...,"tool":"codex","event":"start","session":"019fd1b4-...
+```
+
+**Mutation-probed in both directions**, not merely observed green: neutering
+`resolve_hook_root` back to `cwd.to_path_buf()` (the pre-fix behavior), rebuilding, and
+re-running reds EXACTLY the two subdirectory regression tests — one per emitter
+(`hook_root_discovery::hook_codex_from_subdirectory_finds_root_and_creates_no_nested_agentrec`,
+`…hook_claude_…`) — while the root-itself, explicit-`--root`, and fail-open legs stay green.
+Restoring returns all 5 to green. The absence of `sub/.agentrec/` is asserted explicitly in
+both tests; that absence IS the defect being closed.
+
+Suite 855 → 866/0/3. clippy `-D warnings` clean debug+release, fmt clean, release build
+`--locked`, 0 test seams in release `strings` — all confirmed by real exit codes, after an
+initial `| tail` pipeline masked a genuine `clippy::question_mark` failure (this repo's own
+recorded "`fmt --check | tail` exit-code trap", hit again; the lint was real and is fixed).
+
+**Still OPEN, unchanged by this fix:** the Claude leg's live/direct-invocation split above.
+Nothing here converts that simulated leg into a live one.

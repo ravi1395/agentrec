@@ -11936,3 +11936,199 @@ mod codex_hook {
         assert!(signal_events(root).is_empty());
     }
 }
+
+/// O5 fix (phase-2-tail): the hook's root, absent an explicit `--root`, is
+/// now discovered by walking up from cwd to the nearest ancestor carrying
+/// `.agentrec/` — see `main.rs::resolve_hook_root`. O5's live measurement
+/// (`docs/verify/o5-two-tool-session.md`) found that BOTH the installed
+/// Codex hook (`agentrec hook codex`, no `--root`) and the installed Claude
+/// hook (`agentrec hook claude`, no `--root`) inherit cwd = wherever the
+/// agent process itself was launched from — a launch from a subdirectory
+/// silently minted a second, invisible `.agentrec/` there and lost the
+/// signal for good, with no error. These tests drive the REAL binary with
+/// `current_dir` set to a subdirectory and deliberately omit `--root`,
+/// mirroring exactly how the installed hook command (a bare `agentrec hook
+/// <tool>`, per `initcmd.rs`'s `HOOK_COMMAND`/`CODEX_HOOK_COMMAND`) is
+/// actually invoked in production.
+mod hook_root_discovery {
+    use super::*;
+
+    fn codex_fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs/fixtures/codex")
+                .join(name),
+        )
+        .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+    }
+
+    /// Spawn `agentrec hook <tool>` with NO `--root`, cwd set to `dir`,
+    /// stdin fed `payload`. Returns the captured output.
+    fn send_hook_from_dir(dir: &Path, tool: &str, payload: &str) -> Output {
+        let mut child = Command::new(bin())
+            .args(["hook", tool])
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook (no --root)");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// The load-bearing regression: `hook codex` invoked from three levels
+    /// below the real root, no `--root`, must append to the ROOT's
+    /// `signal.jsonl` and must NOT create `sub/.agentrec/` — that absence IS
+    /// the defect O5 found being closed.
+    #[test]
+    fn hook_codex_from_subdirectory_finds_root_and_creates_no_nested_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let sub = root.join("workdir/deeper/still");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let out = send_hook_from_dir(&sub, "codex", &codex_fixture("user_prompt_submit.json"));
+        assert!(out.status.success(), "hook codex must exit 0: {out:?}");
+
+        assert!(
+            !sub.join(".agentrec").exists(),
+            "hook codex from a subdirectory must NOT create sub/.agentrec/ — \
+             this is the exact silent-data-loss shape O5 measured"
+        );
+        assert!(
+            !root.join("workdir/.agentrec").exists(),
+            "no intermediate ancestor may get a stray .agentrec/ either"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must land in the ROOT's signal.jsonl: {events:?}"
+        );
+    }
+
+    /// Same shape, `hook claude` (`cmds::hook`'s Claude arm) — the second
+    /// emitter O5's fix note says shares the identical bare-command
+    /// vulnerability, just masked today by Claude Code's own cwd behavior.
+    #[test]
+    fn hook_claude_from_subdirectory_finds_root_and_creates_no_nested_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let sub = root.join("workdir/deeper/still");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_o5","prompt":"hello"}"#;
+        let out = send_hook_from_dir(&sub, "claude", payload);
+        assert!(out.status.success(), "hook claude must exit 0: {out:?}");
+
+        assert!(
+            !sub.join(".agentrec").exists(),
+            "hook claude from a subdirectory must NOT create sub/.agentrec/"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must land in the ROOT's signal.jsonl: {events:?}"
+        );
+    }
+
+    /// No-regression companion: invoking from the root itself (cwd == root,
+    /// no `--root`) must keep working exactly as before this fix.
+    #[test]
+    fn hook_codex_from_the_root_itself_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = send_hook_from_dir(root, "codex", &codex_fixture("user_prompt_submit.json"));
+        assert!(out.status.success(), "{out:?}");
+        let events = signal_events(root);
+        assert!(events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")));
+    }
+
+    /// Explicit `--root` still wins over discovery, even when cwd sits
+    /// inside a DIFFERENT initialized repo — proves precedence, not just
+    /// absence-of-flag behavior.
+    #[test]
+    fn explicit_root_flag_wins_over_a_discoverable_cwd_root() {
+        let real_tmp = tempfile::tempdir().unwrap();
+        let real_root = real_tmp.path();
+        init(real_root);
+
+        let decoy_tmp = tempfile::tempdir().unwrap();
+        let decoy_root = decoy_tmp.path();
+        init(decoy_root); // cwd's own ancestor also has .agentrec/
+
+        let mut child = Command::new(bin())
+            .args(["hook", "codex", "--root", real_root.to_str().unwrap()])
+            .current_dir(decoy_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook with explicit --root");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(codex_fixture("user_prompt_submit.json").as_bytes())
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+
+        assert!(
+            !signal_events(decoy_root)
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "explicit --root must win: the decoy cwd root must get nothing"
+        );
+        let events = signal_events(real_root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "the explicitly named root must receive the signal: {events:?}"
+        );
+    }
+
+    /// Discovery-failure leg (no `.agentrec/` anywhere up the tree, no
+    /// `--root`): the deliberate fail-open choice (see
+    /// `main.rs::resolve_hook_root`'s doc comment) falls back to cwd rather
+    /// than erroring — INV-M4 requires the hook path to always exit 0 and
+    /// append the start signal, even against an uninitialized repo.
+    #[test]
+    fn discovery_failure_falls_back_to_cwd_and_still_appends_inv_m4() {
+        let tmp = tempfile::tempdir().unwrap(); // never `init`ed at all
+        let root = tmp.path();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_o5_fail","prompt":"x"}"#;
+        let out = send_hook_from_dir(root, "claude", payload);
+        assert!(
+            out.status.success(),
+            "discovery failure must still exit 0 (INV-M4 fail-open): {out:?}"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must still be appended at the cwd fallback: {events:?}"
+        );
+    }
+}
