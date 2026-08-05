@@ -1729,13 +1729,23 @@ fn reject_candidate(root: &Path, state: &mut State) {
 }
 
 /// C1 dedup key for a start/stop signal carrying `emitter_turn` (PROTOCOL §4
-/// additive): `(tool, event, session, emitter_turn)`, joined on a control
-/// byte that cannot appear in any of the four components as parsed JSON
-/// string content — unlike `\u{1}` inside a Rust string literal, this is a
-/// raw byte, not an escapable delimiter a crafted `tool`/`session` value
-/// could inject to collide two distinct tuples onto the same key. Returns
-/// `None` when `emitter_turn` itself is absent (every Claude Code hook
-/// payload today) — callers must treat that as "does not participate",
+/// additive): `(tool, event, session, emitter_turn)`, joined on the U+0001
+/// control character as a delimiter.
+///
+/// NOT collision-proof against an adversarial component, and not claimed to
+/// be: a JSON string can carry that control character via its own numeric
+/// escape sequence, and `serde_json` decodes it to the real character like
+/// any other escape (measured, not assumed) — so a crafted `tool`/`session`
+/// value could in principle inject the delimiter and collide two distinct
+/// tuples onto one key. Not a threat worth guarding here: the emitter is
+/// inside the local trust boundary this whole signal channel already trusts
+/// (PROTOCOL §9), and a collision's worst effect is dropping one spurious
+/// "resend" a signal early — never a wrong-bytes revert source. The
+/// delimiter is chosen only because no realistic tool name or session id
+/// contains it, not because it is un-injectable.
+///
+/// Returns `None` when `emitter_turn` itself is absent (every Claude Code
+/// hook payload today) — callers must treat that as "does not participate",
 /// never as a key that legitimately equals another `None`-keyed signal's.
 fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
     let et = sig.emitter_turn.as_deref()?;
@@ -2661,7 +2671,6 @@ mod tests {
 
     // ---- C1: emitter_turn dedup key + restart-safe dedup / mismatch -------
 
-    #[allow(clippy::too_many_arguments)]
     fn et_sig(
         tool: &str,
         event: Option<&str>,
