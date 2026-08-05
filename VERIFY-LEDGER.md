@@ -1426,6 +1426,82 @@ recorded "`fmt --check | tail` exit-code trap", hit again; the lint was real and
 **Still OPEN, unchanged by this fix:** the Claude leg's live/direct-invocation split above.
 Nothing here converts that simulated leg into a live one.
 
+### APPENDED 2026-08-05 (later same day) — the Claude leg IS now live; gap CLOSED
+
+Full method, raw captures, every command's actual output:
+`docs/verify/o5-two-tool-session.md`'s second section (below the original "Cleanup performed").
+Worktree unchanged at `3c4f598`; no Rust touched. Debug binary, same choice as every prior round.
+
+**Both legs live in one session, one `log.jsonl`, sequential not simultaneous:** `claude -p
+"Create a file named claude_leg.txt..." --allowedTools "Write"` ran a real Claude Code process
+against the scratch repo (`.claude/settings.local.json` installed by `init`, debug binary
+resolved via `PATH`); `-p`'s own help text confirms the trust dialog is skipped non-interactively
+and settings still load. Codex leg **also re-driven live** (not required by the task, done
+anyway) through the real `/hooks` TUI trust flow in the same repo, same method as the first O5
+round. **Cross-attribution: zero, jq-scoped, both directions** — `codex_leg.txt` never appears
+under `tool=="claude"`, `claude_leg.txt` never appears under `tool=="codex"`.
+
+**§4 wire path observed for the first time with a real `transcript_path`:** the live claude
+Stop signal carried both a genuine `transcript` field (verified: 85,068-byte, 25-line real
+transcript file) and a populated `files_written: ["claude_leg.txt"]` — the prior round's
+direct-invocation payload had omitted `transcript_path` entirely, so this exact wire shape had
+never been observed before in a two-tool context.
+
+**Correction to the prior round's diagnosis, proven from source + controlled repro, not
+asserted:** neither "D6 dark-wiring" (codex) nor "missing `transcript_path`" (claude) is what
+caused the prior round's `files:[]` on both rich turns. `agentrec-core/src/engine.rs::
+observe_changes` appends changes onto the open turn directly, independent of D6; `cli/src/
+daemon.rs` discards D6's resolution unconditionally (`let _declared = ...; // resolved but not
+yet consumed`) — confirmed live here, since this round's `files_written`-carrying, transcript-
+carrying claude Stop STILL required the (older, non-D6) watcher path to populate `turn.files`.
+A controlled repro (fresh scratch repos, the prior round's own direct-invocation method)
+reproduces the exact symptom on demand: a write immediately followed by Stop closes a
+**zero-duration bracket** (`started == ended` to the millisecond) with `files:[]`, the write
+landing in a separate bare turn instead; inserting a 2.5s gap between write and Stop closes a
+~977ms bracket that correctly captures the file. **The mechanism is fs-watcher/bracket timing,
+not D6 and not `transcript_path`** — both facts the prior round cited were true in isolation,
+neither was the actual cause. **Not claimed:** that the prior round's own live Codex leg lost
+this specific race — no write-to-Stop timing was recorded for that run, so it is undiagnosable
+now; only that the identical symptom is reproducible from timing alone. This is a **new,
+previously-undocumented, reproducible defect surface** (a fast-enough bracket can silently
+misattribute its own write to an orphaned bare turn), distinct from D6's phase-3 plan — recorded
+for founder disposition, not fixed here (out of this round's scope).
+
+**Second measurement, independent of the above:** `3c4f598`'s commit message asserted `hook
+claude`'s pre-fix defect was latent because "Claude Code happens to set cwd to the project
+root" — an unverified assumption. A live `claude -p` session launched from `<repo>/sub/` (a
+tracked subdirectory) measured cwd directly (had it write its own `pwd` to a file): **cwd was
+the subdirectory, not the root** — the assumption is false as stated. No `sub/.agentrec/` was
+created (still exactly one `.agentrec/`, at the root) and the signal's `transcript` path names
+the `-sub` project directory, confirming `resolve_hook_root` correctly discovered the root from
+a subdirectory for the **claude** emitter too — the fix earns its keep for claude for a
+live-measured reason, not the assumed one.
+
+**One honest, undiagnosed anomaly, not swept:** after a daemon restart, `state.json`'s
+`signal_offset` advanced to consume the subdirectory session's `start`/`stop` signals in full,
+but **no turn record for that session appears anywhere in `log.jsonl`** — zero occurrences of
+its session id or its file. Source tracing found no obvious filter that would drop a matched
+bracket's Stop turn, and no error was logged. **Cause not established**; candidate explanations
+are listed in the writeup and explicitly not asserted as the mechanism, to avoid repeating this
+document's own signature defect.
+
+**Suite:** `cargo test --workspace -- --test-threads=3` @ `3c4f598` (unchanged, no Rust touched),
+summed directly from all 14 `test result:` lines (not through `| tail`): **866 passed / 0 failed
+/ 3 ignored** — matches `3c4f598`'s own baseline exactly.
+
+**launchd: exactly one unit throughout** (`com.agentrec.bfa6bde6eaa4`, pre-existing dogfood
+daemon), before and after — no plist written for any scratch repo this round touched (main
+two-tool repo, `timing-fast`, `timing-slow`). All daemons this round started were killed by PID
+and confirmed stopped; the four pre-existing unrelated `/var/folders/.../T/.tmp*` recorders from
+other work were left untouched, per the first round's own precedent. Scratch repos removed after
+evidence was captured verbatim into the writeup.
+
+**Plan's O5 exit criterion: DONE, live, both legs, one `log.jsonl`, zero cross-attribution — the
+gap this repo disclosed (Claude leg not live) is closed.** Carried forward as genuinely OPEN:
+interleaved/concurrent two-tool sessions (pre-existing D6 risk); the newly-found bracket-timing
+race (new); the zero-turn-after-offline-bracket anomaly (new, undiagnosed). None fixed —
+verification only, per this round's scope.
+
 ### FOUNDER WAIVER 2026-08-05 — claimd claims not declared for Phase C
 
 Recorded as a debt, not silently closed. The Phase 2 tail plan's executor protocol requires

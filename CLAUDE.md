@@ -50,6 +50,16 @@ carries only current state, what's next, and standing debts.
   clippy+fmt clean debug+release; no test seams in release `strings`.
   **Next: Phase C (Codex 2.1 adapter) — emitter_turn signal field, `hook codex`,
   init/doctor/uninstall, `import codex`.**
+  **O5 Phase C exit criterion re-run LIVE (2026-08-05):** the prior round's Claude leg was
+  direct hook-invocation, not a live process — closed by a genuine `claude -p` session (both
+  legs re-driven live, one `log.jsonl`, zero jq-scoped cross-attribution). Along the way it
+  found the prior round's `files:[]` diagnosis was mis-attributed (D6/`transcript_path` were
+  both true facts but neither was the actual cause — a controlled repro pins it to a
+  fs-watcher/bracket-timing race instead, a new undocumented defect surface) and falsified
+  `3c4f598`'s "Claude Code sets cwd to the project root" assumption (measured: it doesn't; the
+  walk-up fix earns its keep for claude for the measured reason, not the assumed one). Full
+  writeup: `docs/verify/o5-two-tool-session.md`; ledger: `VERIFY-LEDGER.md` § "O5". Not fixed,
+  not gated by a skeptic — verification only, recorded for founder disposition.
 - **User-onboarding docs round (delivered 2026-08-04, branch `docs/user-onboarding`).** README
   restructured for new users: quickstart (`init` → `import claude` → `doctor` → read verbs),
   mermaid architecture diagram, How-it-works glossary (rich/bare, bracketing, epochs, git turns),
