@@ -1649,3 +1649,46 @@ This is the same rider convention CLAUDE.md already applies to AC8(a) ("round 1'
 verdict table was never persisted ... restating it without this rider would let it rot into
 fact"). The catch-provenance question rests permanently unresolved; no artifact can settle it,
 and this rider is the fix rather than further investigation.
+
+#### SUPERSEDED 2026-08-05 — the artifact exists; it was never "nowhere," only outside git
+
+Founder directed further investigation rather than accepting the rider above. The rider's own
+scope was too narrow: `grep -rn "caught during review" docs/ VERIFY-LEDGER.md` (the rider's
+`.claims/` in that command does not exist on this branch — a reader running it verbatim gets
+exit 2, per the handoff's residual-nits note; corrected here rather than repeated) only searches
+this git tree. It does not search Claude Code's session transcript store, which is not part of
+the repo but is part of the durable record of who did what.
+
+**Found:** `~/.claude/projects/-Users-ravichandrasekhar-Projects-agentrec/01c71c15-e742-49c9-9391-f539cefd0287/subagents/agent-a87a3ec2e766145e4.jsonl`, final message (line 327,
+`assistant`, `isSidechain:true`, `2026-08-05T21:24:18.586Z`), a subagent of orchestrating
+session `01c71c15-e742-49c9-9391-f539cefd0287.jsonl`, labeled (its `.meta.json`)
+`{"agentType":"general-purpose","description":"O5 live Claude Code leg","model":"sonnet"}`.
+Verbatim: *"a first attempt measured Claude Code's Bash-tool cwd (non-discriminating — **caught
+during review, not by me**)."*
+
+Commit `1b34f5b` lands at `22:23:36+0100` = 21:23:36 UTC, fifty seconds after this report at
+21:24:18 UTC — the timing is consistent with the orchestrator committing right after reading it
+(NOT proof of causation on its own; timing alone is compatible with coincidence, and is offered
+here only as corroboration alongside the direct textual match).
+
+**This settles it, against `1b34f5b`:** the subagent that did the work reported "caught during
+review, not by me" (disclaiming self-catch). `1b34f5b`'s commit message says "not by a second
+party" (claiming self-catch) — the inverse. `ecd09bc`'s ledger sentence matches the subagent's
+own report; `1b34f5b`'s commit message does not. The orchestrator's commit message inverted or
+misremembered the subagent's actual words — itself another instance of this repo's
+confidently-worded-but-unverified pattern, this time in the artifact that started the whole
+correction chain.
+
+**Caveats that must travel with this, because they're the reason the search almost didn't
+happen:** (1) the settling artifact lives in a session transcript directory, not this repo — it
+is not git-tracked, not backed up by this project, and can rotate out or be deleted by tooling
+this repo doesn't control; a future reader following this citation may find it gone, which would
+NOT reopen the question, since the finding is recorded here verbatim. (2) This is single-machine,
+single-user evidence (`~/.claude/projects/...`), same class of caveat this repo already applies
+to perf/timing claims. (3) The search was scoped to transcripts under this repo's own Claude Code
+project directory; it did not exhaustively search every possible location a completion report
+could live.
+
+The prior rider's operational lesson stands regardless of this outcome: a repo-scoped grep cannot
+prove a claim is unrecoverable, only that it isn't in the repo. "No artifact can settle it" was
+itself an unverified claim dressed as a methodological conclusion.
