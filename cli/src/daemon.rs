@@ -162,12 +162,22 @@ pub fn run(root: &Path) -> Result<(), String> {
     // Candidate-only startup replay: memory-candidate lines that landed in the
     // inbox while no daemon was running are ingested now, and the live tailer
     // starts exactly where this scan stopped so nothing is read twice.
-    let replay_to = replay_pending_candidates(&root, engine.open_turn_id());
-    let mut tailer = SignalTailer { offset: replay_to };
+    let replay = replay_pending_candidates(&root, engine.open_turn_id());
+    let mut tailer = SignalTailer {
+        offset: replay.consumed,
+    };
     let mut ignore_set = IgnoreSet::build(&root);
     let mut journal_cache: Option<String> = None;
 
-    append_epoch(&root, "start", clock.wall_ms(clock.now_ms()))?;
+    // D51: the gap scan's dropped turn-boundary count rides out on THIS
+    // record — the only durable trace that a bracket elapsed while the
+    // recorder was down. `stop` gets 0: a clean shutdown scans no gap.
+    append_epoch(
+        &root,
+        "start",
+        clock.wall_ms(clock.now_ms()),
+        replay.dropped_signals,
+    )?;
 
     // notify → channel of raw events; we debounce and filter here.
     let (tx, rx) = channel();
@@ -454,7 +464,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     persist(&root, &recorder, &clock, closed)?;
     // Clean shutdown: the turn is persisted, so drop the crash journal.
     sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
-    append_epoch(&root, "stop", clock.wall_ms(clock.now_ms()))?;
+    append_epoch(&root, "stop", clock.wall_ms(clock.now_ms()), 0)?;
     release_lock(&root);
     println!("\nstopped recording {}", root.display());
     Ok(())
@@ -1538,12 +1548,21 @@ fn resync_shrunk_signal_offset(root: &Path, persisted: u64, len: u64, when: &str
 /// silent no-op — so replaying candidates is turn-neutral and idempotent across
 /// restarts, while start/stop lines here still never reach the engine.
 ///
-/// Returns the offset consumed up to (the last complete line). The live tailer
-/// adopts this as its starting offset, so within a single boot the startup scan
-/// and the live tailer never read the same line twice. The advanced offset is
-/// also persisted, so an immediate restart doesn't re-scan the same window
-/// (dedup would no-op it, but advancing avoids the repeated work).
-fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
+/// Returns [`ReplayOutcome`]: the offset consumed up to (the last complete
+/// line), plus the D51 count of turn-boundary signals dropped in the gap. The
+/// live tailer adopts the offset as its starting point, so within a single boot
+/// the startup scan and the live tailer never read the same line twice. The
+/// advanced offset is also persisted, so an immediate restart doesn't re-scan
+/// the same window (dedup would no-op it, but advancing avoids the repeated
+/// work).
+///
+/// D51: the drop stays a drop — nothing here changed about which lines reach
+/// the engine — but it is no longer SILENT. The count rides out to the
+/// `start` epoch record `daemon::run` appends immediately after this call, so
+/// a reader of `log.jsonl` can see that a tool session's bracket elapsed while
+/// the recorder was down. Count only: the dropped line's prompt text is never
+/// scrubbed, stored, or excerpted, matching D7's no-phantom-data posture.
+fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> ReplayOutcome {
     let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
         // No inbox. Offset 0 is a fresh store (no hook has ever fired) and is
         // silent. A NONZERO offset against an absent file is the same
@@ -1554,10 +1573,10 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
         if persisted > 0 {
             resync_shrunk_signal_offset(root, persisted, 0, "at startup (inbox absent)");
         }
-        return 0;
+        return ReplayOutcome::at(0);
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
-        return 0;
+        return ReplayOutcome::at(0);
     };
     let mut state = read_state(root);
     let start = state.signal_offset;
@@ -1565,39 +1584,56 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     // external shrink discovered at boot: announce + reconcile + persist,
     // identically to the mid-run branch (red-team D1 — this case previously
     // returned here silently, leaving state.json stale forever).
+    //
+    // D51 count is 0 here and that is NOT an undercount claim: the lost bytes
+    // were never read, so nothing can say how many turn-boundary lines they
+    // held. That loss has its own louder channel already (the resync logs and
+    // counts an I/O failure, so `status`/`doctor` read DEGRADED).
     if len < start {
         resync_shrunk_signal_offset(root, start, len, "at startup");
-        return len;
+        return ReplayOutcome::at(len);
     }
     // `len == start` is the ordinary fully-consumed steady state on every
     // boot — nothing appended since the last session. It must stay SILENT;
     // folding it into the branch above would fire DEGRADED on every start.
     if len == start {
-        return len;
+        return ReplayOutcome::at(len);
     }
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return len;
+        return ReplayOutcome::at(len);
     }
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() {
-        return len;
+        return ReplayOutcome::at(len);
     }
     // Only replay complete lines; a torn final line is left for the live tailer
     // to complete and process (it re-reads from `start` in that case).
     let Some(nl) = buf.iter().rposition(|b| *b == b'\n') else {
-        return start;
+        return ReplayOutcome::at(start);
     };
     // Kill-switch (design spec line 184, binding): `memory_enabled = false`
     // disables injection AND candidate ingestion, including this pre-daemon
     // replay window. One read for the whole replay batch — same rationale as
     // the live loop above.
     let memory_enabled = memorycmds::read_memory_enabled(root);
+    let mut dropped_signals: u32 = 0;
     for sig in parse_signals(&String::from_utf8_lossy(&buf[..=nl])) {
         // D7 preserved: ONLY candidate lines are acted on; start/stop (and any
         // other) signals in the pre-daemon gap are dropped, never fed to the
         // engine, so no phantom turn can be minted here.
         if sig.is_memory_candidate() && memory_enabled {
             ingest_candidate(root, &mut state, &sig, current_turn);
+            continue;
+        }
+        // D51: count the TURN-BOUNDARY drops, and only those. The predicate is
+        // `kind.is_none()` — exactly the set `apply_signal` would route to its
+        // start/stop arms — deliberately NOT "everything the branch above
+        // skipped": that set also holds memory-candidates when the
+        // `memory_enabled` kill-switch is off, and any future typed `kind`,
+        // neither of which is a dropped turn boundary. Pinned by
+        // `replay_gap_drop_count_excludes_non_boundary_kinds`.
+        if sig.kind.is_none() {
+            dropped_signals = dropped_signals.saturating_add(1);
         }
     }
     let consumed = start + (nl as u64) + 1;
@@ -1605,7 +1641,31 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     if let Err(e) = write_state(root, &state) {
         eprintln!("agentrec: warning: failed to persist replayed signal offset: {e}");
     }
-    consumed
+    ReplayOutcome {
+        consumed,
+        dropped_signals,
+    }
+}
+
+/// What the pre-startup gap scan found (`replay_pending_candidates`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayOutcome {
+    /// Offset the scan consumed up to; the live tailer's starting point.
+    consumed: u64,
+    /// D51: turn-boundary signal lines dropped in the gap (never replayed).
+    dropped_signals: u32,
+}
+
+impl ReplayOutcome {
+    /// An outcome that scanned no signal lines at all — every early bail-out.
+    /// A zero count here means "nothing countable was read", never "no
+    /// boundaries were lost"; see the `len < start` branch's comment.
+    fn at(consumed: u64) -> Self {
+        ReplayOutcome {
+            consumed,
+            dropped_signals: 0,
+        }
+    }
 }
 
 fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_turn: Option<&str>) {
@@ -2554,13 +2614,25 @@ fn files_match(a: &[FileEntry], b: &[FileEntry]) -> bool {
     set_a == set_b
 }
 
-fn append_epoch(root: &Path, event: &str, wall_ms: u64) -> Result<(), String> {
+/// Append a `start`/`stop` epoch record (D27).
+///
+/// `dropped_signals` (D51) is the count of turn-boundary signal lines the
+/// pre-startup gap scan dropped without feeding them to the engine; it is
+/// meaningful on `start` only and every other caller passes 0, which serde
+/// omits from the wire.
+fn append_epoch(
+    root: &Path,
+    event: &str,
+    wall_ms: u64,
+    dropped_signals: u32,
+) -> Result<(), String> {
     append_log(
         &log_path(root),
         &LogRecord::Epoch(EpochRecord {
             v: 1,
             event: event.to_string(),
             ts: rfc3339(wall_ms),
+            dropped_signals,
         }),
     )
 }
@@ -4476,7 +4548,7 @@ mod tests {
         let eof = contents.len() as u64;
 
         // No state.json -> persisted offset 0: the whole file is the gap.
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(
             consumed, eof,
             "scan consumes up to the last complete line (EOF)"
@@ -4515,6 +4587,168 @@ mod tests {
         );
     }
 
+    // ---- D51: the gap drop is counted, not silent ------------------------------
+
+    /// AC-D0. The sibling test above asserts only the offset and the ingested
+    /// memory count — it is blind to whether the dropped start/stop lines were
+    /// counted, which is exactly the silence D51 closes. This one reproduces
+    /// the same repro shape (signals appended with no daemon running, fresh
+    /// state.json at offset 0, then the startup scan) and asserts the count
+    /// the `start` epoch record will carry.
+    ///
+    /// Neuter: hardcode `dropped_signals: 0` in `replay_pending_candidates`'s
+    /// returned `ReplayOutcome` -> RED here, while
+    /// `replay_pending_candidates_is_candidate_only_and_offset_reconciled`
+    /// stays GREEN (it never reads the count).
+    #[test]
+    fn replay_gap_drops_are_counted_for_the_epoch_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+
+        let start_line = r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#;
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        // No `event` key: PROTOCOL §4's implicit stop, the shape the real
+        // Claude Code Stop hook writes.
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        let contents = format!("{start_line}\n{candidate}\n{stop_line}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.consumed,
+            contents.len() as u64,
+            "unchanged: the scan still consumes to EOF"
+        );
+        assert_eq!(
+            out.dropped_signals, 2,
+            "both turn-boundary lines in the gap are dropped AND counted"
+        );
+
+        // D7 is unchanged: the drop is still a drop. Nothing minted a turn.
+        assert!(
+            !log_path(root).exists(),
+            "the gap scan must never write a turn record"
+        );
+    }
+
+    /// The discriminating half of AC-D0's predicate: the count is
+    /// `kind.is_none()` (turn boundaries), NOT "everything the ingest branch
+    /// skipped". With the `memory_enabled` kill-switch off, the candidate is
+    /// skipped too — and must NOT inflate the count, or the field lies about
+    /// how many brackets were lost.
+    ///
+    /// Neuter: count the whole else-branch (`else { dropped += 1 }`) -> this
+    /// test reds at 3, while the sibling above still passes at 2.
+    #[test]
+    fn replay_gap_drop_count_excludes_non_boundary_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+        std::fs::write(
+            crate::agentrec_dir(root).join("config.toml"),
+            b"memory_enabled = false\n",
+        )
+        .unwrap();
+
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let contents = format!(
+            "{}\n{candidate}\n{}\n",
+            r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#,
+            r#"{"v":1,"ts":2,"tool":"claude"}"#
+        );
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.dropped_signals, 2,
+            "a kill-switch-skipped candidate is not a dropped turn boundary"
+        );
+        assert!(
+            agentrec_core::memory::load_effective(root)
+                .unwrap()
+                .is_empty(),
+            "precondition: the kill-switch really did suppress ingestion"
+        );
+    }
+
+    /// Every pre-loop bail-out reads no signal lines, so it can count none.
+    /// A steady-state boot (`len == start`) must report 0 — otherwise every
+    /// daemon start would stamp a nonzero count onto its epoch record.
+    #[test]
+    fn replay_early_bailouts_report_a_zero_drop_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // No inbox at all, offset 0: the fresh-store case.
+        assert_eq!(replay_pending_candidates(root, None).dropped_signals, 0);
+
+        // Fully-consumed steady state: the file holds a stop signal, but the
+        // persisted offset is already at EOF, so it is not in any gap.
+        let contents = "{\"v\":1,\"ts\":7,\"tool\":\"claude\"}\n";
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let mut st = read_state(root);
+        st.signal_offset = contents.len() as u64;
+        write_state(root, &st).unwrap();
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(out.consumed, contents.len() as u64);
+        assert_eq!(
+            out.dropped_signals, 0,
+            "an ordinary boot with nothing in the gap counts nothing"
+        );
+    }
+
+    /// Wire shape of the count at the serializer: a nonzero count is written,
+    /// a zero one is omitted entirely (the byte-identity half of AC-D0, at the
+    /// `append_epoch` layer rather than `record.rs`'s type layer).
+    ///
+    /// **What this does NOT pin, stated because the obvious reading is wrong:**
+    /// it supplies both counts itself, so it says nothing about `daemon::run`'s
+    /// `stop` call site passing 0. Measured, not assumed — changing that call
+    /// to `replay.dropped_signals` leaves all four of these tests green. No
+    /// test pins it: every daemon integration test SIGKILLs (deliberately, see
+    /// `integration.rs`'s note that `Child::kill()` is only sometimes
+    /// graceful), so the clean-shutdown `stop` epoch is never written under
+    /// test at all. `stop` passing 0 rests on the argument at the call site —
+    /// a clean shutdown scans no gap — not on coverage.
+    #[test]
+    fn stop_epoch_never_carries_a_dropped_signal_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        append_epoch(root, "start", 1_700_000_000_000, 4).unwrap();
+        append_epoch(root, "stop", 1_700_000_001_000, 0).unwrap();
+
+        let lines: Vec<String> = std::fs::read_to_string(log_path(root))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains(r#""dropped_signals":4"#),
+            "start epoch carries the count: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("dropped_signals"),
+            "a zero count is omitted from the wire entirely: {}",
+            lines[1]
+        );
+    }
+
     // ---- red-team D1: startup shrink detection --------------------------------
 
     /// The defect the skeptic refuted: a persisted `signal_offset` PAST the
@@ -4548,7 +4782,7 @@ mod tests {
         st.signal_offset = 9999;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(
             consumed, len,
             "the tailer must be seeded at the real EOF, never the stale offset"
@@ -4590,7 +4824,7 @@ mod tests {
         st.signal_offset = len;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, len);
 
         let after = read_state(root);
@@ -4621,7 +4855,7 @@ mod tests {
         st.signal_offset = 4242;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, 0, "no inbox means the only honest offset is 0");
 
         let after = read_state(root);
@@ -4642,7 +4876,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, 0);
 
         let after = read_state(root);

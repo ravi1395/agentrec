@@ -284,6 +284,23 @@ pub struct EpochRecord {
     pub v: u32,
     pub event: String, // "start" | "stop"
     pub ts: String,    // RFC 3339
+    /// D51 (PROTOCOL §5, additive): how many turn-boundary signal lines the
+    /// recorder found in the pre-startup gap and DROPPED without feeding them
+    /// to the engine (D7 — replaying a stale start/stop would mint an empty
+    /// turn misdated to daemon boot). A count, never the dropped content:
+    /// nothing about the dropped signals is captured or persisted beyond how
+    /// many there were.
+    ///
+    /// Meaningful on `event: "start"` only — a `stop` epoch is a clean
+    /// shutdown, which has no gap to scan — and omitted from the wire
+    /// whenever it is `0`, so every pre-D51 epoch line round-trips
+    /// byte-identically (`epoch_dropped_signals_roundtrips_and_zero_stays_absent`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dropped_signals: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Append one record; creates parents; never rewrites (append-only invariant).
@@ -535,6 +552,29 @@ mod tests {
         assert_eq!(back.emitter_turn, sig.emitter_turn);
     }
 
+    /// D51 wire half: the type-level byte-identity proof for every epoch line
+    /// written before this field existed.
+    #[test]
+    fn epoch_dropped_signals_roundtrips_and_zero_stays_absent() {
+        // Pre-D51 line: parses with 0, and re-serializing is byte-identical —
+        // the key is never minted.
+        let old = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\"}";
+        let ep: EpochRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(ep.dropped_signals, 0);
+        assert_eq!(serde_json::to_string(&ep).unwrap(), old);
+
+        // An explicit zero on the wire is tolerated and normalizes away.
+        let zero = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\",\"dropped_signals\":0}";
+        let ep: EpochRecord = serde_json::from_str(zero).unwrap();
+        assert_eq!(serde_json::to_string(&ep).unwrap(), old);
+
+        // Nonzero round-trips intact.
+        let new = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\",\"dropped_signals\":3}";
+        let ep: EpochRecord = serde_json::from_str(new).unwrap();
+        assert_eq!(ep.dropped_signals, 3);
+        assert_eq!(serde_json::to_string(&ep).unwrap(), new);
+    }
+
     #[test]
     fn signal_model_roundtrips_and_absence_stays_absent() {
         // Pre-field line (every existing signal, and every Claude Code hook
@@ -632,6 +672,7 @@ mod tests {
                 v: 1,
                 event: "start".into(),
                 ts: "2026-07-05T00:00:02.000Z".into(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();
@@ -815,6 +856,7 @@ mod tests {
                 v: 1,
                 event: "start".into(),
                 ts: "2026-07-05T00:00:00.000Z".into(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();

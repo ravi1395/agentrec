@@ -1609,6 +1609,7 @@ mod tests {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         })
     }
 

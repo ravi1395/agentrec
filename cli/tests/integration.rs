@@ -2692,6 +2692,7 @@ fn seed_epoch(root: &Path, event: &str, ts: &str) {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         }),
     )
     .expect("seed epoch");
@@ -5210,6 +5211,57 @@ fn live_daemon_reports_watcher_armed() {
     assert_eq!(
         armed_nonce, epoch_nonce,
         "watcher_armed_nonce must equal the current epoch_nonce once the daemon is live"
+    );
+}
+
+/// AC-D0 wiring proof (D51). `daemon.rs`'s unit tests can show that
+/// `replay_pending_candidates` counts and that `append_epoch` serializes the
+/// count, and STILL pass with the two never connected — the `append_epoch`
+/// call lives in `daemon::run`, which no unit test reaches (it needs a real
+/// watcher, the flock, and a ctrl-c handler). This drives the real daemon
+/// binary end to end: signals seeded into the inbox with no daemon running,
+/// then a fresh start, then read `log.jsonl`.
+///
+/// Neuter: pass a literal `0` instead of `replay.dropped_signals` at the
+/// `append_epoch(&root, "start", …)` call in `daemon::run` -> RED here, while
+/// every `daemon.rs` unit test stays green.
+#[test]
+fn live_daemon_start_epoch_carries_the_offline_dropped_signal_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A complete bracket that elapsed entirely while nothing was recording:
+    // D7 drops both lines rather than minting a turn misdated to boot.
+    std::fs::write(
+        root.join(".agentrec/signal.jsonl"),
+        concat!(
+            "{\"v\":1,\"ts\":1,\"tool\":\"claude\",\"event\":\"start\"}\n",
+            "{\"v\":1,\"ts\":2,\"tool\":\"claude\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+    let log = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).unwrap();
+    daemon.kill();
+
+    let starts: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "epoch" && v["event"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 1, "one start epoch for one daemon run: {log}");
+    assert_eq!(
+        starts[0]["dropped_signals"], 2,
+        "the start epoch must carry the gap's dropped turn-boundary count: {}",
+        starts[0]
+    );
+
+    // D7 unchanged: the drop is announced, never replayed into a turn.
+    assert!(
+        !log.lines().any(|l| l.contains("\"grade\"")),
+        "no phantom turn may be minted from the dropped bracket: {log}"
     );
 }
 

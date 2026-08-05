@@ -2556,6 +2556,7 @@ mod tests {
                     v: 1,
                     event: event.to_string(),
                     ts: ts.to_string(),
+                    dropped_signals: 0,
                 }),
             )
             .unwrap();
@@ -2595,6 +2596,7 @@ mod tests {
                 v: 1,
                 event: "start".to_string(),
                 ts: "2026-01-01T00:00:00.000Z".to_string(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();
@@ -2629,6 +2631,7 @@ mod tests {
                     v: 1,
                     event: event.to_string(),
                     ts: ts.to_string(),
+                    dropped_signals: 0,
                 }),
             )
             .unwrap();

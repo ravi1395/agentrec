@@ -98,6 +98,7 @@ fn seed_epoch(root: &Path, event: &str, ts: &str) {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         }),
     )
     .expect("seed epoch");

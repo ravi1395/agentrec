@@ -11,6 +11,61 @@ Conformance fixtures for these fields are **not** created yet — the
 protocol freeze is Phase 2.1 (spec decision 5). Until then, these fields
 are additive but UNFROZEN: their shape can still change before 2.1 locks it.
 
+## Phase 2 tail D0 — `EpochRecord.dropped_signals` (2026-08-05)
+
+Added to `EpochRecord`, after `ts`:
+
+```rust
+#[serde(default, skip_serializing_if = "is_zero_u32")]
+pub dropped_signals: u32,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `0`, and `0`
+is what every pre-existing epoch line parses to, so every existing
+`log.jsonl` epoch line round-trips byte-identically
+(`record.rs::epoch_dropped_signals_roundtrips_and_zero_stays_absent`).
+UNFROZEN until the Phase 2.1 protocol freeze, like every field above — though
+this one lands specifically so it is *inside* that freeze rather than after it.
+
+A count of the turn-boundary signals (`start`/`stop`) the recorder found in
+the **pre-startup gap** — the window of `signal.jsonl` that accumulated while
+no daemon was running — and **dropped**. D7's posture is unchanged: those
+signals are still never fed to the engine, because replaying a stale
+start/stop would mint an empty turn misdated to daemon boot. What changes is
+that the drop is no longer silent (decision D51; PROTOCOL §5).
+
+Count only. Nothing about a dropped signal's content is captured: no
+`scrub_prompt`, no `BlobStore` write, no excerpt. A tool session whose whole
+bracket elapsed offline still leaves no turn and no prompt — only the fact
+that N boundaries were dropped.
+
+- **Writer: `cli/src/daemon.rs`.** `replay_pending_candidates` now returns
+  `ReplayOutcome { consumed, dropped_signals }` instead of a bare `u64`, and
+  counts, inside its scan loop, every parsed signal with `kind.is_none()`
+  that it did not ingest. The predicate is `kind.is_none()` — the exact set
+  `apply_signal` routes to its start/stop arms — deliberately NOT "everything
+  the ingest branch skipped": that set also holds memory-candidates when the
+  `memory_enabled` kill-switch is off, and any future typed `kind`
+  (`daemon.rs::replay_gap_drop_count_excludes_non_boundary_kinds`).
+  `daemon::run` threads `replay.dropped_signals` into the `append_epoch(&root,
+  "start", …)` call that immediately follows the scan; `append_epoch` gained a
+  fourth parameter and every other caller passes `0` — the `stop` call site's 0 rests on
+  the argument that a clean shutdown scans no gap, NOT on coverage (no test pins it; every
+  daemon integration test SIGKILLs, so a clean-shutdown `stop` epoch is never written under
+  test). Wiring of the START count is proven against
+  the real daemon binary, not just in-process
+  (`integration.rs::live_daemon_start_epoch_carries_the_offline_dropped_signal_count`).
+- **Zero is not "no loss".** Every early bail-out in the scan returns `0`
+  because it read no lines at all. The `len < start` (inbox shrunk) branch is
+  the one worth naming: bytes were genuinely lost there, but they were never
+  parsed, so nothing can say how many boundaries they held. That loss keeps
+  its own louder channel (`resync_shrunk_signal_offset` → stderr +
+  `record_io_failure` → DEGRADED in `status`/`doctor`).
+- **Readers: none yet.** `view::recording_gaps`/`GapKind` are untouched and no
+  renderer reads the field, so every human-form golden is byte-identical. A
+  `blame` clause surfacing a nonzero count is available and deliberately not
+  built in this round.
+
 ## Phase 2 tail C1 — `SignalEvent.emitter_turn` (2026-08-05)
 
 Added to `SignalEvent`, after `files_written`:
