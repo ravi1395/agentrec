@@ -5694,6 +5694,271 @@ fn doctor_state_parse_advisory_never_flips_exit() {
     );
 }
 
+// --- C3: Codex hook install/uninstall/doctor, end-to-end through the real
+// binary (unit-level coverage of the same logic lives in
+// initcmd.rs/doctorcmd.rs/uninstallcmd.rs's own `#[cfg(test)]` modules —
+// these exercise the CLI surface: flag wiring, printed remedy text, and
+// process exit codes).
+
+fn read_codex_hooks_json(root: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap()
+}
+
+// AC-C3 table: state "none" -> defaults to creating `.codex/hooks.json`
+// with all three events.
+#[test]
+fn codex_init_none_creates_hooks_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Codex hooks installed"), "{stdout}");
+    assert!(
+        stdout.contains("/hooks"),
+        "expected the trust reminder: {stdout}"
+    );
+
+    let settings = read_codex_hooks_json(root);
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        let arr = settings["hooks"][event].as_array().unwrap_or_else(|| {
+            panic!("missing {event} in {settings}");
+        });
+        assert!(arr[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("agentrec hook codex"));
+    }
+    assert_eq!(
+        settings["hooks"]["PostToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap(),
+        "apply_patch"
+    );
+}
+
+// AC-C3 table: state "hooks.json-only" (with a foreign entry) -> merges,
+// preserving the foreign entry.
+#[test]
+fn codex_init_hooks_json_only_preserves_foreign_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(
+        root.join(".codex/hooks.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    assert!(!root.join(".codex/config.toml").exists());
+
+    let settings = read_codex_hooks_json(root);
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 2, "foreign entry must survive: {settings}");
+    assert!(stop
+        .iter()
+        .any(|e| e["hooks"][0]["command"] == "other-tool"));
+}
+
+// AC-C3 table: state "[hooks]-only" -> merges into inline config.toml, never
+// creating hooks.json.
+#[test]
+fn codex_init_config_toml_only_merges_inline_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "model = \"o3\"\n\n[hooks]\n",
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    assert!(
+        !root.join(".codex/hooks.json").exists(),
+        "must not also create hooks.json when inline [hooks] is the target"
+    );
+
+    let text = std::fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert!(text.contains("agentrec hook codex"), "{text}");
+    assert!(text.contains("model"), "unrelated key must survive: {text}");
+}
+
+// AC-C3 table: state "both" -> refuse, neither file touched, no .bak.
+#[test]
+fn codex_init_both_present_refuses_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let hooks_json_before = "{\"hooks\":{}}\n";
+    std::fs::write(root.join(".codex/hooks.json"), hooks_json_before).unwrap();
+    let config_toml_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(stdout.contains("both"), "{stdout}");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+        hooks_json_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_toml_before
+    );
+    assert!(!root.join(".codex/hooks.json.bak").exists());
+    assert!(!root.join(".codex/config.toml.bak").exists());
+}
+
+// AC-C3 table: "idempotent-reinstall" — the whole file, and every
+// agentrec-owned ENTRY specifically, is byte-identical across two
+// `agentrec init --codex` runs (not just the command string: a changed
+// timeout or matcher breaks trust exactly the same way).
+#[test]
+fn codex_init_idempotent_reinstall_is_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out1 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out1.status.success());
+    let first_bytes = std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
+    let first = read_codex_hooks_json(root);
+
+    let out2 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("already present"),
+        "second run must be a no-op: {stdout2}"
+    );
+    let second_bytes = std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
+    let second = read_codex_hooks_json(root);
+
+    assert_eq!(first_bytes, second_bytes, "whole file byte-identical");
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        assert_eq!(
+            first["hooks"][event], second["hooks"][event],
+            "whole entry for {event} must be byte-stable across reinstalls"
+        );
+    }
+}
+
+// Codex integration is opt-in: a plain `agentrec init` (no --codex) must
+// never touch `.codex/` at all.
+#[test]
+fn codex_init_without_flag_touches_nothing_under_codex_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(!root.join(".codex").exists());
+}
+
+// `agentrec uninstall` reverses `init --codex` — mirrors the Claude Code
+// hook removal, which is already covered by existing uninstall tests.
+#[test]
+fn codex_uninstall_removes_installed_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    assert!(root.join(".codex/hooks.json").exists());
+
+    let out = agentrec(root, &["uninstall", "--no-service"]);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed agentrec hook entries from Codex hook config"),
+        "{stdout}"
+    );
+
+    let settings = read_codex_hooks_json(root);
+    assert!(
+        settings.get("hooks").is_none(),
+        "all agentrec-only events must be fully removed: {settings}"
+    );
+}
+
+// AC-C3 doctor case: `[features] hooks = false` reports degraded (Fail,
+// nonzero exit).
+#[test]
+fn doctor_codex_hooks_feature_off_reports_degraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "[features]\nhooks = false\n",
+    )
+    .unwrap();
+
+    let out = doctor(root);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("codex hook flags"), "{stdout}");
+    assert!(stdout.contains("[features] hooks = false"), "{stdout}");
+}
+
+// AC-C3 doctor case: `allow_managed_hooks_only = true` ALSO reports
+// degraded, same severity.
+#[test]
+fn doctor_codex_managed_hooks_only_reports_degraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "allow_managed_hooks_only = true\n",
+    )
+    .unwrap();
+
+    let out = doctor(root);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("codex hook flags"), "{stdout}");
+    assert!(
+        stdout.contains("allow_managed_hooks_only = true"),
+        "{stdout}"
+    );
+}
+
+// A repo that never opted into Codex must report `n/a`, never a fabricated
+// failure — codex hook checks must not appear as "fail" text in an
+// otherwise-healthy repo (mirrors `doctor_healthy_all_pass_exit_0`'s own
+// no-failure-substring assertion).
+#[test]
+fn doctor_codex_checks_are_na_without_codex_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(out.status.success());
+
+    let v = doctor_json_value(root);
+    let checks = v["checks"].as_array().unwrap();
+    for name in ["codex hooks", "codex hook flags"] {
+        let check = checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} check in {v}"));
+        assert_eq!(check["status"], "n/a", "{name}: {v}");
+    }
+}
+
 // --- AC-Z+2, AC-Z+3, AC-Z+4 (D42/D43): relative-time default / --utc
 // absolute, color gated off when piped or under NO_COLOR, and the
 // `--explain` glossary only ever mentions terms present in this listing.

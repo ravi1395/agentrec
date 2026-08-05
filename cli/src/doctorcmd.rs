@@ -128,6 +128,8 @@ pub(crate) fn diagnose(root: &Path) -> Report {
                 "store permissions",
                 "inotify headroom",
                 "orphaned services",
+                "codex hooks",
+                "codex hook flags",
             ]
             .iter()
             .map(|name| Check::na(name)),
@@ -145,6 +147,8 @@ pub(crate) fn diagnose(root: &Path) -> Report {
         check_permissions(root),
         check_inotify(root),
         check_orphan_services(),
+        check_codex_hooks(root),
+        check_codex_hook_flags(root),
     ];
     let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
     Report { checks, ok }
@@ -496,6 +500,145 @@ fn check_orphan_services() -> Check {
         return Check::pass(NAME);
     }
     Check::advisory(NAME, notes.join(" "))
+}
+
+// ---- Codex hooks (C3) --------------------------------------------------------
+
+/// Shape + "recent signals" validation for agentrec's own Codex hook
+/// entries. `n/a` when Codex integration was never opted into (`agentrec
+/// init --codex`) — this is an opt-in feature, so a repo that never asked
+/// for it must not report a fabricated failure. Once installed:
+/// - malformed/missing entries -> `Fail` (mirrors Claude's `check_hooks`);
+/// - shape OK but zero `tool:"codex"` lines ever recorded in `signal.jsonl`
+///   -> ADVISORY pass. This is deliberately non-blocking, unlike Claude's
+///   signal-freshness check: that check is gated on independent evidence of
+///   RECENT transcript activity (so it only fires when a signal is actually
+///   overdue); this repo has no equivalent external oracle for Codex
+///   without scanning `~/.codex/sessions` (out of this round's scope — see
+///   docs/verify/codex-spike.md's "what was NOT probed"), so a freshly
+///   `init --codex`'d repo that hasn't run a Codex turn yet must not be
+///   told it's broken. The note still carries real information: it is
+///   `doctor`'s only behavioral signal for the spike's confirmed
+///   silent-skip-on-untrusted-hook failure mode, since trust state itself
+///   is not inspectable (no documented location — spike, "Trust flow").
+fn check_codex_hooks(root: &Path) -> Check {
+    const NAME: &str = "codex hooks";
+    if !crate::initcmd::codex_hooks_installed(root) {
+        return Check::na(NAME);
+    }
+    if let Err(reason) = crate::initcmd::codex_hooks_shape(root) {
+        return Check::fail(
+            NAME,
+            format!("Codex hook entries missing/mangled ({reason}) — run `agentrec init --codex`"),
+        );
+    }
+    if codex_signal_ever_seen(root) {
+        Check::pass(NAME)
+    } else {
+        Check::advisory(
+            NAME,
+            "Codex hooks are installed but no tool:\"codex\" line has ever appeared in \
+             signal.jsonl — if you've used Codex in this repo, the hooks are likely still \
+             untrusted: inside Codex run `/hooks` and trust them (`codex exec` gives no \
+             warning at all when hooks are silently skipped — confirmed live, \
+             docs/verify/codex-spike.md). Support verified live against codex-cli 0.146.0.",
+        )
+    }
+}
+
+fn codex_signal_ever_seen(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(signal_path(root)) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("tool").and_then(|t| t.as_str()).map(String::from))
+            .is_some_and(|tool| tool == "codex")
+    })
+}
+
+/// Reads repo-local `.codex/config.toml` only — `$CODEX_HOME`'s user-global
+/// layer (and any managed/MDM `requirements.toml` layer) is a stated gap,
+/// not built (spike, "what was NOT probed": "Managed/enterprise hooks
+/// (`requirements.toml`, `allow_managed_hooks_only`) ... no live evidence").
+///
+/// Two conditions, both confirmed by this task round to silently disable
+/// hooks without any other visible symptom, so both get LOUD `Fail`
+/// severity — same as an absent-trust condition would if it were directly
+/// inspectable (it is not; see `check_codex_hooks`):
+///
+/// - `[features] hooks = false` — **measured live this round**, same
+///   pinned `codex-cli 0.146.0`: `codex features list` reports
+///   `hooks  stable  true` (default-on). Checked as `[features].hooks`,
+///   the canonical location (`codex --help`: `--enable <FEATURE>` is
+///   "Equivalent to `-c features.<name>=true`", a dotted `features.<name>`
+///   path). `[features] codex_hooks = false` is ALSO checked, defensively,
+///   but this is NOT confirmed to work the same way: `codex_hooks` does not
+///   appear anywhere in `codex features list`'s registry output on
+///   0.146.0 (only `hooks` and the unrelated, `removed`, `plugin_hooks`
+///   do) — it is checked in case it is a legacy alias, not because that
+///   was verified.
+/// - `allow_managed_hooks_only = true` — the spike explicitly did NOT probe
+///   this live; checked at the top level of `.codex/config.toml` per this
+///   task's instruction. Binary-string inspection of the pinned
+///   `codex-cli` 0.146.0 executable (`strings ... | grep
+///   allow_managed_hooks_only`) shows this key as a field of
+///   `ConfigRequirementsToml`, associated with the enterprise/MDM
+///   `requirements.toml` layer — NOT confirmed to live in, or be honored
+///   from, a repo-local `.codex/config.toml` at all. The remedy text below
+///   states what the config declares, not what Codex does with it.
+fn check_codex_hook_flags(root: &Path) -> Check {
+    const NAME: &str = "codex hook flags";
+    if !crate::initcmd::codex_hooks_installed(root) {
+        return Check::na(NAME);
+    }
+    let path = crate::initcmd::codex_config_toml_path(root);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Check::pass(NAME); // no config.toml at all -> nothing declares a disable
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Check::fail(NAME, format!("{} is not valid TOML", path.display()));
+    };
+
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some(features) = table.get("features").and_then(|v| v.as_table()) {
+        if features.get("hooks").and_then(|v| v.as_bool()) == Some(false) {
+            reasons.push(
+                "[features] hooks = false disables ALL Codex hooks (confirmed live, \
+                 codex-cli 0.146.0: `codex features list` reports `hooks  stable  true` by \
+                 default)"
+                    .to_string(),
+            );
+        }
+        if features.get("codex_hooks").and_then(|v| v.as_bool()) == Some(false) {
+            reasons.push(
+                "[features] codex_hooks = false — checked defensively as a possible legacy \
+                 alias for `hooks`; NOT confirmed live (this key does not appear in `codex \
+                 features list`'s registry on codex-cli 0.146.0)"
+                    .to_string(),
+            );
+        }
+    }
+    if table
+        .get("allow_managed_hooks_only")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        reasons.push(
+            "allow_managed_hooks_only = true is declared in this config — Codex's own \
+             suppression behavior for this key was NOT verified live (spike scope gap); this \
+             key is also associated with the enterprise/managed requirements.toml layer, not \
+             confirmed to be read from repo-local .codex/config.toml"
+                .to_string(),
+        );
+    }
+
+    if reasons.is_empty() {
+        Check::pass(NAME)
+    } else {
+        Check::fail(NAME, reasons.join("; "))
+    }
 }
 
 // ---- inotify headroom (Linux only) ------------------------------------------
@@ -1061,5 +1204,183 @@ mod tests {
             "symlinked dir tree must be followed like notify does: \
              before={before} after={after}"
         );
+    }
+
+    // ---- C3: Codex hooks doctor checks ------------------------------------
+
+    #[test]
+    fn codex_checks_are_na_when_never_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+
+        assert_eq!(check_codex_hooks(root).status, CheckStatus::Na);
+        assert_eq!(check_codex_hook_flags(root).status, CheckStatus::Na);
+    }
+
+    #[test]
+    fn codex_checks_pass_on_a_freshly_installed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+
+        // Shape is fine but no codex signal has ever been recorded ->
+        // advisory pass, not a hard fail — a fresh install hasn't run a
+        // Codex turn yet, which is not evidence of a real problem.
+        let hooks_check = check_codex_hooks(root);
+        assert_eq!(hooks_check.status, CheckStatus::Pass);
+        assert!(hooks_check.remedy.is_some(), "advisory note expected");
+
+        assert_eq!(check_codex_hook_flags(root).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn codex_hooks_shape_check_fails_on_mangled_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        // Only Stop installed — UserPromptSubmit/PostToolUse missing.
+        std::fs::write(
+            crate::initcmd::codex_hooks_json_path(root),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "Stop": [ { "hooks": [ { "type": "command", "command": "agentrec hook codex", "timeout": 10 } ] } ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let check = check_codex_hooks(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("agentrec init --codex"));
+    }
+
+    // AC-C3: `[features] hooks = false` must produce a LOUD (Fail) degraded
+    // result.
+    #[test]
+    fn codex_hook_flags_fails_when_hooks_feature_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("[features] hooks = false"), "{remedy}");
+        assert!(remedy.contains("hooks  stable  true"), "{remedy}");
+    }
+
+    // AC-C3: `allow_managed_hooks_only = true` must ALSO produce a LOUD
+    // (Fail) degraded result, same severity as the feature-flag case.
+    #[test]
+    fn codex_hook_flags_fails_when_managed_hooks_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "allow_managed_hooks_only = true\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check
+            .remedy
+            .unwrap()
+            .contains("allow_managed_hooks_only = true"));
+    }
+
+    #[test]
+    fn codex_hook_flags_reports_both_reasons_when_both_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "allow_managed_hooks_only = true\n\n[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("[features] hooks = false"), "{remedy}");
+        assert!(
+            remedy.contains("allow_managed_hooks_only = true"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_flags_defensive_codex_hooks_alias_also_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\ncodex_hooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("codex_hooks = false"));
+    }
+
+    #[test]
+    fn codex_signal_ever_seen_detects_a_codex_tool_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        assert!(!codex_signal_ever_seen(root));
+
+        std::fs::write(
+            signal_path(root),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"v":1,"ts":0,"tool":"claude","event":"start"}),
+                serde_json::json!({"v":1,"ts":0,"tool":"codex","event":"start"}),
+            ),
+        )
+        .unwrap();
+        assert!(codex_signal_ever_seen(root));
+    }
+
+    // The whole-report leg: `diagnose` on a repo with codex hooks installed
+    // and a disabling flag set must flip `report.ok` to false via THIS
+    // check specifically.
+    #[test]
+    fn diagnose_reports_codex_hook_flags_failure_in_full_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let report = diagnose(root);
+        assert!(!report.ok);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "codex hook flags")
+            .expect("diagnose must include the codex hook flags check");
+        assert_eq!(check.status, CheckStatus::Fail);
     }
 }

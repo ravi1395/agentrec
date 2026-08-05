@@ -119,12 +119,13 @@ fn temp_skip_line(prefix: &Path) -> String {
 pub fn run(
     root: &Path,
     no_hook: bool,
+    codex: bool,
     no_service: bool,
     force_service: bool,
     dry_run: bool,
 ) -> Result<(), String> {
     if dry_run {
-        print_dry_run(root, no_hook, no_service, force_service);
+        print_dry_run(root, no_hook, codex, no_service, force_service);
         return Ok(());
     }
 
@@ -178,6 +179,24 @@ pub fn run(
         ));
     }
 
+    if !codex {
+        actions.push("skipped Codex hook install (pass --codex to enable)".to_string());
+    } else {
+        match install_codex_hooks(root) {
+            Ok(CodexHooksOutcome::Refused) => actions.push(codex_refuse_line(root)),
+            Ok(CodexHooksOutcome::Installed { target, changed: c }) => {
+                changed = changed || c;
+                actions.push(format!(
+                    "Codex hooks {} ({})",
+                    if c { "installed" } else { "already present" },
+                    codex_target_label(target, root),
+                ));
+                actions.push(CODEX_TRUST_REMINDER.to_string());
+            }
+            Err(e) => actions.push(format!("Codex hook install skipped: {e}")),
+        }
+    }
+
     match service_decision(root, no_service, force_service) {
         ServiceDecision::SkipFlag => {
             actions.push("skipped service install (--no-service)".to_string());
@@ -207,7 +226,7 @@ pub fn run(
 
 /// Print every action `run` would take, without creating/writing/loading
 /// anything (AC-Y+5).
-fn print_dry_run(root: &Path, no_hook: bool, no_service: bool, force_service: bool) {
+fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, force_service: bool) {
     println!("[dry-run] would scaffold {}", agentrec_dir(root).display());
     println!("[dry-run] would write default config.toml (if missing)");
     println!("[dry-run] would ensure .gitignore entry (git repos only)");
@@ -218,6 +237,22 @@ fn print_dry_run(root: &Path, no_hook: bool, no_service: bool, force_service: bo
         println!("[dry-run] would skip Claude Code hook install (--no-hook)");
     } else {
         println!("[dry-run] would install Claude Code hooks (UserPromptSubmit + Stop)");
+    }
+    // Same read-only inspect function the real run uses to decide, so
+    // `--dry-run` can never claim an install (or a refuse) the real run
+    // would not also do.
+    if !codex {
+        println!("[dry-run] would skip Codex hook install (pass --codex to enable)");
+    } else {
+        match codex_hooks_target(root) {
+            Ok(CodexHooksTarget::Refuse) => println!("[dry-run] {}", codex_refuse_line(root)),
+            Ok(target) => println!(
+                "[dry-run] would install Codex hooks (UserPromptSubmit + PostToolUse[apply_patch] \
+                 + Stop) into {}",
+                codex_target_label(target, root)
+            ),
+            Err(e) => println!("[dry-run] Codex hook install would be skipped: {e}"),
+        }
     }
     // Same decision function as the real run, so `--dry-run` can never claim
     // an install the real run would skip.
@@ -448,6 +483,16 @@ fn merge_hook(
 }
 
 pub(crate) fn event_has_marker(settings: &serde_json::Value, event: &str) -> bool {
+    event_has_marker_with(settings, event, HOOK_MARKER)
+}
+
+/// Generalized over the marker string so the Codex hooks.json installer
+/// below can reuse the exact same "does `hooks.<event>[].hooks[].command`
+/// contain our marker" shape-walk instead of re-deriving it — the shape is
+/// identical between Claude's `settings.local.json` and Codex's
+/// `hooks.json` (`hooks.<Event>` = array of groups, each group has an inner
+/// `hooks[]` of `{type, command, ...}`).
+fn event_has_marker_with(settings: &serde_json::Value, event: &str, marker: &str) -> bool {
     settings
         .get("hooks")
         .and_then(|h| h.get(event))
@@ -461,7 +506,7 @@ pub(crate) fn event_has_marker(settings: &serde_json::Value, event: &str) -> boo
                         hooks.iter().any(|hook| {
                             hook.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(|c| c.contains(HOOK_MARKER))
+                                .map(|c| c.contains(marker))
                                 .unwrap_or(false)
                         })
                     })
@@ -469,6 +514,461 @@ pub(crate) fn event_has_marker(settings: &serde_json::Value, event: &str) -> boo
             })
         })
         .unwrap_or(false)
+}
+
+// ============================================================================
+// Codex hooks (C3): `.codex/hooks.json` or inline `[hooks]` in
+// `.codex/config.toml`, whichever the repo already uses — mirrors the
+// Claude Code installer above structurally (marker-scoped merge, backup
+// before rewrite, idempotent re-run), generalized for Codex's two possible
+// config locations and its extra `PostToolUse` matcher + explicit timeout.
+// Grounded throughout by the live spike against pinned `codex-cli 0.146.0`
+// (`docs/verify/codex-spike.md`) — nothing below invents a payload or
+// config shape the spike didn't observe or that this round didn't itself
+// measure live (see the timeout and `[features] hooks` comments).
+// ============================================================================
+
+pub(crate) const CODEX_HOOK_MARKER: &str = "agentrec hook codex";
+const CODEX_HOOK_COMMAND: &str = "agentrec hook codex";
+
+/// Per-hook timeout (seconds) for every installed Codex hook entry.
+///
+/// Codex's documented default is 600s (10 minutes) — see the module-level
+/// spike doc's "Hash-invalidation" section, which changed this exact field
+/// on a live hook to test trust invalidation. A wedged `agentrec hook codex`
+/// (e.g. a stuck flock on `codex-scratch.lock`) must not hold a Codex turn
+/// hostage for 10 minutes. 10s is chosen, not merely "small": it is the
+/// EXACT value the spike's own probe hooks ran under live and completed
+/// well within (`docs/verify/codex-spike.md`'s TUI capture: `Timeout 10s`),
+/// and every operation `agentrec hook codex` performs is local — one stdin
+/// read, one flock+append to `codex-scratch.jsonl` or `signal.jsonl`, no
+/// network call — so 10s leaves roughly two orders of magnitude of headroom
+/// over the actual (sub-millisecond, unmeasured-but-structurally-bounded)
+/// work it does.
+const CODEX_HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// The three hook events this integration installs, paired with the
+/// `PostToolUse` matcher (decision 17: only `apply_patch` firings carry a
+/// spike-confirmed extraction rule). `pub(crate)` — `doctorcmd.rs` walks
+/// this same list to validate installed shape without re-deriving it.
+pub(crate) const CODEX_HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("UserPromptSubmit", None),
+    ("PostToolUse", Some("apply_patch")),
+    ("Stop", None),
+];
+
+pub(crate) fn codex_hooks_json_path(root: &Path) -> std::path::PathBuf {
+    root.join(".codex").join("hooks.json")
+}
+
+pub(crate) fn codex_config_toml_path(root: &Path) -> std::path::PathBuf {
+    root.join(".codex").join("config.toml")
+}
+
+/// Which Codex config file `install_codex_hooks` would write to, decided
+/// PURELY by inspection (read-only — never writes) so `--dry-run` and the
+/// real run share one decision and can never diverge, same precedent as
+/// `service_decision`/`print_dry_run` above.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CodexHooksTarget {
+    /// `.codex/hooks.json` — the default: written when it already exists,
+    /// or when NEITHER it nor an inline `[hooks]` table exists (preference
+    /// order per IMPLEMENTATION.md 454 / this task: hooks.json first).
+    HooksJson,
+    /// The inline `[hooks]` table in `.codex/config.toml` — used only when
+    /// hooks.json is absent AND config.toml already has that table.
+    ConfigToml,
+    /// Both exist. Codex itself loads and merges both, printing a startup
+    /// warning ("prefer a single representation for this layer" — confirmed
+    /// live, spike doc "hooks.json + inline [hooks] merge + startup
+    /// warning"). agentrec refuses to add a third source and contribute to
+    /// that already-warned state.
+    Refuse,
+}
+
+pub(crate) fn codex_hooks_target(root: &Path) -> Result<CodexHooksTarget, String> {
+    let hooks_json_present = codex_hooks_json_path(root).is_file();
+    let config_toml_path = codex_config_toml_path(root);
+    let inline_present = match fs::read_to_string(&config_toml_path) {
+        Ok(text) => {
+            let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+                format!(
+                    "existing {} is not valid TOML ({e}); not touching Codex hook config",
+                    config_toml_path.display()
+                )
+            })?;
+            table.contains_key("hooks")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(format!(
+                "cannot read {} ({e}); not touching Codex hook config",
+                config_toml_path.display()
+            ))
+        }
+    };
+    Ok(match (hooks_json_present, inline_present) {
+        (true, true) => CodexHooksTarget::Refuse,
+        (true, false) | (false, false) => CodexHooksTarget::HooksJson,
+        (false, true) => CodexHooksTarget::ConfigToml,
+    })
+}
+
+pub(crate) enum CodexHooksOutcome {
+    Installed {
+        target: CodexHooksTarget,
+        changed: bool,
+    },
+    Refused,
+}
+
+pub(crate) fn install_codex_hooks(root: &Path) -> Result<CodexHooksOutcome, String> {
+    match codex_hooks_target(root)? {
+        CodexHooksTarget::Refuse => Ok(CodexHooksOutcome::Refused),
+        CodexHooksTarget::HooksJson => Ok(CodexHooksOutcome::Installed {
+            target: CodexHooksTarget::HooksJson,
+            changed: install_codex_hooks_json(root)?,
+        }),
+        CodexHooksTarget::ConfigToml => Ok(CodexHooksOutcome::Installed {
+            target: CodexHooksTarget::ConfigToml,
+            changed: install_codex_hooks_toml(root)?,
+        }),
+    }
+}
+
+/// One installed hook-command object: `{"type":"command","command":...,
+/// "timeout":...}` plus an optional `matcher` on the entry itself (Codex's
+/// shape puts `matcher` beside `hooks[]`, not inside each hook — same place
+/// Claude Code puts it, confirmed by the spike's `/hooks` review screen
+/// showing `Matcher` as a per-entry field alongside `Command`/`Timeout`).
+fn codex_hook_json_entry(matcher: Option<&str>) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    if let Some(m) = matcher {
+        entry.insert("matcher".to_string(), serde_json::json!(m));
+    }
+    entry.insert(
+        "hooks".to_string(),
+        serde_json::json!([{
+            "type": "command",
+            "command": CODEX_HOOK_COMMAND,
+            "timeout": CODEX_HOOK_TIMEOUT_SECS,
+        }]),
+    );
+    serde_json::Value::Object(entry)
+}
+
+/// Merge `.codex/hooks.json`: same read/merge/backup/write shape as
+/// `install_claude_hooks` above, generalized over the 3 Codex events.
+fn install_codex_hooks_json(root: &Path) -> Result<bool, String> {
+    let path = codex_hooks_json_path(root);
+    let current = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+            format!(
+                "existing {} is not valid JSON ({e}); not touching it",
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let mut settings = current;
+    let mut changed = false;
+    for (event, matcher) in CODEX_HOOK_EVENTS {
+        if event_has_marker_with(&settings, event, CODEX_HOOK_MARKER) {
+            continue;
+        }
+        let obj = settings
+            .as_object_mut()
+            .ok_or("hooks.json is not a JSON object")?;
+        let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+        let hooks_obj = hooks
+            .as_object_mut()
+            .ok_or("hooks.json \"hooks\" is not a JSON object")?;
+        let arr_entry = hooks_obj
+            .entry(*event)
+            .or_insert_with(|| serde_json::json!([]));
+        let arr = arr_entry
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.json \"hooks.{event}\" is not a JSON array"))?;
+        arr.push(codex_hook_json_entry(*matcher));
+        changed = true;
+    }
+    if changed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if path.exists() {
+            let backup = path.with_extension("json.bak");
+            fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+        }
+        let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        fs::write(&path, text).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
+fn toml_event_has_marker(hooks_table: &toml::Table, event: &str, marker: &str) -> bool {
+    hooks_table
+        .get(event)
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .as_table()
+                    .and_then(|t| t.get("hooks"))
+                    .and_then(|h| h.as_array())
+                    .map(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.as_table()
+                                .and_then(|t| t.get("command"))
+                                .and_then(|c| c.as_str())
+                                .map(|c| c.contains(marker))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn codex_hook_toml_entry(matcher: Option<&str>) -> toml::Value {
+    let mut hook = toml::Table::new();
+    hook.insert(
+        "type".to_string(),
+        toml::Value::String("command".to_string()),
+    );
+    hook.insert(
+        "command".to_string(),
+        toml::Value::String(CODEX_HOOK_COMMAND.to_string()),
+    );
+    hook.insert(
+        "timeout".to_string(),
+        toml::Value::Integer(CODEX_HOOK_TIMEOUT_SECS as i64),
+    );
+    let mut entry = toml::Table::new();
+    if let Some(m) = matcher {
+        entry.insert("matcher".to_string(), toml::Value::String(m.to_string()));
+    }
+    entry.insert(
+        "hooks".to_string(),
+        toml::Value::Array(vec![toml::Value::Table(hook)]),
+    );
+    toml::Value::Table(entry)
+}
+
+/// Merge the inline `[hooks]` table in `.codex/config.toml`. Re-serializes
+/// the WHOLE file (`toml::to_string_pretty`) — this reformats the user's
+/// existing file (comments and key ordering are not preserved by the `toml`
+/// crate's `Value` round-trip; adding `toml_edit` for format-preservation is
+/// out of scope — no new dependency, and `Cargo.lock`/`--locked` must not
+/// move). This is disclosed to the user via the printed action line, not
+/// silent. It does not un-trust the user's OTHER hooks: the spike measured
+/// that Codex's hook trust is keyed on the PARSED hook definition, not raw
+/// file bytes — re-serializing with different JSON whitespace made no
+/// difference to any trust decision observed (spike "Hash-invalidation"
+/// section, bonus finding).
+fn install_codex_hooks_toml(root: &Path) -> Result<bool, String> {
+    let path = codex_config_toml_path(root);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let mut doc: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        format!(
+            "existing {} is not valid TOML ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    let mut changed = false;
+    let hooks_val = doc
+        .entry("hooks")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let hooks_table = hooks_val
+        .as_table_mut()
+        .ok_or_else(|| format!("{} \"hooks\" is not a TOML table", path.display()))?;
+    for (event, matcher) in CODEX_HOOK_EVENTS {
+        if toml_event_has_marker(hooks_table, event, CODEX_HOOK_MARKER) {
+            continue;
+        }
+        let arr_val = hooks_table
+            .entry(event.to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let arr = arr_val
+            .as_array_mut()
+            .ok_or_else(|| format!("{} \"hooks.{event}\" is not a TOML array", path.display()))?;
+        arr.push(codex_hook_toml_entry(*matcher));
+        changed = true;
+    }
+    if changed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if path.exists() {
+            let backup = path.with_extension("toml.bak");
+            fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+        }
+        let out = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+        fs::write(&path, out).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
+/// Printed once Codex hooks are actually written (installed or already
+/// present) — never on refuse. Two spike-confirmed facts, cited rather than
+/// hedged (`docs/verify/codex-spike.md`): (1) `codex exec` gives ZERO
+/// stdout/stderr indication of untrusted hooks — the documented warning is
+/// TUI-only, so this line is automation's only signal; (2) trust is keyed
+/// on a hash of each hook's exact parsed definition — changing ANY field
+/// (command, timeout, or matcher) later silently drops JUST that one hook
+/// back to skipped-until-re-trusted, demonstrated live independently on a
+/// command-only change and a timeout-only change ("Hash-invalidation"
+/// section, Test A / Test B).
+const CODEX_TRUST_REMINDER: &str = "Codex hooks are installed but not yet trusted — inside \
+    Codex, run /hooks and trust the 3 new/changed hooks (or pass \
+    --dangerously-bypass-hook-trust for CI/automation). `codex exec` runs silently with \
+    untrusted hooks skipped — no warning at all outside the interactive TUI. Trust is keyed on \
+    a hash of each hook's exact definition: changing ANY field later (command, timeout, \
+    matcher) silently un-trusts just that hook again (docs/verify/codex-spike.md).";
+
+fn codex_refuse_line(root: &Path) -> String {
+    format!(
+        "skipped Codex hook install: both {} and an inline [hooks] table in {} exist — Codex \
+         loads and merges both, printing a startup warning (\"prefer a single representation \
+         for this layer\", confirmed live); agentrec refuses to add a third source and \
+         contribute to that warned state. Consolidate to one file, then re-run \
+         `agentrec init --codex`.",
+        codex_hooks_json_path(root).display(),
+        codex_config_toml_path(root).display(),
+    )
+}
+
+/// Whether ANY agentrec Codex hook marker is present, in either possible
+/// config location. Read-only; `doctorcmd.rs` uses this to decide whether
+/// its Codex-specific checks apply at all — Codex integration is opt-in
+/// (`--codex`), so a repo that never asked for it must report `n/a`, not a
+/// fabricated failure.
+pub(crate) fn codex_hooks_installed(root: &Path) -> bool {
+    if let Ok(text) = fs::read_to_string(codex_hooks_json_path(root)) {
+        if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) {
+            if CODEX_HOOK_EVENTS
+                .iter()
+                .any(|(event, _)| event_has_marker_with(&settings, event, CODEX_HOOK_MARKER))
+            {
+                return true;
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(codex_config_toml_path(root)) {
+        if let Ok(table) = text.parse::<toml::Table>() {
+            if let Some(hooks_table) = table.get("hooks").and_then(|h| h.as_table()) {
+                if CODEX_HOOK_EVENTS
+                    .iter()
+                    .any(|(event, _)| toml_event_has_marker(hooks_table, event, CODEX_HOOK_MARKER))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Validates that every one of the 3 events carries an agentrec-marked
+/// entry with the right shape (`PostToolUse`'s `matcher` == `"apply_patch"`),
+/// in whichever config location currently carries our marker (hooks.json
+/// checked first, matching install's own preference order). `Err` names
+/// what's missing/wrong — `doctorcmd.rs` renders that as the failing
+/// check's remedy text.
+pub(crate) fn codex_hooks_shape(root: &Path) -> Result<(), String> {
+    if let Ok(text) = fs::read_to_string(codex_hooks_json_path(root)) {
+        if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) {
+            if CODEX_HOOK_EVENTS
+                .iter()
+                .any(|(event, _)| event_has_marker_with(&settings, event, CODEX_HOOK_MARKER))
+            {
+                return codex_hooks_shape_json(&settings);
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(codex_config_toml_path(root)) {
+        if let Ok(table) = text.parse::<toml::Table>() {
+            if let Some(hooks_table) = table.get("hooks").and_then(|h| h.as_table()) {
+                return codex_hooks_shape_toml(hooks_table);
+            }
+        }
+    }
+    Err("no Codex hook config found (neither hooks.json nor config.toml [hooks])".to_string())
+}
+
+fn codex_hooks_shape_json(settings: &serde_json::Value) -> Result<(), String> {
+    for (event, matcher) in CODEX_HOOK_EVENTS {
+        if !event_has_marker_with(settings, event, CODEX_HOOK_MARKER) {
+            return Err(format!("{event} entry missing from hooks.json"));
+        }
+        if let Some(m) = matcher {
+            let has_matcher = settings
+                .get("hooks")
+                .and_then(|h| h.get(event))
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|e| e.get("matcher").and_then(|v| v.as_str()) == Some(*m))
+                })
+                .unwrap_or(false);
+            if !has_matcher {
+                return Err(format!("{event} entry missing matcher {m:?} in hooks.json"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn codex_hooks_shape_toml(hooks_table: &toml::Table) -> Result<(), String> {
+    for (event, matcher) in CODEX_HOOK_EVENTS {
+        if !toml_event_has_marker(hooks_table, event, CODEX_HOOK_MARKER) {
+            return Err(format!("{event} entry missing from config.toml [hooks]"));
+        }
+        if let Some(m) = matcher {
+            let has_matcher = hooks_table
+                .get(*event)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|e| {
+                        e.as_table()
+                            .and_then(|t| t.get("matcher"))
+                            .and_then(|v| v.as_str())
+                            == Some(*m)
+                    })
+                })
+                .unwrap_or(false);
+            if !has_matcher {
+                return Err(format!(
+                    "{event} entry missing matcher {m:?} in config.toml [hooks]"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn codex_target_label(target: CodexHooksTarget, root: &Path) -> String {
+    match target {
+        CodexHooksTarget::HooksJson => codex_hooks_json_path(root).display().to_string(),
+        CodexHooksTarget::ConfigToml => codex_config_toml_path(root).display().to_string(),
+        CodexHooksTarget::Refuse => unreachable!("Refuse has no install target label"),
+    }
 }
 
 #[cfg(test)]
@@ -514,7 +1014,7 @@ mod tests {
         fs::write(&settings_path, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
         let before = fs::read(&settings_path).unwrap();
 
-        let err = run(root, false, true, false, false).unwrap_err();
+        let err = run(root, false, false, true, false, false).unwrap_err();
         assert!(
             err.contains("settings.local.json"),
             "error should name the file: {err}"
@@ -529,8 +1029,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git")).unwrap();
-        run(root, true, true, false, false).unwrap();
-        run(root, true, true, false, false).unwrap(); // second run: no error, no duplicates
+        run(root, true, false, true, false, false).unwrap();
+        run(root, true, false, true, false, false).unwrap(); // second run: no error, no duplicates
         assert!(root.join(".agentrec/config.toml").exists());
         assert!(root.join(".agentrec/objects").exists());
         let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
@@ -540,7 +1040,7 @@ mod tests {
     #[test]
     fn init_without_git_skips_gitignore() {
         let tmp = tempfile::tempdir().unwrap();
-        run(tmp.path(), true, true, false, false).unwrap();
+        run(tmp.path(), true, false, true, false, false).unwrap();
         assert!(!tmp.path().join(".gitignore").exists());
     }
 
@@ -550,7 +1050,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let before = walk(root);
-        run(root, true, true, false, true).unwrap();
+        run(root, true, false, true, false, true).unwrap();
         let after = walk(root);
         assert_eq!(before, after, "dry-run must not create or modify anything");
     }
@@ -563,12 +1063,12 @@ mod tests {
     fn init_no_service_rerun_is_byte_for_byte_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        run(root, false, true, false, false).unwrap();
+        run(root, false, false, true, false, false).unwrap();
         let settings_path = root.join(".claude/settings.local.json");
         let first = fs::read_to_string(&settings_path).unwrap();
         let config_first = fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
 
-        run(root, false, true, false, false).unwrap();
+        run(root, false, false, true, false, false).unwrap();
         let second = fs::read_to_string(&settings_path).unwrap();
         let config_second = fs::read_to_string(root.join(".agentrec/config.toml")).unwrap();
 
@@ -588,7 +1088,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        run(root, true, true, false, false).unwrap();
+        run(root, true, false, true, false, false).unwrap();
 
         let dir_mode = fs::metadata(agentrec_dir(root))
             .unwrap()
@@ -758,7 +1258,7 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
 
         // `no_service: false` — the guard, not the flag, is what must skip it.
-        run(root, false, false, false, false).unwrap();
+        run(root, false, false, false, false, false).unwrap();
 
         assert!(root.join(".agentrec/config.toml").exists());
         assert!(root.join(".agentrec/objects").exists());
@@ -777,6 +1277,280 @@ mod tests {
         let line = temp_skip_line(tmp.path());
         assert!(line.contains("--service"), "{line}");
         assert!(line.contains("temporary directory"), "{line}");
+    }
+
+    // ---- C3: Codex hooks --------------------------------------------------
+
+    /// Pins the EXACT serialized entry `codex_hook_json_entry` produces,
+    /// field-for-field — the test that actually reds if `command`,
+    /// `timeout`, or `matcher` ever drifts. A marker-presence-only
+    /// idempotency test would pass vacuously even if this builder became
+    /// nondeterministic, because a marker hit skips the builder entirely on
+    /// re-install; this test calls the builder directly regardless of any
+    /// marker state.
+    #[test]
+    fn codex_hook_json_entry_is_pinned() {
+        assert_eq!(
+            codex_hook_json_entry(None),
+            serde_json::json!({
+                "hooks": [ { "type": "command", "command": "agentrec hook codex", "timeout": 10 } ]
+            })
+        );
+        assert_eq!(
+            codex_hook_json_entry(Some("apply_patch")),
+            serde_json::json!({
+                "matcher": "apply_patch",
+                "hooks": [ { "type": "command", "command": "agentrec hook codex", "timeout": 10 } ]
+            })
+        );
+    }
+
+    #[test]
+    fn codex_hook_toml_entry_is_pinned() {
+        // Built field-by-field (not via a TOML literal macro — the `toml`
+        // crate's macro feature isn't a dependency this repo carries, and
+        // adding one would move Cargo.lock, which the release build's
+        // `--locked` check must not tolerate) so this test exercises the
+        // exact same `toml::Value` construction independently of
+        // `codex_hook_toml_entry` itself.
+        let mut hook = toml::Table::new();
+        hook.insert("type".into(), toml::Value::String("command".into()));
+        hook.insert(
+            "command".into(),
+            toml::Value::String("agentrec hook codex".into()),
+        );
+        hook.insert("timeout".into(), toml::Value::Integer(10));
+
+        let mut want_no_matcher = toml::Table::new();
+        want_no_matcher.insert(
+            "hooks".into(),
+            toml::Value::Array(vec![toml::Value::Table(hook.clone())]),
+        );
+        assert_eq!(
+            codex_hook_toml_entry(None),
+            toml::Value::Table(want_no_matcher)
+        );
+
+        let mut want_matcher = toml::Table::new();
+        want_matcher.insert("matcher".into(), toml::Value::String("apply_patch".into()));
+        want_matcher.insert(
+            "hooks".into(),
+            toml::Value::Array(vec![toml::Value::Table(hook)]),
+        );
+        assert_eq!(
+            codex_hook_toml_entry(Some("apply_patch")),
+            toml::Value::Table(want_matcher)
+        );
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn codex_install_none_creates_hooks_json_with_all_three_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let outcome = install_codex_hooks(root).unwrap();
+        assert!(matches!(
+            outcome,
+            CodexHooksOutcome::Installed {
+                target: CodexHooksTarget::HooksJson,
+                changed: true,
+            }
+        ));
+
+        let settings = read_json(&codex_hooks_json_path(root));
+        for (event, matcher) in CODEX_HOOK_EVENTS {
+            assert!(
+                event_has_marker_with(&settings, event, CODEX_HOOK_MARKER),
+                "{event} missing agentrec marker: {settings}"
+            );
+            if let Some(m) = matcher {
+                let arr = settings["hooks"][event].as_array().unwrap();
+                assert_eq!(arr[0]["matcher"].as_str(), Some(*m));
+            }
+        }
+        assert!(!codex_config_toml_path(root).exists());
+    }
+
+    #[test]
+    fn codex_install_hooks_json_only_preserves_foreign_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(
+            codex_hooks_json_path(root),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "Stop": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = install_codex_hooks(root).unwrap();
+        assert!(matches!(
+            outcome,
+            CodexHooksOutcome::Installed {
+                target: CodexHooksTarget::HooksJson,
+                changed: true,
+            }
+        ));
+
+        let settings = read_json(&codex_hooks_json_path(root));
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "foreign entry preserved alongside ours");
+        assert!(stop
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "other-tool"));
+        assert!(event_has_marker_with(&settings, "Stop", CODEX_HOOK_MARKER));
+    }
+
+    #[test]
+    fn codex_install_config_toml_only_merges_inline_hooks_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(codex_config_toml_path(root), "model = \"o3\"\n\n[hooks]\n").unwrap();
+
+        let outcome = install_codex_hooks(root).unwrap();
+        assert!(matches!(
+            outcome,
+            CodexHooksOutcome::Installed {
+                target: CodexHooksTarget::ConfigToml,
+                changed: true,
+            }
+        ));
+        assert!(
+            !codex_hooks_json_path(root).is_file(),
+            "must not also create hooks.json"
+        );
+
+        let text = fs::read_to_string(codex_config_toml_path(root)).unwrap();
+        let table: toml::Table = text.parse().unwrap();
+        assert_eq!(
+            table.get("model").and_then(|v| v.as_str()),
+            Some("o3"),
+            "unrelated top-level key must survive"
+        );
+        let hooks_table = table["hooks"].as_table().unwrap();
+        for (event, _) in CODEX_HOOK_EVENTS {
+            assert!(
+                toml_event_has_marker(hooks_table, event, CODEX_HOOK_MARKER),
+                "{event} missing from merged config.toml: {text}"
+            );
+        }
+    }
+
+    // AC: exactly one of hooks.json / inline [hooks] present -> merge there.
+    // Neither present defaults to hooks.json (covered above). This case:
+    // config.toml exists WITHOUT a [hooks] table at all -> still defaults to
+    // hooks.json (a config.toml with unrelated keys must not count as
+    // "inline hooks present").
+    #[test]
+    fn codex_install_config_toml_without_hooks_table_still_defaults_to_hooks_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(codex_config_toml_path(root), "model = \"o3\"\n").unwrap();
+
+        let outcome = install_codex_hooks(root).unwrap();
+        assert!(matches!(
+            outcome,
+            CodexHooksOutcome::Installed {
+                target: CodexHooksTarget::HooksJson,
+                ..
+            }
+        ));
+        assert!(codex_hooks_json_path(root).is_file());
+        // config.toml's unrelated content must be untouched — we never even
+        // opened it for writing on this path.
+        let text = fs::read_to_string(codex_config_toml_path(root)).unwrap();
+        assert_eq!(text, "model = \"o3\"\n");
+    }
+
+    // AC: both hooks.json AND inline [hooks] present -> refuse untouched.
+    // Neither file's bytes may change, and no .bak may appear.
+    #[test]
+    fn codex_install_both_present_refuses_and_leaves_both_files_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        let hooks_json_before = serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ] }
+        }))
+        .unwrap();
+        fs::write(codex_hooks_json_path(root), &hooks_json_before).unwrap();
+        let config_toml_before = "model = \"o3\"\n\n[hooks]\n";
+        fs::write(codex_config_toml_path(root), config_toml_before).unwrap();
+
+        let outcome = install_codex_hooks(root).unwrap();
+        assert!(matches!(outcome, CodexHooksOutcome::Refused));
+
+        assert_eq!(
+            fs::read_to_string(codex_hooks_json_path(root)).unwrap(),
+            hooks_json_before,
+            "hooks.json must be byte-identical after a refuse"
+        );
+        assert_eq!(
+            fs::read_to_string(codex_config_toml_path(root)).unwrap(),
+            config_toml_before,
+            "config.toml must be byte-identical after a refuse"
+        );
+        assert!(
+            !codex_hooks_json_path(root)
+                .with_extension("json.bak")
+                .exists(),
+            "a refuse must not even take a backup"
+        );
+        assert!(
+            !codex_config_toml_path(root)
+                .with_extension("toml.bak")
+                .exists(),
+            "a refuse must not even take a backup"
+        );
+    }
+
+    // AC: idempotent reinstall — every agentrec hook ENTRY (not just the
+    // command string) is byte-identical across two installs. Extracts the
+    // whole entry `serde_json::Value` both times and compares it directly —
+    // a changed timeout or statusMessage would fail this exactly as a
+    // changed command would.
+    #[test]
+    fn codex_install_idempotent_reinstall_entries_are_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let first = install_codex_hooks(root).unwrap();
+        assert!(matches!(
+            first,
+            CodexHooksOutcome::Installed { changed: true, .. }
+        ));
+        let first_bytes = fs::read_to_string(codex_hooks_json_path(root)).unwrap();
+        let first_settings = read_json(&codex_hooks_json_path(root));
+
+        let second = install_codex_hooks(root).unwrap();
+        assert!(
+            matches!(second, CodexHooksOutcome::Installed { changed: false, .. }),
+            "re-install must be a no-op: {:?}",
+            match second {
+                CodexHooksOutcome::Installed { changed, .. } => changed,
+                CodexHooksOutcome::Refused => panic!("must not refuse on reinstall"),
+            }
+        );
+        let second_bytes = fs::read_to_string(codex_hooks_json_path(root)).unwrap();
+        let second_settings = read_json(&codex_hooks_json_path(root));
+
+        assert_eq!(first_bytes, second_bytes, "whole file byte-identical");
+        for (event, _) in CODEX_HOOK_EVENTS {
+            assert_eq!(
+                first_settings["hooks"][event], second_settings["hooks"][event],
+                "whole entry for {event} must be identical across reinstalls, not just its command"
+            );
+        }
     }
 
     fn walk(root: &Path) -> Vec<std::path::PathBuf> {
