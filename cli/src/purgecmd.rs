@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_TTL_DAYS: u64 = 90;
+pub(crate) const DEFAULT_TTL_DAYS: u64 = 90;
 const DAY_MS: u64 = 86_400_000;
 
 // F9 pushed this to 8 parameters (clippy's threshold is 7). Kept as a flat
@@ -1635,19 +1635,12 @@ fn objects_archive_path(root: &Path) -> PathBuf {
     agentrec_dir(root).join(format!("objects.archived.{ts}"))
 }
 
-/// Read `ttl_days` from `.agentrec/config.toml` via the shared
-/// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
-/// unparseable value all fall back to the documented default of 90.
+/// Read `ttl_days` from `.agentrec/config.toml` via
+/// [`crate::config::load_or_default`]. Missing file, missing key, an
+/// unparseable value, or a file-level TOML parse error all fall back to the
+/// documented default of 90 ([`DEFAULT_TTL_DAYS`]).
 fn read_ttl_days(root: &Path) -> u64 {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return DEFAULT_TTL_DAYS;
-    };
-    for value in crate::cmds::config_values(&text, "ttl_days") {
-        if let Ok(n) = value.parse::<u64>() {
-            return n;
-        }
-    }
-    DEFAULT_TTL_DAYS
+    crate::config::load_or_default(root).ttl_days
 }
 
 /// RFC 3339 cutoff `ttl_days` before now — turns started earlier than this

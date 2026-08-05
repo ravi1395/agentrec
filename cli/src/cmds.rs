@@ -1052,22 +1052,14 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
 #[cfg(debug_assertions)]
 const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 
-/// `.agentrec/config.toml` key holding the store budget, in bytes (F28,
-/// redteam round 2). Before this the budget was reachable ONLY through
-/// [`TEST_STORE_BUDGET_BYTES_VAR`], which is `#[cfg(debug_assertions)]` and
-/// therefore compiled out of every shipped binary — a release user had a
-/// non-negotiable 2 GiB per root, and the README's own remedy for D6 ("put
-/// concurrent work in a separate worktree") multiplies roots.
-pub(crate) const STORE_BUDGET_CONFIG_KEY: &str = "store_budget_bytes";
-
 /// Resolution order, highest first:
 ///
 /// 1. [`TEST_STORE_BUDGET_BYTES_VAR`] — debug builds only, never present in a
 ///    release binary (this repo audits release `strings` for exactly that).
 ///    It stays highest so the existing integration seams keep driving a tiny
 ///    budget in fixtures that also carry an `init`-written `config.toml`.
-/// 2. `store_budget_bytes` in `.agentrec/config.toml`, via the shared
-///    [`config_values`] scanner — same convention as `ttl_days`,
+/// 2. `store_budget_bytes` in `.agentrec/config.toml`, via
+///    [`crate::config::load_or_default`] — same convention as `ttl_days`,
 ///    `memory_enabled`, `memory_inject_max`.
 /// 3. [`agentrec_core::MAX_STORE_BYTES`].
 ///
@@ -1081,13 +1073,13 @@ pub(crate) const STORE_BUDGET_CONFIG_KEY: &str = "store_budget_bytes";
 /// does cover the release side, where level 1 does not exist at all.)
 ///
 /// A missing file, a missing key, an unparseable value, and an explicit `0`
-/// all fall through to the default. The zero case is a deliberate extra
-/// condition rather than the bare `parse` other readers use: with F26's
-/// managed-byte semantics a budget of 0 makes every evictable snapshot a
-/// candidate on the daemon's next tick, so a stray `store_budget_bytes = 0`
-/// would be a silent history-wipe. Same protective class as A5 — refuse the
-/// value, keep the data. A user who really wants an aggressive budget can set
-/// a small non-zero one.
+/// all fall through to the default — `crate::config::load`'s per-key
+/// tolerance for this key. The zero case is a deliberate extra condition
+/// rather than a bare parse: with F26's managed-byte semantics a budget of 0
+/// makes every evictable snapshot a candidate on the daemon's next tick, so a
+/// stray `store_budget_bytes = 0` would be a silent history-wipe. Same
+/// protective class as A5 — refuse the value, keep the data. A user who
+/// really wants an aggressive budget can set a small non-zero one.
 pub(crate) fn effective_store_budget(root: &Path) -> u64 {
     #[cfg(debug_assertions)]
     if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
@@ -1095,16 +1087,7 @@ pub(crate) fn effective_store_budget(root: &Path) -> u64 {
             return n;
         }
     }
-    if let Some(text) = read_config_text(root) {
-        for value in config_values(&text, STORE_BUDGET_CONFIG_KEY) {
-            if let Ok(n) = value.parse::<u64>() {
-                if n > 0 {
-                    return n;
-                }
-            }
-        }
-    }
-    agentrec_core::MAX_STORE_BYTES
+    crate::config::load_or_default(root).store_budget_bytes
 }
 
 /// Test-only override (`cli/tests/integration.rs`,
@@ -1359,28 +1342,6 @@ pub(crate) fn wall_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// Read `.agentrec/config.toml`'s raw text, or `None` if it doesn't exist.
-/// Shared entry point for the hand-rolled `key = value` scanners below (not
-/// worth a `toml` dependency for a handful of scalar keys).
-pub(crate) fn read_config_text(root: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(crate::agentrec_dir(root).join("config.toml")).ok()
-}
-
-/// Every `key = value` line in `text` (comments stripped after `#`), in file
-/// order, with the raw trimmed value text. `key` is matched as a literal
-/// prefix before whitespace + `=`, so `memory_enabled_foo = true` never
-/// matches `key: "memory_enabled"`. Multiple matching lines are all
-/// yielded — callers that skip unparseable values fall through to a later
-/// line, exactly like the original per-site scanners.
-pub(crate) fn config_values<'a>(text: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    text.lines().filter_map(move |line| {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let rest = line.strip_prefix(key)?;
-        let value = rest.trim_start().strip_prefix('=')?;
-        Some(value.trim())
-    })
 }
 
 #[cfg(test)]
@@ -1794,8 +1755,11 @@ mod tests {
             "a zero budget must be refused, not honored"
         );
 
-        // Prefix discipline inherited from `config_values`: a longer key that
-        // merely starts with ours must not match.
+        // B2 amendment: was "prefix discipline inherited from the old
+        // hand-rolled line scanner" (it matched by string prefix). Now
+        // backed by the real `toml` parser, this is simply a distinct,
+        // unknown key that must not be mistaken for `store_budget_bytes` —
+        // same assertion, different mechanism.
         std::fs::write(&config, "store_budget_bytes_extra = 42\n").unwrap();
         assert_eq!(effective_store_budget(root), agentrec_core::MAX_STORE_BYTES);
     }

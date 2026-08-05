@@ -15,38 +15,16 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
 
-/// Parse `.agentrec/config.toml`'s `noise_globs` array via the existing
-/// hand-rolled single-line-scalar scanner (`cmds::config_values` — not worth
-/// a `toml` dependency for a handful of keys). Only a single-line TOML array
-/// is supported (`noise_globs = ["a", "b"]`); a multi-line array is not
-/// recognized by the line-based scanner and degrades to "no key found" —
-/// fail-toward-no-folding, the safe direction. Absent file, absent key, or
-/// `noise_globs = []` all yield an empty vec, the "identical to today"
-/// baseline (NF1).
+/// Read `.agentrec/config.toml`'s `noise_globs` array via
+/// [`crate::config::load_or_default`] — B2 amendment: this used to be a
+/// hand-rolled single-line-array scanner limited to `noise_globs = ["a",
+/// "b"]` on one line; the real `toml` parser now backing this also handles a
+/// multi-line array, which is a strict widening (nothing that parsed before
+/// stops parsing). Absent file, absent key, `noise_globs = []`, or a
+/// file-level TOML parse error all yield an empty vec, the "identical to
+/// today" baseline (NF1).
 pub(crate) fn read_noise_globs(root: &Path) -> Vec<String> {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return Vec::new();
-    };
-    for value in crate::cmds::config_values(&text, "noise_globs") {
-        if let Some(globs) = parse_glob_array(value) {
-            return globs;
-        }
-    }
-    Vec::new()
-}
-
-/// `["*.log", '.venv/**']` → `["*.log", ".venv/**"]`. Any value that isn't
-/// bracketed degrades to `None` (caller falls through to the empty-vec
-/// default) rather than panicking on a hand-edited config.
-fn parse_glob_array(value: &str) -> Option<Vec<String>> {
-    let inner = value.trim().strip_prefix('[')?.strip_suffix(']')?;
-    Some(
-        inner
-            .split(',')
-            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-    )
+    crate::config::load_or_default(root).noise_globs
 }
 
 /// Compiled matcher over a repo's `noise_globs`. `NoiseMatcher::build`
@@ -84,7 +62,7 @@ impl NoiseMatcher {
     /// prefix with the matcher's root, which an absolute path never will
     /// against a repo root — so that case is rejected up front rather than
     /// handed to the matcher. Folding nothing is the safe direction (same
-    /// posture as `parse_glob_array`/`build`'s per-line degrade): a foreign
+    /// posture as `build`'s per-line degrade): a foreign
     /// absolute path was never going to match a repo-relative noise glob
     /// anyway, and `log`/`show` must never crash over a `noise_globs`
     /// config that has nothing to do with this entry.
@@ -103,24 +81,6 @@ impl NoiseMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_glob_array_double_and_single_quotes() {
-        assert_eq!(
-            parse_glob_array(r#"["*.log", '.venv/**']"#),
-            Some(vec!["*.log".to_string(), ".venv/**".to_string()])
-        );
-    }
-
-    #[test]
-    fn parse_glob_array_empty_brackets() {
-        assert_eq!(parse_glob_array("[]"), Some(vec![]));
-    }
-
-    #[test]
-    fn parse_glob_array_malformed_degrades_to_none() {
-        assert_eq!(parse_glob_array("not-an-array"), None);
-    }
 
     #[test]
     fn read_noise_globs_missing_config_is_empty() {

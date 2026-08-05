@@ -41,11 +41,16 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            ttl_days: 90,
+            // Sourced from the two pre-existing named constants (rather than
+            // repeating the magic numbers 90 / 5 a third place) so
+            // `purgecmd::DEFAULT_TTL_DAYS` and
+            // `memorycmds::HOOK_MAX_FACTS_DEFAULT` stay the single source of
+            // truth their own doc comments already claim to be.
+            ttl_days: crate::purgecmd::DEFAULT_TTL_DAYS,
             store_budget_bytes: agentrec_core::MAX_STORE_BYTES,
             noise_globs: Vec::new(),
             memory_enabled: true,
-            memory_inject_max: 5,
+            memory_inject_max: crate::memorycmds::HOOK_MAX_FACTS_DEFAULT,
             mcp_destructive: McpDestructive::Off,
         }
     }

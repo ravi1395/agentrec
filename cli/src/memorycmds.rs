@@ -471,36 +471,21 @@ fn count_diff_lines(unified_text: &str) -> (usize, usize) {
     (added, removed)
 }
 
-/// Read `memory_enabled` from `.agentrec/config.toml` via the shared
-/// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
-/// unparseable value all fall back to the documented default of `true`.
+/// Read `memory_enabled` from `.agentrec/config.toml` via
+/// [`crate::config::load_or_default`]. Missing file, missing key, an
+/// unparseable value, or a file-level TOML parse error all fall back to the
+/// documented default of `true`.
 pub fn read_memory_enabled(root: &Path) -> bool {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return true;
-    };
-    for value in crate::cmds::config_values(&text, "memory_enabled") {
-        match value {
-            "true" => return true,
-            "false" => return false,
-            _ => continue,
-        }
-    }
-    true
+    crate::config::load_or_default(root).memory_enabled
 }
 
-/// Read `memory_inject_max` from `.agentrec/config.toml` — same shared
-/// scanner as [`read_memory_enabled`]. Missing file, missing key, or an
-/// unparseable value all fall back to [`HOOK_MAX_FACTS_DEFAULT`].
+/// Read `memory_inject_max` from `.agentrec/config.toml` via
+/// [`crate::config::load_or_default`] — same loader as
+/// [`read_memory_enabled`]. Missing file, missing key, an unparseable value,
+/// or a file-level TOML parse error all fall back to
+/// [`HOOK_MAX_FACTS_DEFAULT`].
 pub fn read_memory_inject_max(root: &Path) -> usize {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return HOOK_MAX_FACTS_DEFAULT;
-    };
-    for value in crate::cmds::config_values(&text, "memory_inject_max") {
-        if let Ok(n) = value.parse::<usize>() {
-            return n;
-        }
-    }
-    HOOK_MAX_FACTS_DEFAULT
+    crate::config::load_or_default(root).memory_inject_max
 }
 
 /// Default `memory_inject_max` (design spec) when `config.toml` has no such
