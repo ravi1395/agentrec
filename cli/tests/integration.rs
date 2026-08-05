@@ -5791,6 +5791,77 @@ fn codex_init_config_toml_only_merges_inline_hooks() {
     assert!(text.contains("model"), "unrelated key must survive: {text}");
 }
 
+// Dry-run must PRINT the same codex decision the real run would take, and
+// write nothing. Lives here rather than in `initcmd`'s unit tests because
+// asserting on printed output in-process needs process-global stdout fd
+// redirection, which hijacks every concurrently-running test's output
+// under cargo's threaded runner; driving the real binary has no such
+// hazard. Pairs with `initcmd::tests::dry_run_with_codex_touches_nothing`,
+// which covers the filesystem half.
+#[test]
+fn codex_init_dry_run_prints_install_line_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(
+        root,
+        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "init --codex --dry-run failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[dry-run] would install Codex hooks"),
+        "{stdout}"
+    );
+    assert!(
+        !root.join(".codex").exists(),
+        "dry-run must not create .codex/"
+    );
+}
+
+// Same, for the refuse decision: dry-run against the "both present" state
+// must print the refusal (not the install line) and leave both files byte-
+// identical. Pins that `run` and `print_dry_run` cannot silently diverge on
+// which decision they reach.
+#[test]
+fn codex_init_dry_run_prints_refuse_line_when_both_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let hooks_json_before = "{\"hooks\":{}}\n";
+    let config_toml_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/hooks.json"), hooks_json_before).unwrap();
+    std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
+
+    let out = agentrec(
+        root,
+        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "init --codex --dry-run failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(stdout.contains("both"), "{stdout}");
+    assert!(
+        !stdout.contains("would install Codex hooks"),
+        "dry-run must not claim it would install when it would refuse: {stdout}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+        hooks_json_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_toml_before
+    );
+}
+
 // AC-C3 table: state "both" -> refuse, neither file touched, no .bak.
 #[test]
 fn codex_init_both_present_refuses_untouched() {

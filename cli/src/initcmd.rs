@@ -533,18 +533,21 @@ const CODEX_HOOK_COMMAND: &str = "agentrec hook codex";
 
 /// Per-hook timeout (seconds) for every installed Codex hook entry.
 ///
-/// Codex's documented default is 600s (10 minutes) — see the module-level
-/// spike doc's "Hash-invalidation" section, which changed this exact field
-/// on a live hook to test trust invalidation. A wedged `agentrec hook codex`
-/// (e.g. a stuck flock on `codex-scratch.lock`) must not hold a Codex turn
-/// hostage for 10 minutes. 10s is chosen, not merely "small": it is the
-/// EXACT value the spike's own probe hooks ran under live and completed
-/// well within (`docs/verify/codex-spike.md`'s TUI capture: `Timeout 10s`),
-/// and every operation `agentrec hook codex` performs is local — one stdin
-/// read, one flock+append to `codex-scratch.jsonl` or `signal.jsonl`, no
-/// network call — so 10s leaves roughly two orders of magnitude of headroom
-/// over the actual (sub-millisecond, unmeasured-but-structurally-bounded)
-/// work it does.
+/// Codex's default is 600s (10 minutes) per this task's own brief ("spike/
+/// docs say the default is 600 s") — NOT independently measured by the
+/// spike itself (`grep -n 600 docs/verify/codex-spike.md` is empty; the
+/// spike's live probes never let a hook run long enough to hit any
+/// timeout). A wedged `agentrec hook codex` (e.g. a stuck flock on
+/// `codex-scratch.lock`) must not hold a Codex turn hostage for 10 minutes
+/// regardless of the exact documented figure. 10s is chosen, not merely
+/// "small": it IS spike-measured — the exact value the spike's own probe
+/// hooks ran under live and completed well within
+/// (`docs/verify/codex-spike.md`'s TUI capture, "Timeout 10s"), and every
+/// operation `agentrec hook codex` performs is local — one stdin read, one
+/// flock+append to `codex-scratch.jsonl` or `signal.jsonl`, no network call
+/// — so 10s leaves roughly two orders of magnitude of headroom over the
+/// actual (sub-millisecond, unmeasured-but-structurally-bounded) work it
+/// does.
 const CODEX_HOOK_TIMEOUT_SECS: u64 = 10;
 
 /// The three hook events this integration installs, paired with the
@@ -1054,6 +1057,40 @@ mod tests {
         let after = walk(root);
         assert_eq!(before, after, "dry-run must not create or modify anything");
     }
+
+    // Same as `dry_run_touches_nothing` but with `--codex` — every previous
+    // dry-run test passed `codex: false`, so the branch that actually calls
+    // `codex_hooks_target` (which reads `.codex/hooks.json` /
+    // `.codex/config.toml`) and could plausibly reach
+    // `install_codex_hooks_json`'s `fs::create_dir_all` had zero coverage.
+    // Asserted twice over: no `.codex/` directory at all afterward, AND the
+    // generic whole-tree walk stays empty (belt-and-braces against a write
+    // anywhere else this test didn't anticipate).
+    #[test]
+    fn dry_run_with_codex_touches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let before = walk(root);
+        run(root, true, true, true, false, true).unwrap();
+        let after = walk(root);
+        assert_eq!(
+            before, after,
+            "dry-run --codex must not create or modify anything"
+        );
+        assert!(
+            !root.join(".codex").exists(),
+            "dry-run --codex must not create .codex/"
+        );
+    }
+
+    // Dry-run's PRINTED codex decision (install vs refuse) is asserted at
+    // the integration level instead of here — `codex_init_dry_run_*` in
+    // `cli/tests/integration.rs` drive the real binary and read its real
+    // stdout. An in-process version needs process-global stdout fd
+    // redirection, which is unsound under cargo's threaded test runner:
+    // it hijacks every concurrently-running test's output for the
+    // duration. The filesystem half of dry-run's contract stays here
+    // (`dry_run_with_codex_touches_nothing`) because it needs no capture.
 
     // AC-Y+3: re-running `init --no-service` (byte-for-byte no-op path) must
     // not duplicate hooks or scaffold files; exercised end-to-end here since
