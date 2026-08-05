@@ -57,8 +57,14 @@ that N boundaries were dropped.
   pins that a candidate carrying `event: "start"` is routed away as a
   candidate and never counted, kill-switch either way). **Corrects
   `deb2f85`'s commit message**, which stated the predicate as `kind.is_none()`
-  and recorded a mutation probe ("widen the predicate…") whose verdict this
-  change inverts.
+  and recorded a mutation probe ("widen the predicate to count the whole
+  else-branch → only `replay_gap_drop_count_excludes_non_boundary_kinds`
+  REDs"). That verdict is **not reproducible** against this predicate — the
+  probe is not inverted, its catcher moved. Re-run here: the widening still
+  reds, but as `replay_gap_drop_count_follows_live_routing` (`left: 3, right:
+  2` — its typed non-`start` line gets counted), while the test the probe
+  named now passes, because the candidate exclusion runs ahead of the
+  predicate unconditionally and `true` cannot reach a candidate.
   `daemon::run` threads `replay.dropped_signals` into the `append_epoch(&root,
   "start", …)` call that immediately follows the scan; `append_epoch` gained a
   fourth parameter and every other caller passes `0` — the `stop` call site's 0 rests on

@@ -741,7 +741,7 @@ carries only current state, what's next, and standing debts.
   runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
   block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
   spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
-- **`integration::daemon_counts_ignore_rebuilds` reported FSEvents-coupled** (`cli/tests/integration.rs:1172`) —
+- **`integration::daemon_counts_ignore_rebuilds` reported FSEvents-coupled** (`integration.rs::daemon_counts_ignore_rebuilds`) —
   **reported by the Task D0 review round 1, NOT reproduced here**, and the mechanism below is
   that review's, relayed with attribution rather than restated as measured fact: a `poll_until`
   on a monotonic counter waiting for exactly `== 2`, which an extra FSEvents rebuild pushes past,
