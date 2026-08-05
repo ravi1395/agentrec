@@ -475,6 +475,19 @@ fn count_diff_lines(unified_text: &str) -> (usize, usize) {
 /// [`crate::config::load_or_default`]. Missing file, missing key, an
 /// unparseable value, or a file-level TOML parse error all fall back to the
 /// documented default of `true`.
+///
+/// **Deliberately stays tolerant** (gate finding, D16 remediation reviewed
+/// this call site and kept it as-is): every production caller today is
+/// either the daemon (`daemon.rs`'s live-loop and startup-replay reads, both
+/// per-tick freshness reads that must never hard-fail) or `cmds::hook`,
+/// whose own doc comment documents an explicit fail-open contract — Claude
+/// Code invokes `hook` on every prompt, and hard-failing here would exit
+/// nonzero AFTER `hook` has already appended the start/stop signal it gates
+/// (`cmds.rs`, `append_log_line` runs before this read), i.e. noise with no
+/// protective value. No CLI verb (`status`, `purge`, `log`, `show`) reads
+/// `memory_enabled` today; if one starts to, route it through
+/// [`crate::config::load`] directly, the same way `effective_store_budget_
+/// checked` and `read_ttl_days` do, rather than widening this function.
 pub fn read_memory_enabled(root: &Path) -> bool {
     crate::config::load_or_default(root).memory_enabled
 }
@@ -484,6 +497,10 @@ pub fn read_memory_enabled(root: &Path) -> bool {
 /// [`read_memory_enabled`]. Missing file, missing key, an unparseable value,
 /// or a file-level TOML parse error all fall back to
 /// [`HOOK_MAX_FACTS_DEFAULT`].
+///
+/// **Deliberately stays tolerant, same rationale as [`read_memory_enabled`]**
+/// — its only production caller is `cmds::inject_memory`, itself only ever
+/// called from `cmds::hook`'s fail-open path.
 pub fn read_memory_inject_max(root: &Path) -> usize {
     crate::config::load_or_default(root).memory_inject_max
 }

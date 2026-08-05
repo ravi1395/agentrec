@@ -10021,6 +10021,129 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
     );
 }
 
+// ---- Config hard-error split (gate finding, D16 remediation): `daemon::run`
+// hard-fails once, at startup, on a config.toml that fails to parse; a
+// config that goes bad AFTER a clean boot must degrade per-tick, never crash
+// the running process — see `daemon.rs`'s `config::load` gate (right after
+// `acquire_lock`) and `cmds::effective_store_budget`'s doc comment.
+
+/// The startup gate sits before the watch loop is ever entered, so a
+/// malformed config makes the process return `Err` and exit on its own —
+/// no spawn-then-kill needed, and `agentrec()`'s blocking `.output()` is
+/// safe here precisely because a healthy `record` invocation would never
+/// return (it loops forever), while this one must.
+#[test]
+fn daemon_startup_refuses_on_malformed_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    let out = agentrec(root, &["record"]);
+    assert!(
+        !out.status.success(),
+        "daemon must refuse to start on an unparseable config.toml: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("config.toml") && stderr.contains("line"),
+        "startup refusal must name the file and the line: {stderr}"
+    );
+}
+
+/// Same over-budget-after-live shape as `daemon_periodic_tick_evicts_after_
+/// startup_pass`, but with `config.toml` corrupted the instant the daemon is
+/// confirmed live. The eviction still firing is what proves the mid-tick
+/// budget read actually executed and degraded rather than the daemon never
+/// reaching it; `try_wait` confirms the process itself never exited.
+#[test]
+fn daemon_mid_tick_survives_config_corruption_after_startup() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
+    );
+    // `spawn` already blocked on `wait_for_live_daemon` — a clean, valid-
+    // config startup has already happened by this point.
+
+    // Corrupt config.toml AFTER the confirmed-live startup. Mid-tick reads
+    // must tolerate this, not crash the process.
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    // A structurally-visible eviction candidate needs a real committed turn
+    // referencing it — `plan_eviction` walks `log.jsonl`'s turns, never the
+    // raw store, so an unreferenced blob is invisible to it regardless of
+    // budget (same shape as `daemon_periodic_tick_evicts_after_startup_
+    // pass`). `new` is a second, newer turn so A5's "protect the newest turn
+    // while older data exists to sacrifice instead" rule doesn't shield the
+    // victim.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+    seed_turn(
+        root,
+        &base_turn(
+            "t_MIDTICKCFGCORRUPT0001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_MIDTICKCFGCORRUPT0002", vec![file_entry("new.bin", &new)]),
+    );
+
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        evicted.is_some(),
+        "the recurring eviction tick did not survive a mid-run config.toml \
+         corruption — mid-tick config reads must degrade, never crash. \
+         victim={victim} stderr={stderr_text:?}"
+    );
+    assert!(store.contains(&new), "newest blob must survive: {new}");
+
+    assert!(
+        matches!(
+            daemon.0.as_mut().expect("daemon child handle").try_wait(),
+            Ok(None)
+        ),
+        "daemon process must still be running after config corruption"
+    );
+
+    daemon.kill();
+}
+
 // ---- P5: `--json` read contracts for `diff`, `blame`, `status` -----------
 //
 // AC references below are P5.md's (as corrected by the founder's two

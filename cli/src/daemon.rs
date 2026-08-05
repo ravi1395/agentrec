@@ -124,6 +124,26 @@ pub fn run(root: &Path) -> Result<(), String> {
     // flock right away, silently destroying mutual exclusion.
     let _lock = acquire_lock(&root)?;
 
+    // D16 / gate finding: a daemon that starts against a config.toml it
+    // can't even parse is worse than one that refuses loudly — hard-fail
+    // HERE, once, at startup, before anything else runs. This is the ONLY
+    // place `daemon::run` calls `config::load` directly; every per-tick read
+    // below (`run_eviction_pass`'s budget read at both its startup and
+    // mid-tick call sites, `replay_pending_candidates`'s and the main loop's
+    // `memory_enabled` reads) still goes through the tolerant
+    // `config::load_or_default`/`memorycmds::read_memory_enabled` shims for
+    // its own per-tick freshness — by the time any of them runs for the
+    // FIRST time, this gate has already proven the file parses, and a config
+    // edited to garbage AFTER a clean boot must degrade, not crash: this
+    // repo has a documented history of exactly that failure mode under
+    // launchd `KeepAlive` (CLAUDE.md, "40 orphaned LaunchAgents").
+    if let Err(e) = crate::config::load(&root) {
+        return Err(format!(
+            ".agentrec/config.toml failed to parse ({e}) — refusing to start; \
+             fix the file (or delete it to use defaults) and retry"
+        ));
+    }
+
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
     recover_orphan(&root)?;

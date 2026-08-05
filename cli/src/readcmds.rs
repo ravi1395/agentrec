@@ -227,7 +227,7 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Resul
     if !prompt {
         println!("{}", render_turn(turn));
         if !all_files {
-            let noise_globs = crate::noise::read_noise_globs(root);
+            let noise_globs = crate::noise::read_noise_globs(root)?;
             if let Some(matcher) = crate::noise::NoiseMatcher::build(root, &noise_globs) {
                 let n = turn
                     .files

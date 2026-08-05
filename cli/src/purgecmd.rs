@@ -173,7 +173,7 @@ fn purge_prompts(
         );
     }
 
-    let ttl_days = read_ttl_days(root);
+    let ttl_days = read_ttl_days(root)?;
     let cutoff = ttl_cutoff(ttl_days);
 
     let mut keep: HashSet<&str> = if all_prompts {
@@ -387,7 +387,7 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
     // proceeding unlocked.
     let _lock = crate::memlock::try_acquire(root)?;
 
-    let ttl_days = read_ttl_days(root);
+    let ttl_days = read_ttl_days(root)?;
     let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
 
     let mem_path = memory_path(root);
@@ -1635,12 +1635,17 @@ fn objects_archive_path(root: &Path) -> PathBuf {
     agentrec_dir(root).join(format!("objects.archived.{ts}"))
 }
 
-/// Read `ttl_days` from `.agentrec/config.toml` via
-/// [`crate::config::load_or_default`]. Missing file, missing key, an
-/// unparseable value, or a file-level TOML parse error all fall back to the
-/// documented default of 90 ([`DEFAULT_TTL_DAYS`]).
-fn read_ttl_days(root: &Path) -> u64 {
-    crate::config::load_or_default(root).ttl_days
+/// Read `ttl_days` from `.agentrec/config.toml` via [`crate::config::load`],
+/// propagating a file-level TOML parse error as `Err` (gate finding, D16
+/// remediation: `purge` is a CLI verb, so a config that fails to parse at
+/// all must surface as a real, nonzero-exit error naming the line — not
+/// silently fall back). Missing file, missing key, or an unparseable VALUE
+/// (value-level, not a syntax error) still fall back to the documented
+/// default of 90 ([`DEFAULT_TTL_DAYS`]) via `Ok`.
+fn read_ttl_days(root: &Path) -> Result<u64, String> {
+    crate::config::load(root)
+        .map(|c| c.ttl_days)
+        .map_err(|e| e.to_string())
 }
 
 /// RFC 3339 cutoff `ttl_days` before now — turns started earlier than this
@@ -1722,7 +1727,7 @@ mod tests {
     #[test]
     fn ttl_days_defaults_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(read_ttl_days(tmp.path()), DEFAULT_TTL_DAYS);
+        assert_eq!(read_ttl_days(tmp.path()).unwrap(), DEFAULT_TTL_DAYS);
     }
 
     #[test]
@@ -1734,7 +1739,23 @@ mod tests {
             "ttl_days = 30\nmcp_destructive = \"off\"\n",
         )
         .unwrap();
-        assert_eq!(read_ttl_days(tmp.path()), 30);
+        assert_eq!(read_ttl_days(tmp.path()).unwrap(), 30);
+    }
+
+    #[test]
+    fn ttl_days_file_level_parse_error_is_hard_error() {
+        // Gate finding (D16 remediation): `read_ttl_days` now propagates a
+        // file-level TOML parse error instead of silently degrading to the
+        // default — `purge` is a CLI verb and must surface it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(agentrec_dir(tmp.path())).unwrap();
+        std::fs::write(
+            agentrec_dir(tmp.path()).join("config.toml"),
+            "ttl_days = [unclosed",
+        )
+        .unwrap();
+        let e = read_ttl_days(tmp.path()).unwrap_err();
+        assert!(e.contains("line"), "error must name a line, got: {e}");
     }
 
     #[test]

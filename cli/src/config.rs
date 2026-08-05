@@ -178,25 +178,36 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
 /// same rationale as [`UNKNOWN_KEY_WARNED`].
 static LOAD_ERROR_WARNED: Once = Once::new();
 
-/// The tolerant shim every per-key CLI reader (`effective_store_budget`,
-/// `read_ttl_days`, `read_noise_globs`, `read_memory_enabled`,
-/// `read_memory_inject_max`) goes through instead of calling [`load`]
-/// directly. [`load`]'s `Err` — a file that fails to parse as TOML at all —
-/// is where D16's hard error actually lives (its message names the
-/// line/col); none of today's reader call sites take a `Result`, and
-/// widening all of their callers (which fan out through `cmds.rs`,
-/// `daemon.rs`, `main.rs`, ...) is out of this task's scope. So on `Err`
-/// this degrades to [`Config::default`] for EVERY key — not just the
-/// offending one — which matches the pre-toml-loader scanner's behavior
-/// exactly (it also silently defaulted the whole read on a line it
-/// couldn't make sense of), so every existing pinned-fallback test survives
-/// unamended.
+/// The tolerant shim for the two consumer classes that must never hard-fail
+/// on a bad `config.toml`, because both are invoked automatically and
+/// frequently rather than as a deliberate one-shot user command: the
+/// `record` daemon's PER-TICK reads (`cmds::run_eviction_pass`'s budget
+/// read, `daemon.rs`'s live-loop and startup-replay `memory_enabled` reads)
+/// and the `hook` subcommand's memory-injection gate (Claude Code invokes it
+/// on every prompt; `cmds::hook`'s own doc comment documents its fail-open
+/// contract, and hard-failing there would exit nonzero *after* the signal
+/// append it precedes already landed — noise with no protective value).
 ///
-/// NOTE this means a single syntax error anywhere in the file reverts keys
+/// CLI verbs (`status`, `purge`, `log`, `show`) call [`load`] directly and
+/// propagate its `Err` instead (gate finding, D16 remediation) — a file that
+/// fails to parse as TOML at all is a hard, user-visible, nonzero-exit error
+/// naming the line/col for those paths now. The daemon additionally hard-
+/// fails once, at startup (`daemon::run`, before `recover_orphan`), via its
+/// own direct `load` call — "daemon startup included" (D16) is satisfied
+/// there, not by this function. Only a config edited to garbage AFTER a
+/// clean boot reaches this tolerant path in the daemon, where it degrades to
+/// [`Config::default`] for every key rather than crash-looping the process
+/// under launchd `KeepAlive` (see CLAUDE.md's "40 orphaned LaunchAgents"
+/// history) — and degrading is the safe direction specifically for
+/// `store_budget_bytes`: the default is [`agentrec_core::MAX_STORE_BYTES`],
+/// the LARGEST value in play, so a mid-tick parse failure means LESS
+/// eviction, never a silent history wipe.
+///
+/// This still means a single syntax error anywhere in the file reverts keys
 /// that parsed fine too — e.g. a stray `mcp_destructive = "yes"` line
-/// silently reverts a correct, adjacent `ttl_days = 30` back to 90. Wiring
-/// a loud top-level failure (D16's "daemon startup included" language) is a
-/// deliberate residual of this task, not an oversight — see CLAUDE.md.
+/// silently reverts a correct, adjacent `ttl_days = 30` back to 90 — but
+/// only for the two consumer classes above; every CLI verb that reads a
+/// config key now surfaces that same file exactly once, loudly.
 pub(crate) fn load_or_default(root: &Path) -> Config {
     match load(root) {
         Ok(cfg) => cfg,
@@ -305,6 +316,26 @@ mod tests {
             agentrec_core::MAX_STORE_BYTES,
             "a zero budget must be refused, not honored"
         );
+    }
+
+    #[test]
+    fn noise_globs_non_string_elements_are_dropped_not_fatal() {
+        // Replacement coverage for the deleted `parse_glob_array_malformed_
+        // degrades_to_none` (B2 amendment): a non-string array element must
+        // not fail the whole array, let alone the whole file — it's simply
+        // filtered out, per-element, same posture as every other value-level
+        // degrade in this module.
+        let cfg = load(&root_with(r#"noise_globs = ["ok", 42]"#)).unwrap();
+        assert_eq!(cfg.noise_globs, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn noise_globs_wrong_shape_value_degrades_to_empty_not_fatal() {
+        // A `noise_globs` that isn't an array at all (wrong TOML type, not a
+        // syntax error) is still valid TOML — `load` must return `Ok` with
+        // the per-key default (empty), not an `Err` for the whole file.
+        let cfg = load(&root_with(r#"noise_globs = "nope""#)).unwrap();
+        assert_eq!(cfg.noise_globs, Vec::<String>::new());
     }
 
     #[test]

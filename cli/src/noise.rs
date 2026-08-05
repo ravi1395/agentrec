@@ -15,16 +15,22 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
 
-/// Read `.agentrec/config.toml`'s `noise_globs` array via
-/// [`crate::config::load_or_default`] — B2 amendment: this used to be a
-/// hand-rolled single-line-array scanner limited to `noise_globs = ["a",
-/// "b"]` on one line; the real `toml` parser now backing this also handles a
-/// multi-line array, which is a strict widening (nothing that parsed before
-/// stops parsing). Absent file, absent key, `noise_globs = []`, or a
-/// file-level TOML parse error all yield an empty vec, the "identical to
-/// today" baseline (NF1).
-pub(crate) fn read_noise_globs(root: &Path) -> Vec<String> {
-    crate::config::load_or_default(root).noise_globs
+/// Read `.agentrec/config.toml`'s `noise_globs` array via [`crate::config::
+/// load`], propagating a file-level TOML parse error as `Err` (gate finding,
+/// D16 remediation: `log`/`show` are CLI verbs, so a config that fails to
+/// parse at all must surface as a real, nonzero-exit error naming the line —
+/// not silently fall back). B2 amendment: this used to be a hand-rolled
+/// single-line-array scanner limited to `noise_globs = ["a", "b"]` on one
+/// line; the real `toml` parser now backing this also handles a multi-line
+/// array, which is a strict widening (nothing that parsed before stops
+/// parsing). Absent file, absent key, `noise_globs = []`, or a VALUE-level
+/// problem (wrong type, non-string array element) all still yield an empty
+/// (or per-element-filtered) vec via `Ok` — only a file that isn't valid TOML
+/// at all is now an `Err`.
+pub(crate) fn read_noise_globs(root: &Path) -> Result<Vec<String>, String> {
+    crate::config::load(root)
+        .map(|c| c.noise_globs)
+        .map_err(|e| e.to_string())
 }
 
 /// Compiled matcher over a repo's `noise_globs`. `NoiseMatcher::build`
@@ -85,7 +91,7 @@ mod tests {
     #[test]
     fn read_noise_globs_missing_config_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(read_noise_globs(tmp.path()).is_empty());
+        assert!(read_noise_globs(tmp.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -98,12 +104,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_noise_globs(tmp.path()),
+            read_noise_globs(tmp.path()).unwrap(),
             vec![
                 ".remember/**".to_string(),
                 ".code-review-graph/**".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn read_noise_globs_file_level_parse_error_is_hard_error() {
+        // Gate finding (D16 remediation): `read_noise_globs` now propagates
+        // a file-level TOML parse error instead of silently degrading to
+        // empty — `log`/`show` are CLI verbs and must surface it.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".agentrec")).unwrap();
+        std::fs::write(
+            tmp.path().join(".agentrec/config.toml"),
+            "noise_globs = [unclosed",
+        )
+        .unwrap();
+        let e = read_noise_globs(tmp.path()).unwrap_err();
+        assert!(e.contains("line"), "error must name a line, got: {e}");
     }
 
     // NF2 precondition (per the round's TDD instructions: this test must

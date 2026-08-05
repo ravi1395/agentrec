@@ -101,7 +101,7 @@ pub fn log(
     // below that consults `noise_matcher` behaves exactly as it did before
     // this feature existed — no separate "is the feature configured" flag
     // needed anywhere else in this function.
-    let noise_globs = crate::noise::read_noise_globs(root);
+    let noise_globs = crate::noise::read_noise_globs(root)?;
     let noise_matcher = crate::noise::NoiseMatcher::build(root, &noise_globs);
 
     let rendered = render_log(
@@ -267,7 +267,10 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
         println!("{}", status_json(root)?);
         return Ok(());
     }
-    print!("{}", status_report(root, effective_store_budget(root))?);
+    print!(
+        "{}",
+        status_report(root, effective_store_budget_checked(root)?)?
+    );
     Ok(())
 }
 
@@ -373,7 +376,7 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         .unwrap_or(0);
     let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
     let health = view
-        .health(effective_store_budget(root))
+        .health(effective_store_budget_checked(root)?)
         .map_err(|e| e.to_string())?;
     let payload = StatusJson {
         health,
@@ -1059,18 +1062,20 @@ const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 ///    It stays highest so the existing integration seams keep driving a tiny
 ///    budget in fixtures that also carry an `init`-written `config.toml`.
 /// 2. `store_budget_bytes` in `.agentrec/config.toml`, via
-///    [`crate::config::load_or_default`] — same convention as `ttl_days`,
-///    `memory_enabled`, `memory_inject_max`.
+///    [`crate::config::load_or_default`] — same convention as `memory_enabled`
+///    (both are consumers documented on [`crate::config::load_or_default`]
+///    itself: the daemon's per-tick reads, which must never hard-fail).
 /// 3. [`agentrec_core::MAX_STORE_BYTES`].
 ///
 /// Levels 2 and 3 are covered by `store_budget_is_settable_from_config_toml`;
 /// level 1 beating level 2 is a **control-flow** fact readable three lines
 /// below — the env arm `return`s before the config read is reached — and is
 /// deliberately NOT asserted by a test: `std::env::set_var` is process-global,
-/// and `status`/`status_json` in this same binary call this function, so such
-/// a test would race every one of them. Stated as mechanism rather than as a
-/// measured outcome on purpose. (`store_budget_override_is_a_no_op_in_release`
-/// does cover the release side, where level 1 does not exist at all.)
+/// and both this function and [`effective_store_budget_checked`] in this same
+/// binary read it, so such a test would race every one of them. Stated as
+/// mechanism rather than as a measured outcome on purpose.
+/// (`store_budget_override_is_a_no_op_in_release` does cover the release
+/// side, where level 1 does not exist at all.)
 ///
 /// A missing file, a missing key, an unparseable value, and an explicit `0`
 /// all fall through to the default — `crate::config::load`'s per-key
@@ -1080,6 +1085,15 @@ const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 /// stray `store_budget_bytes = 0` would be a silent history-wipe. Same
 /// protective class as A5 — refuse the value, keep the data. A user who
 /// really wants an aggressive budget can set a small non-zero one.
+///
+/// **This is the TOLERANT reader.** It is `pub(crate)` for exactly two
+/// callers: `daemon::run_eviction_pass` (both its startup and mid-tick call
+/// sites — the daemon must never crash-loop under launchd `KeepAlive` on a
+/// config edited to garbage after a clean boot) and this module's own tests,
+/// which drive the pre-existing value-level fallback behavior unchanged.
+/// `status`/`status_json` (CLI verbs) call [`effective_store_budget_checked`]
+/// instead — see its doc comment for why a file-level parse error must be a
+/// real, nonzero-exit error for those two, but not for the daemon.
 pub(crate) fn effective_store_budget(root: &Path) -> u64 {
     #[cfg(debug_assertions)]
     if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
@@ -1088,6 +1102,34 @@ pub(crate) fn effective_store_budget(root: &Path) -> u64 {
         }
     }
     crate::config::load_or_default(root).store_budget_bytes
+}
+
+/// Hard-erroring counterpart to [`effective_store_budget`], used ONLY by
+/// `status`/`status_json` (gate finding, D16 remediation): both are CLI
+/// verbs, so a `config.toml` that fails to parse as TOML at all must surface
+/// as a real, nonzero-exit, line-numbered error — not silently degrade every
+/// key (including, connectedly, a bad `mcp_destructive` value: [`crate::
+/// config::load`] treats that as a file-level `Err` too, so it now surfaces
+/// here exactly like a syntax error would, instead of silently resetting
+/// `store_budget_bytes` back to the default alongside it).
+///
+/// Same [`TEST_STORE_BUDGET_BYTES_VAR`] precedence as [`effective_store_
+/// budget`] (same seam, same debug-only fail-safe class) — the existing
+/// `status --json` over-budget integration tests drive this override against
+/// the REAL binary and must keep winning outright, same as the tolerant
+/// reader. Value-level problems (wrong type, an explicit `0`) still degrade
+/// per-key via `Ok`, same as [`load`](crate::config::load)'s documented
+/// per-key tolerance — only a file-level syntax error is `Err` here.
+pub(crate) fn effective_store_budget_checked(root: &Path) -> Result<u64, String> {
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
+        if let Ok(n) = v.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+    crate::config::load(root)
+        .map(|c| c.store_budget_bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Test-only override (`cli/tests/integration.rs`,
