@@ -1334,7 +1334,10 @@ own `claude-501` component would false-positive on — caught and avoided):**
   `[]`; `jq -c 'select(.grade=="bare") | .files[].path' log.jsonl` → `"codex_leg.txt"` then
   `"claude_leg.txt"`. **Zero cross-attribution**: `codex_leg.txt` never appears under
   `tool=="claude"`; `claude_leg.txt` never appears under `tool=="codex"`. `agentrec show <id>`
-  confirms both rich turns render the correct `tool` and prompt excerpt.
+  confirms both rich turns render the correct `tool` and prompt excerpt. **Exact wire value:**
+  the emitter writes `"tool":"claude"`, never `"claude-code"` — INTEGRATIONS.md's
+  "`claude-code`-and-`codex` lines" phrasing is prose shorthand for the product, not a literal
+  field; this row does not claim `"claude-code"` was observed on the wire.
 - Legs run strictly sequentially (each `Stop` fully processed before the next `UserPromptSubmit`),
   distinct filenames per leg — deliberate, because an open start/stop bracket suppresses
   quiet-window closure and retroactively folds interim bare turns into the rich turn (PROTOCOL
@@ -1343,13 +1346,18 @@ own `claude-501` component would false-positive on — caught and avoided):**
   multi-tool sessions are the pre-existing, already-disclosed D6 misattribution risk (README
   threat model), not a new finding here.**
 
-**Disclosed, not new:** both rich turns rendered `files:[]`; each leg's actual file write landed
-in an immediately-following bare (unattributed) turn instead. This matches CLAUDE.md's own
-disclosure that the D6 `files_written` wedge's `resolve_declared` tier ladder "landed dark" (wired
-onto the wire, nothing yet consumes it to populate a turn's rendered `files` at persist time). It
-affects both tools identically, so it does not compromise the cross-attribution result above — a
+**Disclosed, not new — and two different mechanisms, not one:** both rich turns rendered
+`files:[]`; each leg's actual file write landed in an immediately-following bare (unattributed)
+turn instead. For `codex`, `files_written` WAS populated on the stop signal (confirmed above)
+and this matches CLAUDE.md's own disclosure that the D6 `resolve_declared` tier ladder "landed
+dark" — wired onto the wire, nothing yet consumes it at persist time. For `claude`,
+`files_written` was **never populated at all**: `cmds.rs::hook`'s Stop-event `files_written`
+block only runs when the payload carries a `transcript_path`, and this round's direct-invocation
+Stop payload omitted one (a real Claude Code payload supplies it) — a different cause (this
+test's own incomplete synthetic payload) producing the identical rendered symptom, not a second
+instance of the same dark-wiring gap. Neither compromises the cross-attribution result above — a
 file in an unattributed bare turn is a different failure than a file under the wrong tool's rich
-turn, and the latter never happened.
+turn, and the latter never happened, on either leg, for either reason.
 
 **OPEN, not claimed as passed:** the Claude leg is direct-invocation, not live, per the task's
 own acknowledged environment constraint (no nested interactive Claude Code session is possible

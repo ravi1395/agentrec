@@ -191,7 +191,11 @@ t_01KZ…6D4C · rich · codex · 2m ago · 0 files · "Create a file named code
 ```
 
 `agentrec show <id>` on both rich turns confirms `tool` renders as `codex` / `claude`
-respectively, with the correct prompt excerpt attached to each.
+respectively, with the correct prompt excerpt attached to each. **Note the exact wire value:**
+the emitter writes `"tool":"claude"`, not `"claude-code"` — INTEGRATIONS.md's "one `signal.jsonl`
+containing both `claude-code` and `codex` lines" phrasing is prose shorthand for the product,
+not a literal field value; nowhere in this round's evidence does the string `"claude-code"`
+appear on the wire, and this row does not claim it does.
 
 ## Cross-attribution check — jq-scoped, not substring grep
 
@@ -228,16 +232,27 @@ finding of this round.
 ## Disclosed limitation, observed directly on both legs (not new — matches documented status)
 
 Both rich turns (`codex` and `claude`) rendered `"files":[]`; the actual file write in each case
-landed in a separate, immediately-following **bare** (unattributed) turn instead. This is
-consistent with the CLAUDE.md Status section's own disclosure that the D6 `files_written`
-wedge's `resolve_declared` tier ladder "landed dark" — phases 1-2b wired the signal field
-end-to-end onto the wire (confirmed above: `files_written` is present and correct on the
-`codex` stop signal) but nothing yet consumes it to populate a turn's rendered `files` list at
-persist time ("producer at persist" is the next phase, per CLAUDE.md's Now/next list). This
-round is live confirmation of that documented gap, not a new defect — and critically, it affects
-**both tools identically**, so it does not compromise the cross-attribution check above (a file
-landing in an unattributed bare turn is not the same failure as a file landing under the wrong
-tool's rich turn — the latter never happened).
+landed in a separate, immediately-following **bare** (unattributed) turn instead. The identical
+symptom has **two different mechanisms behind it, not one — worth keeping separate rather than
+attributing both to a single cause:**
+- **`codex`:** the stop signal's `files_written` field IS populated (confirmed above:
+  `["/REDACTED/repo/codex_leg.txt"]`). This is exactly CLAUDE.md's disclosed D6
+  `resolve_declared` tier ladder "landed dark" — phases 1-2b wired the field end-to-end onto the
+  wire, but nothing yet consumes it to populate a turn's rendered `files` list at persist time
+  ("producer at persist" is the next phase). This round is live confirmation of that documented
+  gap.
+- **`claude`:** the stop signal's `files_written` field is **absent** — never populated in the
+  first place, for an unrelated reason. `cmds.rs::hook`'s Stop-event `files_written` block only
+  runs `declared_writes_from_transcript` when the payload carries a `transcript_path`; this
+  round's direct-invocation Stop payload did not include one (a realistic Claude Code payload
+  would). So the claude leg's empty `files:[]` is a consequence of this test's own
+  direct-invocation payload being incomplete, not of the `resolve_declared` dark-wiring gap —
+  even a fully-wired `resolve_declared` would have had nothing to resolve here.
+
+Both land on the same rendered symptom, but for different reasons; neither compromises the
+cross-attribution check above (a file landing in an unattributed bare turn is not the same
+failure as a file landing under the wrong tool's rich turn — the latter never happened, on
+either leg, for either reason).
 
 ## What was NOT done — OPEN, stated rather than papered over
 
