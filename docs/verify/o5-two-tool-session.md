@@ -504,17 +504,67 @@ which is an undocumented behavior" — stated as an assumption, not measured. Th
 it: a second live `claude -p` session was launched from `<scratch-repo>/sub/` (a tracked
 subdirectory), prompted to `pwd` and write that exact path into a file.
 
-**Result: `cwd_probe.txt` contained `/REDACTED/scratch-repo/sub` — Claude Code's hook-process cwd
-was the subdirectory, NOT the repo root.** The commit message's assumption is **false as stated**
-for this Claude Code version (2.1.222): Claude Code does not set hook cwd to the project root: it
-tracks the launch directory, exactly like Codex does. `find <scratch-repo> -iname .agentrec -type
-d` still returned exactly **one** directory, at the repo root — no `sub/.agentrec/` was created,
-and the signal's own `transcript` path visibly names the `-sub` project directory, confirming the
-walk-up discovery (`resolve_hook_root`/`discover_agentrec_root`) resolved correctly from a
-subdirectory for the **claude** emitter too. **This converts the fix's own stated rationale from
-an unverified assumption into a live measurement, in the opposite direction the commit message
-guessed — and the fix earns its keep for `hook claude` for a live-measured reason, not the
-assumed one.**
+**Result: `cwd_probe.txt` contained `/REDACTED/scratch-repo/sub`.** `find <scratch-repo> -iname
+.agentrec -type d` still returned exactly **one** directory, at the repo root — no
+`sub/.agentrec/` was created, and the signal's own `transcript` path visibly names the `-sub`
+project directory.
+
+**Caveat, important, resolved in the very next section — read it before taking the paragraph
+above at face value:** this measurement used Claude Code's Bash tool to `pwd`, which measures
+the Bash tool subprocess's cwd, not necessarily the separate hook subprocess's cwd. It is NOT
+yet the discriminating test the Codex leg used (a wrapper substituted for the hook command
+itself). See "Correction to the subdirectory-cwd measurement above" immediately below, which
+redoes this properly and states the corrected, now-actually-measured conclusion.
+
+## Correction to the subdirectory-cwd measurement above: it wasn't measuring what it claimed
+
+The measurement above used Claude Code's own **Bash tool**, running inside the live session, to
+`pwd` and write that path to a file. That measures the Bash tool subprocess's cwd — not
+necessarily the **hook** subprocess's cwd, which is a separate process Claude Code spawns for
+`UserPromptSubmit`/`Stop`. Nothing in that measurement established the two are the same process
+or share a cwd; the claim "Claude Code's hook-process cwd was the subdirectory" was written
+without the discriminating test. This is exactly the failure mode this document exists to avoid,
+and it was caught (not by this round) before being left standing: **the prior round's own
+method for Codex — substitute a wrapper for the hook command itself, capture `pwd -P` from
+inside the hook process, forward stdin to the real binary — was never applied to Claude here.**
+Corrected below, using that same method.
+
+**Method:** `.claude/settings.local.json`'s `command` for both `UserPromptSubmit` and `Stop`
+was replaced with a wrapper script that records `pwd -P` (plus the raw JSON payload, which
+itself carries the session's own `"cwd"` field — a second, independent channel) to a capture
+file outside the repo, then forwards stdin unmodified to the real `agentrec hook claude`
+(resolved via an absolute path this time, not `PATH`, since the wrapper isn't itself resolved
+through the installed command string). Daemon running throughout, to avoid confounding with the
+offline-bracket anomaly below. Two live `claude -p "Say hello. Do not use any tools."` sessions,
+one from the repo root, one from `<repo>/sub/`.
+
+**Capture, both channels agreeing, both firings per session:**
+
+```
+# root-launch session:
+hook_process_pwd=/REDACTED/repo
+payload={"...","cwd":"/REDACTED/repo","hook_event_name":"UserPromptSubmit",...}
+hook_process_pwd=/REDACTED/repo
+payload={"...","cwd":"/REDACTED/repo","hook_event_name":"Stop",...}
+
+# subdirectory-launch session:
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"UserPromptSubmit",...}
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"Stop",...}
+```
+
+**Now genuinely measured, not inferred: the hook subprocess's own cwd IS the subdirectory when
+launched from the subdirectory** — confirmed by two independent channels (the wrapper's own
+`pwd -P`, and the payload's own `"cwd"` JSON field) that agree with each other on both firings.
+The conclusion drawn earlier — that `3c4f598`'s "Claude Code sets hook cwd to the project root"
+assumption is false, and the walk-up fix is load-bearing for the claude emitter, not just
+latent-and-harmless — **stands, and is now backed by the same class of evidence the Codex side
+always had.** The two non-discriminating corroborations from the original measurement (no
+`sub/.agentrec/` created; the transcript path names the `-sub` project directory) are retained
+below only as consistent-with, not as the basis for the claim — they were never sufficient on
+their own, since both hold identically whether hook cwd is the root or the subdirectory, given
+`resolve_hook_root`'s walk-up already in place.
 
 ## An honest, undiagnosed observation — not swept, not explained away
 

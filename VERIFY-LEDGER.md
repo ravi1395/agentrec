@@ -1467,15 +1467,20 @@ previously-undocumented, reproducible defect surface** (a fast-enough bracket ca
 misattribute its own write to an orphaned bare turn), distinct from D6's phase-3 plan — recorded
 for founder disposition, not fixed here (out of this round's scope).
 
-**Second measurement, independent of the above:** `3c4f598`'s commit message asserted `hook
-claude`'s pre-fix defect was latent because "Claude Code happens to set cwd to the project
-root" — an unverified assumption. A live `claude -p` session launched from `<repo>/sub/` (a
-tracked subdirectory) measured cwd directly (had it write its own `pwd` to a file): **cwd was
-the subdirectory, not the root** — the assumption is false as stated. No `sub/.agentrec/` was
-created (still exactly one `.agentrec/`, at the root) and the signal's `transcript` path names
-the `-sub` project directory, confirming `resolve_hook_root` correctly discovered the root from
-a subdirectory for the **claude** emitter too — the fix earns its keep for claude for a
-live-measured reason, not the assumed one.
+**Second measurement, independent of the above — done twice, because the first attempt didn't
+measure the right process:** `3c4f598`'s commit message asserted `hook claude`'s pre-fix defect
+was latent because "Claude Code happens to set cwd to the project root" — an unverified
+assumption. A first live `claude -p` session from `<repo>/sub/` had the session's own **Bash
+tool** run `pwd` into a file — that measures the Bash tool subprocess's cwd, not necessarily the
+separate hook subprocess's cwd, so it was non-discriminating (a self-caught gap, not found by a
+second party). Redone with the Codex leg's own method: a wrapper substituted for the installed
+hook command itself, capturing `pwd -P` from inside the hook subprocess (plus the payload's own
+`"cwd"` JSON field as a second channel), daemon running throughout. **Both channels agree, both
+firings: the hook subprocess's own cwd was the subdirectory when launched from the
+subdirectory.** The assumption in `3c4f598` is false as stated; `resolve_hook_root` correctly
+discovered the root from a subdirectory for the **claude** emitter too — the fix earns its keep
+for claude for a now-properly-measured reason. Full corrected method + raw capture:
+`docs/verify/o5-two-tool-session.md` § "Correction to the subdirectory-cwd measurement above".
 
 **One honest, undiagnosed anomaly, not swept:** after a daemon restart, `state.json`'s
 `signal_offset` advanced to consume the subdirectory session's `start`/`stop` signals in full,
