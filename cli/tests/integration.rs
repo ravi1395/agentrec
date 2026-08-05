@@ -10053,9 +10053,30 @@ fn daemon_startup_refuses_on_malformed_config() {
 
 /// Same over-budget-after-live shape as `daemon_periodic_tick_evicts_after_
 /// startup_pass`, but with `config.toml` corrupted the instant the daemon is
-/// confirmed live. The eviction still firing is what proves the mid-tick
-/// budget read actually executed and degraded rather than the daemon never
-/// reaching it; `try_wait` confirms the process itself never exited.
+/// confirmed live.
+///
+/// CORRECTED (round-2 gate follow-up on commit `9fee3ee`, which added this
+/// test): the doc comment and that commit's message both used to claim "the
+/// eviction still firing is what proves the mid-tick budget read actually
+/// executed and degraded". That is FALSE as written. This test drives the
+/// budget entirely through `AGENTREC_TEST_STORE_BUDGET_BYTES`, and `cmds::
+/// effective_store_budget`'s debug env-override arm `return`s BEFORE
+/// `config::load_or_default` — the actual config-parsing path — is ever
+/// reached. So the corrupted `config.toml` written to disk below is never
+/// parsed by the budget path in this test at all.
+///
+/// What this test actually proves: the daemon's per-poll `read_memory_
+/// enabled` re-read (a DIFFERENT config consumer, invoked every ~250ms tick
+/// regardless of the eviction interval) survives parsing a corrupted file
+/// repeatedly without crashing the process; `try_wait` below confirms the
+/// process itself never exited. It does NOT exercise, and cannot
+/// discriminate a regression in, the mid-tick BUDGET read's own tolerance —
+/// a budget read changed from tolerant (`effective_store_budget`) to
+/// hard-error-propagating would still pass this test unchanged, because the
+/// env override bypasses config parsing before that code would ever run.
+/// See `daemon_survives_config_corruption_with_real_budget_from_file` below
+/// for a test that sources the budget from a real on-disk `config.toml`
+/// (no env override) and so genuinely covers that path.
 #[test]
 fn daemon_mid_tick_survives_config_corruption_after_startup() {
     use agentrec_core::record::FileEntry;
@@ -10139,6 +10160,155 @@ fn daemon_mid_tick_survives_config_corruption_after_startup() {
             Ok(None)
         ),
         "daemon process must still be running after config corruption"
+    );
+
+    daemon.kill();
+}
+
+/// Genuinely exercises the mid-tick BUDGET read's tolerance of a corrupted
+/// `config.toml` — the gap `daemon_mid_tick_survives_config_corruption_
+/// after_startup` above cannot close, because that test's budget comes
+/// entirely from `AGENTREC_TEST_STORE_BUDGET_BYTES`, whose env-override arm
+/// in `cmds::effective_store_budget` returns before `config::load_or_
+/// default` (the real config-parsing path) is ever reached.
+///
+/// This test sets NO budget env override anywhere: `store_budget_bytes`
+/// comes only from a real `.agentrec/config.toml` written to disk.
+/// Sequence: (1) seed an over-budget store BEFORE spawning, so the STARTUP
+/// eviction pass (`daemon::run`'s `run_eviction_pass` call, which runs
+/// before the watcher arms — same ordering `daemon_eviction_keeps_
+/// protected_refs` relies on) is what's observed evicting the victim,
+/// proving the low budget genuinely came from the config FILE since no env
+/// var is set anywhere in this test; (2) corrupt `config.toml`; (3) seed a
+/// second, equally-evictable blob and poll `try_wait` across several
+/// eviction ticks, asserting the daemon process never exits.
+///
+/// Per `config::load_or_default`'s own doc comment, a corrupted file
+/// degrades EVERY key back to `Config::default()`, whose `store_budget_
+/// bytes` is `agentrec_core::MAX_STORE_BYTES` — the LARGEST value in play —
+/// so eviction is expected to gracefully CEASE after corruption, not
+/// continue against the last-known-good low budget. This test asserts both
+/// halves: no crash (the `try_wait` loop) and the post-corruption blob
+/// surviving (the observable signature of "ceased", ruling out a stale-
+/// low-budget continuation as a false pass). The crash-direction assertion
+/// is what would catch a regression that changed the mid-tick budget read
+/// from the tolerant `effective_store_budget` to the hard-erroring
+/// `effective_store_budget_checked` (or an equivalent `.unwrap()`) — the
+/// exact crash-loop-under-`launchd KeepAlive` bug this whole fix round
+/// exists to prevent.
+#[test]
+fn daemon_survives_config_corruption_with_real_budget_from_file() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // Real, valid, low budget written to the actual config file — no
+    // AGENTREC_TEST_STORE_BUDGET_BYTES anywhere in this test.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "store_budget_bytes = 5\n",
+    )
+    .unwrap();
+
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+    seed_turn(
+        root,
+        &base_turn(
+            "t_REALBUDGETVICTIM00001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_REALBUDGETNEW0000001", vec![file_entry("new.bin", &new)]),
+    );
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[("AGENTREC_TEST_EVICT_INTERVAL_MS", "500")],
+    );
+
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob was not evicted at startup — the real config.toml's \
+         store_budget_bytes = 5 did not reach the budget read"
+    );
+    assert!(
+        store.contains(&new),
+        "newest blob must survive the startup pass"
+    );
+
+    // Corrupt config.toml AFTER the confirmed-live, confirmed-evicting
+    // startup pass.
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    // A second, equally over-budget candidate, added post-corruption — only
+    // a post-corruption tick can act on it either way.
+    let victim2 = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim2, 3600);
+    seed_turn(
+        root,
+        &base_turn(
+            "t_REALBUDGETVICTIM00002",
+            vec![file_entry("victim2.bin", &victim2)],
+        ),
+    );
+
+    // Poll across several ~500ms eviction ticks (well past the interval),
+    // asserting the process is alive at every check — not just once at the
+    // end — so a crash on any individual tick's corrupted-config read is
+    // caught regardless of which tick it happens on.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(
+            matches!(
+                daemon.0.as_mut().expect("daemon child handle").try_wait(),
+                Ok(None)
+            ),
+            "daemon process must not exit while ticking against a \
+             corrupted config.toml on the real (non-env-override) budget \
+             path"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Per `config::load_or_default`'s documented degrade-to-default
+    // behavior, the corrupted file reverts `store_budget_bytes` to
+    // `MAX_STORE_BYTES` — eviction gracefully CEASES rather than continuing
+    // against the stale low budget, so the post-corruption blob survives.
+    assert!(
+        store.contains(&victim2),
+        "post-corruption blob should survive: a corrupted config.toml \
+         degrades store_budget_bytes back to MAX_STORE_BYTES, not to a \
+         crash and not to the last-known-good low value"
     );
 
     daemon.kill();
