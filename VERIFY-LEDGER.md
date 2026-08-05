@@ -1127,10 +1127,10 @@ designed.
   `codex exec` (`turn interrupted`, exit 1, no `Stop`); does **not** fire on `/clear` (the
   abandoned session gets no `Stop`, a fresh `session_id`/`turn_id` starts on the next prompt).
   `SubagentStop` not exercised (out of this round's effort budget).
-- `Stop` (and by extension `SubagentStop`) genuinely rejects non-empty non-JSON stdout
-  (`Stop Failed` in the transcript, session still completes normally) while **empty** stdout is
-  treated as success — the emitter's "write nothing on success" design (C2) is confirmed correct,
-  not merely assumed.
+- `Stop` genuinely rejects non-empty non-JSON stdout (`Stop Failed` in the transcript, session
+  still completes normally) while **empty** stdout is treated as success — the emitter's "write
+  nothing on success" design (C2) is confirmed correct for `Stop`, not merely assumed.
+  `SubagentStop` was never exercised; whether it behaves the same is documented (not measured).
 
 **Not probed, stated explicitly rather than inferred:** `PreToolUse`, `PermissionRequest`,
 `SessionStart`/`SessionEnd` payload shapes (only `/clear`'s side effects were observed, not the

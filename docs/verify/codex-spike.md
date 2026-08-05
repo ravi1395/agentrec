@@ -355,8 +355,10 @@ for it).
 
 Functionally confirmed: on an otherwise-never-trusted scratch repo, adding this flag to `codex
 exec` made all three configured hooks fire (`hook: UserPromptSubmit`/`Stop`/`PostToolUse` +
-`Completed` lines) and printed this banner twice per invocation (once per triggered hook event in
-this run):
+`Completed` lines) and printed this banner twice per invocation. The per-invocation count is
+observed to be 2 regardless of how many hook events fired that run (also 2 in a run where only
+2 of 3 hooks triggered) — the mechanism is not "once per triggered hook event"; the exact
+trigger count for the banner is unconfirmed:
 
 ```
 warning: `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for
