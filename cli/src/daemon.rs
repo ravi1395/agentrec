@@ -1621,18 +1621,54 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> ReplayO
         // D7 preserved: ONLY candidate lines are acted on; start/stop (and any
         // other) signals in the pre-daemon gap are dropped, never fed to the
         // engine, so no phantom turn can be minted here.
-        if sig.is_memory_candidate() && memory_enabled {
-            ingest_candidate(root, &mut state, &sig, current_turn);
+        //
+        // INVARIANT (D51): the counted set below == the set `apply_signal`
+        // would route to its start/stop arms in the LIVE loop, with
+        // memory-candidates excluded FIRST, in the same order as the live
+        // loop. Any drift between this branch order and `daemon::run`'s poll
+        // loop makes the count lie. The candidate exclusion is UNCONDITIONAL —
+        // the `memory_enabled` kill-switch decides whether the line is
+        // ingested, never whether it is a turn boundary — because the live
+        // loop likewise `continue`s on a candidate whether memory is on or
+        // off. Gating this exclusion on `memory_enabled` would let a
+        // `{"event":"start","type":"memory-candidate"}` line inflate the count
+        // when memory is disabled, which the live loop never treats as a
+        // boundary. Pinned by
+        // `replay_gap_drop_count_excludes_non_boundary_kinds`.
+        if sig.is_memory_candidate() {
+            if memory_enabled {
+                ingest_candidate(root, &mut state, &sig, current_turn);
+            }
             continue;
         }
-        // D51: count the TURN-BOUNDARY drops, and only those. The predicate is
-        // `kind.is_none()` — exactly the set `apply_signal` would route to its
-        // start/stop arms — deliberately NOT "everything the branch above
-        // skipped": that set also holds memory-candidates when the
-        // `memory_enabled` kill-switch is off, and any future typed `kind`,
-        // neither of which is a dropped turn boundary. Pinned by
-        // `replay_gap_drop_count_excludes_non_boundary_kinds`.
-        if sig.kind.is_none() {
+        // D51: count the TURN-BOUNDARY drops, and only those. The predicate
+        // mirrors `apply_signal`'s own check ORDER: it tests `is_start()`
+        // BEFORE its `kind` guard, so the routed-as-boundary set is
+        // `{event == "start"} ∪ {kind.is_none()}`, not `kind.is_none()` alone.
+        // Two consequences worth stating, because both read as bugs otherwise:
+        //   - The asymmetry is real and inherited, not a mistake here.
+        //     `{"event":"start","type":"<unknown>"}` IS a boundary (live opens
+        //     a real turn for it), while `{"event":"stop","type":"<unknown>"}`
+        //     is NOT — it falls to `apply_signal`'s `record_unknown_signal`
+        //     arm. Pinned by `replay_gap_drop_count_follows_live_routing`.
+        //   - Still deliberately NOT "everything the branch above skipped":
+        //     that set also holds memory-candidates under a disabled
+        //     kill-switch, plus any future typed non-`start` `kind`, neither
+        //     of which is a dropped turn boundary.
+        // Known unmodelled divergence, disclosed rather than fixed: the live
+        // loop's `handle_emitter_turn_signal` pre-filter can also swallow an
+        // untyped start/stop before `apply_signal` sees it (a dedup resend, or
+        // a mismatched stop), so a count here can OVERSTATE what the live loop
+        // would have routed. This is live today, not theoretical: the Codex
+        // hook emits `emitter_turn` on both signals
+        // (`hookcmds.rs`, `emitter_turn: Some(turn_id)`; Claude Code payloads
+        // still carry none). Not modelled because the pre-filter's verdict is
+        // a function of `state.json`'s `last_emitter_turn_key` and the OPEN
+        // BRACKET — engine state the gap scan has, by D7's design, refused to
+        // reconstruct. Over-counting is the safe direction here: the field
+        // exists to break silence, and it is documented (PROTOCOL §5) as a
+        // count of drops, never as an activity record.
+        if sig.is_start() || sig.kind.is_none() {
             dropped_signals = dropped_signals.saturating_add(1);
         }
     }
@@ -4616,7 +4652,18 @@ mod tests {
         // No `event` key: PROTOCOL §4's implicit stop, the shape the real
         // Claude Code Stop hook writes.
         let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
-        let contents = format!("{start_line}\n{candidate}\n{stop_line}\n");
+        // Review round 1: a candidate that ALSO carries `event: "start"`. The
+        // live loop routes candidates away BEFORE `apply_signal`, so this is
+        // ingested, never a boundary — the widened predicate must not count it
+        // despite `is_start()` being true.
+        let start_shaped_candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_001_000u64, "tool": "claude-code",
+            "event": "start",
+            "type": "memory-candidate", "fact": "a start-shaped gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let contents =
+            format!("{start_line}\n{candidate}\n{stop_line}\n{start_shaped_candidate}\n");
         std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
 
         let out = replay_pending_candidates(root, None);
@@ -4627,7 +4674,13 @@ mod tests {
         );
         assert_eq!(
             out.dropped_signals, 2,
-            "both turn-boundary lines in the gap are dropped AND counted"
+            "both turn-boundary lines in the gap are dropped AND counted; the \
+             two memory-candidates — including the start-shaped one — are not"
+        );
+        assert_eq!(
+            agentrec_core::memory::load_effective(root).unwrap().len(),
+            2,
+            "the start-shaped candidate is INGESTED as a candidate, not dropped"
         );
 
         // D7 is unchanged: the drop is still a drop. Nothing minted a turn.
@@ -4637,14 +4690,71 @@ mod tests {
         );
     }
 
-    /// The discriminating half of AC-D0's predicate: the count is
-    /// `kind.is_none()` (turn boundaries), NOT "everything the ingest branch
-    /// skipped". With the `memory_enabled` kill-switch off, the candidate is
-    /// skipped too — and must NOT inflate the count, or the field lies about
-    /// how many brackets were lost.
+    /// AC-D0 review round 1. The count predicate must mirror the LIVE routed
+    /// set, and `apply_signal` tests `is_start()` BEFORE its `kind` guard — so
+    /// `{"event":"start","type":"<unknown>"}` opens a real turn live, and is
+    /// therefore a real dropped boundary in the gap. The original
+    /// `kind.is_none()`-only predicate dropped it AND failed to count it: the
+    /// exact silence D51 exists to close, reintroduced for one shape.
     ///
-    /// Neuter: count the whole else-branch (`else { dropped += 1 }`) -> this
-    /// test reds at 3, while the sibling above still passes at 2.
+    /// Neuter: restore `if sig.kind.is_none()` as the whole predicate -> this
+    /// test REDs (1 vs 2), while every other D51 test stays GREEN (none of
+    /// their fixtures carries a typed `start`).
+    #[test]
+    fn replay_gap_drop_count_follows_live_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // A typed `start` — the divergent shape. Live: `apply_signal`'s
+        // `is_start()` check precedes the `kind` guard, so this opens a turn.
+        let typed_start =
+            r#"{"v":1,"ts":1,"tool":"claude","event":"start","type":"some-future-thing"}"#;
+        // Untyped stop: the ordinary boundary, counted before and after.
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        // A typed NON-start unknown: live routes it to `record_unknown_signal`,
+        // never to the stop arm, so it is not a boundary and stays uncounted.
+        // This is what keeps the widening from collapsing into "count
+        // everything".
+        let typed_other = r#"{"v":1,"ts":3,"tool":"claude","type":"some-future-thing"}"#;
+        let contents = format!("{typed_start}\n{stop_line}\n{typed_other}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.dropped_signals, 2,
+            "a typed `start` is a boundary live, so it is a counted drop here; \
+             a typed non-start is not"
+        );
+        assert!(
+            !log_path(root).exists(),
+            "D7 unchanged: still no turn minted from any of these"
+        );
+    }
+
+    /// The discriminating half of AC-D0's predicate: the count is the set
+    /// `apply_signal` routes to its start/stop arms, NOT "everything the
+    /// ingest branch skipped". With the `memory_enabled` kill-switch off, the
+    /// candidate is skipped too — and must NOT inflate the count, or the field
+    /// lies about how many brackets were lost.
+    ///
+    /// Since review round 1 this also pins the ORDERING: the candidate
+    /// exclusion runs before the boundary predicate, unconditionally. The
+    /// third fixture line is a memory-candidate that ALSO carries
+    /// `"event":"start"`. Live routes it away as a candidate regardless of the
+    /// kill-switch, so it is not a boundary — but the widened predicate's
+    /// `is_start()` arm would count it if the exclusion were gated on
+    /// `memory_enabled` (the naive widening), which is exactly why this
+    /// assertion lives in the kill-switch-OFF fixture: under memory ON both
+    /// the old and new predicates decline it, and it would discriminate
+    /// nothing.
+    ///
+    /// Neuter A: gate the candidate `continue` on `memory_enabled` (i.e.
+    /// `if sig.is_memory_candidate() && memory_enabled`) -> reds at 3.
+    /// Neuter B: hoist the boundary predicate ABOVE the candidate branch ->
+    /// reds at 3 here AND (measured, not assumed) in
+    /// `replay_gap_drops_are_counted_for_the_epoch_record`, which carries the
+    /// same start-shaped candidate under memory ON.
     #[test]
     fn replay_gap_drop_count_excludes_non_boundary_kinds() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4662,8 +4772,16 @@ mod tests {
             "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
         })
         .to_string();
+        // A candidate that ALSO looks start-shaped. `is_memory_candidate()`
+        // wins in the live loop's routing order, so this is not a boundary.
+        let start_shaped_candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_001_000u64, "tool": "claude-code",
+            "event": "start",
+            "type": "memory-candidate", "fact": "another gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
         let contents = format!(
-            "{}\n{candidate}\n{}\n",
+            "{}\n{candidate}\n{}\n{start_shaped_candidate}\n",
             r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#,
             r#"{"v":1,"ts":2,"tool":"claude"}"#
         );
@@ -4672,7 +4790,8 @@ mod tests {
         let out = replay_pending_candidates(root, None);
         assert_eq!(
             out.dropped_signals, 2,
-            "a kill-switch-skipped candidate is not a dropped turn boundary"
+            "a kill-switch-skipped candidate is not a dropped turn boundary, \
+             not even one carrying `event: start`"
         );
         assert!(
             agentrec_core::memory::load_effective(root)

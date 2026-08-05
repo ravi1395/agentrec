@@ -41,12 +41,24 @@ that N boundaries were dropped.
 
 - **Writer: `cli/src/daemon.rs`.** `replay_pending_candidates` now returns
   `ReplayOutcome { consumed, dropped_signals }` instead of a bare `u64`, and
-  counts, inside its scan loop, every parsed signal with `kind.is_none()`
-  that it did not ingest. The predicate is `kind.is_none()` — the exact set
-  `apply_signal` routes to its start/stop arms — deliberately NOT "everything
-  the ingest branch skipped": that set also holds memory-candidates when the
-  `memory_enabled` kill-switch is off, and any future typed `kind`
-  (`daemon.rs::replay_gap_drop_count_excludes_non_boundary_kinds`).
+  counts, inside its scan loop, every parsed signal the LIVE poll loop would
+  have routed to `apply_signal`'s start/stop arms. The predicate is
+  `is_start() || kind.is_none()`, evaluated AFTER an unconditional
+  memory-candidate exclusion — the same order the live loop uses.
+  `apply_signal` tests `is_start()` before its `kind` guard, so a typed
+  `start` (`{"event":"start","type":"<unknown>"}`) opens a real turn live and
+  is therefore a real dropped boundary
+  (`daemon.rs::replay_gap_drop_count_follows_live_routing`); a typed
+  NON-`start` line is tolerated-unknown (§10) and is not counted. Deliberately
+  NOT "everything the ingest branch skipped": that set also holds
+  memory-candidates when the `memory_enabled` kill-switch is off, and any
+  future typed non-`start` `kind`
+  (`daemon.rs::replay_gap_drop_count_excludes_non_boundary_kinds`, which also
+  pins that a candidate carrying `event: "start"` is routed away as a
+  candidate and never counted, kill-switch either way). **Corrects
+  `deb2f85`'s commit message**, which stated the predicate as `kind.is_none()`
+  and recorded a mutation probe ("widen the predicate…") whose verdict this
+  change inverts.
   `daemon::run` threads `replay.dropped_signals` into the `append_epoch(&root,
   "start", …)` call that immediately follows the scan; `append_epoch` gained a
   fourth parameter and every other caller passes `0` — the `stop` call site's 0 rests on
