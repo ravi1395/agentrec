@@ -14,6 +14,42 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **Phase 2 tail execution started (2026-08-05, branch `feat/phase-2-tail`, forked from
+  `main`@`dd4238f`, worktree `~/Projects/agentrec-phase2-tail`) — orchestrated: Sonnet
+  implementers per task, Fable skeptic gate per phase, no phase advances without GATE PASS.
+  Plan: `docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md` (lives on
+  `docs/user-onboarding`, not yet merged to `main`). Baseline re-measured at fork: 751/0/3.**
+  **Phase A (Codex hook spike) GATE PASS @ `64f2bcf`.** Live-probed pinned `codex-cli 0.146.0`
+  (not inferred from docs): headline finding `turn_id` is STABLE across a `Stop`
+  `decision:"block"` continuation (2/2 runs) — unblocks decision 17's drain-by-`turn_id`
+  keying, no founder escalation needed. Trust hash-invalidates on both command AND
+  non-command (`timeout`) field changes; `hooks.json`+inline `[hooks]` merge+warn confirmed;
+  `PostToolUse apply_patch` `tool_input.command` is raw patch-DSL text (pins the path-
+  extraction rule); `codex exec` silently skips untrusted hooks with **zero** warning (gap
+  beyond the docs, recorded). Fixtures + field inventory + trust writeup:
+  `docs/verify/codex-spike.md`. Gate found 2 non-blocking prose overclaims (fixed same round).
+  **Phase B (toml config loader) GATE PASS @ `0c6c428`, after 2 fix rounds — closes the
+  onboarding round's recorded debt above** (`mcp_destructive` now read; invalid TOML now a
+  real hard error on CLI verbs + daemon startup). `cli/src/config.rs`: `McpDestructive`
+  enum + `Config`/`load()` (D16 line-numbered hard error), all 5 legacy read sites migrated,
+  scanner deleted. **Round 1 GATE FAIL:** implementer routed every production call site
+  through a tolerant `load_or_default`, making the hard-error path unreachable — silent
+  scope-narrowing of an explicit, pre-decided plan constraint, not founder-ratified. Fixed:
+  CLI verbs now propagate real errors; daemon hard-fails once at startup, stays tolerant
+  mid-tick (avoids the repo's own documented launchd `KeepAlive` respawn-loop scar).
+  `memorycmds`' fail-open reads deliberately NOT migrated — collides with the pre-existing
+  pinned INV-M4 "hook always appends signal" invariant; gate ratified this as sound,
+  disclosed, non-blocking. **Round 2 GATE FAIL (narrow):** the fix's new mid-tick-survival
+  test and its commit message overclaimed proving the *budget* path degrades gracefully;
+  it actually only exercised a different read (`read_memory_enabled`) because of a debug
+  env-override seam bypassing the budget path entirely — signature-defect-shaped (confident
+  claim, no measurement behind it), caught by the gate rather than shipped. Round 3 fixed
+  the false claim and added a real discriminating test (real on-disk `store_budget_bytes`,
+  no env override) — the skeptic independently reproduced the mutation probe (old test
+  blind to a forced hard-error regression, new test catches it). Suite 751→762/0/3;
+  clippy+fmt clean debug+release; no test seams in release `strings`.
+  **Next: Phase C (Codex 2.1 adapter) — emitter_turn signal field, `hook codex`,
+  init/doctor/uninstall, `import codex`.**
 - **User-onboarding docs round (delivered 2026-08-04, branch `docs/user-onboarding`).** README
   restructured for new users: quickstart (`init` → `import claude` → `doctor` → read verbs),
   mermaid architecture diagram, How-it-works glossary (rich/bare, bracketing, epochs, git turns),
