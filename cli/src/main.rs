@@ -2,6 +2,7 @@
 //! (called by agent lifecycle hooks), doctor.
 
 mod cmds;
+mod config;
 mod daemon;
 mod doctorcmd;
 mod fmt;
