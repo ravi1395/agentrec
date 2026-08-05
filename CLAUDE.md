@@ -48,8 +48,31 @@ carries only current state, what's next, and standing debts.
   no env override) — the skeptic independently reproduced the mutation probe (old test
   blind to a forced hard-error regression, new test catches it). Suite 751→762/0/3;
   clippy+fmt clean debug+release; no test seams in release `strings`.
-  **Next: Phase C (Codex 2.1 adapter) — emitter_turn signal field, `hook codex`,
-  init/doctor/uninstall, `import codex`.**
+  **Phase C (Codex 2.1 adapter) DONE — task ACs C1–C4 GATE PASS, and Phase C EXIT REACHED
+  @ `7212ba8`.** C1 `emitter_turn` + restart-safe dedup; C2 `agentrec hook codex` (three-event
+  emitter + `files_written` accumulator); C3 init/doctor/uninstall codex hook management;
+  C4 `import codex` (K-series, real-corpus derived: 616 rollout files, 100% importable).
+  **Two founder-ratified mid-phase fixes:** content-aware dedup — Codex's `Stop` fires twice
+  with an identical `turn_id` on a block-continuation and identity-only dedup was silently
+  dropping the second WITH its new `files_written` (real attribution data loss) — and a
+  `model` field on `SignalEvent`, without which Codex rich turns shipped with zero model
+  attribution. **O5 met live** (real `claude -p` session + real interactive Codex session
+  through the un-bypassed `/hooks` trust flow; sequential, not simultaneous; zero
+  cross-attribution by jq-scoped queries). **O5 found a blocking product defect, fixed
+  @ `3c4f598`:** Codex spawns hook processes with cwd = its LAUNCH directory, not the repo
+  root, and the installed entry is bare — so a subdirectory launch silently minted a second
+  `.agentrec/signal.jsonl` under `sub/`, invisible to the daemon, no error. Fixed by walking
+  up to the nearest `.agentrec/` (git-style), **both emitters**, chosen over baking an
+  absolute `--root` (that is this repo's 39-orphan scar). **`3c4f598`'s own message then
+  carried an unmeasured claim** — that Claude Code pins hook cwd to the project root, making
+  its defect "latent" — **measured FALSE** (`ecd09bc`): Claude inherits the launch dir too, so
+  that defect was real and live. claimd gap **founder-waived** (`baeee84`): nothing in Phase C
+  is claim-attested. Suite 762→866/0/3.
+  **Next: Phase D (Protocol 1.0 freeze) — BLOCKED on three founder decisions, see
+  `HANDOFF.md`: ratify the D7 offline-drop posture as 1.0-acceptable, ratify the
+  bracket-timing race as §4-compatible, accept that the catch-provenance question rests
+  permanently unresolved. The freeze is a ONE-WAY DOOR; both findings are assessed
+  §4-compatible but that assessment is what needs ratifying, not assuming.**
   **O5 Phase C exit criterion re-run LIVE (2026-08-05):** the prior round's Claude leg was
   direct hook-invocation, not a live process — closed by a genuine `claude -p` session (both
   legs re-driven live, one `log.jsonl`, zero jq-scoped cross-attribution). Along the way it
