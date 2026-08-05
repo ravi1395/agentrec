@@ -1622,3 +1622,30 @@ diagnosis round to commission. It is a product-posture call on D7 — any tool s
 FULL bracket elapses while the daemon is down is silently dropped as-if-consumed, prompt
 included. That is the known D7 tradeoff (never mint a phantom turn) doing exactly what it was
 built to do, at a cost that is now measured rather than theoretical.
+
+#### Rider to CORRECTION (b) — its own evidence is unpersisted, and must not rot into fact
+
+Added after a gate round caught CORRECTION (b) committing the pattern it diagnoses. That
+paragraph labels `ecd09bc` "a transcription of an unverified claim" and then, one sentence
+later, offers as "what CAN be established" a verbatim quote from the implementing agent's
+completion report — an artifact that **exists nowhere in this repo**. `grep -rn "caught during
+review" docs/ VERIFY-LEDGER.md .claims/` returns exactly one hit: the sentence asserting it.
+
+Therefore, explicitly:
+
+- The completion report lives only in the orchestrating agent's session context. Its quote
+  cannot be checked by any reader of this repository — not a future round, not a skeptic, not
+  the founder.
+- **The only repo-verifiable fact here is the textual contradiction** between `1b34f5b`'s
+  commit message ("not by a second party") and `ecd09bc`'s ledger sentence ("caught in review
+  rather than by the agent that ran it"). Both strings are in git; anyone can diff them.
+- "The agent's two accounts of its own work disagree" is NOT repo-verifiable, because the
+  bridge — that the same agent authored the report, and that the report contained those words
+  — is unpersisted. Restating it without this rider would let it rot into fact.
+- `ecd09bc`'s sentence being a transcription is the orchestrator's own account of its own
+  action, offered as such, and carries exactly the weight of an unattested self-report.
+
+This is the same rider convention CLAUDE.md already applies to AC8(a) ("round 1's per-AC
+verdict table was never persisted ... restating it without this rider would let it rot into
+fact"). The catch-provenance question rests permanently unresolved; no artifact can settle it,
+and this rider is the fix rather than further investigation.
