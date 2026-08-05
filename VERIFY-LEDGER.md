@@ -1425,3 +1425,29 @@ recorded "`fmt --check | tail` exit-code trap", hit again; the lint was real and
 
 **Still OPEN, unchanged by this fix:** the Claude leg's live/direct-invocation split above.
 Nothing here converts that simulated leg into a live one.
+
+### FOUNDER WAIVER 2026-08-05 — claimd claims not declared for Phase C
+
+Recorded as a debt, not silently closed. The Phase 2 tail plan's executor protocol requires
+declaring a claimd claim per AC *before* implementing, plus one covering each normative-doc
+edit (C1 edited `PROTOCOL.md` §4). **This was not done for any of Phase C** — C1, C2, C3, C4,
+the §4 edit, or the O5 hook-root fix. Two successive skeptic gates found the gap; it is
+unchanged between them. Measured, not asserted: the worktree has no `.claims/` at all, and the
+main repo's `.claims/claims.jsonl` carries zero claim statements mentioning
+codex/`emitter_turn`/hook-root/O5 and zero events dated 2026-08-05 — the date of every Phase C
+commit.
+
+**Founder ruling (2026-08-05): waived, proceed.** Phase C ships without claims, carried as a
+coverage debt in the same shape as this repo's existing touched-uncovered rows
+(`cli/src/cmds.rs` from the P3 residuals round; `cli/src/purgecmd.rs` from the honesty round).
+Retroactive declaration was offered and **declined** on the founder's own standing rule that
+it is refused by design — a claim declared after its evidence exists is a weaker artifact than
+one declared before, and an agent minting claims for work it just finished is exactly the
+self-attestation the protocol exists to prevent.
+
+Scope of the debt, stated so it cannot be read as narrower than it is: every Phase C
+acceptance criterion rests on the automated suite plus two independent adversarial gate rounds
+(both of which re-ran the load-bearing mutation probes themselves rather than trusting the
+implementers), and on **no** claimd replay. Nothing here is claim-attested. A future round
+that wants claim coverage over this surface must declare fresh claims against live code, not
+backfill these.
