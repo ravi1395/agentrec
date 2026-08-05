@@ -1266,3 +1266,105 @@ for `update` entries exactly as its doc comment already describes it, not repurp
   real-measured field structures (including the symlink defect above, only findable by actually
   running persist against a real filesystem); the `--dry-run` real-corpus run (this task's explicit
   verification step) covers the full 616-file real corpus.
+
+## O5 — live two-tool session evidence (Phase C exit, 2026-08-05, `feat/phase-2-tail` worktree)
+
+Manual, not-unit-testable honesty row per the plan's Phase C exit criterion. Full method, raw
+(redacted) captures, and every command's actual output: `docs/verify/o5-two-tool-session.md`.
+Binary: debug build (`target/debug/agentrec`, `agentrec 0.2.0`), NOT release — disclosed; this
+round checks protocol/attribution correctness, not performance. Disposable scratch git repo
+under this session's scratchpad, never the agentrec repo; isolated `CODEX_HOME` (`auth.json`
+only), mirroring Phase A's isolation method. Pinned `codex-cli 0.146.0` (same pin as Phase A;
+0.146.1 was available and deliberately not taken).
+
+**Execution-branch baseline, re-measured at the start of this round:** `cargo test --workspace --
+--test-threads=3` on `feat/phase-2-tail` @ `af3175a` → **855 passed / 0 failed / 3 ignored**.
+Re-measured again after the doc edits below (no Rust files touched) — same **855 / 0 / 3**.
+
+**Temp-root service guard (D46), verified live, not assumed:** `agentrec init --codex` on the
+`/private/tmp/...` scratch root printed `skipped service install: root is under a temporary
+directory`; `launchctl list` and `~/Library/LaunchAgents` were enumerated before this round
+started and after every step — **exactly one unit throughout**, `com.agentrec.bfa6bde6eaa4` (the
+pre-existing live dogfood daemon for `~/Projects/agentrec`, unrelated to this round). No plist
+was ever written for the scratch repo; `--service` was never passed.
+
+**Headline finding — BLOCKING product defect, confirmed live, reported here per the task's
+instruction rather than fixed:** the installed Codex hook entry is the bare command `agentrec
+hook codex`, no `--root` (`cli/src/initcmd.rs::CODEX_HOOK_COMMAND`; root then defaults to
+`std::env::current_dir()` at `cli/src/main.rs:386-389`). **Codex's hook-process cwd tracks the
+directory Codex was launched from, not the git repo root.** Measured directly with a `pwd -P` +
+payload-`cwd` probe wrapper substituted for the real hook command (`codex exec
+--dangerously-bypass-hook-trust`, sanctioned for this scripted leg per the plan), launched from
+two positions on the same trusted scratch repo:
+- From the repo root: `process_pwd` == `payload_cwd` == the repo root, on all three hook firings.
+  Corroborated by a second, independent channel — the interactive TUI's own startup banner
+  (`directory: /REDACTED/scratch-repo`) for a root-launch session (Part 2 of the writeup).
+- From a tracked subdirectory (`repo/sub/`): `process_pwd` == `payload_cwd` == **the
+  subdirectory**, on all three firings.
+
+**Consequence, observed directly:** the subdirectory run left a **second, independent**
+`sub/.agentrec/signal.jsonl` (`record.rs`'s append path creates parent dirs with no error) that a
+daemon running `agentrec record --root <repo-root>` never tails — every Codex signal from a
+session launched inside that subdirectory is silently and permanently invisible to the repo's
+real recorder. No error, no warning, anywhere in the chain. **This needs a founder-level design
+decision (most plausibly: `init --codex` bakes an explicit `--root <resolved-repo-root>` into the
+installed hook command) — not decided or built here**, per the task's explicit instruction not to
+attempt a redesign mid-verification.
+
+**Real `/hooks` trust flow — live, via `tmux` (bare `expect` hangs on Ratatui's terminal-capability
+queries, per the Phase A spike's method):** first launch in the scratch repo showed the same
+"Hooks need review" gate the spike documented; "Review hooks" → `/hooks` browser showed all three
+events `Installed=1 Active=0 Review=1`; `t` ("trust all") flipped every row to `Active=1`, Review
+column cleared. No bypass flag on this leg.
+
+**Cross-attribution — clean, jq-scoped (not substring grep, which the redacted scratchpad path's
+own `claude-501` component would false-positive on — caught and avoided):**
+- **Codex leg: LIVE**, real interactive session, now-trusted hooks, no bypass flag. Prompted to
+  create `codex_leg.txt`; all three hooks fired for real; `signal.jsonl`'s `stop` line carries
+  `files_written: [".../codex_leg.txt"]` and a stable `emitter_turn`.
+- **Claude leg: NOT live.** Driven by invoking `agentrec hook claude` directly with realistic
+  `UserPromptSubmit`/`Stop` JSON on stdin — exactly as Claude Code's own hooks would invoke it —
+  plus a real `claude_leg.txt` write in between so the daemon's fs watcher observes a genuine
+  mutation. Stated explicitly here because overstating this is exactly what this repo's history
+  punishes: **this is a direct-invocation leg, not a live Claude Code process.**
+- Resulting `log.jsonl`: one rich `codex` turn (prompt attached, `codex_leg.txt` mentioned nowhere
+  but its own signal), one rich `claude` turn (prompt attached, `claude_leg.txt` mentioned nowhere
+  but its own signal), plus two bare turns each holding exactly one file. `jq -c 'select(.tool==
+  "codex") | .files' log.jsonl` → `[]`; `jq -c 'select(.tool=="claude") | .files' log.jsonl` →
+  `[]`; `jq -c 'select(.grade=="bare") | .files[].path' log.jsonl` → `"codex_leg.txt"` then
+  `"claude_leg.txt"`. **Zero cross-attribution**: `codex_leg.txt` never appears under
+  `tool=="claude"`; `claude_leg.txt` never appears under `tool=="codex"`. `agentrec show <id>`
+  confirms both rich turns render the correct `tool` and prompt excerpt.
+- Legs run strictly sequentially (each `Stop` fully processed before the next `UserPromptSubmit`),
+  distinct filenames per leg — deliberate, because an open start/stop bracket suppresses
+  quiet-window closure and retroactively folds interim bare turns into the rich turn (PROTOCOL
+  bracketing), so an interleaved run could manufacture cross-attribution from the test's own
+  design rather than measure the real thing. **Only the sequential case was exercised; interleaved
+  multi-tool sessions are the pre-existing, already-disclosed D6 misattribution risk (README
+  threat model), not a new finding here.**
+
+**Disclosed, not new:** both rich turns rendered `files:[]`; each leg's actual file write landed
+in an immediately-following bare (unattributed) turn instead. This matches CLAUDE.md's own
+disclosure that the D6 `files_written` wedge's `resolve_declared` tier ladder "landed dark" (wired
+onto the wire, nothing yet consumes it to populate a turn's rendered `files` at persist time). It
+affects both tools identically, so it does not compromise the cross-attribution result above — a
+file in an unattributed bare turn is a different failure than a file under the wrong tool's rich
+turn, and the latter never happened.
+
+**OPEN, not claimed as passed:** the Claude leg is direct-invocation, not live, per the task's
+own acknowledged environment constraint (no nested interactive Claude Code session is possible
+here) — the Codex leg IS live throughout, hooks trusted through the genuine un-bypassed `/hooks`
+flow. Interleaved/concurrent two-tool sessions were not exercised. The subdirectory-launch cwd
+measurement used `codex exec`, not the TUI (no non-interactive way to re-launch per position
+without a fresh trust cycle each time) — recorded as a scope note in the writeup, since both
+surfaces read cwd via the same `std::env::current_dir()` call in the same binary.
+
+**Cleanup:** `tmux kill-session`; this round's own daemon process killed by PID. Pre-existing,
+unrelated `agentrec record` processes found running against `/var/folders/.../T/.tmp*` roots
+(started hours before this round, leftover from other work) were deliberately left untouched —
+out of scope. `launchctl`/`~/Library/LaunchAgents` re-checked after cleanup: unchanged from the
+Part-0 baseline.
+
+Plan's O5 exit criterion: **DONE, with the two disclosures above carried forward as OPEN, not
+silently closed** — the live/direct-invocation split on the Claude leg, and the confirmed
+subdirectory-cwd defect now escalated rather than papered over.

@@ -451,9 +451,9 @@ its complete test set — no "pending" rows remain.
 ## 5. v2 — The integration release (Codex, MCP, VS Code)
 
 ### O. Codex CLI capture
-1. `agentrec init --codex` merges a Stop hook into Codex's hook config (`hooks.json` or `[hooks]` in `config.toml`, whichever exists; `hooks.json` created if neither), idempotently, preserving unrelated hooks; malformed existing config aborts untouched (mirror of A5).
-2. Hook emits the standard signal line with `tool: "codex"` and the rollout path as `transcript`.
-3. Prompt extraction from rollout format (last user message, D7); scrubbed.
+1. `agentrec init --codex` merges three hooks — `UserPromptSubmit`, `PostToolUse` (matcher `apply_patch`), and `Stop` — into Codex's hook config (`hooks.json` or `[hooks]` in `config.toml`, whichever exists; `hooks.json` created if neither), idempotently, preserving unrelated hooks; malformed existing config aborts untouched (mirror of A5).
+2. `UserPromptSubmit` emits the standard start signal (`tool: "codex"`, rollout path as `transcript`). `PostToolUse` (`apply_patch`) emits no signal — it accumulates the turn's touched file paths, parsed from the patch-DSL `tool_input.command` (decision 17), into a per-turn scratch file keyed on Codex's own `turn_id`. `Stop` emits the stop signal, carrying the accumulated `files_written` list and `emitter_turn` (that same `turn_id` — confirmed live-stable across a `decision:"block"` continuation, Phase A spike).
+3. Prompt comes directly from the `UserPromptSubmit` payload's `prompt` field (confirmed live — Codex furnishes it on the hook payload itself; no rollout-file parsing is needed on the live-hook path, unlike Claude Code's transcript-based extraction). This is D7's primary-signal case, not its transcript-extraction fallback; scrubbed.
 4. `import codex` from `~/.codex/sessions/**/rollout-*.jsonl` with the full K-series AC applied (cwd mapping, idempotency, malformed-line tolerance, streaming, scrub).
 5. Neutrality proof test: one live session each of Claude Code and Codex on the same repo yields one `log.jsonl` with both tools attributed correctly and zero cross-attribution.
 

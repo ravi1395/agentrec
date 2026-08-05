@@ -34,7 +34,7 @@ Codex now ships a first-class lifecycle hook system — `Stop`, `UserPromptSubmi
 
 The integration is therefore a structural mirror of Claude Code's:
 
-- `agentrec init --codex` installs a `Stop` hook emitting the standard signal line with `tool: "codex"` and the rollout path as `transcript`.
+- `agentrec init --codex` installs three hooks — `UserPromptSubmit` (start signal), `PostToolUse` scoped to the `apply_patch` matcher (accumulates the turn's touched file paths from the patch-DSL text, no signal emitted), and `Stop` (stop signal, carrying the accumulated `files_written` and `emitter_turn` for decision-17 keying) — all `tool: "codex"`, the rollout path as `transcript`.
 - `agentrec import codex` backfills history from rollout files — same cold-start killer, second ecosystem.
 - MCP registration for Codex's MCP client config, so Codex agents get `blame`/`log`/`diff` (and gated `undo`) too.
 
