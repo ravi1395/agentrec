@@ -45,12 +45,18 @@ use std::path::{Path, PathBuf};
 /// of the crate root, so the root's private `ImportSource` is already
 /// visible here; no re-export needed).
 pub fn run(root: &Path, source: crate::ImportSource) -> Result<(), String> {
-    let crate::ImportSource::Claude {
-        dry_run,
-        source,
-        json,
-    } = source;
-    run_claude(root, dry_run, source, json)
+    match source {
+        crate::ImportSource::Claude {
+            dry_run,
+            source,
+            json,
+        } => run_claude(root, dry_run, source, json),
+        crate::ImportSource::Codex {
+            dry_run,
+            source,
+            json,
+        } => codex::run(root, dry_run, source, json),
+    }
 }
 
 fn run_claude(
@@ -148,7 +154,7 @@ fn run_claude(
             serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
         );
     } else {
-        print_text_report(&report);
+        print_text_report(&report, "claude");
     }
 
     // AC8: schema drift is surfaced loudly (stderr line above + named,
@@ -302,8 +308,13 @@ fn build_report(
     }
 }
 
-fn print_text_report(report: &ImportReport) {
-    println!("agentrec import claude --dry-run report");
+/// `label` names the importer ("claude" or "codex") in the header line only
+/// — every field below it is generic over both (Codex K-series reuses this
+/// verbatim, see `codex::run`, for AC-C4's "report keys match `import
+/// claude`'s report keys" requirement: same struct, same printer, only the
+/// header differs).
+fn print_text_report(report: &ImportReport, label: &str) {
+    println!("agentrec import {label} --dry-run report");
     println!("  sessions_total: {}", report.sessions_total);
     println!(
         "  sessions_importable: {} ({:.1}%)",
@@ -2527,6 +2538,814 @@ mod persist {
             .get("oldStart")?
             .as_u64()
             .map(|n| n as usize)
+    }
+}
+
+// ---- Codex import (K-series, Phase 2 tail C4) ------------------------------
+//
+// `agentrec import codex` streams Codex's own rollout transcript corpus,
+// `<source>/sessions/**/rollout-*.jsonl` (real default `~/.codex`, walked at
+// any depth rather than a hardcoded YYYY/MM/DD — the exact date-dir depth is
+// not a contract Codex documents, and `walkdir` costs nothing extra). Every
+// K-series AC (cwd mapping, idempotency via `existing_ids`/`run_ids`,
+// malformed-line tolerance, streaming, scrub reuse, `files_complete:
+// Some(false)`, `after_synthesized` honesty, fidelity report — no threshold
+// gate) is implemented the same way `import claude` implements it; the
+// `--dry-run` report reuses `ImportReport`/`TierCounts`/`MissingFieldCounts`
+// verbatim (same struct, same `build_report`/`print_text_report`) so the two
+// importers' report keys are identical by construction, not by convention.
+//
+// Corpus-shape grounding (real `~/.codex/sessions`, 616 rollout files,
+// measured 2026-08-05 on this machine — this repo's standing lesson is
+// "fixture-only evidence cannot close a corpus-shape claim", so every
+// decision below has a command behind it, not an inference from the docs):
+//   - `session_meta.id` / `session_meta.cwd` are present on the first line
+//     of every real file and never vary within a file (`turn_context.cwd`
+//     cross-checked identical to `session_meta.cwd` on 860/860 sampled
+//     `turn_context` lines, 0 diffs) — `cwd` is genuinely session-level here,
+//     simpler than Claude's "first line that carries one wins" ladder
+//     (Pinned decision 14), because Codex has no resumed-transcript shape
+//     that omits it.
+//   - File changes are NOT parsed from the `apply_patch` tool call's raw
+//     patch-DSL text (that text carries only diff hunks for updates, never a
+//     full file — the module doc's honesty section explains why this
+//     importer does not attempt to reconstruct `update` bytes from it).
+//     Instead this importer keys off `event_msg` type `patch_apply_end`
+//     (`success: bool`, `changes: {<abs path>: {type: "add"|"update"|
+//     "delete", content?, unified_diff?, move_path?}}`) — a **structured,
+//     already-verified** per-file signal Codex itself emits after applying a
+//     patch. Measured: 726 `apply_patch` tool calls, 1421 `patch_apply_end`
+//     events (a patch call commonly touches >1 file), `success` was `true`
+//     on 1421/1421 observed — `success` is still checked defensively before
+//     any `changes` entry is trusted, since a false value has never been
+//     observed, not because one can't occur (18 of 726 real `apply_patch`
+//     calls in this same corpus verification-FAILED before ever reaching a
+//     `patch_apply_end` line at all — see "Coverage rider" below).
+//   - `changes[path].type == "add"` carries `content`: the FULL new file,
+//     real/observed (Codex's own recorded post-write bytes) — never
+//     synthesized. `changes[path].type == "delete"` ALSO carries `content`:
+//     the FULL pre-deletion file, likewise real/observed. Both map to T1
+//     (before OR after bytes known with certainty from the transcript
+//     itself, no derivation).
+//   - `changes[path].type == "update"` carries only `unified_diff` — hunks
+//     with real line numbers, but never a full file on either side. There is
+//     no `originalFile`/backup-snapshot mechanism in Codex's rollout format
+//     the way Claude's file-history snapshots give T1.5 — reconstructing
+//     full before/after bytes from a diff requires already having ONE full
+//     side, which this transcript never provides. **This importer does not
+//     attempt it**: `update` entries are persisted with `before: None`,
+//     `after: None`, `baseline_unknown: true`, and (necessarily, since
+//     nothing is ever derived) `after_synthesized` is never set to `Some(true)`
+//     by this importer — there is no derived-`after` case to mark honest
+//     about; the honest statement is simply that no `after` exists to
+//     misread as observed. `dry-run`'s tier report still classifies `update`
+//     entries `t2_candidate` (git-tracked) vs `t3` (not), matching Claude's
+//     "detect-only" T2 dry-run posture — cheap (`git ls-files` cache, never
+//     `git show`) and gives a real forward-looking recoverability signal,
+//     even though this importer never resolves the blob.
+//   - `t1_5` (and every `t15_*` sub-counter) is **structurally unreachable
+//     for Codex, not merely measured zero** — no code path in this module
+//     ever increments it. It stays in the shared `TierCounts`/`Counters`
+//     wire shape purely for report-key parity with `import claude`.
+//     Likewise `skipped_sidechain` (Codex has no sidechain/subagent-file
+//     concept in this format) and `skipped_missing_field.tool_use_result`
+//     (no analogous nested-field-drift shape exists here) are always 0 by
+//     construction.
+//   - `event_msg` type `user_message` (`payload.message`, the literal typed
+//     prompt) is the turn-boundary signal — same "genuine user-authored
+//     line starts a new turn" judgment call `import claude` makes
+//     (`is_genuine_user_prompt`), and the same caveat applies: over-segments
+//     turns in edge cases, never mis-resolves a file entry's own bytes.
+//   - Coverage rider (this importer's analogue of P1's "99.6% is an
+//     ingestion rate, never a recovery rate" honesty note, NEVER to be
+//     quoted without it): file mutations Codex performs via `exec`/
+//     `exec_command`-family shell tool calls (redirects, `sed -i`, heredocs)
+//     are invisible to this importer — only `apply_patch`-driven changes are
+//     recovered. And within `apply_patch` itself, a call whose verification
+//     fails produces no `patch_apply_end` event and is invisible to every
+//     counter here (neither tiered nor counted `opaque_calls`) — measured on
+//     this same corpus: 18 of 726 real `apply_patch` calls (2.5%) had no
+//     corresponding `patch_apply_end`. `opaque_calls` here counts every
+//     non-`apply_patch` tool call (`exec`, `wait`, `update_plan`, ...),
+//     mirroring Claude's "a tool call happened, no file to tier" bucket.
+
+mod codex {
+    use super::*;
+
+    /// `~/.codex` — mirrors `default_source_for_home` exactly (Claude's
+    /// version is not reused: it's two lines, and reusing it would mean
+    /// threading a directory-name parameter through tested Claude code for
+    /// no benefit — see the parallel note on `deterministic_turn_id` below).
+    fn default_source_for_home_codex(home: &str) -> PathBuf {
+        PathBuf::from(home).join(".codex")
+    }
+
+    fn default_codex_source() -> Result<PathBuf, String> {
+        match std::env::var("HOME") {
+            Ok(home) if !home.is_empty() => Ok(default_source_for_home_codex(&home)),
+            _ => Err(
+                "import codex: cannot resolve default --source (~/.codex) — $HOME \
+                 is not set; pass --source explicitly"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Every `<source>/sessions/**/rollout-*.jsonl` file, sorted for
+    /// deterministic scan order (mirrors Claude's `dirs.sort()` /
+    /// `session_files.sort()` — matters for `run_ids` collision resolution
+    /// below: which copy "wins" is lexical order, not richness).
+    fn find_rollout_files(sessions_dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = walkdir::WalkDir::new(sessions_dir)
+            .into_iter()
+            .flatten()
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("rollout-") && n.ends_with(".jsonl")
+                    })
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    pub fn run(
+        root: &Path,
+        dry_run: bool,
+        source: Option<PathBuf>,
+        json: bool,
+    ) -> Result<(), String> {
+        if !dry_run {
+            return persist::run(root, source, json);
+        }
+
+        let src = match source {
+            Some(s) => s,
+            None => default_codex_source()?,
+        };
+        if !src.is_dir() {
+            return Err(format!(
+                "import codex: --source '{}' is not a directory (does it exist?)",
+                src.display()
+            ));
+        }
+        let sessions_dir = src.join("sessions");
+        if !sessions_dir.is_dir() {
+            return Err(format!(
+                "import codex: --source '{}' has no 'sessions' subdirectory — expected \
+                 Codex's transcript layout (<source>/sessions/YYYY/MM/DD/rollout-*.jsonl)",
+                src.display()
+            ));
+        }
+
+        let mut counters = Counters::default();
+        let mut debug = DebugSink::new(debug_dump_entries_enabled());
+        let mut git_cache = GitTrackCache::default();
+
+        for file in find_rollout_files(&sessions_dir) {
+            counters.sessions_total += 1;
+            scan_session_file(&file, root, &mut counters, &mut debug, &mut git_cache);
+        }
+
+        let peak_rss_mb = peak_rss_mb();
+        let report = build_report(&counters, peak_rss_mb, debug.entries);
+
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+        } else {
+            print_text_report(&report, "codex");
+        }
+        Ok(())
+    }
+
+    fn scan_session_file(
+        path: &Path,
+        root: &Path,
+        counters: &mut Counters,
+        debug: &mut DebugSink,
+        git_cache: &mut GitTrackCache,
+    ) {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                counters.skipped_io_error += 1;
+                eprintln!(
+                    "agentrec: import codex: warning: failed to open session file \
+                     '{}': {e} (counted in sessions_total, never importable)",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let session_file_label = path.display().to_string();
+
+        let mut any_line_parsed = false;
+        let mut session_cwd: Option<PathBuf> = None;
+        let mut session_opaque = 0usize;
+        let mut session_entries = 0usize;
+
+        each_raw_line(file, |outcome| {
+            let line = match outcome {
+                LineOutcome::Line(s) => s,
+                LineOutcome::NonUtf8 => {
+                    counters.skipped_non_utf8_line += 1;
+                    return;
+                }
+            };
+            if line.trim().is_empty() {
+                return;
+            }
+            let value: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => {
+                    counters.skipped_malformed_line += 1;
+                    return;
+                }
+            };
+            any_line_parsed = true;
+
+            let outer_type = value.get("type").and_then(|v| v.as_str());
+
+            // Session-level `cwd`, first sighting wins (`session_meta` is
+            // the primary source; `turn_context` is a same-value fallback —
+            // see module doc, 0/860 measured diffs).
+            if session_cwd.is_none() && matches!(outer_type, Some("session_meta" | "turn_context"))
+            {
+                if let Some(cwd) = value.pointer("/payload/cwd").and_then(|v| v.as_str()) {
+                    session_cwd = Some(PathBuf::from(cwd));
+                }
+            }
+
+            match outer_type {
+                Some("event_msg") => {
+                    let sub = value.pointer("/payload/type").and_then(|v| v.as_str());
+                    if sub == Some("patch_apply_end") {
+                        if value.pointer("/payload/success").and_then(|v| v.as_bool()) != Some(true)
+                        {
+                            return;
+                        }
+                        let Some(changes) = value
+                            .pointer("/payload/changes")
+                            .and_then(|v| v.as_object())
+                        else {
+                            return;
+                        };
+                        for (abs_path, change) in changes {
+                            session_entries += 1;
+                            classify_codex_change(
+                                abs_path,
+                                change,
+                                session_cwd.as_deref(),
+                                &session_file_label,
+                                counters,
+                                debug,
+                                git_cache,
+                            );
+                        }
+                    }
+                }
+                Some("response_item") => {
+                    let sub = value.pointer("/payload/type").and_then(|v| v.as_str());
+                    if matches!(sub, Some("function_call" | "custom_tool_call")) {
+                        let name = value.pointer("/payload/name").and_then(|v| v.as_str());
+                        if name != Some("apply_patch") {
+                            counters.opaque_calls += 1;
+                            session_opaque += 1;
+                            session_entries += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        if any_line_parsed && session_cwd.is_none() {
+            counters.skipped_missing_cwd += 1;
+        } else if any_line_parsed {
+            counters.sessions_importable += 1;
+        }
+
+        if let Some(cwd) = &session_cwd {
+            if path_is_under_root(cwd, root) {
+                counters.sessions_in_root += 1;
+            }
+        }
+
+        let session_fraction = if session_entries == 0 {
+            0.0
+        } else {
+            session_opaque as f64 / session_entries as f64
+        };
+        counters.opaque_share_sum += session_fraction;
+    }
+
+    /// Dry-run tier classification for one `changes[path]` entry — mirrors
+    /// Claude's `classify_file_entry`/`classify_t2_or_t3` posture (detect
+    /// candidacy only for `update`, never read a git blob here; that only
+    /// happens in `persist::resolve_codex_file_entry`).
+    fn classify_codex_change(
+        abs_path: &str,
+        change: &Value,
+        session_cwd: Option<&Path>,
+        session_file_label: &str,
+        counters: &mut Counters,
+        debug: &mut DebugSink,
+        git_cache: &mut GitTrackCache,
+    ) {
+        if agentrec_core::scrub::is_secret_path(abs_path) {
+            counters.skipped_secret_path += 1;
+            debug.push(session_file_label, abs_path, "secret_path", None);
+            return;
+        }
+        match change.get("type").and_then(|v| v.as_str()) {
+            Some("add") => {
+                counters.t1 += 1;
+                let hash = change
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_hash_prefix(&hash_bytes(c.as_bytes())));
+                debug.push(session_file_label, abs_path, "t1", hash);
+            }
+            Some("delete") => {
+                counters.t1 += 1;
+                let hash = change
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_hash_prefix(&hash_bytes(c.as_bytes())));
+                debug.push(session_file_label, abs_path, "t1", hash);
+            }
+            Some("update") => {
+                let tracked = session_cwd.is_some_and(|cwd| git_cache.is_tracked(cwd, abs_path));
+                if tracked {
+                    counters.t2_candidate += 1;
+                    debug.push(session_file_label, abs_path, "t2_candidate", None);
+                } else {
+                    counters.t3 += 1;
+                    debug.push(session_file_label, abs_path, "t3", None);
+                }
+            }
+            _ => {
+                // Unrecognized/future `changes[path].type` — never observed
+                // live (module doc). Treated conservatively as unresolved
+                // rather than guessed at.
+                counters.t3 += 1;
+                debug.push(session_file_label, abs_path, "t3", None);
+            }
+        }
+    }
+
+    // ---- P2-equivalent: persistence (`agentrec import codex`, no
+    // `--dry-run`) --------------------------------------------------------
+    mod persist {
+        use super::*;
+        use agentrec_core::record::{skip_reason, FileEntry, LogRecord, TurnRecord};
+        use agentrec_core::store::{BlobStore, PutResult};
+
+        pub fn run(root: &Path, source: Option<PathBuf>, json: bool) -> Result<(), String> {
+            let src = match source {
+                Some(s) => s,
+                None => default_codex_source()?,
+            };
+            if !src.is_dir() {
+                return Err(format!(
+                    "import codex: --source '{}' is not a directory (does it exist?)",
+                    src.display()
+                ));
+            }
+            let sessions_dir = src.join("sessions");
+            if !sessions_dir.is_dir() {
+                return Err(format!(
+                    "import codex: --source '{}' has no 'sessions' subdirectory — expected \
+                     Codex's transcript layout (<source>/sessions/YYYY/MM/DD/rollout-*.jsonl)",
+                    src.display()
+                ));
+            }
+
+            let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+            let log_path = crate::log_path(root);
+            let existing_ids: HashSet<String> = agentrec_core::record::load_log(&log_path)
+                .into_iter()
+                .filter_map(|r| match r {
+                    LogRecord::Turn(t) => Some(t.id),
+                    LogRecord::Epoch(_) => None,
+                })
+                .collect();
+
+            let store = BlobStore::new(crate::objects_dir(root));
+
+            let mut appended = 0usize;
+            // Same shape as Claude's `run_ids`/`skipped_duplicate_turn_id`
+            // (see `importcmd.rs`'s comment on that field): ids are
+            // `hash(session_id:turn_index)`, so two rollout files that
+            // somehow carry the same `session_meta.id` mint identical ids.
+            // `existing_ids` (prior runs) stays a SILENT skip; an intra-run
+            // collision is COUNTED, never silently dropped.
+            let mut run_ids: HashSet<String> = HashSet::new();
+            let mut skipped_duplicate_turn_id = 0usize;
+            let mut skipped_out_of_root = 0usize;
+
+            for file in find_rollout_files(&sessions_dir) {
+                let records =
+                    persist_session_file(&file, &root_canon, &store, &mut skipped_out_of_root);
+                for record in records {
+                    if let LogRecord::Turn(t) = &record {
+                        if existing_ids.contains(&t.id) {
+                            continue; // idempotent resume/re-run
+                        }
+                        if !run_ids.insert(t.id.clone()) {
+                            skipped_duplicate_turn_id += 1;
+                            continue;
+                        }
+                    }
+                    crate::loglock::append_log_locked(&log_path, &record)?;
+                    appended += 1;
+                }
+            }
+
+            if json {
+                let obj = serde_json::json!({
+                    "appended": appended,
+                    "skipped_duplicate_turn_id": skipped_duplicate_turn_id,
+                    "skipped_out_of_root": skipped_out_of_root,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("appended: {appended}");
+                println!("skipped_duplicate_turn_id: {skipped_duplicate_turn_id}");
+                println!("skipped_out_of_root: {skipped_out_of_root}");
+            }
+            Ok(())
+        }
+
+        struct PendingTurn {
+            turn_index: usize,
+            prompt_raw: Option<String>,
+            started: Option<String>,
+            ended: Option<String>,
+            files: Vec<FileEntry>,
+        }
+
+        impl PendingTurn {
+            fn new(turn_index: usize) -> Self {
+                PendingTurn {
+                    turn_index,
+                    prompt_raw: None,
+                    started: None,
+                    ended: None,
+                    files: Vec::new(),
+                }
+            }
+
+            fn touch_ts(&mut self, ts: &str) {
+                if self.started.as_deref().is_none_or(|s| ts < s) {
+                    self.started = Some(ts.to_string());
+                }
+                if self.ended.as_deref().is_none_or(|e| ts > e) {
+                    self.ended = Some(ts.to_string());
+                }
+            }
+        }
+
+        /// Deliberately duplicated from Claude's `persist::deterministic_
+        /// turn_id` rather than shared across modules (that function is
+        /// private to a sibling module, and this repo's convention — see
+        /// `default_source_for_home_codex` above — is a tiny, obviously-
+        /// identical duplicate over threading visibility through tested
+        /// Claude code for a 4-line function). Formula is IDENTICAL per the
+        /// K-series constraint: `hash(session_id:turn_index)` only, never
+        /// wall-clock or a process-local counter, so a resumed/interrupted
+        /// run mints byte-identical ids to an uninterrupted one.
+        fn deterministic_turn_id(session_id: &str, turn_index: usize) -> String {
+            let hash =
+                agentrec_core::store::hash_bytes(format!("{session_id}:{turn_index}").as_bytes());
+            let hex = hash.strip_prefix("sha256:").unwrap_or(&hash);
+            format!("t_imp_{}", &hex[..26.min(hex.len())])
+        }
+
+        fn persist_session_file(
+            path: &Path,
+            root_canon: &Path,
+            store: &BlobStore,
+            skipped_out_of_root: &mut usize,
+        ) -> Vec<LogRecord> {
+            let Ok(file) = File::open(path) else {
+                return vec![];
+            };
+
+            let mut session_cwd: Option<PathBuf> = None;
+            let mut session_id: Option<String> = None;
+            let mut turn_index = 0usize;
+            let mut cur = PendingTurn::new(0);
+            let mut finished: Vec<PendingTurn> = Vec::new();
+
+            each_raw_line(file, |outcome| {
+                let line = match outcome {
+                    LineOutcome::Line(s) => s,
+                    LineOutcome::NonUtf8 => return,
+                };
+                if line.trim().is_empty() {
+                    return;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    return;
+                };
+
+                let outer_type = value.get("type").and_then(|v| v.as_str());
+                let line_ts = value.get("timestamp").and_then(|v| v.as_str());
+
+                if session_id.is_none() && outer_type == Some("session_meta") {
+                    session_id = value
+                        .pointer("/payload/id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                if session_cwd.is_none()
+                    && matches!(outer_type, Some("session_meta" | "turn_context"))
+                {
+                    if let Some(cwd) = value.pointer("/payload/cwd").and_then(|v| v.as_str()) {
+                        session_cwd = Some(PathBuf::from(cwd));
+                    }
+                }
+
+                if outer_type == Some("event_msg") {
+                    let sub = value.pointer("/payload/type").and_then(|v| v.as_str());
+                    match sub {
+                        Some("user_message") => {
+                            let text = value
+                                .pointer("/payload/message")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty());
+                            if let Some(text) = text {
+                                if cur.prompt_raw.is_some() || !cur.files.is_empty() {
+                                    turn_index += 1;
+                                    finished.push(std::mem::replace(
+                                        &mut cur,
+                                        PendingTurn::new(turn_index),
+                                    ));
+                                }
+                                cur.prompt_raw = Some(text.to_string());
+                                if let Some(ts) = line_ts {
+                                    cur.touch_ts(ts);
+                                }
+                            }
+                        }
+                        Some("patch_apply_end") => {
+                            if value.pointer("/payload/success").and_then(|v| v.as_bool())
+                                != Some(true)
+                            {
+                                return;
+                            }
+                            let Some(changes) = value
+                                .pointer("/payload/changes")
+                                .and_then(|v| v.as_object())
+                            else {
+                                return;
+                            };
+                            for (abs_path, change) in changes {
+                                if let Some(ts) = line_ts {
+                                    cur.touch_ts(ts);
+                                }
+                                if let Some(entry) = resolve_codex_file_entry(
+                                    abs_path,
+                                    change,
+                                    session_cwd.as_deref(),
+                                    root_canon,
+                                    store,
+                                    skipped_out_of_root,
+                                ) {
+                                    cur.files.push(entry);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            if cur.prompt_raw.is_some() || !cur.files.is_empty() {
+                finished.push(cur);
+            }
+
+            let Some(cwd) = session_cwd else {
+                return vec![];
+            };
+            let Ok(cwd_canon) = fs::canonicalize(&cwd) else {
+                return vec![];
+            };
+            if !cwd_canon.starts_with(root_canon) {
+                return vec![]; // out of scope for this repo
+            }
+            let Some(sid) = session_id else {
+                return vec![];
+            };
+
+            let mut out = Vec::new();
+            for t in finished {
+                if t.files.is_empty() {
+                    continue;
+                }
+                let id = deterministic_turn_id(&sid, t.turn_index);
+                let (prompt_ref, prompt_excerpt) = match &t.prompt_raw {
+                    Some(text) => {
+                        let excerpt = agentrec_core::scrub::excerpt(text);
+                        let full = agentrec_core::scrub::scrub(text);
+                        let prompt_ref = match store.put_result(full.as_bytes()) {
+                            PutResult::Stored { hash, .. } => Some(hash),
+                            PutResult::OverCap | PutResult::IoError(_) => None,
+                        };
+                        (prompt_ref, Some(excerpt))
+                    }
+                    None => (None, None),
+                };
+                let started = t
+                    .started
+                    .clone()
+                    .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+                let ended = t.ended.clone().unwrap_or_else(|| started.clone());
+                out.push(LogRecord::Turn(TurnRecord {
+                    v: 1,
+                    id,
+                    grade: "rich".to_string(),
+                    truncated: false,
+                    started,
+                    ended,
+                    tool: Some("codex".to_string()),
+                    model: None,
+                    session: Some(sid.clone()),
+                    root: root_canon.to_string_lossy().to_string(),
+                    prompt_ref,
+                    prompt_excerpt,
+                    merges: vec![],
+                    imported: Some(true),
+                    files_complete: Some(false),
+                    files: t.files,
+                }));
+            }
+            out
+        }
+
+        /// The persist-time before/after resolution for one
+        /// `changes[path]` entry (module doc has the full honesty
+        /// argument): `add`/`delete` carry real, observed full-file
+        /// `content` from Codex itself — never derived, so
+        /// `after_synthesized` is never set on any entry this function
+        /// returns. `update` carries only a diff, which is never enough to
+        /// derive a full file without an already-known side — persisted
+        /// with `before: None`, `after: None`, `baseline_unknown: true`,
+        /// same "never fabricate" posture Claude's T2/T1.5 gates enforce.
+        fn resolve_codex_file_entry(
+            abs_path: &str,
+            change: &Value,
+            session_cwd: Option<&Path>,
+            root_canon: &Path,
+            store: &BlobStore,
+            skipped_out_of_root: &mut usize,
+        ) -> Option<FileEntry> {
+            // `abs_path` (from the transcript) and `root_canon` (from
+            // `--root`) are not guaranteed to have gone through the same
+            // symlink resolution (e.g. macOS `/var/folders` ->
+            // `/private/var/folders`) — comparing them directly fails
+            // whenever `--root` sits behind a symlinked path segment, even
+            // though the two names the SAME directory. Route `abs_path`
+            // through `session_cwd` and canonicalize THAT, mirroring
+            // Claude's `classify_and_resolve` fix for the identical bug
+            // class, so both sides of the final `strip_prefix` went through
+            // the same resolution.
+            let rel_to_cwd = session_cwd.and_then(|cwd| Path::new(abs_path).strip_prefix(cwd).ok());
+            let abs = match (rel_to_cwd, session_cwd) {
+                (Some(rel_to_cwd), Some(cwd)) => match fs::canonicalize(cwd) {
+                    Ok(cwd_canon) => lexical_normalize(&cwd_canon.join(rel_to_cwd)),
+                    Err(_) => lexical_normalize(Path::new(abs_path)),
+                },
+                _ => lexical_normalize(Path::new(abs_path)),
+            };
+            let rel = match abs.strip_prefix(root_canon) {
+                Ok(r) if !r.as_os_str().is_empty() => r.to_string_lossy().into_owned(),
+                _ => {
+                    *skipped_out_of_root += 1;
+                    return None;
+                }
+            };
+
+            if agentrec_core::scrub::is_secret_path(&rel) {
+                let op = match change.get("type").and_then(|v| v.as_str()) {
+                    Some("add") => "create",
+                    Some("delete") => "delete",
+                    _ => "modify",
+                };
+                return Some(FileEntry {
+                    path: rel,
+                    before: None,
+                    after: None,
+                    op: op.to_string(),
+                    skipped: false,
+                    withheld: true,
+                    baseline_unknown: false,
+                    skipped_reason: None,
+                    after_synthesized: None,
+                    link_kind: None,
+                    attribution: None,
+                });
+            }
+
+            let (before_bytes, after_bytes, op, baseline_unknown): (
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                &str,
+                bool,
+            ) = match change.get("type").and_then(|v| v.as_str()) {
+                Some("add") => {
+                    let content = change.get("content").and_then(|v| v.as_str());
+                    (
+                        None,
+                        content.map(|c| c.as_bytes().to_vec()),
+                        "create",
+                        false,
+                    )
+                }
+                Some("delete") => {
+                    let content = change.get("content").and_then(|v| v.as_str());
+                    let known = content.is_some();
+                    (
+                        content.map(|c| c.as_bytes().to_vec()),
+                        None,
+                        "delete",
+                        !known,
+                    )
+                }
+                Some("update") => (None, None, "modify", true),
+                // Unrecognized `changes[path].type` — never observed live
+                // (module doc). Refuse rather than guess an op.
+                _ => return None,
+            };
+
+            let mut skipped = false;
+            let mut skipped_reason: Option<String> = None;
+            let mut before_ref: Option<String> = None;
+            let mut after_ref: Option<String> = None;
+
+            if let Some(b) = &before_bytes {
+                match store.put_result(b) {
+                    PutResult::Stored { hash, .. } => before_ref = Some(hash),
+                    PutResult::OverCap => {
+                        skipped = true;
+                        skipped_reason = Some(skip_reason::OVER_CAP.to_string());
+                    }
+                    PutResult::IoError(_) => {
+                        skipped = true;
+                        skipped_reason = Some(skip_reason::IO_FAILED.to_string());
+                    }
+                }
+            }
+            if !skipped {
+                if let Some(a) = &after_bytes {
+                    match store.put_result(a) {
+                        PutResult::Stored { hash, .. } => after_ref = Some(hash),
+                        PutResult::OverCap => {
+                            skipped = true;
+                            skipped_reason = Some(skip_reason::OVER_CAP.to_string());
+                        }
+                        PutResult::IoError(_) => {
+                            skipped = true;
+                            skipped_reason = Some(skip_reason::IO_FAILED.to_string());
+                        }
+                    }
+                }
+            }
+            if skipped {
+                before_ref = None;
+                after_ref = None;
+            }
+
+            Some(FileEntry {
+                path: rel,
+                before: before_ref,
+                after: after_ref,
+                op: op.to_string(),
+                skipped,
+                withheld: false,
+                // `update`'s before is unknown by construction; `delete`
+                // without `content` (never observed live, but the field is
+                // `Option` on the wire) is likewise unknown.
+                baseline_unknown,
+                skipped_reason,
+                // Never `Some(true)`: this importer only ever writes real,
+                // observed bytes (`add`/`delete` `content`) or nothing —
+                // see module doc.
+                after_synthesized: None,
+                link_kind: None,
+                attribution: None,
+            })
+        }
     }
 }
 

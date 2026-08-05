@@ -1148,3 +1148,121 @@ reader doesn't assume silence means "confirmed absent."
 
 Closes here — all 5 Phase A exit criteria met, no founder escalation triggered, Phase C's
 decision-17 keying assumption is upheld by live measurement rather than inference.
+
+## Task C4 — `agentrec import codex` (2026-08-05, `feat/phase-2-tail` worktree)
+
+K-series: streams Codex's `<source>/sessions/YYYY/MM/DD/rollout-*.jsonl` corpus (default
+`~/.codex`), same `--dry-run`/persist split as `import claude`. Files:
+`cli/src/importcmd.rs` (`mod codex`, new), `cli/src/main.rs` (`ImportSource::Codex` arm — shared
+file, only these lines are C4's), `cli/tests/import_codex.rs` (new, 14 tests, all green),
+`cli/tests/fixtures/import/codex/*` (new, synthetic fixtures grounded in the corpus-shape
+measurements below), `docs/fixtures/codex/rollout-add-sample-redacted.jsonl` (new — one genuine
+redacted rollout excerpt, real Position.java `add`, used by
+`real_redacted_rollout_dry_run_report_keys_match_claude` so at least one test is not
+fixture-only evidence, per this repo's standing lesson).
+
+**Real-corpus grounding (616 rollout files, this machine, measured 2026-08-05, commands behind
+every number — this is what decided the design, not an inference from Codex's docs):**
+- `session_meta.id`/`session_meta.cwd` present on line 1 of every file, `turn_context.cwd`
+  cross-checked identical on 860/860 sampled lines (0 diffs) — `cwd` is genuinely session-level,
+  no Claude-style "first line that carries one" ladder needed.
+- File changes are NOT parsed from the `apply_patch` tool call's raw patch-DSL text (that text
+  carries only diff hunks for updates, never a full file). Instead this importer keys off
+  `event_msg` type `patch_apply_end` — a structured, Codex-verified per-file signal
+  (`success: bool`, `changes: {<abs path>: {type, content?, unified_diff?, move_path?}}`).
+  Measured: 726 `apply_patch` calls, 1421 `patch_apply_end` events, `success` true on 1421/1421
+  observed (checked defensively anyway — never trust `changes` when `success != true`). 18 of 726
+  real `apply_patch` calls (2.5%) verification-FAILED before any `patch_apply_end` fired at all
+  (a completely different failure shape: `"apply_patch verification failed: ..."`, no exit code
+  at all) — invisible to every counter in this importer (a coverage rider, see below), and pinned
+  by the `failed_patch_apply_is_never_trusted` test using that exact real failure shape.
+- `changes[path].type == "add"` AND `"delete"` both carry `content` — the FULL new file (add) or
+  FULL pre-deletion file (delete), real/observed, never derived. Both map to T1 ("before or after
+  bytes known with certainty from the transcript itself"). `changes[path].type == "update"` carries
+  only `unified_diff` (hunks, real line numbers, never a full file either side) — **this importer
+  does not attempt to reconstruct `update` before/after bytes** (advisor-directed descope: no AC
+  requires it, and Codex's rollout format has no snapshot/backup mechanism analogous to Claude's
+  `trackedFileBackups` that would let it be done without fabrication risk). `update` entries are
+  persisted with `before: None`, `after: None`, `baseline_unknown: true` (the same field the live
+  daemon uses for "existed before we could see it" — `agentrec-core/src/daemon.rs`/`view.rs`) —
+  never dropped, since a "we know it changed but not to what" entry is still real information, and
+  never silently equivalent to a null-content file.
+- `t1_5` (and every `t15_*` sub-counter) is structurally unreachable, not merely measured
+  zero — no code path increments it (no per-edit snapshot mechanism exists in this format).
+  `skipped_sidechain` and `skipped_missing_field.tool_use_result` are likewise always 0 by
+  construction (no analogous concept in Codex's rollout shape). Kept in the wire report purely
+  for AC-C4's report-key-parity requirement — the shared `ImportReport`/`TierCounts` struct is
+  reused verbatim (same struct = same JSON, not "keys happen to match").
+
+**Real-corpus `--dry-run` run** (`cargo run --release -p agentrec -- import codex --dry-run --root
+~/Projects/agentrec`, release binary, this machine, 2026-08-05):
+```
+sessions_total: 616
+sessions_importable: 616 (100.0%)
+sessions_in_root: 36
+tier_counts: t1=382 t1_5=0 t2_candidate=1139 t3=431
+opaque_calls: 15000
+mean_opaque_share_pct: 68.32
+skipped_secret_path: 0 / skipped_sidechain: 0 / skipped_malformed_line: 0
+skipped_non_utf8_line: 0 / skipped_io_error: 0
+skipped_missing_field: cwd=0 tool_use_result=0
+peak_rss_mb: 31.59
+```
+**Coverage rider (Codex's analogue of P1's "99.6% is an ingestion rate, never a recovery rate" —
+never quote the numbers above without it):** this importer only recovers `apply_patch`-driven
+changes with a successful `patch_apply_end`. File mutations via `exec`/`exec_command`-family shell
+calls (redirects, `sed -i`, heredocs — a real and common Codex pattern, not a hypothetical) are
+completely invisible to it; `opaque_calls: 15000` on this corpus is dominated by exactly this
+population, not idle/no-op tool calls. No threshold gate is attached to any of these figures per
+plan decision 8 — report only, exactly as instructed.
+
+**Test baseline:** 806 → **842 passed / 0 failed / 3 ignored** on `cargo test --workspace --
+--test-threads=3` (parallel `feat/phase-2-tail` C3 work landed concurrently in the same run; the
+14 new tests here are `cli/tests/import_codex.rs`, all green, run in isolation and as part of the
+full suite). `cargo clippy --workspace --all-targets [--release] -- -D warnings` clean; `cargo
+fmt --check` clean on `cli/src/importcmd.rs` and `cli/tests/import_codex.rs` specifically (ran
+targeted `rustfmt`, not workspace-wide `cargo fmt`, to avoid touching C3's in-flight files —
+residual fmt drift in `doctorcmd.rs`/`initcmd.rs`/`uninstallcmd.rs`/`integration.rs` is C3's, not
+this task's). `cargo build --release --locked -p agentrec` succeeds; `AGENTREC_IMPORT_DEBUG_ENTRIES`
+(the existing debug seam, reused rather than minting a Codex-specific one) absent from release
+`strings`.
+
+**Real defect found and fixed by testing against a real tempdir root (not by inspection):** the
+first `resolve_codex_file_entry` implementation compared a raw transcript `abs_path` directly
+against a canonicalized `--root` — on macOS, `tempfile::tempdir()` roots live behind
+`/var/folders` -> `/private/var/folders` symlinks, so every persist test failed with
+`skipped_out_of_root: 1`, `appended: 0`. Fixed by routing the path through `session_cwd`,
+canonicalizing THAT, then rejoining — the exact same fix `import claude`'s own
+`classify_and_resolve` doc comment already documents for the identical bug class. Caught by
+`same_session_reimport_appends_zero` and `intra_run_duplicate_session_id_...` both failing with
+`appended: 0` on a first run (should never happen when a session file legitimately touches its own
+cwd) rather than by reasoning about the code.
+
+**Turn-id derivation:** `hash(session_id:turn_index)`, identical formula to `import claude`
+(duplicated as a tiny 4-line function, not shared across sibling modules — same posture as the
+duplicated `default_source_for_home`, deliberate per "diff ∝ request" over threading `pub(super)`
+visibility through tested Claude code). `session_id` = `session_meta.id` (first line, 616/616
+files carry exactly one). `turn_index` = a local counter incremented on each `event_msg
+user_message` boundary (mirrors Claude's `is_genuine_user_prompt` turn-boundary judgment call).
+**No new id-derivation rule was invented and none was needed** — nothing about Codex's rollout
+shape required deviating from the pinned formula.
+
+**No new wire/protocol field was added.** `FileEntry`'s existing `baseline_unknown` field is used
+for `update` entries exactly as its doc comment already describes it, not repurposed.
+
+**Not done, disclosed rather than silently skipped:**
+- `update` before/after byte reconstruction (see grounding notes above) — the highest-effort,
+  least-mandated piece per the advisor consult that shaped this task's scope; not built.
+- No fallback path when a `patch_apply_end` event never fires for an `apply_patch` call (verified
+  or interrupted) — such an attempt is invisible to every counter, not merely uncounted-but-flagged.
+- `Move to:`/`move_path` (rename) semantics: `move_path` was `null` on all 1952 real `changes`
+  entries sampled — never exercised live, so this importer makes no attempt to represent a rename
+  as anything other than independent per-path entries (which is what the `changes` map already
+  gives it).
+- Real corpus persist run: NOT executed against the live dogfood repos this machine's real Codex
+  sessions are rooted in (`~/Projects/agentrec`, `~/Projects/sutra`, etc.) — that would write real
+  turns into those repos' production `.agentrec/log.jsonl`, which this task has no mandate to do.
+  Persist correctness against real corpus *shapes* is covered by 7 integration tests built from
+  real-measured field structures (including the symlink defect above, only findable by actually
+  running persist against a real filesystem); the `--dry-run` real-corpus run (this task's explicit
+  verification step) covers the full 616-file real corpus.

@@ -1,0 +1,2 @@
+{"timestamp":"2026-06-01T00:00:00.000Z","type":"session_meta","payload":{"id":"f6666666-6666-4666-8666-666666666666","originator":"Codex CLI","cli_version":"0.146.0"}}
+{"timestamp":"2026-06-01T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello","images":[],"local_images":[],"text_elements":[]}}

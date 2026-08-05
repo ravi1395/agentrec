@@ -45,6 +45,13 @@ enum Command {
         /// Skip agent hook installation (bare-turn capture only).
         #[arg(long)]
         no_hook: bool,
+        /// Also install Codex's three lifecycle hooks (UserPromptSubmit,
+        /// PostToolUse[apply_patch], Stop) into `.codex/hooks.json` or an
+        /// existing inline `[hooks]` table in `.codex/config.toml`. Off by
+        /// default — unlike Claude Code, Codex integration is opt-in
+        /// (IMPLEMENTATION.md 454).
+        #[arg(long)]
+        codex: bool,
         /// Skip writing/loading the per-repo service unit (launchd/systemd).
         #[arg(long)]
         no_service: bool,
@@ -323,7 +330,7 @@ enum Command {
         reason: Option<String>,
     },
     /// Import history from another agent tool's transcript store (Claude
-    /// Code only). `--dry-run` classifies and reports without writing;
+    /// Code or Codex). `--dry-run` classifies and reports without writing;
     /// omitting it persists imported turns into this repo's `log.jsonl`,
     /// scoped to sessions whose `cwd` resolves under `--root`.
     Import {
@@ -353,6 +360,25 @@ enum ImportSource {
         #[arg(long)]
         json: bool,
     },
+    /// Classify (and, without `--dry-run`, persist) Codex's
+    /// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl transcript corpus
+    /// (K-series, Phase 2 tail C4). `--dry-run` is read-only classification
+    /// only; omitting it persists imported turns into `log.jsonl` for
+    /// sessions in scope of `--root` — idempotent and safe to interrupt,
+    /// same contract as `import claude`.
+    Codex {
+        /// Read-only classify-and-report mode — no writes. Omit to persist
+        /// imported turns into this repo's `log.jsonl`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Corpus root containing a `sessions/` dir (mirrors the real
+        /// `~/.codex` layout). Defaults to `~/.codex`.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Emit the machine-readable report instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -364,10 +390,11 @@ fn main() {
     let result = match cli.command {
         Command::Init {
             no_hook,
+            codex,
             no_service,
             service,
             dry_run,
-        } => initcmd::run(&root, no_hook, no_service, service, dry_run),
+        } => initcmd::run(&root, no_hook, codex, no_service, service, dry_run),
         Command::Record => daemon::run(&root),
         Command::Log {
             all,
