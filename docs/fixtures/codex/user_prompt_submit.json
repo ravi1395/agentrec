@@ -1,0 +1,10 @@
+{
+  "session_id": "019fd1b4-aa34-7721-8d1d-fb198c45ecd6",
+  "turn_id": "019fd1b4-aa71-7a41-a9b2-fa189d8689e8",
+  "transcript_path": "/REDACTED/codex-home/sessions/2026/08/05/rollout-2026-08-05T12-35-06-019fd1b4-aa34-7721-8d1d-fb198c45ecd6.jsonl",
+  "cwd": "/REDACTED/scratch-repo",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-5.6-terra",
+  "permission_mode": "bypassPermissions",
+  "prompt": "Say hello. Do not run any commands or edit any files."
+}

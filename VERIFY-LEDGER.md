@@ -1070,3 +1070,75 @@ that end-to-end test; check `launchctl print gui/$(id -u)/com.agentrec.bfa6bde6e
 The posture change means the **next `agentrec init` in `~/Projects/agentrec` rewrites and
 reloads the live dogfood unit** (`service::install` rewrites on content difference). Harmless in
 principle; flagged because that daemon is production evidence infrastructure.
+
+## Phase A — Codex hook spike (2026-08-05, `feat/phase-2-tail` worktree)
+
+Live-probe gate on `docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md` Phase A, before any
+Codex-emitter production code (Phase C) is written. Pinned Codex CLI: **`codex-cli 0.146.0`**
+(`/opt/homebrew/bin/codex`, Homebrew cask, confirmed via both `codex --version` and `codex
+doctor`). All work in a disposable scratch git repo under `scratchpad/`, isolated `CODEX_HOME`
+(only `auth.json` copied), never the agentrec repo or the user's real `~/.codex`. Full writeup,
+raw terminal transcripts, and field-inventory table: `docs/verify/codex-spike.md`. Redacted
+fixtures for all three required events (+2 bonus continuation-pair fixtures):
+`docs/fixtures/codex/*.json`, all `jq .`-valid.
+
+**Exit criteria 1–5 (plan Phase A), status:**
+1. Pinned version recorded here + `INTEGRATIONS.md` (Codex CLI section) — **DONE**.
+2. Redacted fixtures for all three events + field-inventory table — **DONE**
+   (`docs/fixtures/codex/`, table in `docs/verify/codex-spike.md`).
+3. Trust-flow writeup incl. hash-re-review on a changed command field AND a changed non-command
+   field — **DONE**, both tested independently and live via the real `/hooks` TUI (driven through
+   `tmux`, which — unlike a bare `expect` pty — answers the Ratatui terminal-capability queries
+   the TUI blocks on at startup).
+4. Continuation-semantics answers — **DONE**, see finding below.
+5. This row — **DONE**.
+
+**Headline finding — NOT a blocker.** The plan's scariest-unknown question (Phase A probe 5) was
+whether `turn_id` is stable across a `Stop`-hook `decision:"block"` continuation, since decision
+17's file-accumulator is keyed on `turn_id`. **Measured twice, independently: `turn_id` is
+STABLE** across the block-continuation (identical value on both `Stop` firings), `stop_hook_active`
+flips `false`→`true` exactly as documented, and `UserPromptSubmit` does **not** re-fire for the
+synthetic continuation prompt. This is the opposite of the plan's feared outcome — the
+pre-authorized founder-escalation contingency ("if `turn_id` proves UNSTABLE ... go back to the
+founder before Phase C") is **not triggered**. Phase C's drain-by-`turn_id` keying is sound as
+designed.
+
+**Other confirmed-live findings feeding Phase B/C directly:**
+- `PostToolUse` (`apply_patch`) `tool_input.command` is the raw patch-DSL text, not a structured
+  file list — confirmed the path-extraction rule must regex `^\*\*\* (Add|Update|Delete) File:
+  (.+)$` over that string. One firing = one `apply_patch` call, which can bundle several file
+  operations in one patch (observed 3 ops in one firing) — the accumulator must union across
+  potentially several `PostToolUse` firings per turn, not assume one-to-one.
+- Trust is **per-hook**, keyed on the parsed hook definition (not per-file, not per-session), and
+  **ANY** field change — command or non-command (`timeout` tested) — revokes trust for exactly
+  that hook while leaving untouched sibling hooks trusted; reverting to a previously-approved
+  definition silently restores trust with no re-review. C3's byte-stability requirement is
+  therefore load-bearing exactly as the plan assumed.
+- `hooks.json` + inline `[hooks]` in the same config layer **does** merge (not override) and
+  **does** print the documented startup warning verbatim, both in `codex exec`'s plain transcript
+  and inside the `/hooks` browser's "Issues" line.
+- **Silent-skip gap, not in the docs:** `codex exec` (non-interactive) with an untrusted
+  repo-local `hooks.json` and no `--dangerously-bypass-hook-trust` produces **zero** warning
+  anywhere in stdout/stderr — the documented "prints a warning" behavior is TUI-only. CI/automation
+  relying on stderr to notice an untrusted-hook config will see nothing; `--dangerously-bypass-
+  hook-trust` (confirmed live, exact flag name matches docs) is the correct automation answer, not
+  a fallback warning.
+- `Stop` fires on normal turn end; does **not** fire on a `SIGINT` mid-tool-call interrupt of
+  `codex exec` (`turn interrupted`, exit 1, no `Stop`); does **not** fire on `/clear` (the
+  abandoned session gets no `Stop`, a fresh `session_id`/`turn_id` starts on the next prompt).
+  `SubagentStop` not exercised (out of this round's effort budget).
+- `Stop` (and by extension `SubagentStop`) genuinely rejects non-empty non-JSON stdout
+  (`Stop Failed` in the transcript, session still completes normally) while **empty** stdout is
+  treated as success — the emitter's "write nothing on success" design (C2) is confirmed correct,
+  not merely assumed.
+
+**Not probed, stated explicitly rather than inferred:** `PreToolUse`, `PermissionRequest`,
+`SessionStart`/`SessionEnd` payload shapes (only `/clear`'s side effects were observed, not the
+`SessionStart` event itself — no `SessionStart` hook was wired this round), `PreCompact`/
+`PostCompact`, managed/enterprise/plugin-bundled hooks, Windows command variants, and interactive-
+TUI Ctrl-C specifically (only process-level `SIGINT` against `codex exec` was tested for the
+interrupt probe). None of these were required by the plan's exit criteria; listed so a later
+reader doesn't assume silence means "confirmed absent."
+
+Closes here — all 5 Phase A exit criteria met, no founder escalation triggered, Phase C's
+decision-17 keying assumption is upheld by live measurement rather than inference.

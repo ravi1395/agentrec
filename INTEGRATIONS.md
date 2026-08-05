@@ -40,6 +40,11 @@ The integration is therefore a structural mirror of Claude Code's:
 
 Conformance: **L2**. Strategic weight: one `signal.jsonl` containing both `claude-code` and `codex` lines is the screenshot that makes the "open standard" claim credible — nobody believes a standard with one emitter.
 
+**Pinned minimum version (live-verified, 2026-08-05):** `codex-cli 0.146.0` — the hook payload
+shapes, trust flow, and continuation semantics this integration is built against were captured
+live against this exact pinned binary, not inferred from docs. Full spike writeup:
+`docs/verify/codex-spike.md`; ledger row: `VERIFY-LEDGER.md` § "Phase A — Codex hook spike".
+
 References: [Codex hooks](https://developers.openai.com/codex/hooks), [advanced config / notify](https://developers.openai.com/codex/config-advanced), [session storage](https://codex.danielvaughan.com/2026/06/02/codex-cli-session-archiving-lifecycle-management-v0136/).
 
 ### 3. VS Code — the first render surface

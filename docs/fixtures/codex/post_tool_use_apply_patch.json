@@ -1,0 +1,15 @@
+{
+  "session_id": "019fd1b5-83e9-7300-bc21-b79f709bb12c",
+  "turn_id": "019fd1b5-8445-7f91-b3bf-2d5092cd1e3c",
+  "transcript_path": "/REDACTED/codex-home/sessions/2026/08/05/rollout-2026-08-05T12-36-01-019fd1b5-83e9-7300-bc21-b79f709bb12c.jsonl",
+  "cwd": "/REDACTED/scratch-repo",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-5.6-terra",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "apply_patch",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: hello.txt\n@@\n+line two\n*** Add File: second.txt\n+second file\n*** Add File: to_delete.txt\n+delete me\n*** End Patch"
+  },
+  "tool_response": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA second.txt\nA to_delete.txt\nM hello.txt\n",
+  "tool_use_id": "exec-a0f73985-ff11-49ae-972b-e700f8a5896f"
+}
