@@ -1082,6 +1082,12 @@ raw terminal transcripts, and field-inventory table: `docs/verify/codex-spike.md
 fixtures for all three required events (+2 bonus continuation-pair fixtures):
 `docs/fixtures/codex/*.json`, all `jq .`-valid.
 
+**Execution-branch baseline (global constraint: re-measure at start, never trust a stale count):**
+`cargo test --workspace -- --test-threads=3` on `feat/phase-2-tail` @ `64f2bcf` (forked from
+`origin/main` @ `dd4238f`) → **751 passed / 0 failed / 3 ignored**. Matches `main`'s last
+recorded figure (`fix/import-existing-ids-staleness` merge) — no drift since fork. This is the
+number every later phase in this branch diffs against.
+
 **Exit criteria 1–5 (plan Phase A), status:**
 1. Pinned version recorded here + `INTEGRATIONS.md` (Codex CLI section) — **DONE**.
 2. Redacted fixtures for all three events + field-inventory table — **DONE**
