@@ -696,3 +696,44 @@ fn execute_keeps_its_mode_gate_and_its_argument_channel() {
     );
     assert!(!auto.join(".agentrec/undo-requests.jsonl").exists());
 }
+
+/// Re-gate round 4 blocker: the FIFO hang was only HALF fixed by the
+/// planner-side `inode_refusal`, because `claim_grant` runs its drift loop
+/// through `read_current_hash` BEFORE it ever calls `build_plan`. A target
+/// swapped for a fifo between preview and execute therefore blocked in
+/// `std::fs::read` with the gate never reached — killing the single-threaded
+/// stdio MCP loop for that whole session. `agentrec approve` shares
+/// `claim_grant` and was exposed identically.
+///
+/// The fix guards the PRIMITIVE (`read_current_hash` lstats first), so this
+/// test pins the leg the planner cannot protect. Like the unit-level fifo
+/// test, a regression makes this HANG rather than fail — which is why the
+/// harness-level timeout matters more here than the assertion.
+#[test]
+#[cfg(unix)]
+fn a_fifo_swapped_in_after_the_preview_refuses_instead_of_hanging() {
+    let root = root_with_mode("auto");
+    seed(&root, vec![revertible(&root, "a.rs")]);
+    let token = issue_token(&root);
+
+    // Swap the previewed regular file for a fifo — the shape that hung.
+    std::fs::remove_file(root.join("a.rs")).unwrap();
+    let c = std::ffi::CString::new(root.join("a.rs").as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+
+    let (code, msg) = domain(&execute(&root, &token));
+    assert_eq!(
+        code, "preview_stale",
+        "a fifo must read as drift, not block: {msg}"
+    );
+    assert!(undo_turns(&root).is_empty(), "nothing may be written");
+    assert_eq!(
+        rows_of(&root, EVENT_CONSUME),
+        0,
+        "an aborted execute must not spend the token"
+    );
+}

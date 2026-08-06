@@ -1965,7 +1965,37 @@ pub fn build_plan(
 /// compare", which only ever makes the modified-since check MORE cautious
 /// (a spurious `None` looks like a legitimate delete-target, not a bypass).
 pub fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
-    std::fs::read(root.join(rel)).ok().map(|b| hash_bytes(&b))
+    let abs = root.join(rel);
+    // lstat BEFORE the read, and refuse to read anything that is not a
+    // regular file. This is a fix to the PRIMITIVE, not to a call site,
+    // because the call sites are not all downstream of the planner: the
+    // planner's own [`inode_refusal`] cannot protect `claim_grant`, which
+    // runs its drift loop through this function BEFORE it ever calls
+    // [`build_plan`]. `std::fs::read` on a FIFO BLOCKS until a writer
+    // appears, so a target swapped for a fifo between preview and execute
+    // hung the process here — the single-threaded stdio MCP loop dies for
+    // that whole session (branch review re-gate round 4; `agentrec approve`
+    // shares `claim_grant` and was exposed identically). Guarding the
+    // primitive means every present and future caller inherits it.
+    //
+    // A non-regular file yielding `None` reads downstream as "no content to
+    // compare", i.e. as drift — which surfaces as a clean `preview_stale`
+    // refusal instead of a hang. That is the same direction the doc below
+    // already describes for an unreadable path, so no caller learns a new
+    // shape. Symlinks are included: this returns `None` for them rather than
+    // the pointed-to file's hash, which only makes the "a symlink is always
+    // modified-since" property (pinned by
+    // `undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified`)
+    // hold more strongly, and the entry is `symlink_refusal`'s to reject
+    // either way.
+    #[cfg(unix)]
+    {
+        let meta = std::fs::symlink_metadata(&abs).ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+    }
+    std::fs::read(&abs).ok().map(|b| hash_bytes(&b))
 }
 
 /// True when `path` is itself a symbolic link. `symlink_metadata` is an
