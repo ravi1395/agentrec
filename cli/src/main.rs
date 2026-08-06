@@ -10,6 +10,7 @@ mod hookcmds;
 mod importcmd;
 mod initcmd;
 mod loglock;
+mod mcpcmd;
 mod memlock;
 mod memorycmds;
 mod noise;
@@ -329,6 +330,12 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Serve this repository's read tools to an MCP host over stdio
+    /// (newline-delimited JSON-RPC 2.0). Long-lived: the host spawns it and
+    /// speaks on stdin/stdout. Reads are file-based, so it works with the
+    /// recorder daemon stopped. Config is read once at startup — changing
+    /// `mcp_destructive` requires a restart.
+    Mcp,
     /// Import history from another agent tool's transcript store (Claude
     /// Code or Codex). `--dry-run` classifies and reports without writing;
     /// omitting it persists imported turns into this repo's `log.jsonl`,
@@ -436,6 +443,27 @@ fn resolve_hook_root(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
     discover_agentrec_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
+/// Root resolution for the `mcp` subcommand. Same discovery RULE as the hook
+/// path — an explicit `--root` wins outright, otherwise walk up from cwd via
+/// [`discover_agentrec_root`] — deliberately reusing that one function rather
+/// than adding a second rule. An MCP host spawns the server with cwd set to
+/// whatever it considers the workspace, which O5 measured is not reliably the
+/// repo root.
+///
+/// The FAILURE POSTURE differs from [`resolve_hook_root`], which is why this
+/// is its own wrapper rather than a shared one: the hook path is pinned
+/// fail-open by INV-M4 and falls back to cwd, but a long-lived read server
+/// that silently answers against a non-repo would report an empty history
+/// forever. Discovery failure here resolves to cwd only so that
+/// `mcpcmd::run`'s startup precondition can name the offending directory in
+/// its hard error.
+fn resolve_mcp_root(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit.to_path_buf();
+    }
+    discover_agentrec_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
 fn main() {
     let cli = Cli::parse();
     let explicit_root = cli.root.clone();
@@ -534,6 +562,10 @@ fn main() {
             replace_pin,
         } => memorycmds::verify(&root, &id, confirm, &drop_pin, &replace_pin),
         Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
+        Command::Mcp => {
+            let mcp_root = resolve_mcp_root(explicit_root.as_deref(), &root);
+            mcpcmd::run(&mcp_root)
+        }
         Command::Import { source } => importcmd::run(&root, source),
     };
     if let Err(message) = result {
