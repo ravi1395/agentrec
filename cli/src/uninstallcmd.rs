@@ -63,10 +63,13 @@ pub fn run(root: &Path, no_service: bool) -> Result<(), String> {
 }
 
 /// Remove only agentrec's own hook entries (matched by [`HOOK_MARKER`]) from
-/// `UserPromptSubmit`/`Stop`, preserving unrelated hooks and every other key
-/// byte-compatibly (no rewrite at all when nothing changes). Now-empty event
-/// arrays and an empty `hooks` object are dropped tidily. Returns whether
-/// anything changed.
+/// `UserPromptSubmit`/`Stop`, preserving unrelated hooks and every other key.
+/// Nothing is rewritten at all when nothing changes — that path IS
+/// byte-preserving. When something does change the file is re-serialized
+/// whole, so survivors survive as parsed values, not as bytes (keys re-sort,
+/// `to_string_pretty` reformats): the same caveat as
+/// `initcmd::install_mcp_json`. Now-empty event arrays and an empty `hooks`
+/// object are dropped tidily. Returns whether anything changed.
 fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
     let path = root.join(".claude").join("settings.local.json");
     let Ok(text) = fs::read_to_string(&path) else {
@@ -740,22 +743,30 @@ mod tests {
 
     /// AC-E4 round trip: a foreign server pre-seeded in BOTH registries
     /// survives `init` + `uninstall` untouched, while our own entry is added
-    /// and then removed. `.mcp.json` is asserted BYTE-identical across the
-    /// round trip; `.codex/config.toml` is asserted parsed-value-identical,
-    /// because the `toml` crate round-trip reformats the whole file (an
-    /// existing, documented property of `install_codex_hooks_toml` that this
-    /// path inherits — byte-identity there would be a false claim).
+    /// and then removed. BOTH files are asserted parsed-value-identical, not
+    /// byte-identical: each is re-serialized whole when we write it, so keys
+    /// re-sort and formatting normalizes (`serde_json`'s `Map` is a
+    /// `BTreeMap` + `to_string_pretty`; the `toml` crate reformats the same
+    /// way, an existing documented property of `install_codex_hooks_toml`
+    /// that path inherits). Byte-identity would be a false claim on either.
+    /// The `.mcp.json` fixture is seeded out of alphabetical order and
+    /// compact so that the reordering is inside the test's reach — under a
+    /// canonically seeded fixture even the old byte assertion passed.
     #[test]
     fn init_uninstall_round_trip_leaves_foreign_mcp_registrations_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".codex")).unwrap();
 
-        let json_before = serde_json::to_string_pretty(&serde_json::json!({
-            "mcpServers": {"other": {"command": "other-tool", "args": ["serve"]}}
-        }))
-        .unwrap();
-        fs::write(crate::initcmd::mcp_json_path(root), &json_before).unwrap();
+        // Seeded in NON-canonical form on purpose: keys out of alphabetical
+        // order and compact (not pretty). A canonically seeded fixture would
+        // pass a byte assertion for the wrong reason — it cannot observe the
+        // `BTreeMap` re-sort and the `to_string_pretty` reformat that
+        // `install_mcp_json` actually performs.
+        let json_before = "{\"zzz_note\":\"keep me\",\
+                           \"mcpServers\":{\"other\":{\"command\":\"other-tool\",\"args\":[\"serve\"]}},\
+                           \"aaa_note\":\"keep me too\"}";
+        fs::write(crate::initcmd::mcp_json_path(root), json_before).unwrap();
         fs::write(
             codex_config_toml_path(root),
             "[mcp_servers.other]\ncommand = \"other-tool\"\nargs = [\"serve\"]\n",
@@ -787,10 +798,13 @@ mod tests {
             McpRegState::Absent
         );
 
+        let json_after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(crate::initcmd::mcp_json_path(root)).unwrap())
+                .unwrap();
         assert_eq!(
-            fs::read_to_string(crate::initcmd::mcp_json_path(root)).unwrap(),
-            json_before,
-            ".mcp.json must return to its pre-init bytes"
+            json_after,
+            serde_json::from_str::<serde_json::Value>(json_before).unwrap(),
+            ".mcp.json must return to its pre-init parsed value"
         );
         let toml_after: toml::Table = fs::read_to_string(codex_config_toml_path(root))
             .unwrap()

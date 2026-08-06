@@ -1799,7 +1799,31 @@ sentence is the thing out of date.
   WHOLE `.codex/config.toml` through the `toml` crate, so a user's comments and key ordering
   are lost on a file they did not ask to have reformatted. Same documented limitation as
   `install_codex_hooks_toml` (fixing it needs `toml_edit`, a new dependency). Disclosed by
-  the printed action line; not silent.
+  the printed action line; not silent. **`.mcp.json` reformats the same way** (post-review
+  correction — this bullet previously read as Codex-only): `install_mcp_json`/`remove_mcp_json`
+  re-serialize whole through `serde_json`, whose `Map` is a `BTreeMap` here, so keys re-sort
+  alphabetically and `to_string_pretty` normalizes layout. Foreign entries survive as parsed
+  values, never as bytes. Its printed action line carries no equivalent disclosure — recorded,
+  and deliberately NOT added (a new user-facing line is a behavior change nobody asked for).
+- **Declared `cursor` type is narrower than the implementation, and narrower than the only
+  cursor a client can hold — found by the P.7 F1 schema sweep, recorded NOT fixed.**
+  `agentrec_log`/`agentrec_diff`/`agentrec_recall` all declare
+  `"cursor": {"type": "string"}`, but `Page::next` serializes `view::Cursor` as a JSON
+  OBJECT (parity with `--json` forbids stringifying it), and `mcpcmd::cursor_arg`
+  deliberately accepts both shapes. A host that validates `tools/call` arguments against
+  the advertised schema would therefore reject the obvious move — lifting `next` verbatim
+  out of the page it just read. Widening the declared type is a wire-contract decision the
+  review did not mandate and is founder-owned; the descriptions ("Opaque cursor from a
+  previous page") are accurate as written. This is the one further schema/implementation
+  mismatch the F1 sweep turned up; the four non-diff tools' parameter *descriptions* are
+  accurate (`log.limit` and `recall.k` both clamp, `log.include_hidden` names both halves
+  of `include_all`, `blame.line` matches, `status` takes no parameters).
+- **`uninstall` aborts on an unparseable registration file before service removal and
+  `.agentrec/` archival.** An invalid `.mcp.json` (or `.codex/config.toml`) returns `Err` and
+  ends the run early. Pre-existing pattern — `remove_claude_hooks` aborts identically — and
+  extended by E4 to the two registration files; `init`'s counterpart degrades gracefully
+  ("MCP registration skipped: {e}" as an action line). Tested in neither direction. Changing
+  the ordering, or making uninstall degrade like init, is founder-owned.
 - The sweep script is committed `100755` but every caller invokes it as
   `bash scripts/mcp-demand-sweep.sh` (test and docs both), matching the `check-versions.sh`
   precedent — nothing depends on git's recording mode.

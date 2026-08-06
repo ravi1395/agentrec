@@ -1220,8 +1220,15 @@ pub(crate) fn codex_mcp_state(root: &Path) -> Result<McpRegState, String> {
 }
 
 /// Merge `mcpServers.agentrec` into `.mcp.json`. Foreign entry under our key →
-/// no write at all. Every other key (and every other server) is preserved
-/// byte-compatibly: the file is only rewritten when we actually add our entry.
+/// no write at all, and no rewrite happens on any path where we add nothing.
+///
+/// When we DO write, every other key (and every other server) survives as a
+/// PARSED VALUE, not as bytes: the file is re-serialized whole through
+/// `serde_json`, whose `Map` is a `BTreeMap` here (no `preserve_order`
+/// feature), so keys come back alphabetically ordered and
+/// `to_string_pretty` normalizes the formatting. Same caveat as
+/// [`install_codex_mcp`]; parsed-value identity is the strongest true claim
+/// on this path and is what the round-trip test asserts.
 pub(crate) fn install_mcp_json(root: &Path) -> Result<McpRegOutcome, String> {
     let path = mcp_json_path(root);
     match mcp_json_state(root)? {
@@ -1272,8 +1279,9 @@ pub(crate) fn install_mcp_json(root: &Path) -> Result<McpRegOutcome, String> {
 /// `install_codex_hooks_toml`: comments and key ordering are NOT preserved
 /// (adding `toml_edit` would be a new dependency). Foreign servers therefore
 /// survive as PARSED VALUES, not as bytes — the round-trip test asserts
-/// parsed-value identity on this path and byte identity on the `.mcp.json`
-/// path, which is the strongest true statement available here.
+/// parsed-value identity here, and the same on the `.mcp.json` path, which
+/// re-serializes whole for its own reasons (see [`install_mcp_json`]). That
+/// is the strongest true statement available on either path.
 pub(crate) fn install_codex_mcp(root: &Path) -> Result<McpRegOutcome, String> {
     let path = codex_config_toml_path(root);
     match codex_mcp_state(root)? {

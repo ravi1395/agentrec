@@ -126,13 +126,14 @@ const READ_TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "agentrec_diff",
-        description: "Unified diff of one recorded turn's file changes, with per-file \
-                      metadata and a pagination cursor when the diff exceeds the line bound.",
+        description: "One recorded turn's file changes as raw before/after content per file \
+                      — not rendered diff hunks — with per-file metadata and a pagination \
+                      cursor when the payload exceeds the content-line bound.",
         properties: || {
             json!({
                 "turn": {"type": "string", "description": "Turn id, full or an unambiguous prefix."},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Restrict the diff to these repo-relative paths."},
-                "limit": {"type": "integer", "minimum": 1, "description": "Maximum diff lines to return (server-bounded)."},
+                "limit": {"type": "integer", "minimum": 1, "description": "Payload budget in content lines — the before/after blob lines each admitted file entry carries, NOT rendered unified-diff lines. Spent by admitting whole file entries; one entry is always admitted, so a single oversized file can exceed it. Server-bounded."},
                 "cursor": {"type": "string", "description": "Opaque cursor from a previous page."}
             })
         },
@@ -277,8 +278,17 @@ pub fn run(root: &Path) -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for line in stdin.lock().lines() {
-        // A read error on stdin (host went away mid-frame) ends the session
-        // the same way EOF does: graceful shutdown, exit 0.
+        // A read error on stdin ends the session the same way EOF does:
+        // graceful shutdown, exit 0. Two causes reach here, not one — the
+        // host went away mid-frame, OR a live host sent bytes that are not
+        // valid UTF-8 (`BufRead::lines` errors on those). Neither is
+        // recoverable framing: the stream position is no longer known.
+        //
+        // There is deliberately NO line-length bound: an unterminated frame
+        // allocates without limit. Accepted, not overlooked — this is a
+        // stdio server with exactly one client, the host process that spawned
+        // it, and that host also controls the input; a bound here would only
+        // constrain a party already able to exhaust us by other means.
         let Ok(line) = line else { break };
         if let Some(response) = handle_line(&mut server, &line) {
             // Each response is written AND FLUSHED before the next line is
