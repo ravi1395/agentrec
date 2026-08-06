@@ -2361,3 +2361,62 @@ grep: 0.
 - `main`'s published v0.2.0 CLI carries the unfixed primitive; this branch's fix lands in
   shared core so merging carries it to the CLI too, but whether the published version warrants
   a security note is a founder call. No Linux leg has run this branch's HEAD.
+
+### Re-gate round 3 — GATE PASS on scope, plus a FIFO that hung the process
+
+The round-3 re-gate **PASSED** both subjects it was called on, on evidence it generated
+itself: it rebuilt the hardlink exploit in its own repo (both legs refuse, `token issued:
+False`, victim byte-unchanged) and — better than the orchestrator's mutation probe — ran an
+`nlink == 1` control with IDENTICAL content, identical record shape, same directory:
+`plain.txt` got `token issued: True`, `hard.txt` got the hardlink refusal. The link count is
+the only difference between them, so nothing incidental is doing the refusing. MINOR 2 was
+confirmed working on a live attack path, and the ledger's race distinction (swap-before-
+`claim_grant` caught; `build_plan`→`fs::write` window open) was independently verified rather
+than taken on the orchestrator's word.
+
+**Its hunt for a fourth shape succeeded again — MAJOR 1, fixed at `ca94cdd`.**
+
+**A FIFO target HUNG the process, because the hardlink gate SKIPPED what it should have
+REFUSED.** `inode_refusal`'s predecessor guarded on `meta.file_type().is_file()`, so a
+non-regular file fell through the gate entirely rather than being refused, and nothing
+downstream checks file type. `fs::read` on a fifo blocks until a writer appears. Measured by
+the gate: `agentrec undo --confirm` hung until killed at 30 s; MCP `preview` returned ZERO
+frames with the process still alive at 20 s. The MCP server is a single-threaded stdio loop,
+so this is not one failed call — it kills the whole agent-facing surface for that session.
+`mkfifo` needs no privileges and creating one is a write INSIDE cwd, so the sandboxed-agent
+precondition is identical to every escape shape above. **Availability, not an out-of-root
+write** — which is why the gate scored it MAJOR, not BLOCKER, and why it still blocked merge.
+
+**The fix is one inverted guard, and the inversion IS the lesson:** the branch now reads
+"refuse unless it is a regular file", never "skip unless it is a regular file". The skipping
+form is what let the class through, and it looked correct while doing so. The same branch
+closes NOTE 2 — a directory recorded as a `modify` entry was rendered as a performable
+`revert  adir (modify)` and then failed at execution with `Is a directory (os error 21)`, a
+plan promising an action it could not take. `hardlink_refusal` is renamed `inode_refusal`: it
+now carries two distinct refusals, both inode-level facts no path check can express.
+
+**A symlink returns `None` from this gate DELIBERATELY** and falls through to
+`symlink_refusal`, whose distinct wording that gate's own tests assert; stealing it would make
+those tests pass for the wrong reason. Pinned by a test named for that intent
+(`inode_gate_leaves_symlinks_to_the_symlink_gate`). An absent path also returns `None` —
+`create` reverts and delete-restores legitimately target paths that do not exist.
+
+**Evidence, all run:** live fifo probe against the release binary — CLI leg refuses and
+returns promptly (checked with an 8 s liveness poll that would have reported `STILL HUNG`),
+MCP leg returns `files: []`, the non-regular-file refusal, `token issued: False`, within a
+10 s poll. Suite **999 / 0 / 4** (996 + 3). Clippy `-D warnings` `--all-targets` debug AND
+release, `cargo fmt --check`: clean. Release-seam grep: 0. The fifo test would **HANG rather
+than fail** on a regression, which makes it self-enforcing.
+
+**NOTE 3 — the daemon's FIFO exposure: PROBED, and the result is PARTIAL. Do not read it as a
+clean bill of health.** The gate flagged this as potentially worse than the MCP case (silent
+loss of recording) and explicitly did not test it. Measured here: a live `agentrec record`
+daemon on a scratch repo, `mkfifo watched.pipe` in the watched tree, then an ordinary mutation
+afterwards. The daemon **stayed alive and kept recording** — 2 turns, `after.txt` (the
+post-fifo mutation) present. **But `watched.pipe` never entered a turn at all**, which means
+the snapshot READ path was never exercised on it, so this probe does NOT establish that the
+daemon survives reading a fifo — only that creating one in the watched tree neither hung it
+nor stopped recording. `daemon.rs`'s snapshot loop guards `is_symlink` and `is_dir` but has NO
+regular-file check, so the exposure is plausible on inspection and unrefuted. Forcing the read
+path needs a writer on the other end of the fifo, which was not attempted. **Open, and outside
+the undo surface this round fixed.**
