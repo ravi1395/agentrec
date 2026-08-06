@@ -68,11 +68,40 @@ carries only current state, what's next, and standing debts.
   its defect "latent" — **measured FALSE** (`ecd09bc`): Claude inherits the launch dir too, so
   that defect was real and live. claimd gap **founder-waived** (`baeee84`): nothing in Phase C
   is claim-attested. Suite 762→866/0/3.
-  **Next: Phase D (Protocol 1.0 freeze) — BLOCKED on three founder decisions, see
-  `HANDOFF.md`: ratify the D7 offline-drop posture as 1.0-acceptable, ratify the
-  bracket-timing race as §4-compatible, accept that the catch-provenance question rests
-  permanently unresolved. The freeze is a ONE-WAY DOOR; both findings are assessed
-  §4-compatible but that assessment is what needs ratifying, not assuming.**
+  **Phase D (Protocol 1.0 freeze) GATE PASS @ `8d8e1db` (Fable, 10/10 ACs).** D0 landed the
+  D7 dropped-signal count on the epoch-start record (decision 51) first as a durable marker;
+  the freeze commit then stamped `PROTOCOL.md` **1.0 (frozen 2026-08-06)** with 29 conformance
+  fixtures (`docs/fixtures/conformance/{valid,tolerated,invalid}` + manifest test
+  `cli/tests/conformance.rs`). Founder review of the freeze diff is asserted in `8d8e1db`'s
+  commit message; **no ledger row records it** (provenance noted at plan exit — founder
+  attestation welcome). Suite 866→876/0/4.
+  **Phase E (MCP read 2.2) GATE PASS @ `d5b3deb` (E-commits `f48b519`/`75ae1de`/`d851408`/
+  `f4a96c3`).** `agentrec mcp`: stdio JSON-RPC server, five read tools; `diff`/`blame`
+  payloads byte-equal to `--json` (parity-pinned), `log` returns typed `Page<TurnSummary>`
+  (P4b decision 12), `recall` returns `RecallPage` (delta 14). PROTOCOL delta across the
+  whole phase = exactly the additive §8 `agentrec_status` row (first post-freeze additive
+  change). Suite 876→926/0/4. Residuals: no real MCP host has spoken to the server yet;
+  Codex repo-local `mcp_servers` honoring unconfirmed.
+  **Phase F (MCP destructive 2.3) GATE PASS @ `670fba3` — 4 rounds; rounds 2–3 failed on
+  RECORD defects only, never code.** F1 mode gating + matrix (`e264d7c` fixed §8
+  `allow_modified` text first — delta 15); F2 `UndoCoordinator` preview + path reservations;
+  F3 confirm-mode request ledger + `agentrec approve`/deny (D23 10-min expiry); F4 auto-mode
+  two-phase tokened execute (spend-before-write, crash matrix); F5 `origin` cli/mcp
+  discriminator (delta 11). Finding 11(b) fix `e32d247` (mid-revert failure-path persistence
+  surfaced + fault injection). **Blocker closures:** self-healing E2E run LIVE on the release
+  binary (`d8c69e3`, `docs/verify/f-exit-self-healing.md` — confirm + auto legs, token-hash
+  cryptographic tie, teardown 5→5; agent identity simulated via hook emitter, disclosed);
+  finding 13 (unbounded `undo-requests.jsonl`) recorded `78fbc36`. Gate-round-2/3 record
+  fixes `64f6b68`/`670fba3`: false `reserve`+`approve` join corrected to `request`+`execute`;
+  false flake name `hook_kill_9_closes_open_epoch` provenance-pinned (never existed — real
+  recorded flake is `approve.rs::a_killed_approve_never_leaves_a_phantom_approval`, 1/26 and
+  2/~14, disposition founder-owned); seam-sentence over-claim fixed. Suite **987/0/4**
+  (measured 4×), clippy debug+release + fmt clean, release-seam grep zero hits.
+  **Standing debts (recorded, founder-owned):** coordinator-layer `allow_modified` is
+  downgrade-with-warning, not refusal — §8's refusal exists only at the transport rail;
+  `undo-requests.jsonl` unbounded (reclaim needs a decision-register entry); Phase D founder
+  review unledgered; kill-9 flake disposition.
+  **Next: plan-exit checklist (in progress), then merge vehicle for `feat/phase-2-tail`.**
   **O5 Phase C exit criterion re-run LIVE (2026-08-05):** the prior round's Claude leg was
   direct hook-invocation, not a live process — closed by a genuine `claude -p` session (both
   legs re-driven live, one `log.jsonl`, zero jq-scoped cross-attribution). Along the way it
@@ -98,10 +127,9 @@ carries only current state, what's next, and standing debts.
   **Found+fixed: today's squash `23a2e0d` (via f6cadea's untrack of `docs/`) had removed
   `docs/blame-demo.gif` from the remote, breaking README's demo image on GitHub — the three
   demo files are re-tracked; the rest of `docs/` stays local per the untrack decision.**
-  Recorded, NOT fixed (founder-owned normative doc): IMPLEMENTATION.md ACs J1/J2/I3 claim
-  config behavior that does not exist — `mcp_destructive` is written by `init` but read by
-  nothing, invalid TOML is silently tolerated (no "hard error with line number"), no
-  user-supplied scrub-rule key exists.
+  The J1/J2/I3 config debt recorded here (mcp_destructive read by nothing; invalid TOML
+  silently tolerated) was CLOSED by Phase B's config loader (`0c6c428`, 2026-08-05) — see the
+  Phase 2 tail bullet above. The user-supplied scrub-rule key still does not exist.
 - **Release-version gate + `agentrec-release` skill (delivered 2026-08-04, UNCOMMITTED on
   `main`, not gated by a skeptic, never exercised by a real tag).** Closes the
   "4 files bumped by hand, no CI enforcement of match" gap recorded at v0.2.0. Three

@@ -8,7 +8,7 @@ How agentrec integrates with the world changes over time. Think of it as four ri
 
 **Ring 1 — Capture adapters (v1–v2).** Per-tool hooks and importers we build: a Stop hook here, a transcript importer there. Cost: roughly one config file per tool. This ring never scales past a handful of tools by design — it exists to prove the record is worth having.
 
-**Ring 2 — Agent-side, via MCP (v2).** One MCP server and agentrec is inside every MCP-capable host — Claude Code, Codex, Cursor, Windsurf, next month's tool — with a single config entry. This ring inverts the relationship: agents stop being things we record and become *users* of the record — self-diagnosis via `blame`, cross-agent coordination via `log`, and user-consented reversion via `undo` (PROTOCOL.md §8). We integrate with N agents by implementing one protocol they all already speak.
+**Ring 2 — Agent-side, via MCP (v2).** One MCP server and agentrec is inside every MCP-capable host — Claude Code, Codex, Cursor, Windsurf, next month's tool — with a single config entry. This ring inverts the relationship: agents stop being things we record and become *users* of the record — self-diagnosis via `blame`/`diff`, cross-agent coordination via `log`, memory via `recall`, health via `status`, and user-consented reversion via `undo` (PROTOCOL.md §8). We integrate with N agents by implementing one protocol they all already speak.
 
 **Ring 3 — Render surfaces (v2–v3).** Editors, git, PR review. Pure consumers of the open format with zero capture logic: a VS Code gutter, `Agent-Turn:` commit trailers, a PR bot. Because rendering needs only PROTOCOL.md and a JSONL file, this ring is community-buildable — we ship one flagship per surface and let the JetBrains plugin and the Neovim gutter be someone else's weekend project.
 
@@ -36,7 +36,7 @@ The integration is therefore a structural mirror of Claude Code's:
 
 - `agentrec init --codex` installs three hooks — `UserPromptSubmit` (start signal), `PostToolUse` scoped to the `apply_patch` matcher (accumulates the turn's touched file paths from the patch-DSL text, no signal emitted), and `Stop` (stop signal, carrying the accumulated `files_written` and `emitter_turn` for decision-17 keying) — all `tool: "codex"`, the rollout path as `transcript`.
 - `agentrec import codex` backfills history from rollout files — same cold-start killer, second ecosystem.
-- MCP registration for Codex's MCP client config, so Codex agents get `blame`/`log`/`diff` (and gated `undo`) too.
+- MCP registration for Codex's MCP client config, so Codex agents get all five read tools — `log`/`diff`/`blame`/`recall`/`status` — (and gated `undo`) too.
 
 Conformance: **L2**. Strategic weight: one `signal.jsonl` containing both `claude-code` and `codex` lines is the screenshot that makes the "open standard" claim credible — nobody believes a standard with one emitter.
 

@@ -1157,8 +1157,10 @@ mod tests {
     // Env vars are process-global; every test below drives the debug-only
     // AGENTREC_TEST_SERVICE_DIR seam, so they must serialize against each
     // other or the mutations race across cargo's parallel test threads.
+    #[cfg(debug_assertions)]
     static SERVICE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(debug_assertions)]
     fn with_service_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = SERVICE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("AGENTREC_TEST_SERVICE_DIR").ok();
@@ -1175,6 +1177,11 @@ mod tests {
     // `pass` so a stale unit from an unrelated scratch repo cannot break this
     // repo's all-pass exit-0 gate, while the note still carries the count and
     // the runnable removal command.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn orphaned_unit_is_advisory_not_fail() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1208,6 +1215,11 @@ mod tests {
 
     // The whole-report leg: `diagnose` on an otherwise-healthy-shaped repo
     // must carry the check, and an orphan must not flip `report.ok`.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn orphaned_unit_does_not_flip_report_ok_reason() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1233,6 +1245,11 @@ mod tests {
 
     // No orphan -> a plain pass with NO note, so a healthy machine's `doctor`
     // output gains no noise.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn no_orphans_is_a_silent_pass() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1266,6 +1283,11 @@ mod tests {
     // reports nothing. Advisory like its sibling, and it must name the exec
     // and the re-init remedy — NOT the removal command, since the repo is
     // still there and the user almost certainly wants recording back.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn vanished_exec_on_a_live_root_is_reported_advisory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1306,6 +1328,11 @@ mod tests {
     // The two staleness axes are ORTHOGONAL, and an unreadable unit must gain
     // no exec finding at all: `Unparseable` means we know nothing, and a
     // fabricated finding is the failure mode this check's design forbids.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn vanished_root_and_unparseable_units_carry_no_exec_finding() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1350,6 +1377,11 @@ mod tests {
     // check names; a new check missing from it makes the report shape differ
     // between the two paths. Asserted as set equality, not by name, so any
     // future check that forgets the list also reds here.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn uninitialized_report_has_the_same_check_set_as_an_initialized_one() {
         let tmp = tempfile::tempdir().unwrap();

@@ -2101,3 +2101,80 @@ lines, on a release binary whose mtime postdates the last code commit (`e32d247`
 commit is docs-only, so the artifact corresponds to this HEAD's code). Caveat carried from
 that gate: the seam grep keys on the `AGENTREC_TEST` prefix convention — a seam named outside
 that prefix would evade it (none known).
+
+## Phase 2 tail — plan exit round (2026-08-06, HEAD `670fba3` + this commit)
+
+Evidence roll-up for the plan's "Final acceptance — plan exit" checklist
+(`docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md`, on `docs/user-onboarding`).
+Per-box refs, then this round's own measurements.
+
+- **Phase A fixtures + pin:** ledger § "Phase A — Codex hook spike"; `codex-cli 0.146.0` pin
+  (INTEGRATIONS.md, live-verified); `docs/fixtures/codex/*.json` (7, git-tracked);
+  `docs/verify/codex-spike.md`.
+- **Config loader:** `cli/src/config.rs` live, 5 legacy read sites migrated, scanner deleted
+  (remaining "scanner" hits are historical prose in doc comments only); D16 semantics tested
+  (`config.rs::tests` ×5 + `integration.rs::daemon_startup_refuses_on_malformed_config` +
+  `mcp.rs::invalid_config_toml_is_a_startup_hard_error`).
+- **O5:** ledger § "O5" + `docs/verify/o5-two-tool-session.md`; Claude leg re-run LIVE
+  (appended row); carried disclosures stand (sequential not simultaneous; debug binary).
+- **PROTOCOL 1.0:** `PROTOCOL.md` header "1.0 (frozen 2026-08-06)"; 29 conformance fixtures
+  + manifest test (`cli/tests/conformance.rs`), all in `8d8e1db`. **Founder review of the
+  freeze diff is asserted ONLY in `8d8e1db`'s commit message — no ledger row records it and
+  there is no Phase D ledger section at all.** Recorded as provenance, not as fact
+  established by this round; founder attestation would close it.
+- **Five read tools + parity + §8 status row:** `mcpcmd.rs` (five read tools + gated undo);
+  parity pinned in `cli/tests/mcp.rs` (`ac_e2_diff/blame_*_byte_equals_*`; log/recall
+  typed-shape by decision 12 / delta 14); `PROTOCOL.md` §8 `agentrec_status` row.
+- **Mode matrix + §8 `allow_modified` + origin:** `ac_f1_*` (mcp.rs), `ac_f4_*`
+  (undo_execute.rs), approve.rs suite; §8 fixed at `e264d7c`; origin tests
+  `cli/tests/undo_origin.rs::ac_f5_*` + conformance fixture. Coordinator-layer downgrade
+  residual stands (gate finding 1).
+- **Self-healing story:** ledger § "Phase F exit" + `docs/verify/f-exit-self-healing.md`
+  (`d8c69e3`); Phase F gate rounds 2–4 above.
+- **Baselines:** debug `cargo test --workspace -- --test-threads=3` → **987/0/4** (§ "Phase F
+  gate round 2"). Clippy `-D warnings` debug+release, `cargo fmt --check`, release-seam grep:
+  all clean (same section + round-3 fix).
+
+**Release-profile suite, run for the first time in this repo's recorded history — and the
+checklist box's "debug+release" cannot be read as "the full suite passes under
+`--release`":** `cargo test --release --workspace --no-fail-fast -- --test-threads=3` →
+**964 passed / 24 failed / 4 ignored** (debug: 987/0/4). All 24 failures were individually
+classified against source (Opus classification round, table preserved in the session
+transcript; spot-anchors below): **24 SEAM / 0 TIMING / 0 REAL** — every failure is a test
+driving a `#[cfg(debug_assertions)]`-gated seam that release strips BY DESIGN (the same
+design the release-seam `strings` check exists to enforce). Five distinct seams:
+`importcmd.rs::debug_dump_entries_enabled` (11 tests), `importcmd.rs::t2_oracle_enabled`
+(2), `purgecmd.rs` test-pause sleeps (3), `cmds.rs::effective_store_budget` +
+`daemon.rs::effective_evict_interval` overrides (4), `cmds.rs::recall_deadline` forced
+deadline + `memory.rs::test_slow_pin_read_delay` (3), `import_codex.rs` key-parity list
+hardcoding `debug_entries` (counted in the 11+2 families). Positive control:
+`persist::ac5b_oracle_seam_disabled_in_release_even_with_env_set` PASSES in release.
+**No release-only product defect found.** Honest coverage statement: ~20 of the 24 fail at a
+seam-gated precondition, so their subject invariant is UNEXERCISED in release (not proven
+equivalent) — notably the zero-write status parity assertion; four others' invariants are
+visibly confirmed in the captured release output despite the test failing (daemon degrades
+to defaults on mid-tick corruption; codex/claude report key parity at 14 keys; two
+tier-classification runs print correct `tier_counts`).
+
+**Fix landed this round (code, small):** the three `doctorcmd` service-unit tests that
+FAILED in release (`orphaned_unit_is_advisory_not_fail`,
+`vanished_exec_on_a_live_root_is_reported_advisory`,
+`vanished_root_and_unparseable_units_carry_no_exec_finding`) — plus the three sibling tests
+that PASSED in release only by ACCIDENT — all drive the debug-only
+`AGENTREC_TEST_SERVICE_DIR` seam; in a release build the seam is ignored and all six scan
+the developer's REAL service directory, so their verdicts depend on ambient machine state
+(the accidental passes are the worse failure mode). All six + the `with_service_dir` helper
+are now `#[cfg(debug_assertions)]`. The other 24 seam tests are deliberately NOT gated: they
+fail deterministically at a seam precondition and never touch real user state, so leaving
+them visible in a release run is a truthful signal rather than a hazard; gating them is
+available if a release-suite CI leg is ever added. Debug suite after the gating change,
+re-measured: **987 / 0 / 4** — unchanged, because `cfg(debug_assertions)` is true in the
+debug profile so all six still compile and run there. Clippy `-D warnings` `--all-targets`
+debug AND release, `cargo fmt --check`: clean after the change.
+
+**Stale-doc fixes landed this round:** IMPLEMENTATION.md §P.1 (three-tool list → five,
+amended-note style), §P.2 ("mirroring `--json`" → parity/typed split per decision 12 /
+delta 14), §O.5 (O5 evidence pointer added); INTEGRATIONS.md Codex bullet + Ring 2 verb
+lists (three tools → five); CLAUDE.md worktree Status rewritten through Phase F (the stale
+"Next: Phase D BLOCKED" block replaced; the false "J1/J2/I3 recorded-not-fixed" bullet
+corrected — Phase B closed that debt).
