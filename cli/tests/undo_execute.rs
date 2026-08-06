@@ -340,6 +340,69 @@ fn ac_f4_a_reused_token_is_refused_and_the_tree_is_untouched() {
     assert_eq!(rows_of(&root, EVENT_EXECUTE), 1);
 }
 
+/// AC-F4 (crash matrix), the ORDERING half: the `consume` row is on disk
+/// **before the first working-tree write**, not merely before the `execute`
+/// row.
+///
+/// This is the assertion the constructed-state test below cannot make. That
+/// one rebuilds the ledger after the fact, so an implementation that spent
+/// the token last — F3's ordering, and the obvious thing to write — leaves an
+/// indistinguishable file. The only way to tell the two apart is to look at
+/// the ledger *while the writes are happening*, so this test does exactly
+/// that: it reverts a turn wide enough (300 files) to make the write window
+/// milliseconds rather than microseconds, polls until the worktree is
+/// visibly HALF reverted, and reads the ledger at that instant.
+///
+/// The half-reverted requirement is not decoration. Without it a poll that
+/// arrived late would read a completed run's ledger — which carries a
+/// `consume` row under either ordering — and the test would be green while
+/// never once looking inside the window it exists to probe. The sweep fails
+/// loudly rather than passing vacuously if it never lands there.
+#[test]
+fn ac_f4_the_token_is_spent_before_the_first_worktree_write() {
+    const N: usize = 300;
+    let root = root_with_mode("auto");
+    let files: Vec<FileEntry> = (0..N)
+        .map(|i| revertible(&root, &format!("f{i:03}.rs")))
+        .collect();
+    seed(&root, files);
+    let token = issue_token(&root);
+    let first = root.join("f000.rs");
+    let last = root.join(format!("f{:03}.rs", N - 1));
+    let reverted = |p: &Path| std::fs::read(p).unwrap_or_default().starts_with(b"old ");
+
+    let root_for_child = root.clone();
+    let token_for_child = token.clone();
+    let observed = std::thread::scope(|s| {
+        let child = s.spawn(move || execute(&root_for_child, &token_for_child));
+        let mut snapshot: Option<Vec<Value>> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            // Half reverted: the first file has flipped, the last has not.
+            // Read the LEDGER first, so a row appearing between the two reads
+            // can only make this test more likely to fail, never less.
+            let rows = ledger(&root);
+            if reverted(&first) && !reverted(&last) {
+                snapshot = Some(rows);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        ok_payload(&child.join().unwrap());
+        snapshot
+    });
+
+    let rows = observed.expect(
+        "the poll never caught the revert half-done, so it never looked inside the write \
+         window this test exists to probe",
+    );
+    assert!(
+        rows.iter().any(|e| e["event"] == EVENT_CONSUME),
+        "the token was still unspent while the worktree was being rewritten — a crash here \
+         would leave a live token over already-reverted files: {rows:?}"
+    );
+}
+
 /// AC-F4 (crash matrix, the hard case): a token consumed by a run that died
 /// before its `execute` row — and before, or during, its writes — is still
 /// dead on the next presentation.
@@ -352,6 +415,10 @@ fn ac_f4_a_reused_token_is_refused_and_the_tree_is_untouched() {
 /// The worktree is restored to its PRE-revert bytes, which is the most
 /// dangerous variant: content drift alone would not refuse the retry, so only
 /// the consumption record can.
+///
+/// What this does NOT establish is *when* the row was written — that is
+/// `ac_f4_the_token_is_spent_before_the_first_worktree_write`'s job, and the
+/// two are only jointly sufficient.
 #[test]
 fn ac_f4_a_consumed_token_stays_dead_after_a_crash_before_the_execute_row() {
     let root = root_with_mode("auto");
