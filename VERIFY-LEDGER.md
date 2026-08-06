@@ -2210,3 +2210,84 @@ delta 14), §O.5 (O5 evidence pointer added); INTEGRATIONS.md Codex bullet + Rin
 lists (three tools → five); CLAUDE.md worktree Status rewritten through Phase F (the stale
 "Next: Phase D BLOCKED" block replaced; the false "J1/J2/I3 recorded-not-fixed" bullet
 corrected — Phase B closed that debt).
+
+## Branch review (PR #20) — root-containment blockers 1+2, FIXED (2026-08-06)
+
+Whole-branch adversarial review of `feat/phase-2-tail` at `e5d7ea8` (58 commits vs
+`main`@`23a2e0d`), scoped deliberately to what per-phase gates structurally could not see:
+cross-phase seam drift, freeze discipline across the whole history, and the security posture
+of the new agent-triggerable write surface. It returned **NOT MERGE-READY on two BLOCKERs**,
+both proven end-to-end against the real binary rather than inferred. Fixed at `f501f07`.
+
+**The defect.** `entry.path` is wire data, and `root.join(&entry.path)` in
+`undo_coordinator.rs::execute_revert`/`restore_from_before` was an arbitrary-write primitive:
+`Path::join` with an ABSOLUTE path silently discards the base, and a `..` component walks
+straight out. `preview` validated requested paths only against `target.files` — the same
+attacker-supplied record. Two shapes, each proven live in `mcp_destructive = "auto"` over
+real JSON-RPC frames, zero refusals, no human in the loop:
+
+1. `"path":"../outside/victim.txt"` → preview issued a token, execute reported
+   `{"reverted":1}`, and the outside file's bytes changed.
+2. `"path":"linkdir/c.txt"` where `linkdir` is a symlink OUT of the repo → same result.
+   `is_symlink_on_disk` lstats the FINAL component only, while `restore_from_before` runs
+   `create_dir_all(parent)` and writes THROUGH the intermediate link. **This shape is the
+   worse one**: the rendered path looks entirely ordinary, so the CLI's human-reads-the-plan
+   mitigation fails too.
+
+**Provenance, stated rather than shaded.** The primitive is PRE-EXISTING on `main`
+(`23a2e0d:cli/src/readcmds.rs:1063` is the identical `root.join`); F3 moved it verbatim.
+What this branch changed is the ACTOR — on `main` the only caller is a human who sees
+`revert ../outside/victim.txt` printed before typing confirm; `agentrec_undo` in `auto` mode
+removes that human. Phase F's own gate validated its rails against the refusal inventory
+inherited from the CLI (symlink, skipped, withheld, modified-since), and root containment was
+never in that inventory *because the CLI's actor was a human reading a list*. That is exactly
+the class a per-phase gate cannot catch, and why the whole-branch pass earned its cost.
+Threat model is the SANDBOXED AGENT: agent permissions commonly confine edits to cwd,
+`.agentrec/` is inside cwd, the victim is not — agentrec becomes a confused deputy performing
+the out-of-sandbox write. Precondition bounded and checked: `import` is NOT a vector (both
+sites `strip_prefix(root_canon)` → `skipped_out_of_root`), and L3 sidecar-log merging does not
+exist, so the precondition is a direct write to `.agentrec/log.jsonl`.
+
+**The fix (`f501f07`).** `undo_coordinator.rs::escape_refusal`, called FIRST in `build_plan`'s
+per-entry loop — above even the symlink refusal, and unconditional w.r.t. `allow_modified`.
+`build_plan` is the shared planner both legs reach (`readcmds.rs::undo`,
+`undo_coordinator.rs::preview`, `::claim_grant`), so ONE gate covers CLI and MCP; the review's
+disposition explicitly warned against treating the CLI's rendered plan as a mitigation for the
+MCP leg. Two checks, and probe-proven non-redundant:
+1. LEXICAL — reject absolute paths and any `ParentDir`/`RootDir`/`Prefix` component.
+2. RESOLVED — canonicalize the nearest EXISTING ancestor of the target, require canonical
+   `root` as a prefix. Absent deeper components cannot be links, which is why a not-yet-created
+   directory is still allowed.
+Both sides canonicalized because a symlinked root is ordinary (macOS `/tmp` → `/private/tmp`);
+comparing a canonical child against a non-canonical root would refuse every legitimate revert.
+Canonicalize failure REFUSES — fail closed.
+
+**A fail-open bug in the fix's own first draft, caught before commit and recorded because the
+pattern is subtle:** the draft wrote `root.canonicalize().ok()?` inside a
+`-> Option<PlanKind>` where `None` MEANS ALLOWED, so `?` would have failed OPEN on an
+unresolvable root — inverting the doc comment sitting directly above it. Now an explicit
+`return refuse()`, with a comment naming the trap.
+
+**Evidence, all run:**
+- Live re-run of BOTH exploits against the release binary, `auto` mode, real JSON-RPC:
+  `files: []`, one refusal each carrying the containment reason, **`token issued: False`**,
+  and both victim files byte-unchanged. CLI leg on the same forged record:
+  `REFUSE … nothing to revert`.
+- Mutation probe 1 (gate call neutered): exactly the 3 escape tests red, all 3 positive
+  controls green.
+- Mutation probe 2 (RESOLVED check short-circuited, LEXICAL retained): exactly the
+  symlinked-parent test red, other 8 green — check 2 earns its place.
+- Suite **993 / 0 / 4** (base 987 + 6 new). An intermediate run with the gate but no new tests
+  measured 987/0/4, which is the evidence that containment over-refuses NO existing path.
+- Clippy `-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean.
+  Release-seam grep `AGENTREC_TEST`: 0.
+
+Positive controls are DISCRIMINATING by construction: each asserts the entry reaches the
+store gate BELOW containment (`prior snapshot unavailable — refusing to restore`), not merely
+that it was "not refused", so a gate that refused everything reds.
+
+**Not fixed here, recorded:** the review's finding that `main`'s CLI leg carries the same
+primitive today (mitigated only by a human reading a path that shape 2 shows can be made to
+look innocent). This branch's fix lands in shared core, so merging carries it to the CLI too —
+but v0.2.0 is already published with the unfixed CLI, and whether that warrants a security
+note is a founder call. Also unverified by anyone: no Linux leg has run this branch's HEAD.
