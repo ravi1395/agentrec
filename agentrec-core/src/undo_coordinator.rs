@@ -985,6 +985,40 @@ impl UndoCoordinator {
             &request.paths,
             request.allow_modified,
         );
+        // The executable set must still be EXACTLY what was approved. Content
+        // drift is caught above; this catches SCOPE drift — a `purge
+        // --snapshots-before` between the request and the approval can turn
+        // one entry into a refusal, and reverting the remainder would apply a
+        // narrower change than the human agreed to while reporting success.
+        // A preview "binds the target record, selected paths, current hashes"
+        // (parent :286-318); a subset is not that preview, so it is
+        // `preview_stale` like any other divergence, and the empty case falls
+        // out of the same check rather than needing its own rule.
+        let executable: HashSet<&str> = plans
+            .iter()
+            .filter(|p| matches!(p.kind, PlanKind::Revert { .. }))
+            .map(|p| p.entry.path.as_str())
+            .collect();
+        let dropped: Vec<String> = request
+            .paths
+            .iter()
+            .filter(|p| !executable.contains(p.as_str()))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.append_terminal(
+                lock,
+                &request,
+                EVENT_FAIL,
+                None,
+                Some("preview_stale".to_string()),
+            )?;
+            return Err(UndoError::PreviewStale {
+                request: request.id.clone(),
+                paths: dropped,
+            });
+        }
+
         Ok(Claim {
             target: target.clone(),
             plans,

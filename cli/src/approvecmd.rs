@@ -28,6 +28,17 @@
 //! internally per call. Lock ORDER is `undo.lock` then `log.lock`, never the
 //! reverse — nothing else in the tree takes `log.lock` first.
 //!
+//! ## `mcp_destructive` gates the agent, not the human
+//!
+//! Neither verb reads `mcp_destructive`, deliberately. The mode governs what
+//! an AGENT may ask for — whether `agentrec_undo` is listed at all, and which
+//! sub-actions it may call — and a lodged request is a question already put to
+//! a human. Flipping the config to `off` stops new requests being lodged; it
+//! does not retroactively strip a human of the ability to answer one already
+//! in front of them, any more than it gates `undo --confirm`, which is
+//! likewise ungated. The reservation a pending request holds would otherwise
+//! sit unreleasable until its TTL lapsed.
+//!
 //! ## Why the terminal row is appended last
 //!
 //! `execute` goes into the ledger only after the undo turn is in `log.jsonl`
@@ -74,21 +85,14 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
         .filter(|p| matches!(p.kind, PlanKind::Revert { .. }))
         .collect();
     if revertible.is_empty() {
-        // Reachable only if the log itself changed under the request (a purge
-        // or a later turn), since a request is never lodged for an empty
-        // executable set. Terminal, so the reservation is released rather
-        // than pinned by something that can never succeed.
-        co.append_terminal(
-            &lock,
-            &request,
-            EVENT_FAIL,
-            None,
-            Some("nothing_to_revert".to_string()),
-        )
-        .map_err(|e| e.to_string())?;
+        // Defensive only: `claim` refuses any request whose executable set no
+        // longer equals the approved one, and the empty set is the extreme
+        // case of that, so this is unreachable. It writes NO terminal row —
+        // `claim` already appended one for every divergence it refused, and a
+        // second would be a duplicate resolution of one request.
         return Err(format!(
             "undo request {} no longer has anything to revert — nothing was written",
-            fmt::short_id(&request.id)
+            request.id
         ));
     }
 
@@ -142,7 +146,7 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
 
     println!(
         "approved request {}; reverted {reverted} file(s); recorded as turn {}",
-        fmt::short_id(&request.id),
+        request.id,
         fmt::short_id(&undo_turn)
     );
     Ok(())
@@ -156,7 +160,7 @@ pub fn deny(root: &Path, request_ref: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!(
         "denied request {} ({} file(s) left untouched)",
-        fmt::short_id(&status.request),
+        status.request,
         status.paths.len()
     );
     Ok(())
@@ -181,11 +185,20 @@ fn list_pending(root: &Path) -> Result<(), String> {
 /// come from a turn record, so they are attacker-controllable in exactly the
 /// way `render_plan`'s F8 comment describes, and this list is read by a human
 /// deciding whether to authorize a destructive op.
+///
+/// **The request id is printed WHOLE, and never through [`fmt::short_id`].**
+/// That helper is a TURN-id formatter: it strips a `t_` prefix, elides the
+/// middle, and re-adds `t_`. A request id is a bare ULID, so short_id renders
+/// it as `t_01KZ…VEGY` — a string that is neither the id nor a prefix of it,
+/// so feeding it back to `approve` cannot resolve, and which reads as a turn
+/// id besides. D23's whole loop is "lists pending undo requests; approve/deny
+/// by id", so what this prints has to be exactly what the next command takes.
+/// Pinned by `approve.rs::the_listed_id_can_be_pasted_straight_back_into_approve`.
 fn pending_line(p: &PendingStatus) -> String {
     let paths: Vec<String> = p.paths.iter().map(|s| fmt::sanitize_terminal(s)).collect();
     format!(
         "{}  undo of {}  {} file(s): {}{}",
-        fmt::short_id(&p.request),
+        p.request,
         fmt::short_id(&p.turn),
         p.paths.len(),
         paths.join(", "),

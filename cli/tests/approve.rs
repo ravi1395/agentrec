@@ -776,3 +776,111 @@ fn undo_tool(root: &Path, arguments: Value) -> Value {
     assert_ne!(resp["result"]["isError"], true, "refusal: {resp}");
     serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
+
+// ---- the id a human actually reads ------------------------------------------
+
+/// D23's loop end to end: `agentrec approve` lists pending requests, and the
+/// id it prints is approved by pasting it straight back. Every other test here
+/// takes the id from `lodge`'s return value, so none of them can see a
+/// listing that renders an id a user cannot use — which is exactly the defect
+/// this pins. The id is PARSED OUT OF STDOUT on purpose; asserting the
+/// rendered string against a locally-computed expectation would re-implement
+/// the renderer and pass with it.
+#[test]
+fn the_listed_id_can_be_pasted_straight_back_into_approve() {
+    let root = root_with_mode("confirm");
+    seed(&root, vec![revertible(&root, "a.rs")]);
+    let expected = lodge(&root, None, false);
+
+    let listed = run(&root, &["approve"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let text = stdout(&listed);
+    let printed = text
+        .lines()
+        .find(|l| l.contains("undo of"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("a pending row naming a request id")
+        .to_string();
+    assert_eq!(
+        printed, expected,
+        "the listed id must BE the request id, not a re-formatting of it: {text}"
+    );
+
+    let out = run(&root, &["approve", &printed]);
+    assert!(
+        out.status.success(),
+        "the listed id must resolve: {}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert_eq!(state(&root, &expected), "executed");
+    // And the success line names the same id, so a scripted caller can join
+    // the two.
+    assert!(stdout(&out).contains(&expected), "{}", stdout(&out));
+}
+
+/// Same round trip for `deny`, which shares the renderer.
+#[test]
+fn the_listed_id_can_be_pasted_straight_back_into_deny() {
+    let root = root_with_mode("confirm");
+    seed(&root, vec![revertible(&root, "a.rs")]);
+    let expected = lodge(&root, None, false);
+    let text = stdout(&run(&root, &["approve"]));
+    let printed = text
+        .lines()
+        .find(|l| l.contains("undo of"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("a pending row")
+        .to_string();
+
+    let out = run(&root, &["deny", &printed]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(state(&root, &expected), "denied");
+    assert!(stdout(&out).contains(&expected), "{}", stdout(&out));
+}
+
+// ---- scope drift -------------------------------------------------------------
+
+/// A request binds the SELECTED PATHS, not just their content. If one entry
+/// stops being executable between the request and the approval — here, its
+/// `before` blob is purged out of the CAS, which leaves every on-disk hash
+/// untouched so the content recheck passes — approving the remainder would
+/// apply a narrower revert than the human agreed to, and report success. That
+/// is `preview_stale` too, and nothing is written.
+#[test]
+fn an_executable_set_that_shrank_after_the_request_is_preview_stale() {
+    let root = root_with_mode("confirm");
+    let a = revertible(&root, "a.rs");
+    let b = revertible(&root, "b.rs");
+    let doomed = b.before.clone().unwrap();
+    seed(&root, vec![a, b]);
+    let id = lodge(&root, None, false);
+
+    // Remove b.rs's prior snapshot; a.rs is untouched and still executable.
+    let blob = BlobStore::new(root.join(".agentrec/objects"));
+    assert!(
+        blob.remove(&doomed).is_some(),
+        "the before blob must exist to remove"
+    );
+    assert!(!blob.contains(&doomed));
+
+    let before_a = std::fs::read(root.join("a.rs")).unwrap();
+    let out = run(&root, &["approve", &id]);
+    assert!(
+        !out.status.success(),
+        "a shrunk set must not silently apply"
+    );
+    assert!(stderr(&out).contains("stale"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("b.rs"),
+        "name what dropped out: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read(root.join("a.rs")).unwrap(),
+        before_a,
+        "the still-executable file must NOT be reverted on its own"
+    );
+    assert!(undo_turns(&root).is_empty());
+    assert_eq!(state(&root, &id), "failed");
+}
