@@ -1273,6 +1273,65 @@ mod tests {
         );
     }
 
+    // Hardlink escape (branch review re-gate, PR #20 blocker 1). Path
+    // containment CANNOT close this: `canonicalize` resolves symlinks, and a
+    // hardlink leaves no path-level evidence that the inode has another name.
+    // The repo-internal path is lexically ordinary, canonicalizes inside
+    // root, and is not a symlink — yet `fs::write` truncates the shared inode
+    // and the outside name sees the new bytes. Proven through MCP auto mode
+    // before this gate existed.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_hardlink_to_a_file_outside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"VICTIM\n").unwrap();
+        std::fs::hard_link(&victim, root.join("hard.txt")).unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("hard.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a hardlink — its inode has another name, which reverting would also rewrite"
+        );
+    }
+
+    // The predicate is `nlink > 1`, deliberately not "the other name is
+    // outside the root" — we cannot know where it is, and a second name
+    // inside the repo is equally a file this turn's record does not describe.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_hardlink_whose_other_name_is_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"shared\n").unwrap();
+        std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("b.txt", "modify")], true);
+        assert!(
+            refusal_reason(&plans).starts_with("path is a hardlink"),
+            "an in-root second name is still a file the record does not describe"
+        );
+    }
+
+    // Discriminating control for the hardlink gate specifically: an ordinary
+    // single-named file at nlink == 1 must pass it and reach the store gate.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_allows_an_ordinary_single_linked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("plain.txt"), b"plain\n").unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("plain.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "nlink == 1 must not trip the hardlink gate"
+        );
+    }
+
     // A root that is ITSELF reached through a symlink (macOS `/tmp` →
     // `/private/tmp` is the everyday case) must not make every revert under
     // it look like an escape — which is what comparing a canonical child

@@ -336,9 +336,20 @@ pub enum UndoError {
     },
     /// F3: the working tree moved between the request and the approval. No
     /// writes happened; a fresh request is required.
+    ///
+    /// `refusals` carries the plan's own reason for each dropped path that
+    /// was REFUSED rather than merely changed. Both causes are
+    /// `preview_stale` on the wire — the caller's remedy is identical — but
+    /// they are different facts, and reporting a containment refusal as
+    /// "changed since it was lodged" misdirects an operator investigating an
+    /// attack toward a benign explanation (branch review, PR #20, MINOR 2:
+    /// observed on a preview→swap-parent-to-symlink→execute race whose
+    /// content hash was deliberately IDENTICAL across the swap, so drift
+    /// provably was not what refused it). Empty for genuine content drift.
     PreviewStale {
         request: String,
         paths: Vec<String>,
+        refusals: Vec<String>,
     },
     /// F4: no reservation, live or dead, was ever issued for this token. An
     /// agent seeing this has a bug (it invented or mangled a token), which is
@@ -433,7 +444,18 @@ impl std::fmt::Display for UndoError {
                 f,
                 "undo request {request} is {state}, not pending — nothing was written"
             ),
-            UndoError::PreviewStale { request, paths } => write!(
+            UndoError::PreviewStale {
+                request,
+                paths,
+                refusals,
+            } if !refusals.is_empty() => write!(
+                f,
+                "undo request {request} is stale: {} can no longer be reverted ({}) — nothing \
+                 was written; ask for a fresh preview and a new request",
+                paths.join(", "),
+                refusals.join("; ")
+            ),
+            UndoError::PreviewStale { request, paths, .. } => write!(
                 f,
                 "undo request {request} is stale: {} changed since it was lodged — nothing was \
                  written; ask for a fresh preview and a new request",
@@ -1144,6 +1166,9 @@ impl UndoCoordinator {
             return Err(UndoError::PreviewStale {
                 request: request.id.clone(),
                 paths: drifted,
+                // Genuine content drift: the hash moved. No plan was built
+                // here, so there is no refusal reason to carry.
+                refusals: Vec::new(),
             });
         }
 
@@ -1190,6 +1215,19 @@ impl UndoCoordinator {
             .cloned()
             .collect();
         if !dropped.is_empty() {
+            // Name the plan's OWN reason for each dropped path that was
+            // refused outright, so a containment refusal is not reported as
+            // content drift (branch review MINOR 2). Paths dropped for any
+            // other cause (excluded, absent from the plan entirely)
+            // contribute nothing here and fall back to the drift wording.
+            let refusals: Vec<String> = plans
+                .iter()
+                .filter(|p| dropped.iter().any(|d| d == &p.entry.path))
+                .filter_map(|p| match &p.kind {
+                    PlanKind::Refused { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect();
             self.append_terminal(
                 lock,
                 &request,
@@ -1200,6 +1238,7 @@ impl UndoCoordinator {
             return Err(UndoError::PreviewStale {
                 request: request.id.clone(),
                 paths: dropped,
+                refusals,
             });
         }
 
@@ -1783,6 +1822,17 @@ pub fn build_plan(
             });
             continue;
         }
+        // Hardlink containment, immediately after path containment because it
+        // is the same harm through a channel paths cannot express: a second
+        // name for the target's inode, possibly outside the repo, that
+        // `fs::write`'s in-place truncate would rewrite too.
+        if let Some(kind) = hardlink_refusal(root, entry) {
+            plans.push(Plan {
+                entry: entry.clone(),
+                kind,
+            });
+            continue;
+        }
         // F2 (red team round 2). This gate is above every other refusal
         // except containment, because its failure mode writes to a
         // file that was never in the plan: `std::fs::write` follows a
@@ -2009,6 +2059,57 @@ fn escape_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
         }
     }
     refuse()
+}
+
+/// Hardlink containment: `Some(PlanKind::Refused)` when the target file's
+/// inode has more than one name, `None` otherwise.
+///
+/// PATH CONTAINMENT CANNOT CLOSE THIS CLASS, which is why it is a separate
+/// gate rather than another branch of [`escape_refusal`]. `canonicalize`
+/// resolves SYMLINKS; a hardlink is a second directory entry for the same
+/// inode, and there is no path-level evidence that the inode is reachable
+/// anywhere else. A repo-internal `hard.txt` hardlinked to a file outside the
+/// repo is lexically ordinary, canonicalizes inside `root`, and is not a
+/// symlink — so it passes every check in `escape_refusal` and
+/// [`symlink_refusal`] — yet `fs::write` truncates the SHARED INODE in place
+/// and the outside name sees the new bytes. Proven end-to-end through
+/// `agentrec_undo` in `auto` mode (branch review, PR #20), same
+/// confused-deputy shape as the `..` and symlinked-parent escapes: creating
+/// the link is a write INSIDE cwd, which a path-based agent sandbox permits,
+/// while the victim is outside it.
+///
+/// `nlink > 1` is the whole predicate: it does not matter WHERE the other
+/// name is, because we cannot know, and a second name inside the repo is
+/// equally a file this turn's record does not describe. False positives
+/// (deliberately hardlinked files within a repo) are rare and degrade to a
+/// refusal, which is the safe direction — this is the same
+/// refuse-to-act-not-guess posture as `link_kind`.
+///
+/// Unix-only: `nlink` needs [`std::os::unix::fs::MetadataExt`]. On a
+/// non-unix target this returns `None` (no refusal) — stated rather than
+/// silently implied. The repo targets macOS + Linux (D19).
+fn hardlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // lstat, not stat: a symlink is `symlink_refusal`'s to refuse, and
+        // following it here would read the TARGET's link count instead.
+        let meta = std::fs::symlink_metadata(root.join(&entry.path)).ok()?;
+        if meta.file_type().is_file() && meta.nlink() > 1 {
+            return Some(PlanKind::Refused {
+                reason:
+                    "path is a hardlink — its inode has another name, which reverting would also \
+                     rewrite"
+                        .to_string(),
+            });
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, entry);
+        None
+    }
 }
 
 /// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
