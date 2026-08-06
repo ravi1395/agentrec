@@ -2573,3 +2573,86 @@ read path remains unexercised; `daemon.rs` has no regular-file check, so the exp
 plausible on inspection. `fsguard` now EXISTS for the daemon to adopt, but this round did not
 adopt it there — that is a deliberate scope line, not an oversight, and the daemon's reads are
 outside the undo surface this review is scoped to.
+
+### Re-gate round 6 — the audit's SCOPE was wrong, not its method
+
+Round 6 PASSED items 1 and 3: the CAS blocker is closed (gate planted the fifo itself; preview
+returned in 1 s with `files: []`, `token: None`, against a 90 s timeout before), and `fsguard`
+broke nothing (1005/0/4 reproduced; `Missing` confirmed the right class for a non-regular CAS
+object, since `Corrupt` would assert a content mismatch nobody observed). **GATE FAIL on two
+blockers, both fixed at `0d971bc`** — and it falsified one ledger claim: *"applied at EVERY
+blocking-I/O site on the undo path"* was **not true**.
+
+**BLOCKER 2 is the lowest-precondition finding in the entire review series, and the ONLY one
+that can fire BY ACCIDENT.** `view.rs::blame` read a WIRE-SUPPLIED working-tree path with a
+bare `fs::read`, and `view.rs:289` is a second log reader that `record::load_log`'s guard does
+not cover. The gate reduced it to: `agentrec init`; `mkfifo notes.txt` (an ordinary write
+inside cwd); `agentrec_blame notes.txt` → **HUNG, killed at 18 s**. `mcp_destructive` was the
+untouched `off` default; no forged `log.jsonl`; no write to `.agentrec/` at all; a **read-only**
+tool available in the default configuration. Every earlier finding needed a hostile
+precondition. This one needs a repo that merely CONTAINS a named pipe.
+
+**BLOCKER 1 was inside the very module whose write side was guarded one round earlier.**
+`append_event` guards the write (`:820`), but `events()` (`:857`) and `live_reservations()`
+(`:732`) read the same `.agentrec/undo-requests.jsonl` with a bare `read_to_string`. Every flow
+READS BEFORE IT WRITES, so the write-side guard could never fire first. Reached by
+`claim_token`/`deny`/`status`/`pending_requests`/`resolve_request` and `reserve`. Demonstrated
+by the gate: `mkfifo .agentrec/undo-requests.jsonl` → MCP preview, zero frames, process alive
+at 20 s.
+
+**THE LESSON, and it is about method, not about these two sites.** `fsguard` was the right
+abstraction and the right response to round 5. What was wrong was the BOUNDARY: the audit
+covered *"the undo path"* while the exposure is *"every path that opens a file whose name came
+from wire data or the working tree."* That is why two sites survived — one INSIDE the undo
+module, one in the read tools. **The way to stop being one probe behind is a MECHANICAL audit,
+not an enumerative one:** `grep -rn "fs::read\|File::open\|read_to_string" agentrec-core/src
+cli/src`, then guard or JUSTIFY every remaining hit. That grep found both blockers in about a
+minute; unlike an enumeration it does not depend on correctly guessing the reachable set, and
+it is short enough to be a review checklist item.
+
+**Sites guarded this round**, from running exactly that grep: both `view.rs` sites, both undo-
+ledger reads, `store.rs`'s dedup read of an existing CAS object, `memory.rs`'s pin-path read
+and `memory.jsonl` open, `config.rs`, `hookcmds`' scratch file, and the `.agentrec` reads in
+`cmds.rs`/`doctorcmd.rs`/`memorycmds.rs`. Adds `fsguard::read_regular_to_string`.
+
+**Three exemptions, each JUSTIFIED in the module rather than silently skipped:**
+1. **`/dev/urandom` (`id.rs`) is a CHARACTER DEVICE** — `read_regular` would REFUSE it, and
+   refusing the entropy source is a worse failure than the hang this module prevents. Guarding
+   it would have been a self-inflicted outage.
+2. Fixed `/proc` paths, which no local party can replace.
+3. `File::open` on a DIRECTORY for fsync (`store.rs:95`, `:323`) — opening a real directory
+   cannot block. **The gate's note is adopted: the assumption is now stated in the module**,
+   because "this path is the type I expect" is the exact assumption class that produced this
+   whole series. It holds only while the parent really is a directory; a FIFO pre-created at a
+   fan-out path makes `create_dir_all` fail first, so the fsync open is never reached holding
+   one.
+
+**Evidence, all run:** two new tests, both HANGING rather than failing on regression —
+`blame_on_a_fifo_answers_instead_of_hanging` (default config, read-only tool) and
+`a_fifo_undo_ledger_does_not_hang_the_server` (via `agentrec_status`) — pass in 0.48 s.
+Mutation probe on the blame guard (reverted to the bare `fs::read`): **HUNG at 25 s**, so the
+highest-stakes test is load-bearing. Suite **1007 / 0 / 4**. Clippy `-D warnings`
+`--all-targets` debug AND release, `cargo fmt --check`: clean.
+
+**MINOR carried, not fixed:** `load_log` now returns an EMPTY ledger for a fifo `log.jsonl`
+rather than an error, so `undo` would report "no turns" instead of naming the real cause. Safe
+direction but silent, and a distinct error would suit a branch whose value is largely in not
+misreporting causes. Not taken here because `load_log` returns `Vec<LogRecord>` with no error
+channel, and widening that signature reaches far outside this fix.
+
+**THREE ORCHESTRATOR ERRORS THIS ROUND, recorded because two were nearly costly:**
+1. A blind string replace turned SEVEN pre-existing `serde_json::json!` calls into
+   `serde_json::serde_json::json!`. Caught by the compiler; repaired. `git diff --stat`
+   showing **+50 / -0** on that file is the evidence the pre-existing code is intact.
+2. The commit message used backticks inside a double-quoted shell string, so `` `off` `` ran
+   as a COMMAND SUBSTITUTION and the word vanished from the recorded message ("untouched
+   default"). Amended via `git commit -F` from a file. Shell-interpreted commit messages are a
+   silent-corruption channel.
+3. **`pkill -9 -f "mcp-"` — the same broad-pattern hazard the round-4 gate hit with
+   `pkill -f "agentrec record"`, and this repo already records in memory.** The pattern matched
+   `claude` processes and a node plugin whose COMMAND LINES merely contain `mcp-`; the
+   founder's other Claude sessions were in the blast radius. No damage occurred (14 sessions
+   verified alive afterwards, dogfood daemon healthy), but that is luck, not care. The real
+   stray — one leaked `agentrec mcp` blocked on the probe's fifo — was then killed by EXACT
+   PID after inspecting `ps` output. **Kill by pid; if a pattern is unavoidable, anchor it to
+   the binary path, never to a substring that can appear in an unrelated command line.**
