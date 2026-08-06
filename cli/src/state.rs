@@ -247,7 +247,7 @@ const WHOLE_FILE_SENTINEL: &str = "<state.json: unreadable or not a JSON object>
 /// counts as exactly one failure (`state_parse_failures = 1`,
 /// `last_bad_field` = the whole-file sentinel) rather than being silent.
 pub fn read_state(root: &Path) -> State {
-    let text = match std::fs::read_to_string(state_path(root)) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&state_path(root)) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
         Err(_) => return whole_file_failure(), // exists but unreadable (e.g. permissions)

@@ -989,7 +989,8 @@ fn log_ignore_rebuild(root: &Path, matcher_count: usize, wall_ms: u64) {
 /// than blocking normal recording — a crash-orphaned guard must not wedge
 /// the daemon.
 fn undo_guard_paths(root: &Path, now_wall_ms: u64) -> HashSet<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(crate::undo_guard_path(root)) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&crate::undo_guard_path(root))
+    else {
         return HashSet::new();
     };
     let Ok(guard) = serde_json::from_str::<crate::UndoGuard>(&text) else {
@@ -1170,7 +1171,12 @@ impl Recorder {
                 }
                 (after, snapshotted, withheld, skip_cause)
             } else {
-                match std::fs::read(abs) {
+                // fsguard: THE daemon snapshot read. A fifo in the watched
+                // tree reaches this line; the exposure was recorded as
+                // plausible-on-inspection and unrefuted after three probe
+                // attempts, and this closes it by construction rather than by
+                // another probe.
+                match agentrec_core::fsguard::read_regular(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
                         match self.store.put_result(&bytes) {
                             PutResult::Stored {
@@ -1432,7 +1438,7 @@ impl SignalTailer {
     /// during the truncated window is lost.
     fn poll(&mut self, root: &Path) -> Vec<SignalEvent> {
         let path = signal_path(root);
-        let Ok(mut file) = std::fs::File::open(&path) else {
+        let Ok(mut file) = agentrec_core::fsguard::open_regular(&path) else {
             return vec![];
         };
         let Ok(len) = file.metadata().map(|m| m.len()) else {
@@ -1563,7 +1569,7 @@ fn resync_shrunk_signal_offset(root: &Path, persisted: u64, len: u64, when: &str
 /// the recorder was down. Count only: the dropped line's prompt text is never
 /// scrubbed, stored, or excerpted, matching D7's no-phantom-data posture.
 fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> ReplayOutcome {
-    let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
+    let Ok(mut file) = agentrec_core::fsguard::open_regular(&signal_path(root)) else {
         // No inbox. Offset 0 is a fresh store (no hook has ever fired) and is
         // silent. A NONZERO offset against an absent file is the same
         // inconsistency as a shrink with length 0 — the inbox was deleted or
@@ -2049,7 +2055,8 @@ fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>, Option<
     let mut model = sig.model.clone();
     let mut transcript = None;
     if let Some(path) = &sig.transcript {
-        if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(std::path::Path::new(path))
+        {
             let (tp, tm) = parse_transcript(&text);
             if prompt.is_none() {
                 prompt = tp;
@@ -2261,7 +2268,7 @@ pub(crate) fn read_transcript_capped(path: &Path, cap: u64) -> Option<String> {
     if len > cap {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    agentrec_core::fsguard::read_regular_to_string(path).ok()
 }
 
 /// Extract the CURRENT turn's declared writes from a Claude Code transcript:
@@ -2504,7 +2511,7 @@ fn sync_journal(
 /// the journaled files already exist — they were snapshotted before the crash.
 fn recover_orphan(root: &Path) -> Result<(), String> {
     let path = open_path(root);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         return Ok(());
     };
     let Ok(journal) = serde_json::from_str::<OrphanJournal>(&text) else {

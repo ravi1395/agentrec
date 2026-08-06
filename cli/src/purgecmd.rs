@@ -391,7 +391,7 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
     let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
 
     let mem_path = memory_path(root);
-    let Ok(text) = std::fs::read_to_string(&mem_path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&mem_path) else {
         println!("purged 0 retracted memory chain(s) (ttl {ttl_days}d) — no memory.jsonl yet");
         return Ok(());
     };
@@ -662,7 +662,7 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
     let _log_lock = crate::loglock::try_acquire(root)?;
 
     let path = log_path(root);
-    let Ok(original) = std::fs::read_to_string(&path) else {
+    let Ok(original) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         println!("scanned 0 turn record(s), 0 duplicate(s) removed — no log.jsonl yet");
         return Ok(());
     };
@@ -1015,7 +1015,7 @@ fn purge_signals_consumed_inner(
     let offset = crate::state::read_state(root).signal_offset;
 
     let path = signal_path(root);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = agentrec_core::fsguard::read_regular(&path) else {
         println!("scanned 0 B of signal inbox — no signal.jsonl yet");
         return Ok(());
     };
@@ -1345,7 +1345,7 @@ fn scan_for_path(root: &Path, pattern: &str) -> Scan {
     let mut protect: HashSet<String> = HashSet::new();
     let mut matched_entries = 0usize;
 
-    let text = std::fs::read_to_string(log_path(root)).unwrap_or_default();
+    let text = agentrec_core::fsguard::read_regular_to_string(&log_path(root)).unwrap_or_default();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;

@@ -597,7 +597,7 @@ fn scan_project_dir(
 /// "session that fails" — not counted at all). It still needs walking so its
 /// file-producing lines land in `skipped_sidechain` (AC5's path-signal half).
 fn harvest_sidechain_only(path: &Path, counters: &mut Counters) {
-    let Ok(file) = File::open(path) else {
+    let Ok(file) = agentrec_core::fsguard::open_regular(path) else {
         return;
     };
     each_raw_line(file, |outcome| {
@@ -634,7 +634,7 @@ fn process_session_file(
     debug: &mut DebugSink,
     git_cache: &mut GitTrackCache,
 ) {
-    let file = match File::open(path) {
+    let file = match agentrec_core::fsguard::open_regular(path) {
         Ok(f) => f,
         Err(e) => {
             // Item 6: a session file that fails to open after already being
@@ -1133,7 +1133,7 @@ fn classify_file_entry(
                 counters.t15_rejected_unsafe_path += 1;
             } else {
                 let blob_path = source.join("file-history").join(sid).join(backup_name);
-                if let Ok(bytes) = fs::read(&blob_path) {
+                if let Ok(bytes) = agentrec_core::fsguard::read_regular(&blob_path) {
                     // "Never fabricate" invariant (PROTOCOL.md /
                     // IMPLEMENTATION.md): resolving `before` bytes from a
                     // blob that is NOT actually this edit's pre-state would
