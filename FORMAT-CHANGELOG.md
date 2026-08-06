@@ -13,6 +13,33 @@ the freeze entry directly beneath this paragraph. Those notes are left in
 place verbatim: they were true when written, and this file is a history.
 Conformance fixtures now exist, at `docs/fixtures/conformance/`.
 
+## `agentrec_status` added to the §8 MCP table (2026-08-06)
+
+**No wire change** — neither the signal schema (§4) nor the record schema
+(§5) is touched, and no serializer, `Cargo.toml`, or golden moves. §8's tool
+table gains one row, `agentrec_status` (read tier), between `agentrec_recall`
+and `agentrec_undo`.
+
+Permitted post-freeze because it is purely additive under the rule the freeze
+binds: a new row is a new tool, no existing row changes tier, name, or
+meaning, and a consumer that does not know the tool simply does not call it.
+Delta decision 16 names this row and 2.3's origin discriminator as the two
+post-freeze additions anticipated at freeze time.
+
+**Placement is a deliberate deviation.** The parent Phase 2 design
+(`docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md`, the §8
+reservation at :384-387) reserved this row for "2.2's first commit"; it lands
+instead with the commit that implements the tool (plan task E3), per that same
+document's own rationale that normative wire text rides the code it describes.
+Recorded as gap 7 in the delta spec
+(`docs/superpowers/specs/2026-08-05-phase-2-tail-codex-mcp-design.md`).
+
+What the tool returns is `agentrec-core`'s `RepositoryHealth` plus this
+server's own operational facts (recorder liveness, effective agent-undo mode,
+negotiated MCP revision, and whether `config.toml` changed since startup). The
+§8 row deliberately does not enumerate that payload: §8 defines the tool
+surface a conforming server exposes, not one implementation's response shape.
+
 ## Protocol 1.0 freeze (2026-08-06)
 
 No wire change. `PROTOCOL.md` moves from `v0.2` to **1.0, frozen**: within

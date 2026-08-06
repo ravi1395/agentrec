@@ -757,11 +757,24 @@ pub struct MemoryHit {
 /// A page of recall hits plus the flags that split `recall_cmd`'s empty-
 /// state branches (F3 `capped`, F10 `store_corrupt`, PD3 `store_empty`).
 ///
-/// Deliberately NOT `Serialize` — decision 3 requires `--json` to emit only
-/// `page.items`, never these flags; leaving the type unserializable makes
-/// that structurally impossible to violate by accident, not merely
-/// conventional (the adapter must explicitly reach for `.page.items`).
-#[derive(Debug, Clone)]
+/// **`Serialize` since E3, reversing this type's original stance — read the
+/// reversal, do not re-derive it.** Until MCP 2.2 this type was deliberately
+/// left unserializable, so that decision 3 ("`recall --json` emits only
+/// `page.items`, never these flags") was structurally impossible to violate
+/// by accident rather than merely conventional. Delta decision 14 requires
+/// the opposite on the MCP wire: `agentrec_recall` returns the WHOLE page
+/// including `capped`/`store_corrupt`/`store_empty`, because hiding store
+/// corruption from an agent consumer would violate the same gap-honesty
+/// stance the CLI's human renderer already honors. Both cannot be had; the
+/// derive lands and the structural guard is replaced by a **test** one:
+/// `recall --json`'s byte contract is pinned by
+/// `cli/tests/fixtures/golden/recall_json_{hits,empty_store,no_match,stale_pin}.golden`,
+/// and the CLI adapter (`memorycmds::recall_cmd`) still reaches for
+/// `.page.items` explicitly. A future edit that serialized the whole page
+/// from the CLI reds those four goldens. That is the compensating control —
+/// strictly weaker than "does not compile", and named here so it is not
+/// mistaken for the old guarantee.
+#[derive(Debug, Clone, Serialize)]
 pub struct RecallPage {
     pub page: Page<MemoryHit>,
     /// The verify walk stopped at [`RECALL_VERIFY_CAP`] with candidates still

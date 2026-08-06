@@ -8,11 +8,12 @@
 //! `tools/list`, `tools/call` dispatch, graceful shutdown on stdin EOF. No
 //! new dependency: `serde_json` was already present.
 //!
-//! E1 ships the *skeleton*: the five 2.2 read tools appear in `tools/list`
-//! with their metadata and read-only annotations, but their implementations
-//! land in E2 (`agentrec_log`/`agentrec_diff`/`agentrec_blame`) and E3
-//! (`agentrec_recall`/`agentrec_status`). A `tools/call` naming one of them
-//! answers with a clean JSON-RPC error until then — never a silent empty
+//! E1 shipped the *skeleton* (framing, handshake, `tools/list` metadata and
+//! read-only annotations); E2 implemented `agentrec_log`/`agentrec_diff`/
+//! `agentrec_blame`; **E3 implements the last two, `agentrec_recall` and
+//! `agentrec_status`, so all five 2.2 read tools now answer.** The
+//! listed-but-unimplemented refusal path survives for F1's `agentrec_undo`
+//! (see [`tools_call`]) — a listed tool must never answer a silent empty
 //! result, which an agent would read as "no history".
 //!
 //! Reads are file-based (P3), so nothing here touches the daemon: the server
@@ -111,11 +112,12 @@ const READ_TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "agentrec_log",
         description: "Recorded turns for this repository, newest first, as bounded turn \
-                      summaries with a pagination cursor. Git-operation turns are excluded \
-                      unless requested.",
+                      summaries with a pagination cursor. Turns hidden from the default \
+                      listing — git-operation turns, and turns superseded by a retroactive \
+                      merge — are excluded unless requested.",
         properties: || {
             json!({
-                "include_git": {"type": "boolean", "description": "Include git-operation turns."},
+                "include_hidden": {"type": "boolean", "description": "Also return turns the default listing hides: git-operation turns AND turns superseded by a retroactive merge."},
                 "limit": {"type": "integer", "minimum": 1, "description": "Maximum summaries to return (server-bounded)."},
                 "cursor": {"type": "string", "description": "Opaque cursor from a previous page."}
             })
@@ -153,12 +155,15 @@ const READ_TOOLS: &[ToolSpec] = &[
         name: "agentrec_recall",
         description: "Rank-then-verify search over this repository's recorded memory facts. \
                       Returns hash-verified fresh hits only, with the store's own \
-                      capped/corrupt/empty state.",
+                      capped/corrupt/empty state. Freshness is derived from the live \
+                      worktree, so a later page can miss a fact that became fresh after the \
+                      cursor was minted. A recall page never carries a continuation cursor \
+                      of its own; raise `k` to see more hits.",
         properties: || {
             json!({
                 "query": {"type": "string", "description": "Free-text query."},
                 "k": {"type": "integer", "minimum": 1, "description": "Maximum hits to return (server-bounded)."},
-                "cursor": {"type": "string", "description": "Opaque cursor from a previous page."}
+                "cursor": {"type": "string", "description": "Opaque cursor identifying the hit to resume after. A recall page's own `next` is always null today, so this cannot be obtained from a previous page — see the tool description."}
             })
         },
         required: &["query"],
@@ -182,6 +187,10 @@ struct Server {
     root: std::path::PathBuf,
     config: Config,
     negotiated_revision: Option<String>,
+    /// `.agentrec/config.toml`'s modification time as of startup, or `None`
+    /// when the file did not exist then. Compared against the live value by
+    /// `agentrec_status` — see [`config_mtime`].
+    config_stamp: Option<std::time::SystemTime>,
 }
 
 impl Server {
@@ -241,10 +250,16 @@ pub fn run(root: &Path) -> Result<(), String> {
         ));
     }
     let config = config::load(root).map_err(|e| e.to_string())?;
+    // Stamped AFTER the load, deliberately: a stamp taken first could be
+    // older than the bytes actually parsed (an edit landing between the two
+    // reads), which would make `agentrec_status` report restart-required for
+    // a change this process already picked up.
+    let config_stamp = config_mtime(root);
     let mut server = Server {
         root: root.to_path_buf(),
         config,
         negotiated_revision: None,
+        config_stamp,
     };
 
     // Startup banner on STDERR — stdout is reserved for JSON-RPC frames and a
@@ -255,11 +270,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     eprintln!(
         "agentrec mcp: root {} — agent-undo mode {}",
         root.display(),
-        match server.destructive_mode() {
-            config::McpDestructive::Off => "off",
-            config::McpDestructive::Confirm => "confirm",
-            config::McpDestructive::Auto => "auto",
-        }
+        mode_str(server.destructive_mode())
     );
 
     let stdin = std::io::stdin();
@@ -412,8 +423,17 @@ fn tools_call(server: &Server, id: Value, params: Option<&Value>) -> Value {
         "agentrec_log" => log_tool(&server.root, &args),
         "agentrec_diff" => diff_tool(&server.root, &args),
         "agentrec_blame" => blame_tool(&server.root, &args),
-        // E3's, still listed-but-unimplemented. Refused by name, distinctly
-        // from a tool that does not exist at all.
+        "agentrec_recall" => recall_tool(&server.root, &args),
+        "agentrec_status" => status_tool(server),
+        // **Kept, though E3 leaves it unreachable from `READ_TOOLS` alone.**
+        // All five listed read tools now dispatch above, so nothing in
+        // `READ_TOOLS` reaches this arm today. It is retained rather than
+        // deleted because F1 adds `agentrec_undo` to the listed set gated on
+        // `mcp_destructive`, and the window in which a tool is listed but not
+        // yet dispatched is exactly when this arm matters: without it that
+        // call falls through to "unknown tool", which tells an agent the tool
+        // does not exist when `tools/list` just said it does. The two
+        // refusals are deliberately distinct messages.
         other if READ_TOOLS.iter().any(|t| t.name == other) => {
             return error_response(
                 id,
@@ -594,14 +614,27 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<String, ToolFailure> {
 /// the serialized [`view::Page`] the view returned, so a field added to
 /// [`view::TurnSummary`] reaches the agent with no edit here.
 ///
-/// `include_git` maps to [`view::TurnQuery::include_all`], the one knob the
-/// view offers — which also unhides turns superseded by a retroactive merge.
-/// That is a widening the parameter name does not advertise, and it is the
-/// honest mapping: the alternative is a second filter implemented here, i.e.
-/// adapter-owned interpretation of the ledger.
+/// `include_hidden` maps to [`view::TurnQuery::include_all`], the one knob
+/// the view offers: it unhides git-operation turns AND turns superseded by a
+/// retroactive merge.
+///
+/// **Renamed from `include_git` in E3** (E2 flagged the mismatch as its own
+/// residual). E2 shipped the parameter as `include_git` with the description
+/// "Include git-operation turns", which named half of what the knob does; the
+/// widening was documented here but not on the wire, where the agent reads.
+/// Of the two honest fixes — rename, or keep the name and correct the
+/// description — the rename was chosen because a model keys on the parameter
+/// NAME at least as much as on its description, so a name that under-promises
+/// would keep misleading readers of `tools/list` who never read past it.
+/// Renaming is free at this point: 2.2 has never shipped, the identifier was
+/// confined to this file (E1's golden transcript asserts only that
+/// descriptions are non-empty, so no test pinned the old text and none needed
+/// amending), and no host holds a saved call. The alternative rejected in E2
+/// stands rejected: a second git-only filter implemented here would put
+/// ledger interpretation back in `cli/src`.
 fn log_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
     let q = view::TurnQuery {
-        include_all: bool_arg(args, "include_git")?,
+        include_all: bool_arg(args, "include_hidden")?,
         limit: Some(bounded_limit(args, MAX_LOG_SUMMARIES)?),
         after: cursor_arg(args)?,
     };
@@ -721,6 +754,164 @@ fn blame_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
     encode(&result)
 }
 
+// ---- E3: recall + status --------------------------------------------------
+
+/// `agentrec_recall`'s server bound on `k`.
+///
+/// Not an arbitrary page size: [`view::RECALL_VERIFY_CAP`] is where the
+/// rank-then-verify walk stops examining candidates, so a call asking for
+/// more hits than this can never receive them — the hits are a subset of the
+/// candidates walked. Bounding at the cap therefore removes no reachable
+/// result, and it is the same figure the cursored path inside `view::recall`
+/// already fetches at.
+const MAX_RECALL_HITS: usize = view::RECALL_VERIFY_CAP;
+
+fn mode_str(mode: config::McpDestructive) -> &'static str {
+    match mode {
+        config::McpDestructive::Off => "off",
+        config::McpDestructive::Confirm => "confirm",
+        config::McpDestructive::Auto => "auto",
+    }
+}
+
+/// `.agentrec/config.toml`'s mtime, or `None` if it is absent or unstattable.
+///
+/// **Single-component on purpose.** Pairing mtime with a size or a hash would
+/// make the comparison in [`status_tool`] pass for the wrong reason under a
+/// mutation probe of either half, so the check stays exactly the one the plan
+/// names. Its two error directions, both stated rather than papered over:
+///
+/// * *False negative* — a filesystem whose mtime granularity is coarser than
+///   the interval between startup and the edit can report an unchanged stamp
+///   for a real change. The effective mode is still the startup one either
+///   way (nothing here ever reloads), so the failure is a missing note, never
+///   a wrong mode.
+/// * *False positive* — `touch`ing the file, or rewriting it with identical
+///   bytes, reports restart-required. Conservative in the safe direction: the
+///   note says "restart to pick up config changes", not "your mode changed".
+fn config_mtime(root: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(crate::agentrec_dir(root).join("config.toml"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// `agentrec_recall` → the FULL [`view::RecallPage`], honesty flags included
+/// (delta decision 14).
+///
+/// The one 2.2 tool with no `--json` byte-parity to pin, and deliberately so:
+/// `recall --json` serializes `page.items` alone (decision 3 of the memory
+/// round), so there is no CLI contract carrying `capped`/`store_corrupt`/
+/// `store_empty` for this to mirror. Withholding them from an agent would be
+/// the same dishonesty the CLI's human renderer refuses — a corrupt store
+/// would read to the agent as "no memories match". The CLI surface is
+/// untouched by this; see [`view::RecallPage`]'s doc comment for the golden
+/// pin that now stands in for the type's former unserializability.
+///
+/// Hits are hash-verified-fresh by construction — that filtering is
+/// `memory::recall`'s, not re-implemented here.
+///
+/// **Two pagination facts, both measured here rather than assumed, because
+/// E3 is the first caller in the repo's history to set
+/// [`view::RecallQuery::after`] (its doc comment has been dead text until
+/// now).**
+///
+/// 1. *A recall page never mints its own `next`.* `view::recall` mints a
+///    continuation only on a call that ALREADY carried a cursor
+///    (`fetch.from_cursor && end < hits.len()`), so a client's first page
+///    always reports `next: null` no matter how many hits it left behind. The
+///    `cursor` parameter is therefore reachable only by a caller that
+///    constructs a `Cursor` itself. That is left as the view's behavior, not
+///    worked around here — synthesizing a first cursor in this adapter would
+///    be adapter-owned pagination, the seam P4/P5 closed — and the tool
+///    metadata says so plainly instead of advertising a round-trip that does
+///    not exist. Both halves are pinned by
+///    `mcp.rs::e3::recall_cursor_wiring_round_trips_a_caller_built_cursor`.
+/// 2. *The `after` path's staleness check is one-sided.* A memory that
+///    becomes Fresh between two calls can sort ahead of the cursor and be
+///    skipped silently — no error, no gap. That is documented on
+///    `view::RecallQuery::after` and, from here, on the wire.
+fn recall_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
+    let q = view::RecallQuery {
+        query: required_str_arg(args, "query")?,
+        k: positive_usize_arg(args, "k")?
+            .unwrap_or(MAX_RECALL_HITS)
+            .min(MAX_RECALL_HITS),
+        after: cursor_arg(args)?,
+    };
+    let page = open_view(root)?.recall(&q).map_err(|e| match e {
+        view::RecallError::Cursor(c) => cursor_failure(&c),
+        view::RecallError::Io(message) => ToolFailure::Domain {
+            code: "io_error",
+            message,
+        },
+    })?;
+    encode(&page)
+}
+
+/// The `agentrec_status` payload. Composed from typed values the read layer
+/// already produces — no interpretation is re-implemented here.
+#[derive(serde::Serialize)]
+struct StatusPayload<'a> {
+    /// [`view::RepositoryHealth`] verbatim, the same struct `status --json`
+    /// flattens (P5). Serialized nested rather than flattened so the
+    /// operational fields below cannot collide with a field health gains
+    /// later.
+    health: view::RepositoryHealth,
+    /// `daemon::daemon_is_running` — the non-blocking `flock` probe on
+    /// `.agentrec/daemon.lock` (D2) that `status`, `doctor` and `purge`
+    /// already share. Not a second liveness notion; a pid check false-passes
+    /// on pid recycling.
+    daemon_running: bool,
+    /// The effective agent-undo mode for THIS process: the startup value, not
+    /// what is on disk now. See `restart_required`.
+    agent_undo_mode: &'a str,
+    /// The MCP revision negotiated by `initialize`, or `null` when no
+    /// handshake has happened — `handle_line` deliberately does not enforce
+    /// initialize-first ordering, so `null` here is a real, reachable state
+    /// meaning "unnegotiated", never "unknown".
+    protocol_revision: Option<&'a str>,
+    /// `.agentrec/config.toml` changed since this process read it.
+    restart_required: bool,
+    /// Human-readable companion to `restart_required`; `null` when false.
+    /// Emitted unconditionally (no `skip_serializing_if`) so an absent key
+    /// can never be confused with a suppressed one.
+    note: Option<&'a str>,
+}
+
+/// `agentrec_status` → [`view::RepositoryHealth`] plus this process's own
+/// operational facts.
+///
+/// **The budget comes from `server.config`, not from a fresh
+/// `config::load`.** `cmds::effective_store_budget_checked` re-reads the file
+/// at call time; using it here would let `store_budget_bytes` hot-reload in
+/// the very payload that reports the mode as needing a restart — two config
+/// keys with two different reload semantics, in one response. Everything this
+/// tool reports about configuration is the startup value.
+///
+/// `health()` is a pure read (P4): it never evicts, so a `tools/call` cannot
+/// mutate the store.
+fn status_tool(server: &Server) -> Result<String, ToolFailure> {
+    let health = open_view(&server.root)?
+        .health(server.config.store_budget_bytes)
+        .map_err(|e| ToolFailure::Domain {
+            code: "repo_error",
+            message: e.to_string(),
+        })?;
+    let restart_required = config_mtime(&server.root) != server.config_stamp;
+    encode(&StatusPayload {
+        health,
+        daemon_running: crate::daemon::daemon_is_running(&server.root),
+        agent_undo_mode: mode_str(server.destructive_mode()),
+        protocol_revision: server.negotiated_revision.as_deref(),
+        restart_required,
+        note: restart_required.then_some(
+            ".agentrec/config.toml changed since this server started; the reported \
+             agent-undo mode is the one loaded at startup. Restart the server to apply \
+             the file's current contents.",
+        ),
+    })
+}
+
 fn success(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -744,6 +935,7 @@ mod tests {
             root: std::path::PathBuf::from("/nonexistent"),
             config: Config::default(),
             negotiated_revision: None,
+            config_stamp: None,
         }
     }
 

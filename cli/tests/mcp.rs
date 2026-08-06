@@ -380,34 +380,17 @@ fn tools_call_without_a_name_is_invalid_params() {
     assert_eq!(responses[0]["error"]["code"], -32602);
 }
 
-/// A listed tool whose implementation lands in E3 answers with a clean
-/// JSON-RPC error naming it, never a panic or a silent empty result.
-///
-/// **Amended by E2**, which implemented `agentrec_log`/`agentrec_diff`/
-/// `agentrec_blame`: the probe tool moved from `agentrec_log` to
-/// `agentrec_recall`, the nearest still-unimplemented listed tool. The
-/// assertion is unweakened — same code, same "names the tool" requirement —
-/// and the property it guards (a listed-but-unimplemented tool is refused by
-/// name, distinctly from one that does not exist) is unchanged. E3 moves it
-/// again or retires it.
-#[test]
-fn listed_but_unimplemented_tool_errors_cleanly() {
-    let root = init_root();
-    let responses = mcp(
-        &root,
-        &format!(
-            "{}\n",
-            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"agentrec_recall","arguments":{"query":"x"}}}"#
-        ),
-    );
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0]["error"]["code"], -32602);
-    let msg = responses[0]["error"]["message"].as_str().unwrap();
-    assert!(
-        msg.contains("agentrec_recall"),
-        "error must name the tool, got {msg:?}"
-    );
-}
+// `listed_but_unimplemented_tool_errors_cleanly` lived here through E1 and E2
+// and is **RETIRED by E3**, which implemented the last two listed tools
+// (`agentrec_recall`, `agentrec_status`). It asserted that a tool present in
+// `tools/list` but not yet dispatched is refused by name; with all five read
+// tools answering there is no such tool left to probe, and E2's own amendment
+// note ("E3 moves it again or retires it") anticipated exactly this. The
+// production arm it covered is deliberately KEPT (see `mcpcmd::tools_call`)
+// because F1 re-opens the window when `agentrec_undo` joins the listed set;
+// the test comes back with it, against `agentrec_undo`, rather than being
+// re-pointed at a tool that now works. Unknown-tool refusal — the neighboring
+// property — is still pinned, by `ac_e1_golden_transcript_init_list_unknown_tool`.
 
 /// An `initialize` naming a protocol revision the build does not support is
 /// refused cleanly — error, not a silent downgrade — and the refusal names
@@ -534,7 +517,7 @@ mod e2 {
     /// by `agentrec init` itself rather than by hand — `--no-hook`/
     /// `--no-service` so no developer settings file or launchd unit is
     /// touched.
-    fn repo() -> PathBuf {
+    pub(super) fn repo() -> PathBuf {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.keep();
         let out = Command::new(bin())
@@ -546,7 +529,7 @@ mod e2 {
         root
     }
 
-    fn turn(id: &str, files: Vec<FileEntry>) -> TurnRecord {
+    pub(super) fn turn(id: &str, files: Vec<FileEntry>) -> TurnRecord {
         TurnRecord {
             v: 1,
             id: id.to_string(),
@@ -567,7 +550,7 @@ mod e2 {
         }
     }
 
-    fn entry(path: &str, before: Option<String>, after: Option<String>) -> FileEntry {
+    pub(super) fn entry(path: &str, before: Option<String>, after: Option<String>) -> FileEntry {
         FileEntry {
             path: path.into(),
             before,
@@ -583,7 +566,7 @@ mod e2 {
         }
     }
 
-    fn seed(root: &Path, t: &TurnRecord) {
+    pub(super) fn seed(root: &Path, t: &TurnRecord) {
         append_log(
             &root.join(".agentrec/log.jsonl"),
             &LogRecord::Turn(t.clone()),
@@ -592,13 +575,13 @@ mod e2 {
     }
 
     /// Twenty-eight characters after `t_`, matching the recorded id shape.
-    fn turn_id(n: usize) -> String {
+    pub(super) fn turn_id(n: usize) -> String {
         format!("t_{n:026}E2")
     }
 
     /// One `tools/call`, driven through a fresh server process. Returns the
     /// whole JSON-RPC response.
-    fn call(root: &Path, tool: &str, args: Value) -> Value {
+    pub(super) fn call(root: &Path, tool: &str, args: Value) -> Value {
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -613,7 +596,7 @@ mod e2 {
     /// The `text` content block of a successful call. Panics (loudly, with the
     /// payload) on `isError` — a test that silently accepted an error result
     /// would assert nothing.
-    fn text(root: &Path, tool: &str, args: Value) -> String {
+    pub(super) fn text(root: &Path, tool: &str, args: Value) -> String {
         let resp = call(root, tool, args);
         assert!(resp.get("error").is_none(), "JSON-RPC error: {resp}");
         assert_eq!(
@@ -632,7 +615,7 @@ mod e2 {
     }
 
     /// The error code an `isError: true` result carries in its payload.
-    fn error_code(root: &Path, tool: &str, args: Value) -> String {
+    pub(super) fn error_code(root: &Path, tool: &str, args: Value) -> String {
         let resp = call(root, tool, args);
         assert_eq!(
             resp["result"]["isError"], true,
@@ -648,7 +631,7 @@ mod e2 {
     /// `println!` adds a trailing newline that the MCP payload does not carry;
     /// it is stripped EXPLICITLY (not trimmed) so a payload that grows a stray
     /// newline of its own still reds.
-    fn cli_json(root: &Path, args: &[&str]) -> String {
+    pub(super) fn cli_json(root: &Path, args: &[&str]) -> String {
         let out = Command::new(bin())
             .args(args)
             .args(["--root", root.to_str().unwrap()])
@@ -1018,6 +1001,587 @@ mod e2 {
                 serde_json::json!({"turn": "t_NOSUCHTURN"})
             ),
             "turn_not_found"
+        );
+    }
+}
+
+// =========================================================================
+// Task E3 — `agentrec_recall` / `agentrec_status`, plus E2's carried residual
+// =========================================================================
+
+/// `agentrec_recall` is the one 2.2 tool with NO `--json` byte-parity to pin
+/// (delta decision 14: the CLI serializes `page.items` alone, the MCP tool
+/// returns the whole `RecallPage`), and `agentrec_status` composes typed
+/// values that no single CLI verb emits together. Both are driven here
+/// against a real store through the real binary, same as E2.
+mod e3 {
+    use super::e2::{cli_json, entry, error_code, repo, seed, text, turn, turn_id};
+    use super::*;
+    use agentrec_core::record::{append_log, EpochRecord, LogRecord};
+    use agentrec_core::store::BlobStore;
+    use serde_json::Value;
+
+    /// `agentrec <args> --root <root>`, asserted exit 0, stdout returned raw.
+    fn cli(root: &Path, args: &[&str]) -> String {
+        let out = Command::new(bin())
+            .args(args)
+            .args(["--root", root.to_str().unwrap()])
+            .output()
+            .expect("run agentrec");
+        assert!(out.status.success(), "cli failed: {out:?}");
+        String::from_utf8(out.stdout).expect("utf8")
+    }
+
+    /// Two memories whose BM25 scores are known to clear `SCORE_FLOOR` on a
+    /// two-document corpus — the same shape `cli/tests/golden.rs` documents at
+    /// length (a single-occurrence match cannot clear the floor at
+    /// `dl ≈ avg_dl`; the doubled `throttle` is what carries it). Written by
+    /// the real `remember` verb, so the store is one production wrote.
+    ///
+    /// Do NOT tidy the fact strings: rewording silently turns every recall in
+    /// this module into an empty page, and an empty page passes a shape test
+    /// that only checks keys.
+    fn seed_memories(root: &Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/throttle.rs"), b"fn throttle() {}\n").unwrap();
+        std::fs::write(root.join("src/changelog.rs"), b"fn changelog() {}\n").unwrap();
+        cli(
+            root,
+            &[
+                "remember",
+                "throttle limiter guards the API from bursty traffic via throttle checks",
+                "--from",
+                "src/throttle.rs",
+            ],
+        );
+        cli(
+            root,
+            &[
+                "remember",
+                "the release changelog script lives under scripts",
+                "--from",
+                "src/changelog.rs",
+            ],
+        );
+    }
+
+    /// AC-E3 (recall shape): the payload is the WHOLE `RecallPage` — the page
+    /// plus all three honesty flags (delta decision 14) — asserted by exact
+    /// key set at both levels, so a flag dropped or renamed reds here.
+    ///
+    /// The hits half is pinned by containment against `recall --json`: the
+    /// CLI emits exactly the `page.items` array, so those bytes must appear
+    /// verbatim inside the MCP payload. That is the discriminating half —
+    /// without it an implementation returning `items: []` beside three
+    /// correct flags would pass.
+    #[test]
+    fn ac_e3_recall_payload_is_the_whole_recall_page() {
+        let root = repo();
+        seed_memories(&root);
+
+        let payload = text(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle"}),
+        );
+        let v: Value = serde_json::from_str(&payload).expect("payload is JSON");
+        let top: std::collections::BTreeSet<&str> =
+            v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            top,
+            ["page", "capped", "store_corrupt", "store_empty"]
+                .into_iter()
+                .collect(),
+            "RecallPage shape — all three flags reach the agent: {payload}"
+        );
+        let page: std::collections::BTreeSet<&str> = v["page"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(page, ["items", "next"].into_iter().collect());
+        assert_eq!(v["capped"], false);
+        assert_eq!(v["store_corrupt"], false);
+        assert_eq!(v["store_empty"], false);
+
+        let items = v["page"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "one fresh match expected: {payload}");
+        let hit: std::collections::BTreeSet<&str> = items[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            hit,
+            [
+                "id",
+                "fact",
+                "pins",
+                "origin",
+                "ts",
+                "retracted",
+                "freshness"
+            ]
+            .into_iter()
+            .collect(),
+            "MemoryHit shape: {payload}"
+        );
+        assert_eq!(items[0]["freshness"], "fresh");
+
+        // The hits are the SAME bytes `recall --json` prints — the CLI's whole
+        // output is `page.items`, so it must appear verbatim inside the page.
+        let cli_items = cli_json(&root, &["recall", "throttle", "--json"]);
+        assert!(
+            payload.contains(&cli_items),
+            "MCP hits must be the --json item bytes.\n  mcp: {payload}\n  cli: {cli_items}"
+        );
+    }
+
+    /// AC-E3 (corrupt store): a malformed non-empty `memory.jsonl` reaches the
+    /// agent as `store_corrupt: true` rather than as an innocent empty page.
+    ///
+    /// The corruption shape is copied from the producer, not invented: the
+    /// non-UTF8 line below is what `memory::load_effective_checked` sets the
+    /// flag on (it is also the fixture `integration.rs`'s
+    /// `hook_corrupt_memory_store_is_counted` uses for AC-F10.2a).
+    ///
+    /// The second half is the one that matters: the SAME store answers
+    /// `recall --json` with a bare `[]`, indistinguishable from "no memories
+    /// match". That asymmetry is decision 14's entire justification, so it is
+    /// asserted rather than described.
+    #[test]
+    fn ac_e3_corrupt_store_reaches_the_agent() {
+        let root = repo();
+        std::fs::write(
+            root.join(".agentrec/memory.jsonl"),
+            b"\xff\xfenot json at all garbage bytes\x00\x01\n",
+        )
+        .unwrap();
+
+        let payload = text(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle"}),
+        );
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            v["store_corrupt"], true,
+            "a corrupt store must not read to an agent as 'no matches': {payload}"
+        );
+        assert_eq!(v["page"]["items"].as_array().unwrap().len(), 0);
+
+        assert_eq!(
+            cli_json(&root, &["recall", "throttle", "--json"]),
+            "[]",
+            "the CLI channel cannot express this, which is why the MCP tool carries the flag"
+        );
+
+        // The CONTROL, and the reason this test is not one-sided: a store that
+        // is merely empty must NOT set the flag. (`store_empty` is true in
+        // both cases and is measured here rather than asserted away — a
+        // wholly-corrupt store folds to zero effective memories under
+        // `load_effective`'s tolerant read, which is what `store_empty` asks.
+        // `store_corrupt` is the bit that separates them, which is exactly why
+        // decision 14 puts it on the wire.)
+        assert_eq!(
+            v["store_empty"], true,
+            "measured, not asserted-away: {payload}"
+        );
+        let empty = repo();
+        let payload = text(
+            &empty,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle"}),
+        );
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            v["store_corrupt"], false,
+            "an empty store is not a corrupt one: {payload}"
+        );
+        assert_eq!(v["store_empty"], true, "{payload}");
+    }
+
+    /// Malformed recall calls stay on the JSON-RPC channel; a bad cursor is a
+    /// domain outcome the agent can act on.
+    #[test]
+    fn recall_argument_and_cursor_failures_use_the_right_channel() {
+        let root = repo();
+        seed_memories(&root);
+        // `query` is required.
+        let resp = super::e2::call(&root, "agentrec_recall", serde_json::json!({}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // `k` honors the schema's `minimum: 1`.
+        let resp = super::e2::call(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle", "k": 0}),
+        );
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // A cursor minted against a different query is a domain refusal.
+        let cursor = serde_json::json!({
+            "after_id": "NOSUCHMEMORY00000000000000",
+            "after_occurrence": 0,
+            "query": "recall:query=something else",
+        });
+        assert_eq!(
+            error_code(
+                &root,
+                "agentrec_recall",
+                serde_json::json!({"query": "throttle", "cursor": cursor})
+            ),
+            "query_mismatch"
+        );
+    }
+
+    /// AC-E3 (recall must not leak into the CLI): `recall --json` is still a
+    /// BARE ARRAY of hits, never the page object.
+    ///
+    /// `RecallPage` was unserializable precisely so this could not regress;
+    /// E3 removed that structural guard (delta decision 14 needs the derive).
+    /// The four `recall_json_*.golden` files are the primary replacement — this
+    /// test is the named, local one, so the reason a leak is forbidden sits
+    /// next to the assertion instead of only in a captured byte-file.
+    #[test]
+    fn ac_e3_recall_json_is_still_a_bare_hit_array() {
+        let root = repo();
+        seed_memories(&root);
+        let out = cli_json(&root, &["recall", "throttle", "--json"]);
+        let v: Value = serde_json::from_str(&out).expect("recall --json is JSON");
+        assert!(
+            v.is_array(),
+            "recall --json must stay `page.items`, never the RecallPage object: {out}"
+        );
+        for key in ["page", "capped", "store_corrupt", "store_empty"] {
+            assert!(
+                !out.contains(key),
+                "decision 3: `{key}` must never reach the CLI --json surface: {out}"
+            );
+        }
+    }
+
+    /// AC-E3 (status): the payload composes the typed values, and a config
+    /// change on disk is reported as RESTART-REQUIRED rather than hot-reloaded.
+    ///
+    /// Driven over ONE long-lived session with stdin held open, deliberately:
+    /// the property under test is "changed since this process started", which
+    /// a fresh process per call cannot express at all. The first status call
+    /// (before any edit) is the control — without it, an implementation
+    /// hardcoding `restart_required: true` would pass.
+    ///
+    /// The discriminating assertion on the second call is NOT `restart_required`
+    /// alone — it is that `agent_undo_mode` is STILL `"off"` while the file on
+    /// disk says `"auto"`. An implementation that reloaded config would report
+    /// `"auto"` there and satisfy a one-sided test.
+    #[test]
+    fn ac_e3_status_reports_a_config_change_as_restart_required_and_never_reloads() {
+        use std::io::{BufRead, BufReader};
+
+        let root = repo();
+        let config = root.join(".agentrec/config.toml");
+        std::fs::write(&config, "mcp_destructive = \"off\"\n").unwrap();
+
+        let mut child = Command::new(bin())
+            .args(["mcp", "--root", root.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut send_and_read = |frame: &str, stdin: &mut std::process::ChildStdin| -> Value {
+            writeln!(stdin, "{frame}").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            stdout.read_line(&mut line).expect("response line");
+            serde_json::from_str(&line).expect("JSON response")
+        };
+        let status_frame = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agentrec_status","arguments":{}}}"#;
+        let payload = |resp: &Value| -> Value {
+            assert_eq!(resp["result"]["isError"], false, "status errored: {resp}");
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("status payload is JSON")
+        };
+
+        // Handshake first, so `protocol_revision` has something to report.
+        let init = send_and_read(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#,
+            &mut stdin,
+        );
+        let revision = init["result"]["protocolVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // --- control: nothing has changed yet ---
+        let before = payload(&send_and_read(status_frame, &mut stdin));
+        let top: std::collections::BTreeSet<&str> = before
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top,
+            [
+                "health",
+                "daemon_running",
+                "agent_undo_mode",
+                "protocol_revision",
+                "restart_required",
+                "note",
+            ]
+            .into_iter()
+            .collect(),
+            "status payload shape: {before}"
+        );
+        assert_eq!(before["agent_undo_mode"], "off");
+        assert_eq!(before["protocol_revision"], revision.as_str());
+        assert_eq!(before["daemon_running"], false, "no daemon was started");
+        assert_eq!(before["restart_required"], false, "nothing changed yet");
+        assert!(before["note"].is_null());
+        // Composed from `RepositoryHealth`, not re-derived here.
+        for key in ["store_bytes", "budgeted_bytes", "budget", "turn_count"] {
+            assert!(
+                before["health"].get(key).is_some(),
+                "health must be the RepositoryHealth struct, missing {key}: {before}"
+            );
+        }
+
+        // --- the edit: agent-undo turned on, on disk, mid-session ---
+        // Slept before rewriting so the new mtime is distinguishable from the
+        // startup stamp on a filesystem with coarse timestamp granularity;
+        // nothing about the property under test depends on the delay.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&config, "mcp_destructive = \"auto\"\n").unwrap();
+
+        let after = payload(&send_and_read(status_frame, &mut stdin));
+        assert_eq!(
+            after["restart_required"], true,
+            "a config change since startup must be reported: {after}"
+        );
+        assert_eq!(
+            after["agent_undo_mode"], "off",
+            "config MUST NOT hot-reload — the file says \"auto\" and the effective mode is \
+             still the startup value: {after}"
+        );
+        assert!(
+            after["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("Restart")),
+            "restart_required must carry a note saying so: {after}"
+        );
+
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "EOF is a graceful exit 0");
+
+        // A NEW process reads the new file, which is what "restart" means.
+        let fresh = text(&root, "agentrec_status", serde_json::json!({}));
+        let fresh: Value = serde_json::from_str(&fresh).unwrap();
+        assert_eq!(fresh["agent_undo_mode"], "auto");
+        assert_eq!(fresh["restart_required"], false);
+    }
+
+    /// `agentrec_status` is annotated `readOnlyHint: true`, so it must not
+    /// touch the filesystem. `view::health()` is a pure read (P4), and the
+    /// liveness probe deliberately opens `.agentrec/daemon.lock` WITHOUT
+    /// `.create(true)` (`daemon::daemon_is_running`) — but "reads a lock file"
+    /// is exactly the kind of claim this repo has been burned asserting from a
+    /// comment, so it is measured: file set AND mtimes, before and after, on a
+    /// repo where the daemon has never run (the only case in which a probe
+    /// could create the lock file).
+    #[test]
+    fn ac_e3_status_call_writes_nothing() {
+        let root = repo();
+        let snapshot = |root: &Path| -> Vec<(PathBuf, std::time::SystemTime)> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.join(".agentrec")];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).unwrap() {
+                    let e = e.unwrap();
+                    let md = e.metadata().unwrap();
+                    if md.is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.push((e.path(), md.modified().unwrap()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let before = snapshot(&root);
+        assert!(
+            !root.join(".agentrec/daemon.lock").exists(),
+            "precondition: the daemon has never run in this fixture"
+        );
+
+        let payload = text(&root, "agentrec_status", serde_json::json!({}));
+        assert!(payload.contains("\"daemon_running\":false"), "{payload}");
+
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "a readOnlyHint tool must leave .agentrec/ byte-for-byte alone"
+        );
+        assert!(
+            !root.join(".agentrec/daemon.lock").exists(),
+            "the liveness probe must not CREATE the lock file it probes"
+        );
+    }
+
+    /// Wiring proof for the `cursor` argument on `agentrec_recall`, plus the
+    /// recorded limitation that makes it awkward. E3 is the first caller
+    /// anywhere in this repo to set `view::RecallQuery::after`.
+    ///
+    /// Half one, RECORDED NOT FIXED: a first page reports `next: null` even
+    /// with hits left behind, because `view::recall` mints a continuation only
+    /// on an already-cursored call. If a later round changes that, this
+    /// assertion reds — and the tool metadata that currently tells clients so
+    /// (`mcpcmd::READ_TOOLS`, `agentrec_recall`) must be updated with it.
+    ///
+    /// Half two: a caller-built cursor round-trips through the adapter and
+    /// yields the NEXT hit, not the first one again. Without this the `after`
+    /// wiring would be exercised by nothing but its rejection paths.
+    ///
+    /// Ten memories, deliberately: `bm25_rank`'s `SCORE_FLOOR` is 0.8 and the
+    /// idf available on a small corpus is `ln(N/matches)`, so a 2- or 3-doc
+    /// fixture scores every hit below the floor and recall returns `[]` — a
+    /// green-looking test asserting nothing. Measured: at N=3 this fixture
+    /// yields 0 hits, at N=10 it yields 2.
+    #[test]
+    fn recall_cursor_wiring_round_trips_a_caller_built_cursor() {
+        let root = repo();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let remember = |fact: &str, path: &str| {
+            std::fs::write(root.join(path), b"fn f() {}\n").unwrap();
+            cli(&root, &["remember", fact, "--from", path]);
+        };
+        remember(
+            "throttle limiter guards the API from bursty traffic via throttle checks",
+            "src/f1.rs",
+        );
+        remember(
+            "throttle budget resets hourly and the throttle counter is per-key",
+            "src/f2.rs",
+        );
+        for i in 3..=10 {
+            remember(
+                &format!("unrelated note number {i} about changelog scripts and release notes"),
+                &format!("src/f{i}.rs"),
+            );
+        }
+
+        let page1: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle", "k": 1}),
+        ))
+        .unwrap();
+        let items = page1["page"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "k=1 bounds the page: {page1}");
+        let first = items[0]["id"].as_str().unwrap().to_string();
+        assert!(
+            page1["page"]["next"].is_null(),
+            "RECORDED LIMITATION: a first recall page never mints a cursor, even with a              second hit waiting. If this now reds, `view::recall` gained first-page              continuations — update the agentrec_recall tool metadata, which tells clients              the opposite: {page1}"
+        );
+
+        // …and the second hit really is there, so the null above is a
+        // limitation and not an empty corpus.
+        let all: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({"query": "throttle"}),
+        ))
+        .unwrap();
+        assert_eq!(all["page"]["items"].as_array().unwrap().len(), 2);
+
+        // A cursor the caller built: the fingerprint is `recall:query=<query>`
+        // (`view::RecallQuery::fingerprint`), which a mismatching value would
+        // reject with `query_mismatch` — already covered above.
+        let page2: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_recall",
+            serde_json::json!({
+                "query": "throttle",
+                "k": 1,
+                "cursor": {
+                    "after_id": first,
+                    "after_occurrence": 0,
+                    "query": "recall:query=throttle",
+                },
+            }),
+        ))
+        .unwrap();
+        let items = page2["page"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{page2}");
+        assert_ne!(
+            items[0]["id"].as_str().unwrap(),
+            first,
+            "a cursor that resolved must advance past its own hit: {page2}"
+        );
+    }
+
+    /// E2 residual 2: the `BlameState::File { gap_stale: true }` arm had no
+    /// MCP-specific test. E2's blame test covers `no_turn_recording_gap` — a
+    /// DIFFERENT arm, reached when no turn touches the path at all.
+    ///
+    /// `gap_stale` is `has_gap_after(records, turn.ended) && modified`
+    /// (`view.rs::blame_file_state`), so the fixture must satisfy BOTH: the
+    /// on-disk bytes deliberately differ from the turn's recorded `after`
+    /// (otherwise `modified` is false and this asserts the wrong arm while
+    /// looking green), and the two unmatched epoch starts are timestamped
+    /// AFTER the turn ended.
+    #[test]
+    fn blame_file_gap_stale_reaches_mcp_byte_identically() {
+        let root = repo();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let blob = store.put(b"recorded\n").unwrap();
+        let t = turn(&turn_id(40), vec![entry("src/z.rs", None, Some(blob))]);
+        seed(&root, &t);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // Different from the recorded `after` → `modified` is true.
+        std::fs::write(root.join("src/z.rs"), b"edited by someone\n").unwrap();
+        // Two starts with no stop between them = an uncovered interval, and
+        // both are after `t.ended` (2026-08-05T00:00:01.000Z).
+        for ts in ["2026-08-05T01:00:00.000Z", "2026-08-05T02:00:00.000Z"] {
+            append_log(
+                &root.join(".agentrec/log.jsonl"),
+                &LogRecord::Epoch(EpochRecord {
+                    v: 1,
+                    event: "start".into(),
+                    ts: ts.into(),
+                    dropped_signals: 0,
+                }),
+            )
+            .unwrap();
+        }
+
+        let mcp_payload = text(
+            &root,
+            "agentrec_blame",
+            serde_json::json!({"path": "src/z.rs"}),
+        );
+        let cli_payload = cli_json(&root, &["blame", "src/z.rs", "--json"]);
+        assert_eq!(
+            mcp_payload, cli_payload,
+            "the gap-stale blame payload must be the --json bytes"
+        );
+        let v: Value = serde_json::from_str(&mcp_payload).unwrap();
+        assert_eq!(v["state"]["type"], "file", "wrong blame arm: {mcp_payload}");
+        assert_eq!(
+            v["state"]["gap_stale"], true,
+            "an uncovered interval after the attributing turn must reach the agent: {mcp_payload}"
+        );
+        assert_eq!(
+            v["state"]["modified"], true,
+            "gap_stale requires modified — if this is false the fixture, not the code, is wrong"
+        );
+        assert!(
+            v["state"]["turn"].is_object(),
+            "the File arm still names its attributor: {mcp_payload}"
         );
     }
 }

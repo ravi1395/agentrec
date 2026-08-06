@@ -168,6 +168,7 @@ A conforming MCP server exposes the record to agents. Tools and their capability
 | `agentrec_diff` | read | Per-turn unified diff |
 | `agentrec_blame` | read | File/line → turn, attribution, human-touched-since |
 | `agentrec_recall` | read | Rank-then-verify recall over pinned/derived memory facts (memory v1) |
+| `agentrec_status` | read | Recording health, recorder liveness, and the server's effective `mcp_destructive` mode |
 | `agentrec_undo` | **destructive** | Gated by the user's `mcp_destructive` mode (below) |
 
 **Destructive tier — the user decides.** Reversion is the point of the record; a recorder that can only watch mistakes is half a product. The user grants agent-driven undo per repo via `config.toml: mcp_destructive = "off" | "confirm" | "auto"` (default `"off"`):
