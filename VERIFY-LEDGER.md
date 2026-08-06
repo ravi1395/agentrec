@@ -1780,6 +1780,18 @@ sentence is the thing out of date.
 
 ### E4 residuals and scope statements (recorded, not fixed)
 
+- **Correction to `f4a96c3`'s commit message (Phase E gate finding 1, measured by the gate):**
+  the message claims the key-only-predicate neuter "reds exactly the **three** foreign-key
+  tests and nothing else." The gate re-ran the neuter (`mcp_entry_is_ours` → `true`):
+  **four** tests red — the three named plus
+  `uninstallcmd::tests::uninstall_does_not_remove_a_foreign_server_named_agentrec`
+  (346 passed / 4 failed). The guard is stronger than claimed; the count in the immutable
+  commit message is wrong. Signature-defect class (confident count in a gated record); this
+  entry is the correction.
+- **Uninstall of a pre-init `{"mcpServers":{}}` is not value-identical (gate finding 2):**
+  `remove_mcp_json` drops the now-empty `mcpServers` key, so an empty-table file does not
+  round-trip to its pre-init parsed value. No foreign registration is harmed — AC-E4's
+  letter holds — recorded here because it was previously recorded nowhere.
 - **No parallel D46 leak class.** Both registration targets are repo-local
   (`initcmd::mcp_json_path` = `root/.mcp.json`, `codex_config_toml_path` =
   `root/.codex/config.toml`); nothing user-scoped or global is written, and `uninstall`
