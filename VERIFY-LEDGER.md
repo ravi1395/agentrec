@@ -1863,7 +1863,9 @@ that EXECUTED the writes, not the one that requested them, so `"cli"` covers bot
 Decision 6's gate was about human confirmation, and both of those are human-confirmed — which is
 why `approve` records `"cli"` and why the count is still the right instrument for the gate. But
 a reader wanting *human-initiated* undos specifically must join to `.agentrec/undo-requests.jsonl`
-(an approved undo has a `reserve`+`approve`/`execute` row naming its undo turn; a bare
+(an approved undo has a `request` event followed by an `execute` event — only the `execute`
+event carries `undo_turn`; no `approve` event is ever written, `EVENT_APPROVE` is reserved and
+`undo_coordinator.rs` documents the durable approval as `EVENT_EXECUTE` itself; a bare
 `undo --confirm` has no ledger row at all). **A count reported as "N human-initiated undos"
 without that join is wrong**, and this paragraph must travel with any figure derived from the
 field.
@@ -2054,3 +2056,43 @@ which intercepts before the coordinator). Per this file's own Phase F gate-round
 did not probe that layer, so nothing here is evidence of refusal at depth, and "both rails fired"
 above names two distinct *rails* (the mode matrix and the `allow_modified` check), never two
 *layers*.
+
+## Phase F gate round 2 (2026-08-06, HEAD `d8c69e3` + this commit)
+
+Adversarial re-gate over the two blocker closures. Verdict on the closures themselves: **both
+HOLD** — the E2E evidence was independently re-verified (the raw token quoted in the preview
+hashes to exactly the `token_sha256` in the reserve row — two independently-quoted values,
+cryptographically bound; all timestamp arithmetic exact; the surviving disposable repo's
+`log.jsonl`/`undo-requests.jsonl`/`calc.py` all match the doc), and finding 13 was confirmed
+truthful against source (`undo_coordinator.rs::append_event` sole writer, no
+truncate/rotate/reclaim path, `purgecmd.rs` has zero references). The round still **GATE-FAILED
+on two record defects**, both fixed in this commit:
+
+1. **The F5 "two populations" paragraph's join instruction was false against the code beside
+   it** (introduced at `2706704`): it said an approved undo has a `reserve`+`approve`/`execute`
+   row. The confirm path writes `request` (not `reserve` — `RESERVING_EVENTS` holds both as
+   distinct events) and **no `approve` event is ever written** — `undo_coordinator.rs::
+   EVENT_APPROVE` documents the durable approval as `EVENT_EXECUTE` itself, and the E2E's own
+   Part 4 shows the real confirm-leg rows (`request` then `execute`). A reader executing the
+   join as written greps for events that do not exist and reads every approved undo as
+   unmatched. Corrected in place; only `execute` carries `undo_turn`. Signature-defect class:
+   confidently-worded record text contradicted by the code beside it.
+2. **A flake that does not exist was briefed to the gate**: `hook_kill_9_closes_open_epoch`
+   (~3/6 rate) appears nowhere in the tree, in git history (`git log -S`, all branches), or in
+   any doc — it existed only in a session handoff transcribed from chat memory. The only
+   durably recorded flake is `approve.rs::a_killed_approve_never_leaves_a_phantom_approval`
+   (rates 1/26 and 2/~14, pinned in gate round 1's provenance bullet above). The false name is
+   recorded here precisely so no future exit narrative resurrects it.
+
+**Suite baseline, re-measured and recorded (not restated):**
+`cargo test --workspace -- --test-threads=3` at this HEAD → **987 passed / 0 failed / 4
+ignored** — measured independently by the orchestrator (twice: once foreground, once summed
+across binaries) and by the gate itself (twice, clean tree before and after, zero
+`FAILED`/`panicked` strings). Arithmetic from the last recorded baseline closes: 985
+(pre-`e32d247`) + 2 (`e32d247`'s fault-injection tests, counted from its diff) = 987.
+
+**Residuals the gate left open, recorded not fixed:** coordinator-layer `allow_modified`
+downgrade (finding 1) stands; the fexit corroboration repo lives in a session scratchpad and
+will vanish — the doc's hashes are the durable evidence; clippy/fmt + release-seam checks on
+this HEAD were run by the orchestrator after the gate, results in the commit that carries this
+section.
