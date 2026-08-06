@@ -130,6 +130,8 @@ pub(crate) fn diagnose(root: &Path) -> Report {
                 "orphaned services",
                 "codex hooks",
                 "codex hook flags",
+                "mcp registration",
+                "mcp server",
             ]
             .iter()
             .map(|name| Check::na(name)),
@@ -149,6 +151,8 @@ pub(crate) fn diagnose(root: &Path) -> Report {
         check_orphan_services(),
         check_codex_hooks(root),
         check_codex_hook_flags(root),
+        check_mcp_registration(root),
+        check_mcp_server(root),
     ];
     let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
     Report { checks, ok }
@@ -639,6 +643,195 @@ fn check_codex_hook_flags(root: &Path) -> Check {
     } else {
         Check::fail(NAME, reasons.join("; "))
     }
+}
+
+// ---- MCP registration + server probe (E4) -----------------------------------
+
+/// Are the repo-local MCP registrations in the state `init` would leave them?
+///
+/// **Advisory, never `fail`, and that is a decision rather than timidity.**
+/// `doctor`'s all-pass exit 0 is a deploy gate; an MCP registration is a
+/// consumer-side convenience (the server answers whether or not any host has
+/// it registered), and every repo initialized before E4 has no registration at
+/// all. Turning those into hard failures would red the gate for a condition
+/// that breaks no recording. A foreign server occupying our key is likewise
+/// reported and left alone — `init` refuses to overwrite it (see
+/// `initcmd::mcp_entry_is_ours`), so surfacing it is all `doctor` can honestly
+/// do.
+///
+/// The Codex leg is `n/a`-shaped: Codex integration is opt-in (`init
+/// --codex`), so a repo that never asked for it is not reported on.
+fn check_mcp_registration(root: &Path) -> Check {
+    const NAME: &str = "mcp registration";
+    use crate::initcmd::McpRegState;
+    let mut notes: Vec<String> = Vec::new();
+
+    let claude_path = crate::initcmd::mcp_json_path(root);
+    match crate::initcmd::mcp_json_state(root) {
+        Ok(McpRegState::Ours) => {}
+        Ok(McpRegState::Absent) => notes.push(format!(
+            "the agentrec MCP server is not registered in {} — run `agentrec init` to add it",
+            claude_path.display()
+        )),
+        Ok(McpRegState::Foreign) => notes.push(format!(
+            "{} declares a server named \"agentrec\" that is not `agentrec mcp` — left \
+             untouched by init and uninstall",
+            claude_path.display()
+        )),
+        Err(e) => notes.push(e),
+    }
+
+    let codex_path = crate::initcmd::codex_config_toml_path(root);
+    let codex_state = crate::initcmd::codex_mcp_state(root);
+    let codex_opted_in =
+        crate::initcmd::codex_hooks_installed(root) || matches!(codex_state, Ok(McpRegState::Ours));
+    if codex_opted_in {
+        match codex_state {
+            Ok(McpRegState::Ours) => {}
+            Ok(McpRegState::Absent) => notes.push(format!(
+                "Codex hooks are installed but {} declares no [mcp_servers.agentrec] — run \
+                 `agentrec init --codex`",
+                codex_path.display()
+            )),
+            Ok(McpRegState::Foreign) => notes.push(format!(
+                "{} declares an [mcp_servers.agentrec] that is not `agentrec mcp` — left \
+                 untouched by init and uninstall",
+                codex_path.display()
+            )),
+            Err(e) => notes.push(e),
+        }
+    }
+
+    if notes.is_empty() {
+        Check::pass(NAME)
+    } else {
+        Check::advisory(NAME, notes.join("; "))
+    }
+}
+
+/// How long the `initialize` probe waits for the server's first frame before
+/// giving up and killing the child. Deliberately short: `doctor` is asserted
+/// to finish well under 2 s by `doctor_completes_quickly`, and every other
+/// check is sub-millisecond, so this is the only one that could blow that
+/// budget. A local stdio handshake that has not answered in a second is
+/// broken, not slow.
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Does `agentrec mcp` actually come up and answer `initialize` against this
+/// root? Spawns the server, writes one frame, reads one line, kills the child.
+///
+/// **Advisory, like the registration check** — a probe failure means the MCP
+/// consumer surface is broken, not that recording is. It never contributes to
+/// the exit code.
+///
+/// **The probe spawns `current_exe()`, not a PATH lookup of `agentrec`**: a
+/// PATH hit could be an entirely different (older, or absent) build than the
+/// one being asked to diagnose itself. The consequence is that under the test
+/// harness `current_exe()` is the *test binary*, which would be spawned with
+/// `--root … mcp` and answer nothing useful; rather than add an env-var test
+/// seam (which would then have to be proven absent from release `strings`),
+/// the probe declares itself skipped when it is not running from a binary
+/// named `agentrec`. Integration tests drive the real binary, so the live path
+/// is exercised there — see `doctor_mcp_server_answers_initialize`.
+fn check_mcp_server(root: &Path) -> Check {
+    const NAME: &str = "mcp server";
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return Check::advisory(NAME, format!("cannot resolve agentrec's own binary ({e})"))
+        }
+    };
+    if exe.file_stem() != Some(std::ffi::OsStr::new("agentrec")) {
+        return Check::advisory(
+            NAME,
+            "probe skipped — doctor is not running from the `agentrec` binary (in-process test \
+             harness); run `agentrec doctor` to exercise it",
+        );
+    }
+    match probe_mcp_initialize(&exe, root) {
+        Ok(()) => Check::pass(NAME),
+        Err(reason) => Check::advisory(
+            NAME,
+            format!(
+                "`agentrec mcp` did not answer `initialize` ({reason}) — MCP hosts will see \
+                     a dead server; try running `agentrec mcp` by hand to see the startup error"
+            ),
+        ),
+    }
+}
+
+/// One `initialize` round-trip against a freshly spawned `agentrec mcp`.
+/// Returns `Ok(())` iff a JSON-RPC success frame carrying a
+/// `result.protocolVersion` came back within [`MCP_PROBE_TIMEOUT`].
+fn probe_mcp_initialize(exe: &Path, root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(exe)
+        .arg("--root")
+        .arg(root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": crate::mcpcmd::PINNED_REVISION,
+                   "capabilities": {},
+                   "clientInfo": {"name": "agentrec-doctor", "version": env!("CARGO_PKG_VERSION")}},
+    });
+    let write_result = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "no stdin pipe".to_string())
+        .and_then(|stdin| {
+            writeln!(stdin, "{frame}")
+                .and_then(|()| stdin.flush())
+                .map_err(|e| format!("write failed: {e}"))
+        });
+
+    // Read the first line on a helper thread so a server that never answers
+    // cannot wedge `doctor`: the child is killed either way below.
+    let outcome = write_result.and_then(|()| {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "no stdout pipe".to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+                .map(|_| line);
+            let _ = tx.send(read);
+        });
+        match rx.recv_timeout(MCP_PROBE_TIMEOUT) {
+            Err(_) => Err(format!("no response within {MCP_PROBE_TIMEOUT:?}")),
+            Ok(Err(e)) => Err(format!("read failed: {e}")),
+            Ok(Ok(line)) => {
+                let value: serde_json::Value = serde_json::from_str(line.trim())
+                    .map_err(|e| format!("response was not JSON ({e})"))?;
+                if value
+                    .get("result")
+                    .and_then(|r| r.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(format!("unexpected first frame: {}", line.trim()))
+                }
+            }
+        }
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
 }
 
 // ---- inotify headroom (Linux only) ------------------------------------------

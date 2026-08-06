@@ -5312,6 +5312,207 @@ fn doctor_healthy_all_pass_exit_0() {
     );
 }
 
+// ---- MCP host registration + demand sweep (E4) -------------------------------
+
+/// AC-E4 end-to-end through the real binary: `init --codex` registers the
+/// agentrec MCP server in BOTH repo-local registries, `uninstall` removes
+/// exactly ours, and a foreign server pre-seeded in each file is untouched.
+#[test]
+fn init_registers_mcp_server_and_uninstall_removes_only_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let mcp_json = root.join(".mcp.json");
+    let codex_toml = root.join(".codex").join("config.toml");
+    let foreign_json = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {"other": {"command": "other-tool", "args": ["serve"]}}
+    }))
+    .unwrap();
+    std::fs::write(&mcp_json, &foreign_json).unwrap();
+    std::fs::write(
+        &codex_toml,
+        "[mcp_servers.other]\ncommand = \"other-tool\"\nargs = [\"serve\"]\n",
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let after_init: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_json).unwrap()).unwrap();
+    assert_eq!(after_init["mcpServers"]["agentrec"]["command"], "agentrec");
+    assert_eq!(after_init["mcpServers"]["agentrec"]["args"][0], "mcp");
+    let toml_after_init: toml::Table = std::fs::read_to_string(&codex_toml)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        toml_after_init["mcp_servers"]["agentrec"]["command"].as_str(),
+        Some("agentrec"),
+        "codex registration missing: {toml_after_init:?}"
+    );
+
+    let out = agentrec(root, &["uninstall", "--no-service"]);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(&mcp_json).unwrap(),
+        foreign_json,
+        ".mcp.json must be back to its pre-init bytes, foreign server intact"
+    );
+    let toml_after_uninstall: toml::Table = std::fs::read_to_string(&codex_toml)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        toml_after_uninstall["mcp_servers"]
+            .get("agentrec")
+            .is_none(),
+        "our registration must be gone: {toml_after_uninstall:?}"
+    );
+    assert_eq!(
+        toml_after_uninstall["mcp_servers"]["other"]["command"].as_str(),
+        Some("other-tool"),
+        "the foreign codex server must survive"
+    );
+}
+
+/// AC-E4: `doctor` reports the registration AND actually round-trips
+/// `initialize` against a spawned `agentrec mcp`.
+///
+/// The discriminating assertion is `remedy == null` on the `mcp server` row:
+/// every failure mode of the probe (skip, spawn failure, timeout, junk frame)
+/// is an advisory carrying a note, and `status` is `pass` in all of them, so
+/// asserting only the status would pass under a probe that never ran.
+#[test]
+fn doctor_reports_mcp_registration_and_server_answers_initialize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-service"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let report = doctor_json_value(root);
+    let checks = report["checks"].as_array().expect("checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name:?} check: {report}"))
+    };
+
+    let registration = find("mcp registration");
+    assert_eq!(registration["status"], "pass", "{registration}");
+    assert!(
+        registration["remedy"].is_null(),
+        "a registered repo needs no note: {registration}"
+    );
+
+    let server = find("mcp server");
+    assert_eq!(server["status"], "pass", "{server}");
+    assert!(
+        server["remedy"].is_null(),
+        "the probe must have spawned `agentrec mcp` and read a valid initialize \
+         result — any other outcome carries a note: {server}"
+    );
+}
+
+/// A repo initialized without the Claude Code integration (`--no-hook`) has no
+/// `.mcp.json`. That is reported as an advisory NOTE, never a failure: it
+/// breaks no recording, and every pre-E4 repo is in this state.
+#[test]
+fn doctor_reports_absent_mcp_registration_without_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-service", "--no-hook"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "--no-hook must not write a registration"
+    );
+
+    let report = doctor_json_value(root);
+    let registration = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "mcp registration")
+        .unwrap_or_else(|| panic!("no mcp registration check: {report}"))
+        .clone();
+    assert_eq!(registration["status"], "pass", "{registration}");
+    let remedy = registration["remedy"].as_str().unwrap_or("");
+    assert!(
+        remedy.contains(".mcp.json"),
+        "the note must name the file: {registration}"
+    );
+}
+
+fn demand_sweep_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts")
+        .join("mcp-demand-sweep.sh")
+}
+
+/// AC-E4: the gap-10 instrument runs against a synthetic `~/.claude/projects`
+/// and prints the candidate invocations it found. `HOME` is overridden so the
+/// script exercises its DEFAULT path (no argument), which is the way it will
+/// actually be run.
+#[test]
+fn mcp_demand_sweep_prints_candidate_invocations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let projects = home.join(".claude").join("projects").join("some-repo");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("session.jsonl"),
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\
+         \"name\":\"mcp__agentrec__agentrec_blame\"}]}}\n\
+         {\"name\":\"mcp__agentrec__agentrec_blame\"}\n\
+         {\"name\":\"Read\"}\n",
+    )
+    .unwrap();
+
+    let out = Command::new("bash")
+        .arg(demand_sweep_script())
+        .env("HOME", home)
+        .output()
+        .expect("run the demand sweep");
+    assert!(out.status.success(), "sweep failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("candidate invocations: 2"),
+        "expected both candidates counted: {stdout}"
+    );
+    assert!(
+        stdout.contains("agentrec_blame"),
+        "expected the tool named: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"name\":\"Read\""),
+        "a non-agentrec tool must not be reported: {stdout}"
+    );
+}
+
+/// The instrument must survive a machine that has never run Claude Code:
+/// absent transcript directory -> a printed explanation and exit 0, never a
+/// failure (it is a monthly cron-shaped chore, not a gate).
+#[test]
+fn mcp_demand_sweep_handles_absent_transcript_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new("bash")
+        .arg(demand_sweep_script())
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run the demand sweep");
+    assert!(out.status.success(), "sweep must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("nothing to sweep"),
+        "expected the absent-dir explanation: {stdout}"
+    );
+}
+
 #[test]
 fn doctor_daemon_down_fails() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5808,7 +6009,31 @@ fn codex_init_hooks_json_only_preserves_foreign_entries() {
 
     let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
-    assert!(!root.join(".codex/config.toml").exists());
+    // SUBSTITUTED ASSERTION (Task E4, recorded in VERIFY-LEDGER.md § "Task E4").
+    // This line read `assert!(!root.join(".codex/config.toml").exists())`. E4
+    // makes `init --codex` write the MCP registration into that file (parent
+    // spec :582 pins it as the registration home), so the file now exists by
+    // design. The invariant the original assertion protected — agentrec never
+    // creates a SECOND hook representation — is asserted directly and more
+    // specifically instead: no `hooks` key at all, and `mcp_servers` as the
+    // file's only table.
+    let config: toml::Table = std::fs::read_to_string(root.join(".codex/config.toml"))
+        .expect("E4 writes the MCP registration here")
+        .parse()
+        .unwrap();
+    assert!(
+        config.get("hooks").is_none(),
+        "no second hook representation may be created: {config:?}"
+    );
+    assert_eq!(
+        config.keys().collect::<Vec<_>>(),
+        vec!["mcp_servers"],
+        "only the MCP registration belongs in a file agentrec created here: {config:?}"
+    );
+    assert_eq!(
+        config["mcp_servers"]["agentrec"]["command"].as_str(),
+        Some("agentrec")
+    );
 
     let settings = read_codex_hooks_json(root);
     let stop = settings["hooks"]["Stop"].as_array().unwrap();
@@ -5940,6 +6165,34 @@ fn codex_init_both_present_refuses_untouched() {
         config_toml_before
     );
     assert!(!root.join(".codex/hooks.json.bak").exists());
+    assert!(!root.join(".codex/config.toml.bak").exists());
+}
+
+/// E4's gate on the dual-hook-representation refusal, pinned separately from
+/// the C3 test above: MCP registration is a DIFFERENT layer, so it takes an
+/// explicit decision to withhold it — and withholding it is what keeps
+/// `init`'s printed "refuses … leaves both untouched" line true.
+#[test]
+fn codex_init_both_present_writes_no_mcp_registration_either() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(root.join(".codex/hooks.json"), "{\"hooks\":{}}\n").unwrap();
+    let config_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/config.toml"), config_before).unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("skipped Codex MCP registration"),
+        "the withheld registration must be announced, not silent: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_before,
+        "no [mcp_servers] table may appear in a file we promised not to touch"
+    );
     assert!(!root.join(".codex/config.toml.bak").exists());
 }
 

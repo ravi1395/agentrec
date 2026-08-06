@@ -1692,3 +1692,117 @@ could live.
 The prior rider's operational lesson stands regardless of this outcome: a repo-scoped grep cannot
 prove a claim is unrecoverable, only that it isn't in the repo. "No artifact can settle it" was
 itself an unverified claim dressed as a methodological conclusion.
+
+## Task E4 — MCP host registration, demand sweep, P.7 review (2026-08-06, `feat/phase-2-tail`)
+
+### DECLARED / manual — MCP demand sweep (delta spec gap 10; D7/D10)
+
+| Row | State | Closes when |
+|---|---|---|
+| MCP demand sweep — first run | **DECLARED, manual, not yet due** | `scripts/mcp-demand-sweep.sh` is run once, **one month after 2.2 ships**, and its output is pasted into this row. 2.2 is **unshipped as of 2026-08-06**, so no absolute date can be written here yet; the release that cuts 2.2 fills it in (`claude-setup/skills/agentrec-release`). An empty date in this row therefore means "2.2 has not shipped", never "the sweep was forgotten". |
+
+Why the date matters rather than the cadence: Claude Code prunes `~/.claude/projects` on a
+~30-day rolling window (measured in the Phase 2.0 P1 round — `-mtime +30` → 0 files). A sweep
+skipped by a month does not run late, it runs against a corpus that no longer contains the
+evidence. Slippage is lossy, not merely delayed.
+
+What the instrument does and does not do: it greps transcripts for `"name":"…agentrec_<tool>"`
+(the `mcp__<server>__<tool>` shape measured on this machine's real transcripts, plus the bare
+form) and prints per-tool and per-transcript candidate counts. **It judges nothing** — per the
+D7 clauses the audit is manual, and a name in a transcript is a candidate, not a verified
+invocation (it can appear in prose or in an echoed tool *definition*). Read-only, no network,
+absent directory → explanation + exit 0. Pinned by `mcp_demand_sweep_prints_candidate_invocations`
+and `mcp_demand_sweep_handles_absent_transcript_dir` (`cli/tests/integration.rs`, `HOME`
+overridden so the script's DEFAULT path is what runs).
+
+### Codex MCP registration — format verified live, location pinned, loading NOT confirmed
+
+Format measured, not recalled: `codex mcp add agentrec -- agentrec mcp` under a throwaway
+`CODEX_HOME` on the pinned `codex-cli 0.146.0` wrote exactly
+
+```toml
+[mcp_servers.agentrec]
+command = "agentrec"
+args = ["mcp"]
+```
+
+Location is **parent spec :582** ("Project `.codex/config.toml` owns the stdio MCP
+registration"), which is founder-owned and not an executor's to overturn.
+
+**Open gap, stated rather than resolved:** that Codex honors `mcp_servers` from a *repo-local*
+`.codex/config.toml` is **not confirmed**. `codex mcp list` under an isolated `CODEX_HOME` did
+not list a project-local `[mcp_servers.projlocal]` entry — but that probe is **weakly
+discriminating**: the management subcommand may only ever consult `CODEX_HOME`, regardless of
+what the agent runtime loads. What *is* confirmed live is that Codex loads repo-local
+`.codex/config.toml` for the `[hooks]` layer (spike: the dual-representation merge warning names
+the scratch repo's own path). The discriminating probe — `codex exec` in a temp repo carrying a
+project-local `mcp_servers` entry whose command leaves a filesystem trace — was **not run**
+(needs auth + a live model call). This code therefore states what the config declares, not what
+Codex does with it, the same honest form `doctorcmd.rs::check_codex_hook_flags` already uses.
+
+### P.7 review (IMPLEMENTATION.md §P.7) — reviewed 2026-08-06, stance unchanged
+
+Reviewed against the surface `agentrec mcp` actually ships today (five read tools, `mcpcmd.rs`).
+
+**Holds.** (a) All five tool descriptions are declarative statements of what is returned —
+no directives aimed at the model, no urgency, no authority claims. (b) Tool results are the
+`view.rs` typed serializers' JSON carried in `content:[{type:"text"}]`; no imperative text is
+synthesized anywhere in the result path. (c) Every tool carries `readOnlyHint: true` /
+`destructiveHint: false` (plus `idempotentHint: true`, `openWorldHint: false`), asserted per
+tool over the exact five-name list by `cli/tests/mcp.rs` (`names == READ_TOOLS`, then the
+per-tool annotation loop) — the Phase E exit item, already satisfied by E1's test, verified
+here rather than re-implemented.
+
+**Two findings, REPORTED not fixed** (both would be changes to shipped wire text or to
+founder-owned normative text, neither of which this task is authorized to rewrite):
+
+1. `agentrec_recall`'s description ends "raise `k` to see more hits", and its `cursor` property
+   says "see the tool description". These are imperatives, addressed to the caller about the
+   tool's own API rather than instructions to act in the world — benign on any reading, but
+   they are literally the shape §P.7's first clause bans ("no instructions"). Either the clause
+   wants narrowing to *instructions to act outside the tool call*, or those two sentences want
+   rephrasing declaratively. Founder's call.
+2. **The stance does not cover the real exposure.** Both clauses are about text *agentrec*
+   writes. The untrusted text on this surface is what agentrec *replays*: recorded prompt
+   excerpts and file diffs flow back into an agent's context through `agentrec_log`/
+   `agentrec_diff`/`agentrec_recall`, and current MCP security guidance treats tool-result
+   content as untrusted data that a host must not follow. Nothing here is a defect in the
+   code — the data is faithfully what was recorded — but §P.7 as written would be satisfied by
+   a server that echoed an attacker-authored prompt verbatim. A clause naming replayed content
+   as untrusted-by-construction is the gap.
+
+**Also stale, found during this review and likewise not rewritten:** §P.2 says read tools
+"return structured JSON mirroring `--json` output". Two later founder-series decisions narrow
+that — P4b decision 12 (`agentrec_log` mirrors `list()`'s `Page<TurnSummary>`, **not**
+`log --json`, which emits protocol JSONL) and delta decision 14 (`agentrec_recall` has no
+`--json` contract to mirror and carries its own flags). The code follows the decisions; §P.2's
+sentence is the thing out of date.
+
+### E4 residuals and scope statements (recorded, not fixed)
+
+- **No parallel D46 leak class.** Both registration targets are repo-local
+  (`initcmd::mcp_json_path` = `root/.mcp.json`, `codex_config_toml_path` =
+  `root/.codex/config.toml`); nothing user-scoped or global is written, and `uninstall`
+  removes both. `init` under a temp root writes them *inside* the temp root, so they vanish
+  with it — unlike the launchd unit `service_decision` guards, which outlives its root. The
+  temp guard is moot here by construction, not by exemption.
+- **`init` does not touch `.gitignore` for `.mcp.json`.** `ensure_gitignore` only ever
+  appends `.agentrec/`. `.mcp.json` is the *shared* registration (unlike
+  `.claude/settings.local.json`) and is left for the user to commit or not. Note this
+  repo's own `.gitignore:10` already lists `.mcp.json` — pre-existing, untouched by E4.
+- **Codex `Refuse`-state asymmetry, deliberate:** registration proceeds on `HooksJson` and
+  `ConfigToml`, and is withheld on `Refuse`, because `codex_refuse_line` promises the user
+  both hook files are left alone. Our own registration cannot push a repo into `Refuse` on a
+  later run — `[mcp_servers]` is not a hook representation, pinned by
+  `initcmd::tests::mcp_registration_alone_does_not_change_the_codex_hook_target`.
+- **Comment-dropping, inherited:** on the non-`Refuse` paths, registering re-serializes the
+  WHOLE `.codex/config.toml` through the `toml` crate, so a user's comments and key ordering
+  are lost on a file they did not ask to have reformatted. Same documented limitation as
+  `install_codex_hooks_toml` (fixing it needs `toml_edit`, a new dependency). Disclosed by
+  the printed action line; not silent.
+- The sweep script is committed `100755` but every caller invokes it as
+  `bash scripts/mcp-demand-sweep.sh` (test and docs both), matching the `check-versions.sh`
+  precedent — nothing depends on git's recording mode.
+- Release-seam check re-run against a **freshly built** `target/release/agentrec` (the
+  earlier reading was against a stale binary and is not the one recorded here):
+  `strings … | grep -c AGENTREC_TEST` → **0**. E4 adds no env seam.

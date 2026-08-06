@@ -166,6 +166,7 @@ pub fn run(
 
     if no_hook {
         actions.push("skipped Claude Code hook install (--no-hook)".to_string());
+        actions.push("skipped Claude Code MCP registration (--no-hook)".to_string());
     } else {
         let hooks_changed = install_claude_hooks(root)?;
         changed = changed || hooks_changed;
@@ -177,10 +178,26 @@ pub fn run(
                 "already present"
             }
         ));
+        // E4: the `.mcp.json` registration rides the same `--no-hook` gate as
+        // the hooks — both are the Claude Code integration surface, and a user
+        // who declined one has declined the other.
+        match install_mcp_json(root) {
+            Ok(McpRegOutcome::Registered { changed: c }) => {
+                changed = changed || c;
+                actions.push(format!(
+                    "Claude Code MCP registration {} ({})",
+                    if c { "written" } else { "already present" },
+                    mcp_json_path(root).display()
+                ));
+            }
+            Ok(McpRegOutcome::Foreign) => actions.push(mcp_foreign_line(&mcp_json_path(root))),
+            Err(e) => actions.push(format!("Claude Code MCP registration skipped: {e}")),
+        }
     }
 
     if !codex {
         actions.push("skipped Codex hook install (pass --codex to enable)".to_string());
+        actions.push("skipped Codex MCP registration (pass --codex to enable)".to_string());
     } else {
         match install_codex_hooks(root) {
             Ok(CodexHooksOutcome::Refused) => actions.push(codex_refuse_line(root)),
@@ -194,6 +211,37 @@ pub fn run(
                 actions.push(CODEX_TRUST_REMINDER.to_string());
             }
             Err(e) => actions.push(format!("Codex hook install skipped: {e}")),
+        }
+        // MCP registration lives in a DIFFERENT table (`[mcp_servers]`) of a
+        // different layer than `[hooks]`, so it does not create a second hook
+        // representation — but it is still gated on the dual-representation
+        // refusal, because `codex_refuse_line` promises the user both files
+        // are left alone. Writing `[mcp_servers.agentrec]` into their
+        // `config.toml` (re-serialized, comments dropped, `.bak` left behind)
+        // while printing that we refused to touch it would make that printed
+        // line false. Pinned by `codex_init_both_present_refuses_untouched`.
+        if matches!(codex_hooks_target(root), Ok(CodexHooksTarget::Refuse)) {
+            actions.push(
+                "skipped Codex MCP registration: the dual hook-representation state above \
+                 leaves .codex/config.toml untouched — consolidate to one hook file, then \
+                 re-run `agentrec init --codex`"
+                    .to_string(),
+            );
+        } else {
+            match install_codex_mcp(root) {
+                Ok(McpRegOutcome::Registered { changed: c }) => {
+                    changed = changed || c;
+                    actions.push(format!(
+                        "Codex MCP registration {} ({})",
+                        if c { "written" } else { "already present" },
+                        codex_config_toml_path(root).display()
+                    ));
+                }
+                Ok(McpRegOutcome::Foreign) => {
+                    actions.push(mcp_foreign_line(&codex_config_toml_path(root)))
+                }
+                Err(e) => actions.push(format!("Codex MCP registration skipped: {e}")),
+            }
         }
     }
 
@@ -235,14 +283,19 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
     }
     if no_hook {
         println!("[dry-run] would skip Claude Code hook install (--no-hook)");
+        println!("[dry-run] would skip Claude Code MCP registration (--no-hook)");
     } else {
         println!("[dry-run] would install Claude Code hooks (UserPromptSubmit + Stop)");
+        // Same read-only inspect function the real run decides with, so a dry
+        // run can never claim a registration the real run would refuse.
+        print_dry_run_mcp("Claude Code", &mcp_json_path(root), mcp_json_state(root));
     }
     // Same read-only inspect function the real run uses to decide, so
     // `--dry-run` can never claim an install (or a refuse) the real run
     // would not also do.
     if !codex {
         println!("[dry-run] would skip Codex hook install (pass --codex to enable)");
+        println!("[dry-run] would skip Codex MCP registration (pass --codex to enable)");
     } else {
         match codex_hooks_target(root) {
             Ok(CodexHooksTarget::Refuse) => println!("[dry-run] {}", codex_refuse_line(root)),
@@ -252,6 +305,21 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
                 codex_target_label(target, root)
             ),
             Err(e) => println!("[dry-run] Codex hook install would be skipped: {e}"),
+        }
+        // Same Refuse gate as the real run, decided by the same inspect
+        // function, so a dry run cannot promise a registration the real run
+        // withholds.
+        if matches!(codex_hooks_target(root), Ok(CodexHooksTarget::Refuse)) {
+            println!(
+                "[dry-run] would skip Codex MCP registration too — the dual \
+                 hook-representation state leaves .codex/config.toml untouched"
+            );
+        } else {
+            print_dry_run_mcp(
+                "Codex",
+                &codex_config_toml_path(root),
+                codex_mcp_state(root),
+            );
         }
     }
     // Same decision function as the real run, so `--dry-run` can never claim
@@ -276,6 +344,23 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
         }
     }
     println!("[dry-run] nothing on disk was touched");
+}
+
+/// One `--dry-run` line per MCP registration surface, derived from the SAME
+/// read-only state function the real run branches on.
+fn print_dry_run_mcp(host: &str, path: &Path, state: Result<McpRegState, String>) {
+    match state {
+        Ok(McpRegState::Absent) => println!(
+            "[dry-run] would register the agentrec MCP server in {}",
+            path.display()
+        ),
+        Ok(McpRegState::Ours) => println!(
+            "[dry-run] {host} MCP registration already present in {}",
+            path.display()
+        ),
+        Ok(McpRegState::Foreign) => println!("[dry-run] {}", mcp_foreign_line(path)),
+        Err(e) => println!("[dry-run] {host} MCP registration would be skipped: {e}"),
+    }
 }
 
 /// Absolute path to this running `agentrec` binary — the exec the generated
@@ -966,6 +1051,299 @@ fn codex_hooks_shape_toml(hooks_table: &toml::Table) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================================
+// MCP server registration (Task E4; IMPLEMENTATION.md Q.2 for Claude Code,
+// parent spec :582 for Codex — "Project `.codex/config.toml` owns the stdio
+// MCP registration"). Both targets are REPO-LOCAL files under `root`, written
+// by `init`, validated by `doctor`, removed by `uninstall`, with the same
+// marker discipline the hook installers above use.
+//
+// Wire shapes, both verified rather than recalled:
+// * Claude Code `.mcp.json`: `{"mcpServers": {"<name>": {"command":…,
+//   "args":[…]}}}`.
+// * Codex `[mcp_servers.<name>]` with `command` / `args` — measured live on
+//   the pinned `codex-cli 0.146.0` by running `codex mcp add agentrec --
+//   agentrec mcp` under a throwaway `CODEX_HOME` and reading the file it
+//   wrote (exactly those three keys, in that shape).
+//
+// **Recorded gap, deliberately not papered over.** `codex mcp add` writes the
+// USER-GLOBAL `$CODEX_HOME/config.toml`; that a repo-local `.codex/
+// config.toml` is honored for the `mcp_servers` layer is NOT confirmed —
+// `codex mcp list` under an isolated `CODEX_HOME` did not list a project-local
+// entry, but that probe is weakly discriminating (the management subcommand
+// may only ever consult `CODEX_HOME`, regardless of what the agent runtime
+// loads). What IS confirmed live is that Codex loads repo-local
+// `.codex/config.toml` for the `[hooks]` layer (spike: the merge warning names
+// the scratch repo's own path). The location is pinned by parent spec :582,
+// which is founder-owned; this code states what the config declares, not what
+// Codex does with it — the same honest form `doctorcmd.rs::
+// check_codex_hook_flags` already uses for this exact class of gap.
+// ============================================================================
+
+/// The registry key agentrec registers itself under in both hosts.
+pub(crate) const MCP_SERVER_NAME: &str = "agentrec";
+/// The command + argv registered. Bare `agentrec` (PATH-resolved by the host),
+/// matching what `codex mcp add agentrec -- agentrec mcp` itself writes; NOT
+/// the absolute `current_exe()` the service unit bakes, because a host config
+/// is user-visible, commonly committed, and must survive a reinstall to a
+/// different prefix — the opposite trade-off from `service_exec_path`.
+const MCP_SERVER_COMMAND: &str = "agentrec";
+const MCP_SERVER_ARGS: &[&str] = &["mcp"];
+
+/// Whether a registry entry is one agentrec wrote.
+///
+/// **This predicate is the whole marker discipline for MCP registration, and
+/// it is not the registry key.** Hook entries carry `agentrec hook` INSIDE the
+/// command string; an MCP entry has no such slot — it is a bare program plus
+/// argv, under a name the user could also have chosen. So identity is
+/// structural: command file-stem `agentrec` AND `mcp` among its args. A
+/// foreign server that merely occupies the `agentrec` key does NOT match, so
+/// `init` refuses it untouched and `uninstall` leaves it alone. A key-only
+/// predicate would silently eat that user's config, which is the failure this
+/// function exists to prevent (pinned by
+/// `foreign_entry_under_our_key_is_not_ours` and the round-trip tests).
+fn mcp_entry_is_ours(command: Option<&str>, args: &[&str]) -> bool {
+    let command_is_ours = command
+        .and_then(|c| {
+            Path::new(c)
+                .file_stem()
+                .map(|s| s == std::ffi::OsStr::new(MCP_SERVER_NAME))
+        })
+        .unwrap_or(false);
+    command_is_ours && args.contains(&"mcp")
+}
+
+fn json_mcp_entry_is_ours(entry: &serde_json::Value) -> bool {
+    let command = entry.get("command").and_then(|c| c.as_str());
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    mcp_entry_is_ours(command, &args)
+}
+
+fn toml_mcp_entry_is_ours(entry: &toml::Value) -> bool {
+    let command = entry.get("command").and_then(|c| c.as_str());
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    mcp_entry_is_ours(command, &args)
+}
+
+/// What the `agentrec` key currently holds in one registry file.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum McpRegState {
+    /// No entry under our key.
+    Absent,
+    /// Our entry (per [`mcp_entry_is_ours`]).
+    Ours,
+    /// Someone else's entry occupying our key — never overwritten, never
+    /// removed.
+    Foreign,
+}
+
+/// Result of an install attempt. Mirrors `CodexHooksOutcome`'s shape so both
+/// registration paths read the same at the call site.
+pub(crate) enum McpRegOutcome {
+    Registered { changed: bool },
+    Foreign,
+}
+
+pub(crate) fn mcp_json_path(root: &Path) -> std::path::PathBuf {
+    root.join(".mcp.json")
+}
+
+/// Read-only inspection of `.mcp.json`. Shared by the real run, `--dry-run`
+/// and `doctor` so none of the three can drift from the others (the same
+/// precedent `codex_hooks_target`/`service_decision` set).
+pub(crate) fn mcp_json_state(root: &Path) -> Result<McpRegState, String> {
+    let path = mcp_json_path(root);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(McpRegState::Absent),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "existing {} is not valid JSON ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    Ok(
+        match value.get("mcpServers").and_then(|s| s.get(MCP_SERVER_NAME)) {
+            None => McpRegState::Absent,
+            Some(entry) if json_mcp_entry_is_ours(entry) => McpRegState::Ours,
+            Some(_) => McpRegState::Foreign,
+        },
+    )
+}
+
+/// Read-only inspection of the repo-local `.codex/config.toml`
+/// `[mcp_servers.agentrec]` table.
+pub(crate) fn codex_mcp_state(root: &Path) -> Result<McpRegState, String> {
+    let path = codex_config_toml_path(root);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(McpRegState::Absent),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        format!(
+            "existing {} is not valid TOML ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    Ok(
+        match table
+            .get("mcp_servers")
+            .and_then(|s| s.as_table())
+            .and_then(|s| s.get(MCP_SERVER_NAME))
+        {
+            None => McpRegState::Absent,
+            Some(entry) if toml_mcp_entry_is_ours(entry) => McpRegState::Ours,
+            Some(_) => McpRegState::Foreign,
+        },
+    )
+}
+
+/// Merge `mcpServers.agentrec` into `.mcp.json`. Foreign entry under our key →
+/// no write at all. Every other key (and every other server) is preserved
+/// byte-compatibly: the file is only rewritten when we actually add our entry.
+pub(crate) fn install_mcp_json(root: &Path) -> Result<McpRegOutcome, String> {
+    let path = mcp_json_path(root);
+    match mcp_json_state(root)? {
+        McpRegState::Foreign => return Ok(McpRegOutcome::Foreign),
+        McpRegState::Ours => return Ok(McpRegOutcome::Registered { changed: false }),
+        McpRegState::Absent => {}
+    }
+    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "existing {} is not valid JSON ({e}); not touching it",
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    let servers_obj = servers
+        .as_object_mut()
+        .ok_or_else(|| format!("{} \"mcpServers\" is not a JSON object", path.display()))?;
+    servers_obj.insert(
+        MCP_SERVER_NAME.to_string(),
+        serde_json::json!({"command": MCP_SERVER_COMMAND, "args": MCP_SERVER_ARGS}),
+    );
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    Ok(McpRegOutcome::Registered { changed: true })
+}
+
+/// Merge `[mcp_servers.agentrec]` into the repo-local `.codex/config.toml`.
+///
+/// Same `toml`-crate whole-file re-serialization caveat as
+/// `install_codex_hooks_toml`: comments and key ordering are NOT preserved
+/// (adding `toml_edit` would be a new dependency). Foreign servers therefore
+/// survive as PARSED VALUES, not as bytes — the round-trip test asserts
+/// parsed-value identity on this path and byte identity on the `.mcp.json`
+/// path, which is the strongest true statement available here.
+pub(crate) fn install_codex_mcp(root: &Path) -> Result<McpRegOutcome, String> {
+    let path = codex_config_toml_path(root);
+    match codex_mcp_state(root)? {
+        McpRegState::Foreign => return Ok(McpRegOutcome::Foreign),
+        McpRegState::Ours => return Ok(McpRegOutcome::Registered { changed: false }),
+        McpRegState::Absent => {}
+    }
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+    };
+    let mut doc: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        format!(
+            "existing {} is not valid TOML ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    let servers_val = doc
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let servers = servers_val
+        .as_table_mut()
+        .ok_or_else(|| format!("{} \"mcp_servers\" is not a TOML table", path.display()))?;
+    let mut entry = toml::Table::new();
+    entry.insert(
+        "command".to_string(),
+        toml::Value::String(MCP_SERVER_COMMAND.to_string()),
+    );
+    entry.insert(
+        "args".to_string(),
+        toml::Value::Array(
+            MCP_SERVER_ARGS
+                .iter()
+                .map(|a| toml::Value::String((*a).to_string()))
+                .collect(),
+        ),
+    );
+    servers.insert(MCP_SERVER_NAME.to_string(), toml::Value::Table(entry));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("toml.bak");
+        fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+    }
+    let out = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(McpRegOutcome::Registered { changed: true })
+}
+
+/// Printed when our key is occupied by someone else's server. Shared by the
+/// real run and `--dry-run`.
+fn mcp_foreign_line(path: &Path) -> String {
+    format!(
+        "skipped MCP registration: {} already declares a server named {:?} that is not \
+         agentrec's own (`{} {}`) — left untouched; rename or remove it, then re-run \
+         `agentrec init`",
+        path.display(),
+        MCP_SERVER_NAME,
+        MCP_SERVER_COMMAND,
+        MCP_SERVER_ARGS.join(" "),
+    )
+}
+
 fn codex_target_label(target: CodexHooksTarget, root: &Path) -> String {
     match target {
         CodexHooksTarget::HooksJson => codex_hooks_json_path(root).display().to_string(),
@@ -1607,5 +1985,164 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    // ---- MCP registration (E4) --------------------------------------------
+
+    /// The predicate that decides whether `init` overwrites and `uninstall`
+    /// removes. A foreign server sitting on the `agentrec` KEY must not match
+    /// — a key-only predicate passes every other test in this file and eats
+    /// that user's config.
+    #[test]
+    fn foreign_entry_under_our_key_is_not_ours() {
+        assert!(mcp_entry_is_ours(Some("agentrec"), &["mcp"]));
+        assert!(mcp_entry_is_ours(
+            Some("/opt/homebrew/bin/agentrec"),
+            &["mcp"]
+        ));
+        // Same key, someone else's server.
+        assert!(!mcp_entry_is_ours(Some("other-tool"), &["mcp"]));
+        // Our binary, but not the MCP subcommand (e.g. a user's own wrapper).
+        assert!(!mcp_entry_is_ours(Some("agentrec"), &["record"]));
+        assert!(!mcp_entry_is_ours(None, &["mcp"]));
+    }
+
+    #[test]
+    fn install_mcp_json_writes_entry_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(mcp_json_state(root).unwrap(), McpRegState::Absent);
+        assert!(matches!(
+            install_mcp_json(root).unwrap(),
+            McpRegOutcome::Registered { changed: true }
+        ));
+        assert_eq!(mcp_json_state(root).unwrap(), McpRegState::Ours);
+        let written = fs::read_to_string(mcp_json_path(root)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(value["mcpServers"]["agentrec"]["command"], "agentrec");
+        assert_eq!(value["mcpServers"]["agentrec"]["args"][0], "mcp");
+        // Re-run: no change, byte-identical file.
+        assert!(matches!(
+            install_mcp_json(root).unwrap(),
+            McpRegOutcome::Registered { changed: false }
+        ));
+        assert_eq!(fs::read_to_string(mcp_json_path(root)).unwrap(), written);
+    }
+
+    #[test]
+    fn install_mcp_json_preserves_foreign_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let foreign = serde_json::json!({"command": "other-tool", "args": ["serve", "--x"]});
+        fs::write(
+            mcp_json_path(root),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"other": foreign.clone()},
+                "unrelatedKey": {"kept": true},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        install_mcp_json(root).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(mcp_json_path(root)).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["other"], foreign);
+        assert_eq!(value["unrelatedKey"]["kept"], true);
+        assert_eq!(value["mcpServers"]["agentrec"]["command"], "agentrec");
+    }
+
+    /// A foreign server occupying OUR key: `init` writes nothing at all and
+    /// the file is byte-identical afterwards.
+    #[test]
+    fn install_mcp_json_refuses_foreign_entry_under_our_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {"agentrec": {"command": "other-tool", "args": ["mcp"]}}
+        }))
+        .unwrap();
+        fs::write(mcp_json_path(root), &text).unwrap();
+        assert_eq!(mcp_json_state(root).unwrap(), McpRegState::Foreign);
+        assert!(matches!(
+            install_mcp_json(root).unwrap(),
+            McpRegOutcome::Foreign
+        ));
+        assert_eq!(
+            fs::read_to_string(mcp_json_path(root)).unwrap(),
+            text,
+            "a foreign entry under our key must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn install_codex_mcp_writes_table_and_preserves_foreign_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(
+            codex_config_toml_path(root),
+            "model = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"other-tool\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        assert_eq!(codex_mcp_state(root).unwrap(), McpRegState::Absent);
+        assert!(matches!(
+            install_codex_mcp(root).unwrap(),
+            McpRegOutcome::Registered { changed: true }
+        ));
+        let doc: toml::Table = fs::read_to_string(codex_config_toml_path(root))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let servers = doc["mcp_servers"].as_table().unwrap();
+        assert_eq!(servers["agentrec"]["command"].as_str(), Some("agentrec"));
+        assert_eq!(servers["agentrec"]["args"][0].as_str(), Some("mcp"));
+        // The foreign server survives as a parsed value (the `toml` crate
+        // round-trip reformats the whole file — documented on
+        // `install_codex_mcp`).
+        assert_eq!(servers["other"]["command"].as_str(), Some("other-tool"));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        assert!(matches!(
+            install_codex_mcp(root).unwrap(),
+            McpRegOutcome::Registered { changed: false }
+        ));
+    }
+
+    /// An MCP registration alone must NOT flip the hook-target decision: a
+    /// `config.toml` carrying only `[mcp_servers]` has no `[hooks]` table, so
+    /// the next `init --codex` still merges hooks into `hooks.json` and never
+    /// enters the dual-representation refusal because of our own write.
+    #[test]
+    fn mcp_registration_alone_does_not_change_the_codex_hook_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(
+            codex_hooks_target(root).unwrap(),
+            CodexHooksTarget::HooksJson
+        );
+        install_codex_mcp(root).unwrap();
+        assert!(codex_config_toml_path(root).is_file());
+        assert_eq!(
+            codex_hooks_target(root).unwrap(),
+            CodexHooksTarget::HooksJson,
+            "an [mcp_servers]-only config.toml is not a hook representation"
+        );
+    }
+
+    #[test]
+    fn install_codex_mcp_refuses_foreign_entry_under_our_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        let text = "[mcp_servers.agentrec]\ncommand = \"other-tool\"\nargs = [\"mcp\"]\n";
+        fs::write(codex_config_toml_path(root), text).unwrap();
+        assert_eq!(codex_mcp_state(root).unwrap(), McpRegState::Foreign);
+        assert!(matches!(
+            install_codex_mcp(root).unwrap(),
+            McpRegOutcome::Foreign
+        ));
+        assert_eq!(
+            fs::read_to_string(codex_config_toml_path(root)).unwrap(),
+            text
+        );
     }
 }

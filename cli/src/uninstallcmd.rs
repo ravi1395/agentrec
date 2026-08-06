@@ -4,8 +4,8 @@
 //! a later `agentrec init` starts fresh while the archive remains on disk.
 
 use crate::initcmd::{
-    codex_config_toml_path, codex_hooks_json_path, CODEX_HOOK_EVENTS, CODEX_HOOK_MARKER,
-    HOOK_MARKER,
+    codex_config_toml_path, codex_hooks_json_path, codex_mcp_state, mcp_json_path, mcp_json_state,
+    McpRegState, CODEX_HOOK_EVENTS, CODEX_HOOK_MARKER, HOOK_MARKER, MCP_SERVER_NAME,
 };
 use crate::{agentrec_dir, service};
 use std::fs;
@@ -29,6 +29,14 @@ pub fn run(root: &Path, no_service: bool) -> Result<(), String> {
             actions.push("removed agentrec hook entries from Codex hook config".to_string())
         }
         Ok(false) => actions.push("no agentrec Codex hook entries found".to_string()),
+        Err(e) => return Err(e),
+    }
+
+    // E4: MCP registration, both hosts. Unconditional like the Codex hook
+    // removal above — a no-op when nothing was registered.
+    match remove_mcp_registrations(root) {
+        Ok(true) => actions.push("removed the agentrec MCP server registration".to_string()),
+        Ok(false) => actions.push("no agentrec MCP server registration found".to_string()),
         Err(e) => return Err(e),
     }
 
@@ -325,6 +333,75 @@ fn remove_codex_hooks_toml(root: &Path) -> Result<bool, String> {
         fs::write(&path, out).map_err(|e| e.to_string())?;
     }
     Ok(changed)
+}
+
+// ---- MCP registration removal (E4) ------------------------------------------
+
+/// Remove agentrec's own MCP server registration from both repo-local
+/// registries. **Identity is `initcmd::mcp_state_*`'s predicate, not the
+/// registry key**: a foreign server occupying the `agentrec` key is left
+/// exactly where it is, byte-for-byte, and this function reports no change for
+/// it. That is the case a key-only removal would silently eat.
+fn remove_mcp_registrations(root: &Path) -> Result<bool, String> {
+    let json_changed = remove_mcp_json(root)?;
+    let toml_changed = remove_codex_mcp(root)?;
+    Ok(json_changed || toml_changed)
+}
+
+fn remove_mcp_json(root: &Path) -> Result<bool, String> {
+    let path = mcp_json_path(root);
+    if mcp_json_state(root)? != McpRegState::Ours {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "existing {} is not valid JSON ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    let mut drop_servers_key = false;
+    if let Some(servers) = value.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+        servers.remove(MCP_SERVER_NAME);
+        drop_servers_key = servers.is_empty();
+    }
+    if drop_servers_key {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("mcpServers");
+        }
+    }
+    let backup = path.with_extension("json.bak");
+    fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+    let out = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn remove_codex_mcp(root: &Path) -> Result<bool, String> {
+    let path = codex_config_toml_path(root);
+    if codex_mcp_state(root)? != McpRegState::Ours {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut doc: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+        format!(
+            "existing {} is not valid TOML ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    let mut drop_servers_key = false;
+    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
+        servers.remove(MCP_SERVER_NAME);
+        drop_servers_key = servers.is_empty();
+    }
+    if drop_servers_key {
+        doc.remove("mcp_servers");
+    }
+    let backup = path.with_extension("toml.bak");
+    fs::copy(&path, &backup).map_err(|e| e.to_string())?;
+    let out = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Sibling archive dir name: `.agentrec.archived.<unix_ts>`.
@@ -657,5 +734,104 @@ mod tests {
     fn uninstall_with_no_agentrec_dir_is_ok() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(run(tmp.path(), true).is_ok());
+    }
+
+    // ---- MCP registration removal (E4) ------------------------------------
+
+    /// AC-E4 round trip: a foreign server pre-seeded in BOTH registries
+    /// survives `init` + `uninstall` untouched, while our own entry is added
+    /// and then removed. `.mcp.json` is asserted BYTE-identical across the
+    /// round trip; `.codex/config.toml` is asserted parsed-value-identical,
+    /// because the `toml` crate round-trip reformats the whole file (an
+    /// existing, documented property of `install_codex_hooks_toml` that this
+    /// path inherits — byte-identity there would be a false claim).
+    #[test]
+    fn init_uninstall_round_trip_leaves_foreign_mcp_registrations_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+
+        let json_before = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {"other": {"command": "other-tool", "args": ["serve"]}}
+        }))
+        .unwrap();
+        fs::write(crate::initcmd::mcp_json_path(root), &json_before).unwrap();
+        fs::write(
+            codex_config_toml_path(root),
+            "[mcp_servers.other]\ncommand = \"other-tool\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        let toml_before: toml::Table = fs::read_to_string(codex_config_toml_path(root))
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        crate::initcmd::install_mcp_json(root).unwrap();
+        crate::initcmd::install_codex_mcp(root).unwrap();
+        assert_eq!(
+            crate::initcmd::mcp_json_state(root).unwrap(),
+            McpRegState::Ours
+        );
+        assert_eq!(
+            crate::initcmd::codex_mcp_state(root).unwrap(),
+            McpRegState::Ours
+        );
+
+        assert!(remove_mcp_registrations(root).unwrap());
+        assert_eq!(
+            crate::initcmd::mcp_json_state(root).unwrap(),
+            McpRegState::Absent
+        );
+        assert_eq!(
+            crate::initcmd::codex_mcp_state(root).unwrap(),
+            McpRegState::Absent
+        );
+
+        assert_eq!(
+            fs::read_to_string(crate::initcmd::mcp_json_path(root)).unwrap(),
+            json_before,
+            ".mcp.json must return to its pre-init bytes"
+        );
+        let toml_after: toml::Table = fs::read_to_string(codex_config_toml_path(root))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(toml_after, toml_before);
+    }
+
+    /// The discriminating case: a FOREIGN server sitting on the `agentrec`
+    /// key. `uninstall` must not remove it. A key-only identity predicate
+    /// deletes it here and passes every other test in this file.
+    #[test]
+    fn uninstall_does_not_remove_a_foreign_server_named_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        let json_before = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {"agentrec": {"command": "other-tool", "args": ["mcp"]}}
+        }))
+        .unwrap();
+        fs::write(crate::initcmd::mcp_json_path(root), &json_before).unwrap();
+        let toml_before = "[mcp_servers.agentrec]\ncommand = \"other-tool\"\nargs = [\"mcp\"]\n";
+        fs::write(codex_config_toml_path(root), toml_before).unwrap();
+
+        assert!(
+            !remove_mcp_registrations(root).unwrap(),
+            "nothing of ours is registered, so nothing may be removed"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::initcmd::mcp_json_path(root)).unwrap(),
+            json_before
+        );
+        assert_eq!(
+            fs::read_to_string(codex_config_toml_path(root)).unwrap(),
+            toml_before
+        );
+    }
+
+    #[test]
+    fn remove_mcp_registrations_with_no_files_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!remove_mcp_registrations(tmp.path()).unwrap());
     }
 }

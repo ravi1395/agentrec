@@ -61,7 +61,7 @@ const SUPPORTED_REVISIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 /// The revision reported when a client's `initialize` omits `protocolVersion`
 /// entirely (permitted by the framing here; the field is how a client *opts
 /// into* a revision, and its absence is not a conflict to refuse).
-const PINNED_REVISION: &str = SUPPORTED_REVISIONS[0];
+pub(crate) const PINNED_REVISION: &str = SUPPORTED_REVISIONS[0];
 
 // JSON-RPC 2.0 error codes (§5.1 of the spec).
 const PARSE_ERROR: i64 = -32700;
