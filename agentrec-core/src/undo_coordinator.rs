@@ -155,7 +155,12 @@ pub struct PreviewFile {
     pub op: String,
     pub before: Option<String>,
     pub after: Option<String>,
+    /// Sizes of the two snapshotted states, when the store still holds them.
+    /// `before_bytes` is what an execute would WRITE; `after_bytes` is what
+    /// it would replace. Both, not just one: "how big is this revert" is the
+    /// question the row exists to answer, and it needs the delta.
     pub before_bytes: Option<u64>,
+    pub after_bytes: Option<u64>,
     /// True only when the file is executable *despite* being modified since
     /// the turn — i.e. confirm mode with `allow_modified`. Always false in
     /// auto mode (see [`UndoPreview::allow_modified_effective`]).
@@ -470,6 +475,7 @@ impl UndoCoordinator {
                     before: p.entry.before.clone(),
                     after: p.entry.after.clone(),
                     before_bytes: p.entry.before.as_deref().and_then(|h| store.size(h)),
+                    after_bytes: p.entry.after.as_deref().and_then(|h| store.size(h)),
                     modified_since: warn.is_some(),
                     warn: warn.clone(),
                 }),
@@ -1260,6 +1266,19 @@ mod coordinator_tests {
         skipped.skipped_reason = Some(skip_reason::OVER_CAP.to_string());
         let mut linked = entry("link.rs");
         linked.link_kind = Some("symlink".to_string());
+        // The SECOND, independent trigger: no `link_kind` on the record (as
+        // every pre-`link_kind` log line looks) but a link at the path right
+        // now. Without its own fixture, `refusal_class` could drop the
+        // `is_symlink_on_disk` call and every other assertion here would
+        // still pass — and that call is the sole guard for the entire
+        // pre-existing log.
+        let legacy_link = entry("legacy-link.rs");
+        std::fs::write(fx.root().join("link-target.rs"), b"target").unwrap();
+        std::os::unix::fs::symlink(
+            fx.root().join("link-target.rs"),
+            fx.root().join("legacy-link.rs"),
+        )
+        .unwrap();
         let no_snapshot = entry("gone.rs"); // op modify, before None
         let modified = {
             let mut e = fx.revertible("drifted.rs");
@@ -1270,7 +1289,14 @@ mod coordinator_tests {
         let id = fx.write_turn(
             "t_BBBB0000000000000000BBBB",
             false,
-            vec![withheld, skipped, linked, no_snapshot, modified],
+            vec![
+                withheld,
+                skipped,
+                linked,
+                legacy_link,
+                no_snapshot,
+                modified,
+            ],
         );
         let p = fx
             .coord()
@@ -1284,6 +1310,7 @@ mod coordinator_tests {
         assert_eq!(got.get("secrets/.env"), Some(&RefusalClass::Withheld));
         assert_eq!(got.get("big.bin"), Some(&RefusalClass::Skipped));
         assert_eq!(got.get("link.rs"), Some(&RefusalClass::Symlink));
+        assert_eq!(got.get("legacy-link.rs"), Some(&RefusalClass::Symlink));
         assert_eq!(got.get("gone.rs"), Some(&RefusalClass::NoSnapshot));
         assert_eq!(got.get("drifted.rs"), Some(&RefusalClass::ModifiedSince));
         assert!(p.files.is_empty(), "no file in this fixture is executable");
@@ -1390,7 +1417,11 @@ mod coordinator_tests {
         );
         let auto = fx.coord().preview(req(&id), McpDestructive::Auto).unwrap();
         assert!(auto.token.is_some());
-        assert!(auto.token_expires_unix_ms.unwrap() - now_ms() > TOKEN_TTL_MS - 5_000);
+        let ttl = auto.token_expires_unix_ms.unwrap() - now_ms();
+        assert!(
+            ttl > TOKEN_TTL_MS - 5_000 && ttl <= TOKEN_TTL_MS,
+            "ttl {ttl}ms"
+        );
     }
 
     // AC-F2 (4b): what is STORED is the hash. The discriminating assertion
