@@ -1932,3 +1932,37 @@ failed as assertions, not as compile errors.
 | AC-F5.3 approve → `"cli"` | `ac_f5_approve_of_an_mcp_request_records_origin_cli` — also asserts the request ledger names the undo turn, so the MCP provenance `origin` drops is demonstrably recoverable |
 | AC-F5.4 pre-F5 line parses, reads as cli, round-trips | `ac_f5_a_pre_f5_undo_turn_without_origin_reads_as_cli`; plus `named_fixtures_carry_the_semantics_they_are_named_for` (`cli/tests/conformance.rs`) against a stripped §5 fixture line |
 | Renders/blames identically | `cargo test --test golden` → **33 passed / 0 failed**, and all **30** golden files are byte-identical (`git status --short cli/tests/fixtures/golden/` empty afterwards). Both figures measured here, and they are different things: **30 `.golden` files, 33 golden tests** — CLAUDE.md's bare "33 goldens" is the test count, and quoting it as a file count is the arithmetic this row refuses. Their seeded undo turn keeps `origin` absent **on purpose** — it IS the pre-F5 record, so every log/show/blame golden built from it is the unchanged-rendering proof (`cli/tests/golden.rs`) |
+
+## Phase F residuals recorded at gate time (2026-08-06, gate round 1 blocker 2 + findings)
+
+- **`.agentrec/undo-requests.jsonl` growth is unbounded, and no sanctioned rewrite class
+  covers it** (Phase F review finding 13, recorded here because the gate found it recorded
+  nowhere). Every auto `preview` and confirm `request` appends rows; terminal events resolve
+  a reservation but no line is ever removed, and the file is deliberately outside the three
+  sanctioned `purge` rewrite classes ("never a wire surface" — `LEDGER_V`'s comment — does
+  not make it non-disk). An agent can grow it without bound by spamming preview/request.
+  Growth rate in real use: unmeasured. Adding a reclaim path requires a decision-register
+  entry, same bar as D48's. Founder-owned.
+- **The coordinator's auto `allow_modified` rail is downgrade-with-warning, not refusal**
+  (gate round 1, non-blocking finding 1). §8's "refused outright" behavior exists only at
+  the transport rail (`mcpcmd`'s router); `UndoCoordinator::preview` in Auto coerces the
+  flag false, warns, and returns a successful preview with modified files excluded
+  `ModifiedSince`. The safety property was probe-proven intact at both layers
+  independently, but any sentence claiming "refused at both rails" is wrong as written — a
+  future non-reference transport built directly on the coordinator would ignore-with-warn,
+  not refuse. Recorded so the §8 wording and the coordinator's behavior are not conflated.
+- **Kill-9 flake provenance, pinned by the gate:** `approve.rs::
+  a_killed_approve_never_leaves_a_phantom_approval` fails intermittently (gate measured 1/26
+  runs at stock `335f076`, 2/~14 at `e32d247`, same assertion `approve.rs:440` both times)
+  when the kill lands between `append_undo_turn` and the EXECUTE row — a window the crash
+  matrix itself documents. Pre-existing; NOT introduced by `e32d247` (test body byte-identical
+  across the range, e32d247's diff touches only the failure branch). The test doc's
+  "window-independent" claim is true of the ledger's two-state invariant and FALSE of the
+  strong-form log↔ledger agreement the failing assertion adds. A crash in that window is
+  SAFE (re-approve → `preview_stale`); the defect is the test's claim, not the crash
+  behavior. Disposition (weaken the assertion + fix the doc vs re-order the writes)
+  founder-owned.
+- **Confirm-path variant of the consumed-but-unresolved residual, stated explicitly** (gate
+  round 1, non-blocking finding 3): a kill-9'd approve leaves worktree reverted + turn
+  logged + request pending + reservation live until `REQUEST_TTL_MS` (10 min), not the 60 s
+  token TTL — the earlier residual named only the auto path.
