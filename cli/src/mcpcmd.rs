@@ -27,6 +27,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use agentrec_core::undo_coordinator;
 use agentrec_core::view;
 
 use crate::config::{self, Config};
@@ -525,7 +526,7 @@ fn tools_call(server: &Server, id: Value, params: Option<&Value>) -> Value {
         // unknown-tool arm below, which is the honest answer: `off` is not
         // "this tool is unbuilt", it is "this server does not offer it".
         "agentrec_undo" if server.destructive_mode() != config::McpDestructive::Off => {
-            undo_tool(server.destructive_mode(), &args)
+            undo_tool(&server.root, server.destructive_mode(), &args)
         }
         // **Unreachable today, and no longer for the reason E3 recorded.**
         // E3's comment here said this arm was retained *because* F1 would add
@@ -1089,7 +1090,11 @@ impl UndoAction {
 /// a transport error does not reliably surface to a model. A bad `action`, by
 /// contrast, IS a malformed frame — the schema declares the enum — and stays
 /// `-32602`.
-fn undo_tool(mode: config::McpDestructive, args: &Value) -> Result<String, ToolFailure> {
+fn undo_tool(
+    root: &Path,
+    mode: config::McpDestructive,
+    args: &Value,
+) -> Result<String, ToolFailure> {
     let action = match required_str_arg(args, "action")?.as_str() {
         "preview" => UndoAction::Preview,
         "request" => UndoAction::Request,
@@ -1140,15 +1145,64 @@ fn undo_tool(mode: config::McpDestructive, args: &Value) -> Result<String, ToolF
         }
     }
 
-    Err(ToolFailure::Domain {
-        code: "not_implemented",
-        message: format!(
-            "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
-             version of agentrec",
-            action.as_str(),
-            mode_str(mode)
-        ),
-    })
+    match action {
+        // F2. Everything below the wire layer is `UndoCoordinator`'s: this
+        // arm parses arguments, calls the seam, and serializes the typed
+        // `UndoPreview` through the SAME `encode` every read tool uses. It
+        // makes no refusal decision of its own — the coordinator re-applies
+        // the auto-mode modified-since rail internally, so the F1 router
+        // above is a fast refusal of the *flag*, not the rail itself.
+        UndoAction::Preview => {
+            let req = undo_coordinator::UndoRequest {
+                turn: required_str_arg(args, "turn")?,
+                paths: string_array_arg(args, "paths")?
+                    .map(|v| v.into_iter().map(std::path::PathBuf::from).collect()),
+                allow_modified: bool_arg(args, "allow_modified")?,
+            };
+            match undo_coordinator::UndoCoordinator::new(root).preview(req, mode) {
+                Ok(preview) => encode(&preview),
+                // Domain, not `-32602`: an unknown turn or a live
+                // `undo_conflict` is the repository answering, and an agent
+                // must be able to branch on the code rather than parse prose.
+                Err(e) => Err(ToolFailure::Domain {
+                    code: e.code(),
+                    message: e.to_string(),
+                }),
+            }
+        }
+        UndoAction::Request | UndoAction::Status | UndoAction::Execute => {
+            Err(ToolFailure::Domain {
+                code: "not_implemented",
+                message: format!(
+                    "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
+                     version of agentrec",
+                    action.as_str(),
+                    mode_str(mode)
+                ),
+            })
+        }
+    }
+}
+
+/// An optional array-of-strings argument. A non-array, or an array holding a
+/// non-string, is `-32602` rather than a silent filter: dropping the bad
+/// element would revert a DIFFERENT set of paths than the caller named.
+fn string_array_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ToolFailure::BadParams(format!("{key:?} must be strings")))
+            })
+            .collect::<Result<Vec<String>, _>>()
+            .map(Some),
+        Some(_) => Err(ToolFailure::BadParams(format!(
+            "{key:?} must be an array of strings"
+        ))),
+    }
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -1217,7 +1271,11 @@ mod tests {
     /// them is cheapest to read.
     #[test]
     fn undo_router_refusal_codes() {
-        let code = |mode, args: Value| match undo_tool(mode, &args) {
+        // An empty root: no `.agentrec/log.jsonl`, so a preview that reaches
+        // the coordinator answers `no_turns` — distinguishable from every
+        // router refusal below, which is the point.
+        let tmp = tempfile::tempdir().unwrap();
+        let code = |mode, args: Value| match undo_tool(tmp.path(), mode, &args) {
             Err(ToolFailure::Domain { code, .. }) => code,
             Err(ToolFailure::BadParams(m)) => panic!("unexpected -32602: {m}"),
             Ok(payload) => panic!("F1 implements no sub-action; got {payload}"),
@@ -1246,10 +1304,25 @@ mod tests {
             "allow_modified_refused"
         );
         for mode in [confirm, auto] {
-            for action in ["preview", "status"] {
-                assert_eq!(code(mode, json!({"action": action})), "not_implemented");
-            }
+            // `status` is still F3's.
+            assert_eq!(code(mode, json!({"action": "status"})), "not_implemented");
+            // `preview` is F2's and now reaches the coordinator in BOTH
+            // modes — the refusal it returns is the repository's, not the
+            // router's.
+            assert_eq!(
+                code(mode, json!({"action": "preview", "turn": "t_NOPE"})),
+                "no_turns"
+            );
         }
+        // The rail still precedes the (now live) preview body: an auto-mode
+        // preview carrying the flag never reaches the coordinator at all.
+        assert_eq!(
+            code(
+                auto,
+                json!({"action": "preview", "turn": "t_NOPE", "allow_modified": true})
+            ),
+            "allow_modified_refused"
+        );
     }
 
     #[test]

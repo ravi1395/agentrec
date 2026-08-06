@@ -657,264 +657,21 @@ fn resolve_panic_target<'a>(
     Ok(*newest)
 }
 
-/// Per-file disposition for an undo.
-struct Plan {
-    entry: FileEntry,
-    kind: PlanKind,
-}
-
-enum PlanKind {
-    /// Will be reverted; `warn` names the modified-since cause when included
-    /// only because of `--allow-modified`.
-    Revert { warn: Option<String> },
-    /// Modified since the turn; skipped unless `--allow-modified`.
-    Excluded { cause: String },
-    /// Never revertible regardless of flags (no content, or none was ever
-    /// snapshotted).
-    Refused { reason: String },
-}
-
-/// Classify every file in `target` (filtered by `files_filter`, when
-/// non-empty) into revert / exclude / refuse. Order matches `target.files`.
-#[allow(clippy::too_many_arguments)]
-fn build_plan(
-    root: &Path,
-    store: &BlobStore,
-    target: &TurnRecord,
-    target_idx: usize,
-    turns: &[&TurnRecord],
-    records: &[LogRecord],
-    files_filter: &[String],
-    allow_modified: bool,
-) -> Vec<Plan> {
-    let filter_set: Option<HashSet<&str>> = if files_filter.is_empty() {
-        None
-    } else {
-        Some(files_filter.iter().map(|s| s.as_str()).collect())
-    };
-
-    let mut plans = Vec::with_capacity(target.files.len());
-    for entry in &target.files {
-        if let Some(set) = &filter_set {
-            if !set.contains(entry.path.as_str()) {
-                continue; // deselected by --files, left untouched (AC H2)
-            }
-        }
-
-        // F2 (red team round 2). This gate is FIRST, above every other
-        // refusal, because it is the only one whose failure mode writes to a
-        // file that was never in the plan: `std::fs::write` follows a
-        // symlink and truncates its target, and the post-write read-back
-        // follows it too, so the corruption verifies clean and reports
-        // success. It is also unconditional w.r.t. `--allow-modified` — it
-        // sits above the modified-since gate below, so that flag never
-        // reaches it.
-        //
-        // TWO INDEPENDENT triggers, each sufficient on its own:
-        //   1. the record says the path was a link when it was snapshotted;
-        //   2. the path IS a link on disk right now.
-        // (1) does not cover records written before `link_kind` existed —
-        // they carry no such field and never will, so (2) is the ONLY guard
-        // for the entire pre-existing log. (2) does not cover a link that
-        // has since been deleted (nothing to lstat), which is exactly the
-        // F2a delete-restore case — so (1) is the only guard there. Neither
-        // subsumes the other; both stay.
-        if let Some(kind) = symlink_refusal(root, entry) {
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind,
-            });
-            continue;
-        }
-        if entry.withheld {
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Refused {
-                    reason: "secret-pattern file, never snapshotted".to_string(),
-                },
-            });
-            continue;
-        }
-        // SR6: the skipped gate MUST stay above modified-since (below). A
-        // skipped entry is refused unconditionally here and `continue`s
-        // before `entry.after` is ever compared against the current on-disk
-        // hash — otherwise an unmodified skipped file (SR-C now gives it a
-        // real `after` hash) could fall through into the revert path and
-        // undo would try to restore a blob that was never stored.
-        if entry.skipped {
-            // SR-D: the wire field is the per-entry authoritative cause —
-            // `state.json`'s `io_failed` is a separate, aggregate/operational
-            // channel (drives the DEGRADED banner) and is deliberately never
-            // consulted here, so the two can't be made to disagree.
-            // Finding #5(a): unified on `print_entry`'s em-dash form (was
-            // parenthesized here) — same fact, one spelling; D-PD6 is the
-            // tracked debt item for exactly this renderer-drift class.
-            let reason = format!(
-                "content not snapshotted — {}",
-                fmt::skip_reason_text(entry.skipped_reason.as_deref())
-            );
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Refused { reason },
-            });
-            continue;
-        }
-        if entry.op == "modify" || entry.op == "delete" {
-            // E1: an integrity READ (store.get), not a bare existence check —
-            // build_plan runs entirely before any file mutation, so a corrupt
-            // (hash-mismatched) before-blob is caught and refused here, never
-            // discovered mid-revert after other files have already changed.
-            let refuse_reason = match entry.before.as_deref() {
-                None => Some("no prior snapshot to restore".to_string()),
-                Some(h) => match store.get(h) {
-                    Ok(_) => None,
-                    Err(StoreError::Missing(_)) => {
-                        Some("prior snapshot unavailable — refusing to restore".to_string())
-                    }
-                    Err(StoreError::Corrupt(_)) => Some(
-                        "prior snapshot corrupt (hash mismatch) — refusing to restore".to_string(),
-                    ),
-                },
-            };
-            if let Some(reason) = refuse_reason {
-                plans.push(Plan {
-                    entry: entry.clone(),
-                    kind: PlanKind::Refused { reason },
-                });
-                continue;
-            }
-        }
-
-        // modified-since (PROTOCOL §5): current on-disk hash vs. the turn's
-        // recorded `after` for this path. `None` on either side means absent.
-        let current = read_current_hash(root, &entry.path);
-        let is_modified = current.as_deref() != entry.after.as_deref();
-
-        let after_synthesized = entry.after_synthesized == Some(true);
-
-        if is_modified && !allow_modified {
-            let cause = modified_cause(
-                target_idx,
-                turns,
-                records,
-                target,
-                &entry.path,
-                after_synthesized,
-            );
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Excluded { cause },
-            });
-            continue;
-        }
-
-        let warn = is_modified.then(|| {
-            modified_cause(
-                target_idx,
-                turns,
-                records,
-                target,
-                &entry.path,
-                after_synthesized,
-            )
-        });
-        plans.push(Plan {
-            entry: entry.clone(),
-            kind: PlanKind::Revert { warn },
-        });
-    }
-    plans
-}
-
-/// On-disk content hash for `rel`, relative to `root`; `None` for an absent
-/// file OR any read error — undo's safety gate treats both as "no content to
-/// compare", which only ever makes the modified-since check MORE cautious
-/// (a spurious `None` looks like a legitimate delete-target, not a bypass).
-fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
-    std::fs::read(root.join(rel)).ok().map(|b| hash_bytes(&b))
-}
-
-/// True when `path` is itself a symbolic link. `symlink_metadata` is an
-/// lstat: it describes the link, where `metadata`/`Path::exists` would
-/// describe (and a write would hit) the pointed-to file. A metadata error —
-/// absent path, permission denied — is `false`: this predicate answers only
-/// "is there a link here", and the absent case is handled by the record-side
-/// trigger instead.
-fn is_symlink_on_disk(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
-/// be reverted because a link is involved, `None` otherwise.
-///
-/// The two triggers produce DELIBERATELY DIFFERENT text. They are different
-/// facts — "the record says this was a link" vs "there is a link here now" —
-/// and only distinct wording lets a reader (or a test) tell which one fired;
-/// identical text would let the legacy-record path pass a test for the wrong
-/// reason.
-///
-/// `entry.link_kind` is matched on `is_some()`, never against the known
-/// value: an unrecognized future kind is still not an ordinary file, so
-/// refusing to act on it is the correct degradation (PROTOCOL §5,
-/// refuse-to-act-not-refuse-to-parse). Never make this an equality test
-/// against [`link_kind::SYMLINK`].
-fn symlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
-    if let Some(kind) = entry.link_kind.as_deref() {
-        // `link_kind` is wire data on an OPEN enum — a foreign producer can
-        // put any bytes here, and this string reaches the pre-confirm plan
-        // the user reads (F8's exact surface). Sanitized at the one
-        // interpolation site so `render_plan`'s every-reason-is-safe
-        // invariant holds by construction.
-        let kind = fmt::sanitize_terminal(kind);
-        return Some(PlanKind::Refused {
-            reason: format!(
-                "recorded as a {kind} — its snapshot is the link target, not file content"
-            ),
-        });
-    }
-    if is_symlink_on_disk(&root.join(&entry.path)) {
-        return Some(PlanKind::Refused {
-            reason: "path is a symlink on disk — reverting would write through the link"
-                .to_string(),
-        });
-    }
-    None
-}
-
-/// Best-effort explanation for why a path is modified-since the target turn:
-/// a later rich turn touching the same path outranks an uncovered recording
-/// gap, which outranks the default "some edit we can't otherwise explain".
-fn modified_cause(
-    target_idx: usize,
-    turns: &[&TurnRecord],
-    records: &[LogRecord],
-    target: &TurnRecord,
-    path: &str,
-    after_synthesized: bool,
-) -> String {
-    // D1 (P2 fix round, founder decision 2): a synthesized `after` is a
-    // DERIVED value, not an observation of what the file actually looked
-    // like post-edit — comparing the real on-disk hash against it and
-    // reporting a mismatch as "human or external edit" would fabricate
-    // attribution nobody earned. This must win over both signals below: a
-    // later rich turn or a recording gap are real facts about *observed*
-    // history, but neither makes an unobserved comparison point trustworthy.
-    if after_synthesized {
-        return "imported turn's after-state was derived (not observed) — cannot attribute this difference".to_string();
-    }
-    let later_touches = turns[target_idx + 1..]
-        .iter()
-        .any(|t| t.grade == "rich" && t.files.iter().any(|f| f.path == path));
-    if later_touches {
-        return "later agent turn".to_string();
-    }
-    if view::has_gap_after(records, &target.ended) {
-        return "recording gap".to_string();
-    }
-    "human or external edit".to_string()
-}
+// `Plan`/`PlanKind`/`build_plan` and its helpers (`read_current_hash`,
+// `is_symlink_on_disk`, `symlink_refusal`, `modified_cause`) plus
+// `window_caution` MOVED to `agentrec_core::undo_coordinator` (task F2).
+// The MCP `agentrec_undo` preview has to reach exactly the same refusal
+// interpretation the CLI's preview does — D42 panic mode, D49 caution, F2
+// symlink refusal, K2 imported-unreconstructible — and reimplementing any
+// of it behind the MCP seam is what the core seam exists to prevent. The
+// bodies moved VERBATIM (gate order is load-bearing: symlink, withheld,
+// skipped/SR6, before-blob integrity, modified-since). Re-imported under
+// their original names so this module's renderer and its whole test module
+// resolve unchanged — an untouched test passing against a moved
+// implementation is the behavior-preservation proof.
+use agentrec_core::undo_coordinator::{
+    build_plan, is_symlink_on_disk, window_caution, Plan, PlanKind,
+};
 
 /// The exact bytes of the pre-`--confirm` undo plan, one `\n`-terminated line
 /// per emitted row. Split out of [`print_plan`] so the text a user reads
@@ -972,86 +729,18 @@ fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
             }
         }
     }
+    // The caution text itself lives in core (one string for the CLI preview
+    // and the MCP preview both); the two-space row indent is this renderer's
+    // and is applied here. Byte-for-byte identical output to before the move
+    // — `render_plan_*` goldens are the proof.
     if let Some(caution) = window_caution(target, plans) {
-        out.push_str(&caution);
-        out.push('\n');
+        out.push_str(&format!("  {caution}\n"));
     }
     out
 }
 
 fn print_plan(target: &TurnRecord, plans: &[Plan]) {
     print!("{}", render_plan(target, plans));
-}
-
-/// D6 honesty line. A rich turn's file list is an *activity window*, not an
-/// authorship record: while a bracket is open, every mutation in the root is
-/// folded into that one turn (D6, "one open turn per root"), so a human edit
-/// landing during the agent's bracket becomes one of the turn's files and the
-/// recorded `after` hash for it IS the human's own content. That makes the
-/// D30 modified-since rail structurally unable to fire for such a file — it
-/// is not modified-since, it is *mis-attributed*, and no post-hoc heuristic
-/// can separate the two. So undo states the limitation rather than guessing:
-/// a warning that is always true beats a detector that is sometimes a lie.
-/// "Always true" is load-bearing and was once violated: the sentence claimed
-/// "every file listed above is reverted", which is false on a MIXED plan where
-/// an `EXCLUDE`/`REFUSE` line is also listed. It now names only the files
-/// marked `revert`, the one set that is reverted under every flag combination
-/// (`--allow-modified` moves a file INTO that set, never out of it).
-///
-/// Deliberately NOT prefixed `WARNING:` — that token is already the per-file
-/// modified-since marker above, and conflating the two would make each one
-/// unreadable as evidence of the other. Turns with `tool: "agentrec"` are the
-/// one rich shape excluded: their file list is built from a revert plan (what
-/// this process itself wrote), not from a watch window. `tool: "git"` turns
-/// are deliberately INCLUDED — a checkout burst is a watch window like any
-/// other — which is why the wording says "the recorded tool's own writes"
-/// rather than "the agent's": the sentence has to stay true for every turn
-/// class the gate admits.
-///
-/// BARE turns get their own sentence (D49, founder decision 2026-08-01; this
-/// was an open residual until then). They are cautioned — the writes are as
-/// real and as irreversible-by-preview as a rich turn's — but not with the
-/// rich text, which names "the recorded tool" and D6: a bare turn has no
-/// recorded tool, so that sentence would fabricate the attribution the grade
-/// exists to withhold. "No recorded tool" is an invariant, not an observation:
-/// every bare close runs through `Source::Quiet`, whose `OpenTurn` is built
-/// `tool: None` (agentrec-core `engine.rs`), and crash recovery hard-codes
-/// `None` for a bare grade (`daemon.rs`) — a producer minting bare-with-tool
-/// would make this sentence false and must change it. The gate stays on
-/// `grade` alone (founder-specified), so that invariant is documented here
-/// rather than defensively re-checked at the call site.
-fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
-    let rich = target.grade == "rich" && target.tool.as_deref() != Some("agentrec");
-    let bare = target.grade == "bare";
-    if !rich && !bare {
-        return None;
-    }
-    if !plans
-        .iter()
-        .any(|p| matches!(p.kind, PlanKind::Revert { .. }))
-    {
-        return None; // nothing will be written; no scope to caution about
-    }
-    // One branch or the other, never a concatenation: that is what makes
-    // "the variants do not bleed" structural rather than test-enforced in
-    // both directions (only the bare-shows-no-rich-text direction is
-    // asserted; the reverse is closed here).
-    if bare {
-        return Some(
-            "  CAUTION: this is a bare turn — an unattributed activity window with no recorded \
-             tool; agentrec cannot say who or what made these writes, and every file marked \
-             `revert` above is reverted regardless of who or what wrote it. Review the list \
-             before confirming."
-                .to_string(),
-        );
-    }
-    Some(
-        "  CAUTION: this turn's file list is an activity window, not an authorship record — \
-         agentrec cannot distinguish the recorded tool's own writes from concurrent human \
-         edits made in the same window (D6), and every file marked `revert` above is \
-         reverted regardless of who wrote it. Review the list before confirming."
-            .to_string(),
-    )
 }
 
 /// Apply one file's revert and return the inverse `FileEntry` for the new

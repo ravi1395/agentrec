@@ -2,7 +2,9 @@
 //! Modules: id (ULID), time (RFC 3339), store (content-addressed blobs),
 //! record (protocol types), scrub (secret redaction), engine (turn boundaries),
 //! diff (unified text diff + binary detection for the `diff` verb), memory
-//! (hash-pinned semantic memory records, fold, fsynced append), pathenc
+//! (hash-pinned semantic memory records, fold, fsynced append), undo_coordinator
+//! (the destructive-decision seam: undo plan classification + reservations),
+//! text (rendering primitives shared with the CLI's formatters), pathenc
 //! (OS path → wire-string conversion decision — never lossy).
 //! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
 //! disagree, the doc wins and the code is a bug.
@@ -17,7 +19,9 @@ pub mod record;
 pub mod retention;
 pub mod scrub;
 pub mod store;
+pub mod text;
 pub mod time;
+pub mod undo_coordinator;
 pub mod view;
 
 /// Per-file snapshot cap (PROTOCOL §6).

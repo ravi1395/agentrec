@@ -40,6 +40,27 @@ pub fn ulid_with(ms: u64, rand: &[u8; 10]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 160 bits of system entropy, lowercase hex — the raw value of an undo
+/// confirm token (`undo_coordinator`), handed to the caller once and stored
+/// only as a sha256.
+///
+/// **Returns `None` rather than falling back**, unlike [`random_bytes`]. That
+/// function's fallback is a time+pid xorshift: acceptable for a ULID, whose
+/// job is uniqueness, and *predictable* for a credential that authorizes
+/// writing to a user's working tree. An agent that can guess a token can
+/// execute an undo the human never granted, so the honest degradation is to
+/// issue no token at all and let the caller refuse the operation.
+pub fn random_token() -> Option<String> {
+    let mut buf = [0u8; 20];
+    let mut f = File::open("/dev/urandom").ok()?;
+    f.read_exact(&mut buf).ok()?;
+    let mut out = String::with_capacity(40);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Some(out)
+}
+
 fn random_bytes() -> [u8; 10] {
     let mut buf = [0u8; 10];
     if let Ok(mut f) = File::open("/dev/urandom") {

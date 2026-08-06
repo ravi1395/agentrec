@@ -1618,7 +1618,7 @@ mod f1 {
 
     /// A minimal read-consumer root pinned to one `mcp_destructive` mode.
     /// No store is seeded: F1's router refuses or defers before touching one.
-    fn root_with_mode(mode: &str) -> PathBuf {
+    pub(super) fn root_with_mode(mode: &str) -> PathBuf {
         let root = init_root();
         std::fs::write(
             root.join(".agentrec/config.toml"),
@@ -1656,7 +1656,7 @@ mod f1 {
     }
 
     /// One `tools/call` of `agentrec_undo` with the given arguments object.
-    fn undo(root: &Path, arguments: Value) -> Value {
+    pub(super) fn undo(root: &Path, arguments: Value) -> Value {
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 9,
@@ -1670,7 +1670,7 @@ mod f1 {
 
     /// The machine-readable `code` out of a domain refusal, asserting the
     /// domain channel was used at all (`isError: true` result, not `-32602`).
-    fn domain(resp: &Value) -> (String, String) {
+    pub(super) fn domain(resp: &Value) -> (String, String) {
         assert!(
             resp.get("error").is_none(),
             "expected a domain refusal, got a JSON-RPC error: {resp}"
@@ -1839,21 +1839,23 @@ mod f1 {
             "the refusal must name the only override path: {message:?}"
         );
 
+        // Controls. F2 built the preview body, so "legal" no longer reads as
+        // `not_implemented`; it reads as the COORDINATOR answering about the
+        // repository (this fixture has no turns). The assertion is not
+        // weakened — it still fails for any build that refuses these calls
+        // at the router, which is what the control exists to catch.
         let (code, _) = domain(&undo(
             &root,
             serde_json::json!({"action": "preview", "turn": "abc"}),
         ));
-        assert_eq!(code, "not_implemented", "preview without the flag is legal");
+        assert_eq!(code, "no_turns", "preview without the flag is legal");
 
         // `false` is not "set" — an explicit false must behave as absence.
         let (code, _) = domain(&undo(
             &root,
             serde_json::json!({"action": "preview", "turn": "abc", "allow_modified": false}),
         ));
-        assert_eq!(
-            code, "not_implemented",
-            "allow_modified: false is not the rail"
-        );
+        assert_eq!(code, "no_turns", "allow_modified: false is not the rail");
     }
 
     /// The rail keys on `auto`, NOT on the flag: decision 6 keeps an override
@@ -1911,7 +1913,15 @@ mod f1 {
                     &root,
                     serde_json::json!({"action": action, "turn": "abc"}),
                 ));
-                if code != "not_implemented" {
+                // "Legal" = not refused by the mode matrix or the rail. The
+                // per-action legal answer differs now that F2 built preview:
+                // `status` is still unbuilt, `preview` reaches the
+                // coordinator and reports this empty fixture's `no_turns`.
+                let legal = match action {
+                    "preview" => "no_turns",
+                    _ => "not_implemented",
+                };
+                if code != legal {
                     refused.push(format!("{mode}/{action}: {code} — {message}"));
                 }
             }
@@ -1943,5 +1953,166 @@ mod f1 {
 
         let resp = undo(&root, serde_json::json!({"action": 7}));
         assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    }
+}
+
+/// Task F2 — `agentrec_undo action:"preview"` over the real wire, driving the
+/// real binary. The unit-level ACs live in
+/// `agentrec_core::undo_coordinator::coordinator_tests`; what these add is the
+/// part only a subprocess can show: the typed `UndoPreview` reaching a client
+/// as JSON, and a reservation created by ONE process being seen by the NEXT
+/// one — which is what makes the ledger a file rather than process memory.
+mod f2 {
+    use super::f1::{domain, root_with_mode, undo};
+    use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
+    use agentrec_core::store::{hash_bytes, BlobStore};
+    use serde_json::Value;
+    use std::path::Path;
+
+    fn entry(path: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: None,
+            op: "modify".to_string(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    /// A file with its `before` blob stored and on-disk bytes matching
+    /// `after` — the only shape that is actually executable.
+    fn revertible(root: &Path, path: &str) -> FileEntry {
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let before = store.put(format!("old {path}").as_bytes()).unwrap();
+        let now = format!("new {path}");
+        std::fs::write(root.join(path), now.as_bytes()).unwrap();
+        let mut e = entry(path);
+        e.before = Some(before);
+        e.after = Some(hash_bytes(now.as_bytes()));
+        e
+    }
+
+    const TURN: &str = "t_F20000000000000000000F2";
+
+    fn seed(root: &Path, files: Vec<FileEntry>) {
+        std::fs::create_dir_all(root.join(".agentrec/objects")).unwrap();
+        let t = TurnRecord {
+            v: 1,
+            id: TURN.to_string(),
+            grade: "rich".into(),
+            truncated: false,
+            started: "2026-01-01T00:00:00.000Z".into(),
+            ended: "2026-01-01T00:00:01.000Z".into(),
+            tool: Some("claude".into()),
+            model: None,
+            session: None,
+            root: root.display().to_string(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: None,
+            files_complete: None,
+            files,
+        };
+        let line = serde_json::to_string(&LogRecord::Turn(t)).unwrap();
+        let p = root.join(".agentrec/log.jsonl");
+        let prev = std::fs::read_to_string(&p).unwrap_or_default();
+        std::fs::write(&p, format!("{prev}{line}\n")).unwrap();
+    }
+
+    /// The success payload of a `tools/call`, asserting it was NOT a refusal.
+    fn ok_payload(resp: &Value) -> Value {
+        assert!(resp.get("error").is_none(), "JSON-RPC error: {resp}");
+        assert_ne!(
+            resp["result"]["isError"], true,
+            "unexpected refusal: {resp}"
+        );
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("payload is JSON")
+    }
+
+    /// AC-F2: the typed preview crosses the wire, carries per-file rows and
+    /// classed refusals, and writes nothing to the working tree.
+    #[test]
+    fn preview_crosses_the_wire_as_the_typed_payload_and_writes_nothing() {
+        let root = root_with_mode("confirm");
+        let mut withheld = entry(".env");
+        withheld.withheld = true;
+        let files = vec![revertible(&root, "a.rs"), withheld];
+        seed(&root, files);
+        let before = std::fs::read(root.join("a.rs")).unwrap();
+
+        let payload = ok_payload(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": TURN}),
+        ));
+        assert_eq!(payload["mode"], "confirm");
+        assert_eq!(payload["turn"], TURN);
+        assert_eq!(payload["files"].as_array().unwrap().len(), 1, "{payload}");
+        assert_eq!(payload["files"][0]["path"], "a.rs");
+        assert_eq!(payload["refusals"][0]["path"], ".env");
+        assert_eq!(payload["refusals"][0]["class"], "withheld");
+        assert!(payload.get("token").is_none(), "confirm issues no token");
+        assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), before);
+        assert!(
+            !root.join(".agentrec/undo-requests.jsonl").exists(),
+            "a confirm preview must not reserve"
+        );
+    }
+
+    /// AC-F2, P6 across PROCESSES. Each `undo(...)` is a fresh
+    /// `agentrec mcp` subprocess, so the second call can only see the first
+    /// call's reservation by reading it off disk — the property that makes
+    /// the ledger a file. Disjoint subsets of the same turn coexist;
+    /// overlapping ones are `undo_conflict`.
+    #[test]
+    fn an_auto_reservation_survives_the_process_that_made_it() {
+        let root = root_with_mode("auto");
+        let files = vec![
+            revertible(&root, "a.rs"),
+            revertible(&root, "b.rs"),
+            revertible(&root, "c.rs"),
+        ];
+        seed(&root, files);
+
+        let first = ok_payload(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": TURN, "paths": ["a.rs"]}),
+        ));
+        let token = first["token"]
+            .as_str()
+            .expect("auto issues a token")
+            .to_string();
+        assert_eq!(token.len(), 40);
+        assert!(first["token_expires_unix_ms"].is_u64());
+
+        // Different process, disjoint subset: no conflict.
+        let second = ok_payload(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": TURN, "paths": ["b.rs"]}),
+        ));
+        assert_ne!(second["token"], first["token"], "tokens must not repeat");
+
+        // Different process, overlapping: refused at creation.
+        let (code, message) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": TURN, "paths": ["b.rs", "c.rs"]}),
+        ));
+        assert_eq!(code, "undo_conflict", "{message}");
+        assert!(message.contains("b.rs"), "{message}");
+
+        // Neither raw token was persisted.
+        let ledger = std::fs::read_to_string(root.join(".agentrec/undo-requests.jsonl")).unwrap();
+        assert!(
+            !ledger.contains(&token),
+            "raw token in the ledger: {ledger}"
+        );
+        assert!(ledger.contains(&hash_bytes(token.as_bytes())));
     }
 }

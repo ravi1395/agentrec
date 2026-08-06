@@ -20,13 +20,17 @@ use std::path::Path;
 use std::sync::Once;
 
 /// Agent-driven-undo gating mode (PROTOCOL.md §8). Default `Off`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum McpDestructive {
-    #[default]
-    Off,
-    Confirm,
-    Auto,
-}
+///
+/// **The definition MOVED to `agentrec_core::undo_coordinator` (task F2) and
+/// is re-exported here.** `UndoCoordinator::preview` takes the mode as a
+/// parameter and core cannot depend on the CLI crate, so the enum had to
+/// live in core — and the F2 contract forbids a second mode type, which a
+/// core-side behaviour enum plus a CLI mapping function would have been.
+/// Re-exporting keeps ONE type under ONE name: every `config::McpDestructive`
+/// path in this crate resolves unchanged, and there is no mapping to drift.
+/// Parsing stays here — core never learns this key's name, its spelling, or
+/// its default, exactly as `view::health` never learns the budget key's.
+pub use agentrec_core::undo_coordinator::McpDestructive;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
