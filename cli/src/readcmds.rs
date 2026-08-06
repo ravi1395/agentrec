@@ -1172,4 +1172,122 @@ mod tests {
             "a create-revert must not unlink a symlink undo never recorded"
         );
     }
+
+    // ---- Root containment (branch review, PR #20 blockers 1+2) -----------
+    //
+    // `entry.path` is wire data, and before this gate `root.join(&path)` was
+    // an arbitrary-write primitive reachable by an agent through
+    // `agentrec_undo` in `auto` mode with no human in the loop. Each shape
+    // below was proven exploitable end-to-end against the real binary before
+    // the fix; the gate lives in the shared `build_plan`, so these cover the
+    // MCP leg too.
+
+    const ESCAPE: &str =
+        "path escapes the repository root — refusing to write outside the recorded repo";
+
+    #[test]
+    fn build_plan_refuses_parent_dir_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        std::fs::write(tmp.path().join("outside/victim.txt"), b"VICTIM\n").unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("../outside/victim.txt", "modify")], true);
+        assert_eq!(refusal_reason(&plans), ESCAPE);
+    }
+
+    #[test]
+    fn build_plan_refuses_absolute_path() {
+        // `Path::join` with an absolute path DISCARDS the base, so a
+        // `..`-component-only guard would not catch this shape at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs = tmp.path().join("elsewhere.txt");
+        std::fs::write(&abs, b"VICTIM\n").unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry(&abs.display().to_string(), "modify")], true);
+        assert_eq!(refusal_reason(&plans), ESCAPE);
+    }
+
+    // The worse shape: lexically innocent, so neither a `..` check nor the
+    // human reading the rendered plan would catch it. `is_symlink_on_disk`
+    // lstats the FINAL component only, while `restore_from_before` runs
+    // `create_dir_all(parent)` and writes THROUGH the intermediate link.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_symlinked_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("c.txt"), b"VICTIM\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("linkdir/c.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            ESCAPE,
+            "an intermediate symlink escapes every lexical check and the final-component lstat"
+        );
+    }
+
+    // Positive control, and it must DISCRIMINATE: an ordinary in-root path
+    // has to reach the gates BELOW containment. Asserting the store-missing
+    // refusal (rather than merely "not ESCAPE") proves the entry was still
+    // being evaluated, so a containment gate that refused everything would
+    // red here.
+    #[test]
+    fn build_plan_allows_an_ordinary_in_root_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("src/main.rs", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "containment must pass this through to the store check, not refuse it"
+        );
+    }
+
+    // A revert whose target directory does not exist yet is legitimate
+    // (`restore_from_before` calls `create_dir_all`). Containment resolves
+    // the nearest EXISTING ancestor precisely so this is not refused.
+    #[test]
+    fn build_plan_allows_a_path_whose_directory_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let (_, plans) = plan_for(root, vec![entry("not/here/yet.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "absent intermediate dirs cannot be links, so they must not trip containment"
+        );
+    }
+
+    // A root that is ITSELF reached through a symlink (macOS `/tmp` →
+    // `/private/tmp` is the everyday case) must not make every revert under
+    // it look like an escape — which is what comparing a canonical child
+    // against a non-canonical root would do.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_allows_in_root_paths_under_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let linked_root = tmp.path().join("linked-repo");
+        std::os::unix::fs::symlink(&real, &linked_root).unwrap();
+
+        let (_, plans) = plan_for(&linked_root, vec![entry("src/main.rs", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "a symlinked root is ordinary, not an escape"
+        );
+    }
 }

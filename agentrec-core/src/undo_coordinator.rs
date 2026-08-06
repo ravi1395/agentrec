@@ -131,7 +131,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -1771,8 +1771,20 @@ pub fn build_plan(
             }
         }
 
-        // F2 (red team round 2). This gate is FIRST, above every other
-        // refusal, because it is the only one whose failure mode writes to a
+        // ROOT CONTAINMENT. This gate is first — above even the symlink
+        // refusal — because it is the only one whose failure mode writes to a
+        // path OUTSIDE the repository entirely, and because the symlink gate
+        // below cannot catch the intermediate-component case (it lstats the
+        // final component only). Unconditional w.r.t. `--allow-modified`.
+        if let Some(kind) = escape_refusal(root, entry) {
+            plans.push(Plan {
+                entry: entry.clone(),
+                kind,
+            });
+            continue;
+        }
+        // F2 (red team round 2). This gate is above every other refusal
+        // except containment, because its failure mode writes to a
         // file that was never in the plan: `std::fs::write` follows a
         // symlink and truncates its target, and the post-write read-back
         // follows it too, so the corruption verifies clean and reports
@@ -1914,6 +1926,89 @@ pub fn is_symlink_on_disk(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Root containment: `Some(PlanKind::Refused)` when reverting `entry` could
+/// write outside `root`, `None` when the write provably lands inside it.
+///
+/// `entry.path` is WIRE DATA. Every other gate in `build_plan` treats it as a
+/// repo-relative name and asks questions *about* it; this one asks whether it
+/// is a repo-relative name at all. Without it, `root.join(&entry.path)` is an
+/// arbitrary-write primitive: `Path::join` with an absolute path silently
+/// DISCARDS the base, and a `..` component walks straight out. Before Phase F
+/// the only caller was a human reading the rendered plan before confirming;
+/// `agentrec_undo` in `auto` mode removes that human, which is why this gate
+/// exists in the shared planner rather than in either transport.
+///
+/// TWO CHECKS, and the second is not redundant:
+///  1. LEXICAL — reject an absolute path or any `..`/root/prefix component.
+///     Catches the plain `../outside/f` and `/etc/passwd` shapes.
+///  2. RESOLVED — canonicalize the nearest EXISTING ancestor of the target and
+///     require `root`'s canonical form to be a prefix. A path that is
+///     lexically innocent (`linkdir/c.txt`) still escapes when `linkdir` is a
+///     symlink to somewhere outside; check 1 cannot see that, and
+///     [`is_symlink_on_disk`] cannot either — it lstats the FINAL component,
+///     while `restore_from_before` runs `create_dir_all(parent)` and writes
+///     THROUGH any intermediate link. That shape is strictly worse than the
+///     `..` one: the rendered path looks ordinary, so human review does not
+///     save the CLI leg either.
+///
+/// Both `root` and the ancestor are canonicalized before comparison because
+/// `root` itself is commonly a symlink (macOS `/tmp` → `/private/tmp`);
+/// comparing a canonical child against a non-canonical root would refuse
+/// every legitimate revert under such a root. A canonicalize failure on
+/// either side refuses — fail closed, since an unresolvable path is exactly
+/// the case where containment cannot be established.
+fn escape_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
+    const REASON: &str =
+        "path escapes the repository root — refusing to write outside the recorded repo";
+    let refuse = || {
+        Some(PlanKind::Refused {
+            reason: REASON.to_string(),
+        })
+    };
+
+    let rel = Path::new(&entry.path);
+    if entry.path.is_empty() {
+        return refuse();
+    }
+    // 1. Lexical. `Prefix` is Windows-only in practice but is an absolute
+    //    root there, so it is refused for the same reason as `RootDir`.
+    for c in rel.components() {
+        match c {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return refuse(),
+            Component::Normal(_) | Component::CurDir => {}
+        }
+    }
+
+    // 2. Resolved. Walk up from the target's parent to the nearest ancestor
+    //    that exists on disk — the deeper components may legitimately be
+    //    absent (a `create` revert, or a delete-restore into a directory
+    //    `restore_from_before` will `create_dir_all`). Canonicalizing the
+    //    nearest existing ancestor resolves every link ABOVE it, which is
+    //    the whole escape surface: any component that does not exist yet
+    //    cannot be a link to anywhere.
+    // NOT `.ok()?` — in a `-> Option<PlanKind>` where `None` MEANS ALLOWED,
+    // `?` would fail OPEN on an unresolvable root. Refuse explicitly.
+    let root_canon = match root.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return refuse(),
+    };
+    let target = root.join(rel);
+    let mut probe = target.parent();
+    while let Some(dir) = probe {
+        match dir.canonicalize() {
+            Ok(canon) => {
+                return if canon.starts_with(&root_canon) {
+                    None
+                } else {
+                    refuse()
+                }
+            }
+            Err(_) => probe = dir.parent(),
+        }
+    }
+    refuse()
 }
 
 /// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
