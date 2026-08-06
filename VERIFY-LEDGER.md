@@ -2420,3 +2420,79 @@ nor stopped recording. `daemon.rs`'s snapshot loop guards `is_symlink` and `is_d
 regular-file check, so the exposure is plausible on inspection and unrefuted. Forcing the read
 path needs a writer on the other end of the fifo, which was not attempted. **Open, and outside
 the undo surface this round fixed.**
+
+### Re-gate round 4 — the FIFO hang was HALF fixed; the gate was in the wrong layer
+
+Round 4 PASSED items 1, 3, 4 and 5 (fifo/directory refusal holds on both legs and returns
+promptly; no over-refusal, 999/0/4 reproduced; the NOTE 3 daemon paragraph judged honest and
+if anything UNDER-claiming; ledger truthful). **GATE FAIL on one blocker, fixed at
+`dc0befb`.**
+
+**`claim_grant` READS BEFORE IT PLANS, so a planner-side gate cannot protect it.**
+`inode_refusal` lives in `build_plan`. But `claim_grant` runs its drift loop through
+`read_current_hash` FIRST, and that was a bare `std::fs::read` — which BLOCKS on a fifo. So the
+exact defect round 3's fix was called to close remained reachable on the leg that matters most,
+the agent-triggerable execute path. Proven by the gate: preview a regular file (token issued),
+`rm` + `mkfifo`, execute → **zero `"id":3` frames, process alive at 25 s**. `agentrec approve`
+shares `claim_grant` and was exposed identically.
+
+**Blast radius, measured by the gate rather than assumed:** the hang holds the undo lock
+(`mcpcmd.rs:1224` acquires, `:1225` calls `claim_token`), but an unrelated `agentrec undo`
+still completed in 4 s during the hang — so it does NOT brick other processes. It kills the
+MCP session and burns the reservation. The token is NOT spent (`consume_token` runs after
+`claim_grant`), so this is availability only: no integrity or escape consequence.
+
+**Fixed at the PRIMITIVE, deliberately, not by policing a third call site.**
+`read_current_hash` now lstats and returns `None` for any non-regular file, so every present
+and future caller inherits it — there are four call sites today (`preview`, the reservation
+path, `claim_grant`'s drift loop, and `build_plan`'s modified-since check) and the next one
+would otherwise have to remember. `None` reads downstream as "no content to compare" = drift,
+surfacing as a clean `preview_stale` refusal instead of a hang; that is the same direction the
+function's existing doc already describes for an unreadable path, so no caller learns a new
+shape. Symlinks are included: returning `None` rather than the pointed-to file's hash only
+strengthens the "a symlink is always modified-since" property that
+`undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified` pins, and the entry is
+`symlink_refusal`'s to reject either way.
+
+**THE GENERAL LESSON, and the reason this round is worth reading later:** round 2's containment
+fix went into `build_plan` because it is the shared planner both legs reach, and that was
+correct — for a DECISION. It was not sufficient for anything that can block or escape **on
+read**, because `claim_grant` touches the filesystem before it calls the planner. *The planner
+is the right home for decisions; it is not the only place reads happen.* A gate's layer has to
+be chosen against the I/O, not against the control flow.
+
+**Evidence, all run:** new integration test at the `claim_grant` level
+(`a_fifo_swapped_in_after_the_preview_refuses_instead_of_hanging`) passes in 0.49 s; its
+mutation probe — the lstat guard neutered with `if false &&` — **HUNG at 25 s**, so the test is
+load-bearing rather than vacuous, and like the unit-level fifo test it hangs rather than fails
+on regression. Live MCP swap probe on the release binary: real 40-char token issued, regular
+file swapped for a fifo, `execute` returned **promptly** with `preview_stale`. Suite
+**1000 / 0 / 4** (999 + 1). Clippy `-D warnings` `--all-targets` debug AND release,
+`cargo fmt --check`: clean. Release-seam grep: 0.
+
+**An invalid probe, recorded because the failure mode is instructive.** The orchestrator's
+FIRST live swap probe reported "returned promptly" and was WORTHLESS: the preview had issued
+no token (empty string), so `execute` failed on `bad_token` and never reached the drift read at
+all. Cause: the fixture wrote CAS blobs at `objects/<fan>/<full-hash>`, but
+`store.rs::object_path` splits as `<fan>/<rest-62>`. Every EARLIER probe in this series refused
+before the store was ever consulted, which is why the wrong layout never surfaced. Re-run with
+the correct layout, the probe issued a real token and became discriminating. **A probe that
+"passes" without establishing its own precondition is evidence of nothing** — the same class as
+this repo's fixture-only-evidence rider.
+
+**Nuance, recorded not fixed:** the swapped-fifo refusal reads *"swap.txt changed since it was
+lodged"*, i.e. the drift wording, not a fifo-specific one. That is defensible here — the path
+genuinely did change, from a regular file to a fifo, and the refusal comes from the drift check
+rather than from a plan refusal, so MINOR 2's `refusals` channel legitimately does not fire.
+Stated so nobody later reads it as MINOR 2 regressing.
+
+**INCIDENT, disclosed by the gate itself and verified independently by the orchestrator:**
+while probing NOTE 3 the gate ran `pkill -f "agentrec record"`, which matched the **live
+dogfood daemon** (pid 865, `~/Projects/agentrec`) and killed it. launchd `KeepAlive` respawned
+it — now **pid 39492, `com.agentrec.bfa6bde6eaa4`, status 0**, confirmed recording turns after
+the respawn (orchestrator checked `pgrep`, `launchctl list`, and the tail of the dogfood
+`log.jsonl`). Consequence: a seconds-long recording gap in the dogfood repo, self-healed, no
+data loss. It also contaminated that round's first suite run (707/2/3, both failures
+daemon/FSEvents tests); the gate re-ran clean at 999/0/4 and correctly attributed the two
+failures to itself rather than to the branch. **This is the broad-pattern `pkill` hazard this
+repo already records in memory, hit anyway** — kill by exact pid.
