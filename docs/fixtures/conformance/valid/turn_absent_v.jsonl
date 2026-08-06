@@ -1,0 +1,1 @@
+{"type":"turn","id":"t_01JXR9W1N1RL4G6U8X0Z2C4E6G","grade":"bare","started":"2026-08-05T14:22:01.412Z","ended":"2026-08-05T14:23:47.008Z","root":"/Users/dev/repo","files":[{"path":"src/auth.rs","before":"sha256:1c8b1f2e4a5d6c7b8a9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e","after":"sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0","op":"modify"}]}

@@ -7,9 +7,84 @@ protocol version (PROTOCOL.md's versioning rule): existing readers must
 tolerate an unknown field, and a record that never sets a new field must
 serialize byte-identically to its pre-change form.
 
-Conformance fixtures for these fields are **not** created yet — the
-protocol freeze is Phase 2.1 (spec decision 5). Until then, these fields
-are additive but UNFROZEN: their shape can still change before 2.1 locks it.
+**The protocol is frozen at 1.0 (2026-08-06).** Every "UNFROZEN until the
+Phase 2.1 protocol freeze" note in the entries below is now discharged — see
+the freeze entry directly beneath this paragraph. Those notes are left in
+place verbatim: they were true when written, and this file is a history.
+Conformance fixtures now exist, at `docs/fixtures/conformance/`.
+
+## Protocol 1.0 freeze (2026-08-06)
+
+No wire change. `PROTOCOL.md` moves from `v0.2` to **1.0, frozen**: within
+major `v: 1`, changes are additive only, permanently. `SCHEMA_MAJOR` is
+untouched and every line's `v` stays `1` — the 1.0 versions the document,
+not the wire — so no existing `log.jsonl` or `signal.jsonl` is affected and
+no golden moves.
+
+What the freeze binds, for every entry below and every future one:
+
+- A field MAY be added. No field may be removed, renamed, retyped, or have
+  its meaning narrowed; no already-defined value may change meaning.
+- The open string enums (`link_kind`, `skipped_reason`, `attribution`) MAY
+  gain values — consumers are already required to tolerate unrecognized
+  ones. `skipped_reason: "policy"` stays reserved with no producer.
+- Anything not expressible additively needs a NEW major, which is a new
+  schema, not an edit to this one (PROTOCOL §10).
+
+Every previously-UNFROZEN field is therefore now frozen as shipped:
+`FileEntry.link_kind`, `FileEntry.attribution`, `FileEntry.skipped_reason`,
+`SignalEvent.emitter_turn`, `SignalEvent.model`, `SignalEvent.files_written`,
+and `EpochRecord.dropped_signals` — all seven already described by
+PROTOCOL.md — plus the four the freeze itself added rows for, immediately
+below.
+
+### Four undescribed fields documented at freeze time — RESOLVED
+
+Four fields were already on the wire with **no row in PROTOCOL.md's §4 or §5
+tables**, so a freeze of the document would not have bound them. The founder
+ruled they are **inside** the freeze; the rows were written from the shipped
+code rather than from the record, and are documentation of existing behavior,
+**not a wire change**. No serializer, no `Cargo.toml`, and no golden moved.
+
+| Field | Where the row now lives | Landed in | Prior marker |
+|---|---|---|---|
+| `SignalEvent.prompt` | §4 signal table | the original Claude Code hook emitter (`cli/src/cmds.rs::hook`), extended to Codex by `cli/src/hookcmds.rs::hook_codex` | none — it predates the UNFROZEN convention entirely, and is the oldest and least-documented of the set |
+| `TurnRecord.imported` | §5 record table | the import round (Phase 2.0 P2); both importers set it — `importcmd.rs`'s `persist::persist_session_file` (Claude) and `codex::persist_session_file` (Codex) | "Additive + UNFROZEN per spec decision 5" |
+| `TurnRecord.files_complete` | §5 record table | same two sites, same round | same |
+| `FileEntry.after_synthesized` | §5 file-entry prose, beside `link_kind`/`attribution`/`skipped_reason` | the Phase 2.0 P2 fix round, founder decision 2; written by the Claude importer only (`persist::classify_and_resolve`) — the Codex importer never derives an `after`, so it never sets it | "Additive, UNFROZEN … founder decision 2" |
+
+Three things the rows say that the code says and the prior record did not:
+
+- **`prompt` is not gated on `event`.** `cmds.rs::hook` reads the payload's
+  `prompt` key whichever hook fired, and `daemon.rs::signal_context` consumes
+  it on `stop` as well as `start` — on a stop it becomes `observe_stop`'s
+  `prompt_fallback`, which is how a stop-only emitter gets a prompt at all.
+  The row says MAY-on-either-event, not "start only".
+- **`prompt` serializes as an explicit `null`.** It has no
+  `skip_serializing_if`, unlike every additive field added after it. The row
+  pins explicit `null` as identical to absence (same posture `dropped_signals`
+  takes for an explicit `0`).
+- **`files_complete` discriminates "imported, so partial" and nothing finer.**
+  It is `false` unconditionally on every imported turn, so it can never mean
+  "entries were dropped from *this* turn". The row forbids reading it that way.
+
+Their shapes were already pinned by the conformance corpus
+(`valid/signal_start_with_prompt.jsonl`, `valid/turn_imported_partial.jsonl`),
+so no fixture was added or changed — the corpus counts below are unchanged.
+`docs/fixtures/conformance/README.md`'s recorded-gap section is updated to
+point at the new rows.
+
+Conformance corpus: `docs/fixtures/conformance/` — 29 fixtures across
+`valid/` (17), `tolerated/` (3) and `invalid/` (9), pinned by
+`cli/tests/conformance.rs`. 19 of the 29 are emitted by the real serializers
+in `agentrec-core/src/record.rs` (16 of the 17 in `valid/`, plus the three
+wrong-major lines). The other 10 are hand-written because no serializer can
+produce them: malformed JSON, unknown fields, an unknown record `type`, and
+`valid/signal_stop_protocol_example.jsonl` — PROTOCOL §4's own example line,
+which omits the optional keys our emitters always write as explicit `null`.
+
+Decision refs: spec decision 5 (freeze behind Codex 2.1), delta decision 16,
+D51 (`dropped_signals`, landed immediately prior so it is inside the freeze).
 
 ## Phase 2 tail D0 — `EpochRecord.dropped_signals` (2026-08-05)
 

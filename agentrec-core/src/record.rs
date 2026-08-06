@@ -60,6 +60,14 @@ pub struct SignalEvent {
     #[serde(default)]
     pub transcript: Option<String>,
     /// Post-scrub prompt text, when the emitting hook has it (UserPromptSubmit).
+    /// PROTOCOL §4 (row added at the 1.0 freeze, documenting shipped
+    /// behavior). NOT gated on `event`: `cmds.rs::hook` reads the payload's
+    /// `prompt` key whichever Claude Code hook fired, and `daemon.rs::
+    /// signal_context` consumes it on `start` and `stop` alike — on a stop it
+    /// becomes `observe_stop`'s `prompt_fallback` for a stop-only emitter.
+    /// Unlike the additive fields below it has no `skip_serializing_if`, so
+    /// it goes on the wire as an explicit `null` when absent; §4 pins
+    /// explicit `null` as identical to absence.
     #[serde(default)]
     pub prompt: Option<String>,
     /// PROTOCOL §4 additive (D6 attribution): absolute paths the emitting tool
@@ -155,8 +163,10 @@ pub struct FileEntry {
     /// and aggregate, driving the DEGRADED banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,
-    /// Additive, UNFROZEN (Phase 2.0 P2 fix round, founder decision 2):
-    /// `Some(true)` when `after` was DERIVED (e.g. applying an imported
+    /// PROTOCOL §5 additive, FROZEN at protocol 1.0 (2026-08-06) — the
+    /// freeze added its §5 row (see the `after_synthesized` paragraph
+    /// there); it landed in the Phase 2.0 P2 fix round under founder
+    /// decision 2. `Some(true)` when `after` was DERIVED (e.g. applying an imported
     /// turn's `oldString`→`newString` substitution to a resolved-or-
     /// unresolved `before`) rather than observed directly from the source
     /// (a live daemon snapshot, or a transcript's own recorded `content`
@@ -262,8 +272,10 @@ pub struct TurnRecord {
     /// PROTOCOL §4). Consumers must treat merged turns as superseded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merges: Vec<String>,
-    /// Import provenance (Phase 2.0 P2). Additive + UNFROZEN per spec
-    /// decision 5. `None` on every live-recorded record, so existing lines
+    /// Import provenance (Phase 2.0 P2). PROTOCOL §5 additive, FROZEN at
+    /// protocol 1.0 (2026-08-06) — the freeze added the §5 rows for this
+    /// field and for `files_complete` below, documenting both as already
+    /// shipped. `None` on every live-recorded record, so existing lines
     /// stay byte-identical — neither this nor `files_complete` is emitted
     /// unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
