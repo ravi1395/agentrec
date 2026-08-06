@@ -1966,3 +1966,91 @@ failed as assertions, not as compile errors.
   round 1, non-blocking finding 3): a kill-9'd approve leaves worktree reverted + turn
   logged + request pending + reservation live until `REQUEST_TTL_MS` (10 min), not the 60 s
   token TTL — the earlier residual named only the auto path.
+
+## Phase F exit — self-healing acceptance story, run live (2026-08-06, `feat/phase-2-tail`)
+
+Manual, not-unit-testable honesty row per the plan's Phase F exit criterion. It exists to close
+the gate's recorded blocker — *"the destructive loop end-to-end has zero live evidence"*. Full
+method, every command, every raw payload and hash: `docs/verify/f-exit-self-healing.md`. Run at
+worktree HEAD `78fbc36` (clean tree).
+
+**Binary: RELEASE, deliberately** — `target/release/agentrec`, `agentrec 0.2.0`, sha256
+`c1c00649dc3b1147120e0c2f1ffbe083eed00eaa4f912ce3a5c9ac10f3ade65e`. This row is a
+product-behavior story about the artifact users install, so unlike O5 (debug, disclosed) it runs
+the release build.
+
+**Agent identity is SIMULATED, stated first because it bounds everything below.** The two agent
+turns were driven through the real hook emitter (`agentrec hook claude` with `UserPromptSubmit` /
+`Stop` payloads on stdin, the way `cli/tests/misattribution.rs::send_hook` drives it) wrapping
+real file edits — the sanctioned hook-driven option. Bracketing, signal inbox, daemon
+consumption, turn minting, CAS snapshots, and every read/destructive verb are production paths;
+only the identity of the writing process is simulated. No `claude -p` session was involved.
+
+**Both legs green, on a disposable python repo (`calc.py` + two independently-failing named
+tests), never the agentrec repo.** Leg 1 (`mcp_destructive = "confirm"`): agent breaks `test_sub`
+→ daemon stopped → `log`/`blame`/`diff` all find the agent's own turn with no daemon running →
+MCP over real newline-delimited JSON-RPC frames (revision `2025-11-25`) lists **6 tools** (5 read
++ `agentrec_undo`, listed because mode ≠ `off`) → `preview` (no token, worktree digest unchanged
+after it) → `request` (10-min expiry observed on the wire as `expires - requested = 600000`) →
+human `agentrec approve <id>` → `test_sub` green → undo turn appended with **`"origin":"cli"`**.
+Leg 2 (`auto`): agent breaks `test_add` → both rails fired with their documented messages
+(`wrong_mode` for `request`-in-auto; `allow_modified_refused` for `allow_modified: true`) →
+`preview` issues a 60 s token → **`execute` run from a SECOND `agentrec mcp` process**, the
+preview process having already exited, with 40.99 s of TTL left → `test_add` green → undo turn
+with **`"origin":"mcp"`**. `grep -o '"origin":"[^"]*"' log.jsonl` over the one repo returns
+exactly `cli` then `mcp`. Replaying the spent token → `token_consumed`, worktree digest unchanged.
+Request ledger ended `0600` with all five events (`request`/`execute`, then
+`reserve`/`consume`/`execute`); F4's spend-before-writes order is visible in the last pair —
+`consume` at `…363051` precedes `execute` at `…363067`, **16 ms apart**. That figure is the
+consume→execute gap ONLY: `reserve`→`consume` is 19,015 ms, the wall-clock interval between the
+preview process and the separate execute process, and says nothing about write ordering. The raw
+token occurs 0 times in the ledger's bytes, only its sha256.
+
+**`origin: "cli"` for an agent-requested, human-approved undo is the SPECIFIED behavior, not a
+miss** — `record.rs`'s doc comment: *"It names the surface that wrote, never the one that asked."*
+Both observations carry the key explicitly, so neither rests on the absent-means-`cli` default.
+
+**The first attempt did not work, and it reshaped the run — recorded, not papered over.** A
+pre-check smoke of the undo round-trip produced `"before": null, "baseline_unknown": true` and
+nothing to revert. Not a defect: `record.rs:154` documents the field as exactly "before
+unrecoverable (first seen post-change)" — a daemon started moments before the edit has never
+observed the file, and git having it committed is irrelevant (the CAS is the daemon's, not git's).
+**Consequence, which is a genuine limit on this row's strength:** each leg required a **warm-up
+human write** (visible as a `bare` turn in every log) so the daemon held a baseline, and it was
+needed **twice** because a fresh daemon process starts baseline-less again. That a
+continuously-running real daemon supplies this for free is an *argument*, not something this round
+measured — **the story was never run against a daemon that had been up for days.**
+
+**Hash tie, observed rather than asserted:** at every transition in both legs, the turn record's
+`before`/`after` CAS refs are byte-identical to `shasum -a 256` of the file at that moment, and
+each post-undo digest equals its leg's baseline digest exactly.
+
+**Hygiene, measured at both ends.** `agentrec record|mcp` processes **5 → 5**, the same five PIDs
+with identical `lstart` (binary-path predicate). LaunchAgents **1 → 1 → 1** across before / after
+`init` / teardown; `init` on the `/private/tmp` root printed the D46 temp-root skip and
+`--service` was never passed. `pkill -f agentrec` was never run.
+
+**Two corrections to the round's own framing, both measured:**
+1. The task briefed **two** pre-existing leaked debug daemons (42419/42421). There are **four** —
+   41925 and 41952 too, all four `lstart` Wed Aug 5 15:37–15:38, all `target/debug` under
+   `/var/folders/...T/` tempdir roots (the same shape D46 reaped). None touched. A "count
+   restored" claim against a denominator of 2 would have been reported against the wrong number.
+2. A `pgrep -f "agentrec (record|mcp)"` predicate reported 7 mid-round and triggered a false
+   alarm: two `claude -p` processes carried the string `agentrec record` **in their prompt text on
+   the command line**. Every count in the evidence doc uses the binary-path predicate instead.
+
+**Not established, enumerated rather than implied:** agent identity simulated (above); the
+warm-up's dependence on a long-lived daemon unmeasured (above); one file / one path per turn, so
+**no** `skipped`/`withheld`/`modified_since` refusal, no path-subset reservation, and no
+`undo_conflict` was exercised live (`refusals` was empty in every preview — those rest on F2's
+fixtures, not on this row); macOS only, no Linux leg; strictly sequential, so no two-actor race on
+a reservation; `deny` never run; and **neither expiry path was reached** — the 10-min request
+expiry and 60 s token TTL were observed only as fields on the wire, beaten by ~9.5 min and ~41 s
+respectively.
+
+**The `allow_modified` refusal observed here is the TRANSPORT rail only** (`mcpcmd`'s router,
+which intercepts before the coordinator). Per this file's own Phase F gate-round-1 finding 1,
+`UndoCoordinator::preview` in Auto **downgrades-with-warning rather than refusing**. This round
+did not probe that layer, so nothing here is evidence of refusal at depth, and "both rails fired"
+above names two distinct *rails* (the mode matrix and the `allow_modified` check), never two
+*layers*.
