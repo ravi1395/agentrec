@@ -616,6 +616,54 @@ fn ac_f4_an_executable_set_that_shrank_after_the_preview_is_preview_stale() {
     assert_eq!(rows_of(&root, EVENT_CONSUME), 0);
 }
 
+// ---- the guard is checked BEFORE the spend ----------------------------------
+
+/// A concurrent undo refuses the call — and, the load-bearing half, does NOT
+/// burn the token: the H7 guard is checked ahead of the spend, so the agent
+/// can re-present the same token once the other undo finishes, inside its TTL.
+///
+/// The re-present leg is what makes this discriminating. Asserting only the
+/// refusal would pass against a build that consumed the token first and then
+/// refused, which is precisely the behavior the ordering exists to avoid.
+#[test]
+fn a_concurrent_undo_refuses_without_spending_the_token() {
+    let root = root_with_mode("auto");
+    seed(&root, vec![revertible(&root, "a.rs")]);
+    let token = issue_token(&root);
+
+    // The H7 coordination guard another `undo --confirm` would have written.
+    let guard = json!({
+        "paths": ["a.rs"],
+        "until_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 30_000,
+    });
+    let guard_path = root.join(".agentrec/undo-guard.json");
+    std::fs::write(&guard_path, guard.to_string()).unwrap();
+
+    let (code, msg) = domain(&execute(&root, &token));
+    assert_eq!(code, "undo_in_progress", "{msg}");
+    assert_eq!(
+        rows_of(&root, EVENT_CONSUME),
+        0,
+        "a collision must not spend the token"
+    );
+    assert!(undo_turns(&root).is_empty());
+    assert_eq!(
+        std::fs::read(root.join("a.rs")).unwrap(),
+        b"new a.rs\n",
+        "nothing was written"
+    );
+
+    // The other undo finishes; the SAME token still works.
+    std::fs::remove_file(&guard_path).unwrap();
+    let payload = ok_payload(&execute(&root, &token));
+    assert_eq!(payload["reverted"], 1);
+    assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), b"old a.rs\n");
+}
+
 // ---- matrix + argument channel ----------------------------------------------
 
 /// `execute` stays confirm-mode-forbidden (F1's matrix precedes the body),

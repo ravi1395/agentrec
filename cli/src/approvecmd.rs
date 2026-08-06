@@ -97,7 +97,10 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
 }
 
 /// What a completed execution produced, for whichever transport asked for it.
-#[derive(serde::Serialize)]
+///
+/// Deliberately NOT `Serialize`: the MCP `execute` payload is not this struct
+/// — it adds the reservation and target-turn ids — and a derive here would
+/// advertise a wire contract that is not the wire contract.
 pub struct Executed {
     /// The id of the undo turn appended to `log.jsonl` (P5).
     pub undo_turn: String,
