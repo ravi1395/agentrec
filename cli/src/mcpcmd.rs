@@ -15,9 +15,10 @@
 //! gating**: `agentrec_undo` is listed iff `mcp_destructive != off`, carries
 //! destructive annotations, and routes four sub-actions through a per-mode
 //! allow matrix plus the auto-mode `allow_modified` rail (PROTOCOL §8). Its
-//! sub-action bodies are F2-F4's; every cell the matrix permits answers a
-//! named `not_implemented` refusal rather than a silent empty result, which
-//! an agent would read as "nothing to revert".
+//! sub-action bodies followed: F2 `preview`, F3 `request`/`status`, F4
+//! `execute`. **All four are now built**, so every cell the matrix permits
+//! reaches the coordinator and answers with the repository's own verdict;
+//! F1's placeholder `not_implemented` refusal no longer has a producer.
 //!
 //! Reads are file-based (P3), so nothing here touches the daemon: the server
 //! is fully functional with `agentrec record` stopped.
@@ -1069,8 +1070,8 @@ impl UndoAction {
     }
 }
 
-/// `agentrec_undo` — F1 ships gating only; every legal cell answers
-/// `not_implemented`.
+/// `agentrec_undo` — the mode gate and the sub-action matrix, above four
+/// built bodies (F2 `preview`, F3 `request`/`status`, F4 `execute`).
 ///
 /// Reached only when the mode is not `Off` (see [`tools_call`]), so `mode`
 /// here is `Confirm` or `Auto`.
@@ -1202,15 +1203,55 @@ fn undo_tool(
                 }),
             }
         }
-        UndoAction::Execute => Err(ToolFailure::Domain {
-            code: "not_implemented",
-            message: format!(
-                "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
-                 version of agentrec",
-                action.as_str(),
-                mode_str(mode)
-            ),
-        }),
+        // F4. The one destructive cell. Everything that DECIDES is the
+        // coordinator's (token validity, drift, scope) and everything that
+        // WRITES is `approvecmd::execute_claim` — the same function
+        // `agentrec approve` runs, so an agent's auto undo and a human's
+        // approved undo write through one implementation and record the same
+        // shape of turn.
+        //
+        // The ordering below is load-bearing and is the module header's
+        // crash matrix in code: the token is spent (durably, under the lock)
+        // only after every refusal that could still happen, and strictly
+        // before the first working-tree write.
+        UndoAction::Execute => {
+            let token = required_str_arg(args, "token")?;
+            let co = undo_coordinator::UndoCoordinator::new(root);
+            let domain = |e: undo_coordinator::UndoError| ToolFailure::Domain {
+                code: e.code(),
+                message: e.to_string(),
+            };
+            let lock = co.lock().map_err(domain)?;
+            let claim = co.claim_token(&lock, &token).map_err(domain)?;
+
+            // Checked here, ahead of the spend, so a concurrent undo does not
+            // burn a token the agent could re-present inside its TTL.
+            // `execute_claim` checks again; that one is `approve`'s.
+            if let Some(reason) = crate::readcmds::live_undo_guard_reason(root) {
+                return Err(ToolFailure::Domain {
+                    code: "undo_in_progress",
+                    message: reason,
+                });
+            }
+            co.consume_token(&lock, &claim.request).map_err(domain)?;
+
+            match crate::approvecmd::execute_claim(root, &co, lock, &claim) {
+                Ok(executed) => encode(&json!({
+                    "reservation": claim.request.id,
+                    "turn": claim.target.id,
+                    "undo_turn": executed.undo_turn,
+                    "reverted": executed.reverted,
+                    "files": executed.files,
+                })),
+                // A mid-revert failure is the repository answering, and
+                // `execute_claim` has already recorded whatever landed as a
+                // truncated undo turn plus a `fail` row.
+                Err(message) => Err(ToolFailure::Domain {
+                    code: "revert_failed",
+                    message,
+                }),
+            }
+        }
     }
 }
 
@@ -1353,10 +1394,16 @@ mod tests {
                 "no_turns"
             );
         }
-        // `execute` is the one sub-action F3 leaves unbuilt (it is F4's), and
-        // in the mode that permits it the answer is still `not_implemented`
-        // rather than the matrix's `wrong_mode`.
-        assert_eq!(code(auto, json!({"action": "execute"})), "not_implemented");
+        // `execute` is live as of F4, so in the mode that permits it the
+        // answer is now the REPOSITORY's — an empty root has issued no
+        // reservation, so a well-formed token matches nothing. The token has
+        // to be present: a missing one is `-32602` (the schema declares the
+        // argument), which `code`'s helper would panic on rather than
+        // silently accept.
+        assert_eq!(
+            code(auto, json!({"action": "execute", "token": "0".repeat(40)})),
+            "bad_token"
+        );
         // The rail still precedes the (now live) preview body: an auto-mode
         // preview carrying the flag never reaches the coordinator at all.
         assert_eq!(

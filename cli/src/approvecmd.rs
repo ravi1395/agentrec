@@ -51,7 +51,7 @@
 use std::path::Path;
 
 use agentrec_core::undo_coordinator::{
-    Claim, PendingStatus, PlanKind, UndoCoordinator, EVENT_EXECUTE, EVENT_FAIL,
+    Claim, PendingStatus, PlanKind, UndoCoordinator, UndoLock, EVENT_EXECUTE, EVENT_FAIL,
 };
 
 use crate::fmt;
@@ -80,16 +80,70 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
     // The same bytes `undo` prints before `--confirm`, D49 caution included.
     readcmds::print_plan(&target, &plans);
 
+    let claim = Claim {
+        request,
+        target,
+        plans,
+    };
+    let executed = execute_claim(root, &co, lock, &claim)?;
+
+    println!(
+        "approved request {}; reverted {} file(s); recorded as turn {}",
+        claim.request.id,
+        executed.reverted,
+        fmt::short_id(&executed.undo_turn)
+    );
+    Ok(())
+}
+
+/// What a completed execution produced, for whichever transport asked for it.
+#[derive(serde::Serialize)]
+pub struct Executed {
+    /// The id of the undo turn appended to `log.jsonl` (P5).
+    pub undo_turn: String,
+    pub reverted: usize,
+    /// The paths actually written, in plan order.
+    pub files: Vec<String>,
+}
+
+/// Apply a claimed grant: guard, revert every file, append the undo turn, and
+/// resolve the grant with its terminal ledger row.
+///
+/// **Shared by both flows that may execute an undo** — `agentrec approve`
+/// (F3, a human's decision) and the MCP `execute` sub-action (F4, an
+/// auto-mode token) — because everything from here down is identical, and a
+/// second copy behind the token seam is exactly the drift the coordinator
+/// exists to prevent. What differs between the two is only how the grant was
+/// authorized, and that is entirely inside `UndoCoordinator::claim` /
+/// `claim_token`. This function prints nothing: the MCP transport owns
+/// stdout.
+///
+/// Takes the lock BY VALUE, because where it is released is part of the
+/// contract: after the terminal row, before [`readcmds::finish_undo_guard`]'s
+/// linger on the success path — the ordering `approve` already had, preserved
+/// exactly.
+pub fn execute_claim(
+    root: &Path,
+    co: &UndoCoordinator,
+    lock: UndoLock,
+    claim: &Claim,
+) -> Result<Executed, String> {
+    let Claim {
+        request,
+        target,
+        plans,
+    } = claim;
+
     let revertible: Vec<_> = plans
         .iter()
         .filter(|p| matches!(p.kind, PlanKind::Revert { .. }))
         .collect();
     if revertible.is_empty() {
-        // Defensive only: `claim` refuses any request whose executable set no
-        // longer equals the approved one, and the empty set is the extreme
-        // case of that, so this is unreachable. It writes NO terminal row —
-        // `claim` already appended one for every divergence it refused, and a
-        // second would be a duplicate resolution of one request.
+        // Defensive only: both claim paths refuse any grant whose executable
+        // set no longer equals the granted one, and the empty set is the
+        // extreme case of that, so this is unreachable. It writes NO terminal
+        // row — the claim already appended one for every divergence it
+        // refused, and a second would be a duplicate resolution.
         return Err(format!(
             "undo request {} no longer has anything to revert — nothing was written",
             request.id
@@ -97,8 +151,13 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
     }
 
     // H7/E8, exactly as `undo --confirm` does it. Without the guard a running
-    // recorder attributes this approval's writes to a bare turn — an
-    // unattributed activity window over changes agentrec itself made.
+    // recorder attributes these writes to a bare turn — an unattributed
+    // activity window over changes agentrec itself made.
+    //
+    // The auto path checks this BEFORE spending the token, so a collision
+    // here does not burn a token the agent could legitimately re-present
+    // seconds later; this second check is the one `approve` needs and is
+    // redundant for that caller.
     if let Some(reason) = readcmds::live_undo_guard_reason(root) {
         return Err(reason);
     }
@@ -125,31 +184,24 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
         if !inverse.is_empty() {
             let _ = readcmds::append_undo_turn(root, &short_target, inverse, true);
         }
-        let _ = co.append_terminal(&lock, &request, EVENT_FAIL, None, Some(e.clone()));
+        let _ = co.append_terminal(&lock, request, EVENT_FAIL, None, Some(e.clone()));
         readcmds::finish_undo_guard(root);
         return Err(e);
     }
 
     let reverted = inverse.len();
     let undo_turn = readcmds::append_undo_turn(root, &short_target, inverse, false)?;
-    co.append_terminal(
-        &lock,
-        &request,
-        EVENT_EXECUTE,
-        Some(undo_turn.clone()),
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    co.append_terminal(&lock, request, EVENT_EXECUTE, Some(undo_turn.clone()), None)
+        .map_err(|e| e.to_string())?;
     drop(lock);
 
     readcmds::finish_undo_guard(root);
 
-    println!(
-        "approved request {}; reverted {reverted} file(s); recorded as turn {}",
-        request.id,
-        fmt::short_id(&undo_turn)
-    );
-    Ok(())
+    Ok(Executed {
+        undo_turn,
+        reverted,
+        files: guarded,
+    })
 }
 
 /// `agentrec deny <id>`: record the refusal. The worktree is not touched,

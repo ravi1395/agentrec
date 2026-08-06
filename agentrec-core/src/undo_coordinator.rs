@@ -81,6 +81,46 @@
 //! pre-sanction the file — "the 2.3 request ledger is a NEW append-only file
 //! under `.agentrec/`, not a rewrite class".
 //!
+//! ## F4: why the token is spent BEFORE the writes, not after them
+//!
+//! F3's ordering — terminal row last, states recognized on read — is right
+//! for a human request and **insufficient for a token**. AC-F4 requires the
+//! second presentation of a token to fail *even if the first presentation
+//! crashed mid-execution*, and a crash between the last worktree write and
+//! the `execute` row leaves the reservation live and the token unspent.
+//! Content drift usually refuses the retry (the files now hold their `before`
+//! bytes), but "usually" is not the guarantee: anything that restores those
+//! files inside the window — an editor undo, a `git checkout`, a second agent
+//! — makes the same token execute again and mint a second undo turn.
+//!
+//! So [`EVENT_CONSUME`] is appended and fsynced under the lock **before the
+//! first working-tree write**, and it is not terminal, so the reservation
+//! keeps holding its paths while the writes run. The ordering is:
+//!
+//! ```text
+//! lock → resolve token → content drift → scope drift → concurrent-undo guard
+//!      → CONSUME (fsync) → guard write → worktree writes → undo turn (fsync)
+//!      → EXECUTE row
+//! ```
+//!
+//! At every instant a crash can land:
+//!
+//! | crash point | ledger reads | worktree | retry with the same token |
+//! |---|---|---|---|
+//! | before `consume` | `reserve` only | untouched | executes — correct, nothing happened |
+//! | after `consume`, before writes | `reserve`+`consume` | untouched | `token_consumed` — conservative, a fresh preview costs nothing |
+//! | mid-writes | `reserve`+`consume` | partly reverted | `token_consumed` — **the case the row exists for** |
+//! | after writes, before the turn | `reserve`+`consume` | reverted | `token_consumed` |
+//! | after the turn, before `execute` | `reserve`+`consume` | reverted | `token_consumed` |
+//!
+//! There is no instant at which the token can execute twice, and none at
+//! which the ledger shows an execution that did not happen — `execute` is
+//! still written last, exactly as F3 writes it. The cost is one direction of
+//! conservatism (a token burned by a crash that wrote nothing) and one
+//! disclosed residual: a consumed-but-unresolved reservation goes on holding
+//! its paths until its 60 s TTL lapses, because releasing it early is the
+//! thing that would let a second grant write to a file mid-revert.
+//!
 //! In F2 the only thing that ended a reservation was TTL expiry. **F3 adds
 //! the terminal writers** — `deny`, `expire` (appended lazily, by whichever
 //! approve/deny first observes a lapsed request), `execute`, and `fail` —
@@ -300,6 +340,18 @@ pub enum UndoError {
         request: String,
         paths: Vec<String>,
     },
+    /// F4: no reservation, live or dead, was ever issued for this token. An
+    /// agent seeing this has a bug (it invented or mangled a token), which is
+    /// why it is distinct from [`UndoError::TokenConsumed`] — that one means
+    /// "take a fresh preview", this one means "you are not holding what you
+    /// think you are holding".
+    BadToken,
+    /// F4: the token matched a reservation that has already been spent. The
+    /// spend is recorded BEFORE the writes, so this fires even when the run
+    /// that spent it died part-way through them.
+    TokenConsumed,
+    /// F4: the token matched a reservation whose 60 s window has closed.
+    TokenExpired,
     Io(String),
 }
 
@@ -324,6 +376,9 @@ impl UndoError {
             // ":641-697 Approval drift records `preview_stale` and requires a
             // new request."
             UndoError::PreviewStale { .. } => "preview_stale",
+            UndoError::BadToken => "bad_token",
+            UndoError::TokenConsumed => "token_consumed",
+            UndoError::TokenExpired => "token_expired",
             UndoError::Io(_) => "repo_error",
         }
     }
@@ -383,6 +438,22 @@ impl std::fmt::Display for UndoError {
                 "undo request {request} is stale: {} changed since it was lodged — nothing was \
                  written; ask for a fresh preview and a new request",
                 paths.join(", ")
+            ),
+            UndoError::BadToken => write!(
+                f,
+                "no undo reservation matches that token — nothing was written; call `preview` \
+                 to obtain one"
+            ),
+            UndoError::TokenConsumed => write!(
+                f,
+                "that undo token has already been spent — nothing was written; a token is \
+                 single-use, so call `preview` again for a fresh one"
+            ),
+            UndoError::TokenExpired => write!(
+                f,
+                "that undo token has expired — nothing was written; tokens are valid for {} \
+                 seconds, so call `preview` again for a fresh one",
+                TOKEN_TTL_MS / 1000
             ),
             UndoError::Io(m) => write!(f, "{m}"),
         }
@@ -690,7 +761,20 @@ impl UndoCoordinator {
             token_sha256: Some(hash_bytes(token.as_bytes())),
             expires_unix_ms: now + TOKEN_TTL_MS,
             at_unix_ms: now,
-            hashes: Vec::new(),
+            // F4: the drift baseline, recorded here because P4's "hash
+            // recheck under lock before writes" needs something to recheck
+            // AGAINST — what each path held at preview time, which is what
+            // the token was issued over. Same field, same shape and same
+            // comparison as `request_human`'s, so one drift rule serves both
+            // flows. A `reserve` row written by a pre-F4 binary carries an
+            // EMPTY `hashes`, which reads as total drift and refuses: that
+            // falls out of the `Option<Option<String>>` comparison rather
+            // than being handled, and it fails closed, which is the safe
+            // direction.
+            hashes: paths
+                .iter()
+                .map(|p| read_current_hash(&self.root, p))
+                .collect(),
             allow_modified: false,
             undo_turn: None,
             reason: None,
@@ -937,6 +1021,94 @@ impl UndoCoordinator {
                 })
             }
         }
+        self.claim_grant(lock, request)
+    }
+
+    /// Resolve an auto-mode token to a claim, under a lock the CALLER already
+    /// holds (F4; parent :641-697 `execute`).
+    ///
+    /// Validation is by HASH: the presented token is hashed and matched
+    /// against `token_sha256` over EVERY `reserve` row, live or not. Matching
+    /// only live rows would collapse "reused" and "never issued" into one
+    /// answer — a spent reservation has been released by its `execute` row and
+    /// is no longer live — and those two mean different things to an agent
+    /// (take a fresh preview vs. fix your caller).
+    ///
+    /// **Nothing is appended on a bad, spent, or expired token.** That is a
+    /// deliberate divergence from [`Self::claim`], which lazily records a
+    /// lapsed request's `expire`: expiry here is already implicit in the
+    /// reservation's own `expires_unix_ms` (the field [`live_from_ledger`]
+    /// filters on), so no row is owed for correctness, and AC-F4 asks for
+    /// zero side effects on exactly these three. Drift is different and DOES
+    /// append its `fail` row — see [`Self::claim_grant`].
+    pub fn claim_token(&self, lock: &UndoLock, token: &str) -> Result<Claim, UndoError> {
+        let events = self.events()?;
+        let presented = hash_bytes(token.as_bytes());
+        let reservation = events
+            .iter()
+            .filter(|e| e.event == EVENT_RESERVE)
+            .find(|e| e.token_sha256.as_deref() == Some(presented.as_str()))
+            .cloned()
+            .ok_or(UndoError::BadToken)?;
+
+        // Spent-ness outranks expiry: a token spent at second 59 and
+        // presented at second 61 is reused, not merely stale, and reporting
+        // it as expired would invite the agent to blame the clock.
+        if events
+            .iter()
+            .any(|e| e.id == reservation.id && e.event == EVENT_CONSUME)
+        {
+            return Err(UndoError::TokenConsumed);
+        }
+        // A terminal row without a `consume` means the grant was resolved
+        // some other way (drift `fail`, or a `deny`): the token is dead too.
+        if events
+            .iter()
+            .any(|e| e.id == reservation.id && TERMINAL_EVENTS.contains(&e.event.as_str()))
+        {
+            return Err(UndoError::TokenConsumed);
+        }
+        // ONE clock rule: the same comparison `live_from_ledger` applies,
+        // against the same field. Re-deriving the deadline from
+        // `at_unix_ms + TOKEN_TTL_MS` would be a second rule to keep in
+        // agreement with the first.
+        if reservation.expires_unix_ms <= now_ms() {
+            return Err(UndoError::TokenExpired);
+        }
+
+        self.claim_grant(lock, reservation)
+    }
+
+    /// Spend the token: append and fsync [`EVENT_CONSUME`] for `reservation`.
+    /// Caller must hold [`Self::lock`], and must call this **before the first
+    /// working-tree write** — that ordering is the whole invariant. See the
+    /// module header's crash matrix.
+    pub fn consume_token(
+        &self,
+        _lock: &UndoLock,
+        reservation: &LedgerEvent,
+    ) -> Result<(), UndoError> {
+        let ev = LedgerEvent::terminal(EVENT_CONSUME, reservation, now_ms());
+        self.append_event(&ev)
+    }
+
+    /// The half of a claim that is identical for a human-approved request and
+    /// an auto-mode token: content drift, then scope drift, then the plan.
+    ///
+    /// Extracted from F3's `claim` rather than copied, because the two flows
+    /// differ ONLY in how the grant is authorized — and a second drift
+    /// implementation behind the token seam is exactly the divergence this
+    /// module exists to prevent. `grant` is a `request` row for `claim` and a
+    /// `reserve` row for `claim_token`; both carry `paths`, `hashes`,
+    /// `allow_modified` and `turn`, which is everything used here.
+    ///
+    /// **Every refusal appends the `fail` row it owes and writes nothing to
+    /// the working tree.** The row is not bookkeeping: it is terminal, so it
+    /// RELEASES the grant's path reservation — without it the fresh preview
+    /// this error tells the caller to take would collide with the dead grant
+    /// it is replacing.
+    fn claim_grant(&self, lock: &UndoLock, grant: LedgerEvent) -> Result<Claim, UndoError> {
+        let request = grant;
 
         // Drift: compare each path's CURRENT bytes against what it held when
         // the request was lodged. Not a re-run of the planner — with
@@ -1113,6 +1285,16 @@ pub const EVENT_REQUEST: &str = "request";
 /// durable approval is [`EVENT_EXECUTE`], appended only after the writes and
 /// the undo turn's fsync, so an interrupted approval can never read as one.
 pub const EVENT_APPROVE: &str = "approve";
+/// F4: the auto-mode token was SPENT. Appended and fsynced **before** the
+/// first working-tree write, which is the whole point of the row — see
+/// [`UndoCoordinator::consume_token`].
+///
+/// Deliberately NOT in [`TERMINAL_EVENTS`]: a consumed reservation still
+/// intends to write to its paths (the writes are happening right now), and
+/// releasing them mid-revert would let an overlapping grant exist against a
+/// file being rewritten. It is not in [`RESERVING_EVENTS`] either — it does
+/// not create a reservation, it annotates one.
+pub const EVENT_CONSUME: &str = "consume";
 /// A human said no (F3). Terminal; no working-tree write happened.
 pub const EVENT_DENY: &str = "deny";
 /// The approval window lapsed (F3). Appended lazily by whichever `approve`
@@ -2348,5 +2530,122 @@ mod coordinator_tests {
             live.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             vec!["r1"]
         );
+    }
+
+    // ---- F4 ---------------------------------------------------------------
+
+    /// The refusal code out of a claim attempt. `unwrap_err` is unavailable
+    /// here — `Claim` is not `Debug`, deliberately (it carries a whole turn
+    /// record) — and this reads better than a `matches!` at each site.
+    fn refusal(r: Result<Claim, UndoError>) -> &'static str {
+        match r {
+            Ok(_) => panic!("expected a refusal, got a claim"),
+            Err(e) => e.code(),
+        }
+    }
+
+    /// The reservation records the drift baseline P4 rechecks against, and
+    /// the RAW token appears nowhere on disk — only its sha256. The ledger is
+    /// 0600 but a credential stored in a file readable by anyone who can read
+    /// `.agentrec/` would make the token pointless.
+    #[test]
+    fn a_reservation_stores_the_hash_and_the_baseline_never_the_raw_token() {
+        let fx = Fx::new();
+        let e = fx.revertible("src/a.rs");
+        let id = fx.write_turn("t_AAAA0000000000000000AAAA", false, vec![e]);
+        let p = fx.coord().preview(req(&id), McpDestructive::Auto).unwrap();
+        let token = p.token.expect("auto issues a token");
+
+        let raw = std::fs::read_to_string(fx.root().join(".agentrec/undo-requests.jsonl")).unwrap();
+        assert!(
+            !raw.contains(&token),
+            "the raw token must never be persisted"
+        );
+        let rows = fx.coord().events().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, EVENT_RESERVE);
+        assert_eq!(rows[0].token_sha256, Some(hash_bytes(token.as_bytes())));
+        assert_eq!(
+            rows[0].hashes,
+            vec![read_current_hash(fx.root(), "src/a.rs")],
+            "the reserve row must carry the per-path drift baseline"
+        );
+        assert_eq!(
+            rows[0].expires_unix_ms - rows[0].at_unix_ms,
+            TOKEN_TTL_MS,
+            "the granted window is the spec's 60s"
+        );
+    }
+
+    /// A `reserve` row written by a PRE-F4 binary carries no `hashes`. It
+    /// reads as total drift and refuses — stated as what happens, not as a
+    /// case that cannot arise: the ledger is append-only and an older
+    /// agentrec may have written into it.
+    #[test]
+    fn a_reserve_row_without_a_baseline_refuses_rather_than_executing() {
+        let fx = Fx::new();
+        let e = fx.revertible("src/a.rs");
+        let id = fx.write_turn("t_AAAA0000000000000000AAAA", false, vec![e]);
+        let p = fx.coord().preview(req(&id), McpDestructive::Auto).unwrap();
+        let token = p.token.unwrap();
+
+        // Rewrite the row the way F2 wrote it: no `hashes` at all.
+        let path = fx.root().join(".agentrec/undo-requests.jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        row.as_object_mut().unwrap().remove("hashes");
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+
+        let co = fx.coord();
+        let lock = co.lock().unwrap();
+        assert_eq!(
+            refusal(co.claim_token(&lock, &token)),
+            "preview_stale",
+            "a baseline-less grant must not execute"
+        );
+    }
+
+    /// The three token refusals are three distinct codes, and none of them is
+    /// reachable by a caller that merely guessed a well-formed string.
+    #[test]
+    fn bad_spent_and_expired_tokens_are_three_different_answers() {
+        let fx = Fx::new();
+        let e = fx.revertible("src/a.rs");
+        let id = fx.write_turn("t_AAAA0000000000000000AAAA", false, vec![e]);
+        let token = fx
+            .coord()
+            .preview(req(&id), McpDestructive::Auto)
+            .unwrap()
+            .token
+            .unwrap();
+        let co = fx.coord();
+
+        let lock = co.lock().unwrap();
+        assert_eq!(refusal(co.claim_token(&lock, "deadbeef")), "bad_token");
+        // Spend it WITHOUT executing — the crash-between-consume-and-writes
+        // state, in its smallest form.
+        let reservation = co.events().unwrap().into_iter().next().unwrap();
+        co.consume_token(&lock, &reservation).unwrap();
+        assert_eq!(refusal(co.claim_token(&lock, &token)), "token_consumed");
+        drop(lock);
+
+        // A second, independent reservation, expired rather than spent.
+        let fx2 = Fx::new();
+        let e2 = fx2.revertible("src/a.rs");
+        let id2 = fx2.write_turn("t_BBBB0000000000000000BBBB", false, vec![e2]);
+        let token2 = fx2
+            .coord()
+            .preview(req(&id2), McpDestructive::Auto)
+            .unwrap()
+            .token
+            .unwrap();
+        let path = fx2.root().join(".agentrec/undo-requests.jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        row["expires_unix_ms"] = serde_json::json!(1_000u64);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let co2 = fx2.coord();
+        let lock2 = co2.lock().unwrap();
+        assert_eq!(refusal(co2.claim_token(&lock2, &token2)), "token_expired");
     }
 }

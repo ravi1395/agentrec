@@ -1608,10 +1608,12 @@ mod e3 {
 ///   `status`" settles confirm; nothing anywhere forbids it in auto.
 ///
 /// So: `preview` both, `status` both, `request` confirm-only, `execute`
-/// auto-only. F1 ships the matrix; F2-F4 ship the sub-actions, which is why
-/// every legal cell here answers `not_implemented`. A build implementing the
-/// shorthand instead reds `preview_and_status_are_legal_in_both_modes` on two
-/// of its four cells — measured, not inferred; see that test's own comment.
+/// auto-only. F1 shipped the matrix and F2-F4 the sub-action bodies, so a
+/// legal cell now answers with the REPOSITORY's verdict rather than F1's
+/// `not_implemented` placeholder — these tests assert the matrix through
+/// those answers. A build implementing the shorthand instead reds
+/// `preview_and_status_are_legal_in_both_modes` on two of its four cells —
+/// measured, not inferred; see that test's own comment.
 mod f1 {
     use super::*;
     use serde_json::Value;
@@ -1818,11 +1820,16 @@ mod f1 {
             "the refusal must name the rail — which mode request belongs to: {message:?}"
         );
 
+        // The mirror control: `execute` is legal in auto mode, so it reaches
+        // the coordinator. F4 made this cell live, so the answer is now the
+        // REPOSITORY's — this root has issued no reservation, so no token
+        // matches — rather than F1's placeholder `not_implemented`. What is
+        // still pinned here is that the matrix does NOT refuse it.
         let (code, _) = domain(&undo(
             &root,
             serde_json::json!({"action": "execute", "token": "t"}),
         ));
-        assert_eq!(code, "not_implemented", "execute is legal in auto mode");
+        assert_eq!(code, "bad_token", "execute is legal in auto mode");
     }
 
     /// AC-F1 (e): auto + `allow_modified: true` is refused (decision 6 /
