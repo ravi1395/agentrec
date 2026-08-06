@@ -737,3 +737,49 @@ fn a_fifo_swapped_in_after_the_preview_refuses_instead_of_hanging() {
         "an aborted execute must not spend the token"
     );
 }
+
+/// Re-gate round 5 blocker: `store.get` was a bare `fs::read`, so a FIFO
+/// planted at a CAS object path hung EVERY undo leg at once — `build_plan`
+/// calls it as an integrity read, so preview, CLI `undo`, `approve` and
+/// `execute` all blocked, and no token was ever issued. Worse-placed than the
+/// round-4 blocker, which only reached the post-token path.
+///
+/// `.agentrec/objects/` is inside the repo, so the precondition is the same
+/// sandboxed-agent write that grounds every containment refusal. Fixed by
+/// `fsguard::read_regular` at the primitive rather than at this call site.
+/// HANGS rather than fails on regression.
+#[test]
+#[cfg(unix)]
+fn a_fifo_planted_in_the_cas_refuses_instead_of_hanging() {
+    let root = root_with_mode("auto");
+    let entry = revertible(&root, "a.rs");
+    let before = entry.before.clone().expect("fixture has a before blob");
+    seed(&root, vec![entry]);
+
+    // Replace the `before` object with a fifo at its exact CAS path.
+    let hex = before.strip_prefix("sha256:").unwrap();
+    let (fan, rest) = hex.split_at(2);
+    let obj = root.join(".agentrec/objects").join(fan).join(rest);
+    std::fs::remove_file(&obj).unwrap();
+    let c = std::ffi::CString::new(obj.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo in the CAS"
+    );
+
+    // preview must ANSWER — refusing the entry, not blocking on it.
+    let out = mcp_call(&root, json!({"action": "preview", "turn": TURN}));
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .expect("preview must return a payload, not hang");
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(
+        payload["files"].as_array().unwrap().is_empty(),
+        "a fifo blob is not a retrievable snapshot: {payload}"
+    );
+    assert!(
+        payload["token"].is_null(),
+        "no token may be issued for an unrevertible entry: {payload}"
+    );
+}

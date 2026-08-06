@@ -815,6 +815,14 @@ impl UndoCoordinator {
         let path = self.ledger_path();
         let line = serde_json::to_string(event)
             .map_err(|e| UndoError::Io(format!("cannot encode ledger event: {e}")))?;
+        // Same write-side hazard as `UndoLock::acquire`: a FIFO here blocks
+        // the append until a reader appears.
+        if crate::fsguard::is_nonregular(&path) {
+            return Err(UndoError::Io(format!(
+                "{} is not a regular file — refusing to append",
+                path.display()
+            )));
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1591,6 +1599,16 @@ pub struct UndoLock {
 
 impl UndoLock {
     fn acquire(path: &Path) -> Result<Self, UndoError> {
+        // Opening a FIFO for WRITE blocks until a READER appears — the
+        // mirror of the read-side hazard, and this one would wedge every
+        // undo leg before any of them reached a gate. The lock file is
+        // inside `.agentrec/`, which the sandboxed agent can write.
+        if crate::fsguard::is_nonregular(path) {
+            return Err(UndoError::Io(format!(
+                "{} is not a regular file — refusing to lock",
+                path.display()
+            )));
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             // Never truncate: this file exists only to be locked.
@@ -1655,7 +1673,10 @@ pub fn execute_revert(
     entry: &FileEntry,
 ) -> Result<FileEntry, String> {
     let path = root.join(&entry.path);
-    let pre_bytes = match std::fs::read(&path) {
+    // fsguard at every read on the write path too: `inode_refusal` covers
+    // plan time, but this runs after it, so a target swapped in between is
+    // a blocking read rather than a refused one.
+    let pre_bytes = match crate::fsguard::read_regular(&path) {
         Ok(b) => Some(b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("{}: cannot read before revert: {e}", entry.path)),
@@ -1748,7 +1769,7 @@ pub fn restore_from_before(
             .map_err(|e| format!("{}: failed to create parent dirs: {e}", entry.path))?;
     }
     std::fs::write(path, &bytes).map_err(|e| format!("{}: failed to write: {e}", entry.path))?;
-    let readback = std::fs::read(path)
+    let readback = crate::fsguard::read_regular(path)
         .map_err(|e| format!("{}: failed to verify after write: {e}", entry.path))?;
     if hash_bytes(&readback) != before_hash {
         return Err(format!(
@@ -1966,17 +1987,17 @@ pub fn build_plan(
 /// (a spurious `None` looks like a legitimate delete-target, not a bypass).
 pub fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
     let abs = root.join(rel);
-    // lstat BEFORE the read, and refuse to read anything that is not a
-    // regular file. This is a fix to the PRIMITIVE, not to a call site,
-    // because the call sites are not all downstream of the planner: the
-    // planner's own [`inode_refusal`] cannot protect `claim_grant`, which
-    // runs its drift loop through this function BEFORE it ever calls
-    // [`build_plan`]. `std::fs::read` on a FIFO BLOCKS until a writer
-    // appears, so a target swapped for a fifo between preview and execute
-    // hung the process here — the single-threaded stdio MCP loop dies for
-    // that whole session (branch review re-gate round 4; `agentrec approve`
-    // shares `claim_grant` and was exposed identically). Guarding the
-    // primitive means every present and future caller inherits it.
+    // [`crate::fsguard::read_regular`], never a bare `std::fs::read`: the
+    // guard lstats and refuses anything that is not a regular file. This
+    // function needed it before the guard existed, because the call sites
+    // are NOT all downstream of the planner — the planner's own
+    // [`inode_refusal`] cannot protect `claim_grant`, which runs its drift
+    // loop through here BEFORE it ever calls [`build_plan`]. `fs::read` on a
+    // FIFO BLOCKS until a writer appears, so a target swapped for a fifo
+    // between preview and execute hung the process at this line, killing the
+    // single-threaded stdio MCP loop for that whole session (branch review
+    // re-gate round 4; `agentrec approve` shares `claim_grant` and was
+    // exposed identically).
     //
     // A non-regular file yielding `None` reads downstream as "no content to
     // compare", i.e. as drift — which surfaces as a clean `preview_stale`
@@ -1988,14 +2009,9 @@ pub fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
     // `undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified`)
     // hold more strongly, and the entry is `symlink_refusal`'s to reject
     // either way.
-    #[cfg(unix)]
-    {
-        let meta = std::fs::symlink_metadata(&abs).ok()?;
-        if !meta.file_type().is_file() {
-            return None;
-        }
-    }
-    std::fs::read(&abs).ok().map(|b| hash_bytes(&b))
+    crate::fsguard::read_regular(&abs)
+        .ok()
+        .map(|b| hash_bytes(&b))
 }
 
 /// True when `path` is itself a symbolic link. `symlink_metadata` is an

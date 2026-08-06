@@ -518,7 +518,11 @@ pub fn parse_log_line(line: &str) -> ParsedLine {
 /// Load all parseable records; torn/corrupt lines are skipped, never fatal
 /// (a bad line must not wipe history — lesson inherited from Sutra).
 pub fn load_log(path: &Path) -> Vec<LogRecord> {
-    let Ok(file) = fs::File::open(path) else {
+    // fsguard: `log.jsonl` lives in `.agentrec/`, which an agent sandboxed
+    // to the repo can write, and opening a FIFO here would block every
+    // reader of the log. Streamed rather than slurped — this file is
+    // multi-MB in a dogfooded repo — so the guard is on the open.
+    let Ok(file) = crate::fsguard::open_regular(path) else {
         return vec![];
     };
     let reader = std::io::BufReader::new(file);

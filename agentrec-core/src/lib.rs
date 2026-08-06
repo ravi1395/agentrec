@@ -11,6 +11,7 @@
 
 pub mod diff;
 pub mod engine;
+pub mod fsguard;
 pub mod id;
 pub mod memory;
 pub mod pathenc;

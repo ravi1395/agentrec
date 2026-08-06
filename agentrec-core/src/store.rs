@@ -155,7 +155,13 @@ impl BlobStore {
         let Some(path) = self.object_path(hash) else {
             return Err(StoreError::Missing(hash.to_string()));
         };
-        let bytes = fs::read(&path).map_err(|_| StoreError::Missing(hash.to_string()))?;
+        // fsguard, not `fs::read`: a FIFO planted at a CAS object path hung
+        // every undo leg at once — `build_plan` calls this as an integrity
+        // read, so preview, CLI `undo`, `approve` and `execute` all blocked
+        // (branch review re-gate round 5). A non-regular object is reported
+        // `Missing`, which is what it is: not a retrievable blob.
+        let bytes = crate::fsguard::read_regular(&path)
+            .map_err(|_| StoreError::Missing(hash.to_string()))?;
         if hash_bytes(&bytes) != hash {
             return Err(StoreError::Corrupt(hash.to_string()));
         }
