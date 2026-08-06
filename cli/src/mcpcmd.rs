@@ -1235,7 +1235,18 @@ fn undo_tool(
             }
             co.consume_token(&lock, &claim.request).map_err(domain)?;
 
-            match crate::approvecmd::execute_claim(root, &co, lock, &claim) {
+            // F5: the only surface that records `origin: "mcp"` — an agent
+            // spending its own token, no human in the loop. `approve` runs
+            // this same function with `Cli`, which is what makes the two
+            // populations delta decision 11's post-ship row counts separable
+            // at all.
+            match crate::approvecmd::execute_claim(
+                root,
+                &co,
+                lock,
+                &claim,
+                agentrec_core::record::UndoOrigin::Mcp,
+            ) {
                 Ok(executed) => encode(&json!({
                     "reservation": claim.request.id,
                     "turn": claim.target.id,

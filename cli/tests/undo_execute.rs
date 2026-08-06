@@ -84,6 +84,7 @@ fn seed(root: &Path, files: Vec<FileEntry>) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     };
     let line = serde_json::to_string(&LogRecord::Turn(t)).unwrap();
@@ -274,9 +275,16 @@ fn ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable() {
         .find(|l| l.contains("\"agentrec\""))
         .expect("undo turn line");
     let v: Value = serde_json::from_str(line).unwrap();
-    assert!(
-        v.get("origin").is_none(),
-        "F5 owns `origin`; F4 must not add it early: {line}"
+    // Inverted BY F5, in the open: F4 wrote this as `origin` MUST be absent
+    // ("F5 owns `origin`; F4 must not add it early"), and F5 flipped it to
+    // the value it specifies rather than deleting the assertion. This is the
+    // ONLY surface that writes `"mcp"` — an agent spending its own token,
+    // with no human in the loop — which is what makes delta decision 11's
+    // post-ship counts separable from `approve`'s human-executed `"cli"`.
+    assert_eq!(
+        v["origin"],
+        Value::String("mcp".into()),
+        "an auto-mode token execute is the mcp surface: {line}"
     );
 
     // The ledger: consume BEFORE execute, and exactly one of each.

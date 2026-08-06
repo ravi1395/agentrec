@@ -1496,6 +1496,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![FileEntry {
                 path: path.into(),
                 before: None,
@@ -1921,6 +1922,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         }
     }
@@ -3124,6 +3126,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: snapshot
                 .map(|h| {
                     vec![FileEntry {

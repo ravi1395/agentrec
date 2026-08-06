@@ -13,6 +13,48 @@ the freeze entry directly beneath this paragraph. Those notes are left in
 place verbatim: they were true when written, and this file is a history.
 Conformance fixtures now exist, at `docs/fixtures/conformance/`.
 
+## `origin` added to `TurnRecord` (2026-08-06)
+
+**Additive, wire-visible.** `TurnRecord` gains `origin: Option<String>`, one
+new §5 row. `v` does not bump; nothing is removed or retyped.
+
+Written by `cli/src/readcmds.rs::append_undo_turn` — the single site that
+decides an undo turn's shape — as `"cli"` or `"mcp"`, and `None` on every
+other turn, so **only undo turns change shape on the wire**. A recorder that
+never executes an undo writes byte-identically to a pre-this-field one, and
+`skip_serializing_if` keeps the key off every record that does not set it.
+Not one golden moved: the goldens' undo turn is hand-seeded and deliberately
+keeps `origin` absent, which makes them the pre-F5 rendering proof (see
+`cli/tests/golden.rs`).
+
+Permitted post-freeze under the rule the 1.0 freeze binds — additive fields
+within the major, consumers tolerate unknown ones. Delta decision 16
+(`docs/superpowers/specs/2026-08-05-phase-2-tail-codex-mcp-design.md`) names
+this discriminator, together with the `agentrec_status` §8 row above, as the
+two post-freeze additions anticipated at freeze time; delta decision 11
+requires it in 2.3's ship commit.
+
+**Absent means `"cli"`, and that is a real reading, not a fallback for
+missing data**: every undo turn written before this field existed was a
+`undo --confirm`. `TurnRecord::origin()` is the one place that default lives.
+Consumers MUST NOT treat absence as a third state.
+
+**It names the executing surface, not the requesting one.** `agentrec
+approve` writes `"cli"` even though the request it settles arrived over MCP,
+because a human at a keyboard performed the writes; the MCP provenance is the
+`.agentrec/undo-requests.jsonl` row, which is implementation-local state and
+deliberately not on the wire. The consequence is stated in the §5 row and
+must travel with any count derived from the field: `"cli"` conflates
+human-initiated and human-approved-but-agent-requested undos, and separating
+them requires joining to that ledger.
+
+Conformance corpus: `valid/turn_undo.jsonl` gains `"origin":"cli"` (it is
+serializer-emitted and would otherwise drift from the real wire — the
+corpus's stated failure mode), and `valid/turn_undo_mcp_origin.jsonl` is
+added for the other value, with a manifest entry. No fixture carries an
+absent `origin`; that reading is pinned by `cli/tests/conformance.rs` against
+a stripped line and by `cli/tests/undo_origin.rs`.
+
 ## §8 `allow_modified` text corrected to match founder decision 6 (2026-08-06)
 
 **No wire change, and not an additive change either — a correction of stale

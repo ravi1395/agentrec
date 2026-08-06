@@ -80,6 +80,7 @@ fn seed(root: &Path, files: Vec<FileEntry>) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     };
     let line = serde_json::to_string(&LogRecord::Turn(t)).unwrap();
@@ -198,7 +199,18 @@ fn approve_executes_once_and_a_second_approve_is_a_clean_error() {
 
 /// The undo turn an approval writes is the SAME shape `undo --confirm`
 /// writes: `tool: "agentrec"`, rich, an inverse entry per reverted file, and
-/// — F5's field, deliberately not added yet — no `origin`.
+/// — since F5 landed — `origin: "cli"`, the value `undo --confirm` itself
+/// writes.
+///
+/// This assertion was inverted BY F5, deliberately and in the open: F3 wrote
+/// it as `origin` MUST be absent ("F5 owns `origin`; F3 must not add it
+/// early"), and F5 flipped it to the value F5 specifies rather than deleting
+/// it. Either way the property under test is unchanged and is the point of
+/// the whole shared-`execute_claim` seam — **approve and `undo --confirm`
+/// agree**. What makes `"cli"` the right value here is that `origin` names
+/// the surface that EXECUTED the writes, and a human ran this verb; that the
+/// undo was REQUESTED over MCP is the request ledger's business, asserted
+/// below and in `cli/tests/undo_origin.rs`.
 #[test]
 fn the_approved_undo_turn_has_the_shape_cli_undo_produces() {
     let root = root_with_mode("confirm");
@@ -224,9 +236,11 @@ fn the_approved_undo_turn_has_the_shape_cli_undo_produces() {
         .find(|l| l.contains("\"agentrec\""))
         .expect("undo turn line");
     let v: Value = serde_json::from_str(line).unwrap();
-    assert!(
-        v.get("origin").is_none(),
-        "F5 owns `origin`; F3 must not add it early: {line}"
+    assert_eq!(
+        v["origin"],
+        Value::String("cli".into()),
+        "an approve executes at a human's keyboard, so it is the cli \
+         surface — not `mcp`, and not absent: {line}"
     );
 
     // The terminal ledger row points at its own evidence.

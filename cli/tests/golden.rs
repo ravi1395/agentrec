@@ -499,6 +499,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![
             fe(
                 "src/app.rs",
@@ -544,6 +545,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![fe(
             "src/bare.rs",
             Some(bare_before),
@@ -570,6 +572,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![fe(
             ".gitattributes",
             Some(git_before),
@@ -582,9 +585,19 @@ fn build_fixture(root: &Path) {
     // ---- undo turn: hand-authored (never exercised via a real
     // `undo --confirm`, deliberately — a real run would embed this
     // tempdir's absolute path in `TurnRecord.root`, see `readcmds::undo`,
-    // breaking determinism). Mirrors the exact shape `readcmds::undo`
-    // constructs: `tool: Some("agentrec")`, `prompt_excerpt: Some(format!(
+    // breaking determinism). Mirrors the shape `readcmds::undo` constructs:
+    // `tool: Some("agentrec")`, `prompt_excerpt: Some(format!(
     // "undo of {short_id}"))`.
+    //
+    // ONE deliberate divergence, and it is load-bearing rather than
+    // oversight: `origin` stays `None`, where a real `undo --confirm` now
+    // writes `Some("cli")` (F5, delta decision 11). This fixture is
+    // therefore a PRE-F5 undo turn, and every golden built from it is the
+    // proof that an undo turn recorded before the field existed still
+    // renders and blames byte-identically — AC-F5's third clause, and the
+    // reason not one golden moved in that commit. Setting it here would
+    // silently trade that coverage for a duplicate of what
+    // `docs/fixtures/conformance/valid/turn_undo.jsonl` already pins.
     let undo = TurnRecord {
         v: 1,
         id: UNDO_TURN_ID.to_string(),
@@ -601,6 +614,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![fe(
             "src/app.rs",
             Some(app_after),
@@ -675,6 +689,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![dup_entry.clone()],
     };
     let dup_b = TurnRecord {
@@ -720,6 +735,7 @@ fn build_fixture(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![
             fe(
                 "assets/img.bin",
@@ -1111,6 +1127,7 @@ fn build_fixture_no_gap(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![fe("src/touched.rs", Some(before), Some(after), "modify")],
     };
     seed_turn(root, &turn);
@@ -1161,6 +1178,7 @@ fn build_fixture_noise(root: &Path) {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![
             fe("debug.log", None, Some(log_after), "create"),
             fe("src/real.rs", None, Some(src_after), "create"),

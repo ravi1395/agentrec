@@ -6,7 +6,7 @@
 use crate::cmds::wall_now_ms;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
-use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
+use agentrec_core::record::{FileEntry, LogRecord, TurnRecord, UndoOrigin};
 use agentrec_core::store::{BlobStore, StoreError};
 use agentrec_core::view;
 use std::collections::HashSet;
@@ -575,7 +575,7 @@ pub fn undo(
         // mutations), so append a partial, honestly-truncated undo turn
         // covering them before surfacing the error.
         if !inverse_entries.is_empty() {
-            let _ = append_undo_turn(root, &short_target, inverse_entries, true);
+            let _ = append_undo_turn(root, &short_target, inverse_entries, true, UndoOrigin::Cli);
         }
         // Any entries already reverted are real writes a concurrent daemon
         // must still not misattribute, so this waits out the same linger as
@@ -585,7 +585,7 @@ pub fn undo(
     }
 
     let reverted_n = inverse_entries.len();
-    let new_id = append_undo_turn(root, &short_target, inverse_entries, false)?;
+    let new_id = append_undo_turn(root, &short_target, inverse_entries, false, UndoOrigin::Cli)?;
     let new_short_id = fmt::short_id(&new_id);
 
     finish_undo_guard(root);
@@ -601,12 +601,22 @@ pub fn undo(
 /// appends through it too, so "an approved undo is recorded exactly as
 /// `undo --confirm` records one" is true by construction rather than by two
 /// struct literals someone has to keep in agreement. F5's `origin`
-/// discriminator belongs here when it lands, for the same reason.
+/// discriminator (delta decision 11) lands here for the same reason: it is a
+/// parameter of THIS function, so a new transport cannot record an undo
+/// without stating which surface it is, and the partial/`truncated` append
+/// on an aborted revert cannot disagree with its success sibling — each
+/// caller passes one `origin` value to both of its call sites.
+///
+/// `origin` is the surface that EXECUTED the writes, never the one that
+/// requested them: `agentrec approve` passes [`UndoOrigin::Cli`] even though
+/// the request it is approving arrived over MCP (a human ran the verb), and
+/// the request's own provenance stays in `.agentrec/undo-requests.jsonl`.
 pub(crate) fn append_undo_turn(
     root: &Path,
     short_target: &str,
     files: Vec<FileEntry>,
     truncated: bool,
+    origin: UndoOrigin,
 ) -> Result<String, String> {
     let now = wall_now_ms();
     let excerpt = if truncated {
@@ -630,6 +640,7 @@ pub(crate) fn append_undo_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: Some(origin.as_str().to_string()),
         files,
     };
     let id = record.id.clone();
@@ -838,6 +849,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         }
     }

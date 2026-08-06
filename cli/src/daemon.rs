@@ -2414,6 +2414,7 @@ fn persist(
             merges: turn.merges.clone(),
             imported: None,
             files_complete: None,
+            origin: None,
             files,
         };
         append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -2599,6 +2600,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: journal.files.clone(),
     };
     append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -5893,6 +5895,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
@@ -5979,6 +5982,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();

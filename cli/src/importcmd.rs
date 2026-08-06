@@ -2044,6 +2044,7 @@ mod persist {
                 merges: vec![],
                 imported: Some(true),
                 files_complete: Some(false),
+                origin: None,
                 files: t.files,
             }));
         }
@@ -3187,6 +3188,7 @@ mod codex {
                     merges: vec![],
                     imported: Some(true),
                     files_complete: Some(false),
+                    origin: None,
                     files: t.files,
                 }));
             }

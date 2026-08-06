@@ -1842,3 +1842,62 @@ sentence is the thing out of date.
 - Release-seam check re-run against a **freshly built** `target/release/agentrec` (the
   earlier reading was against a stale binary and is not the one recorded here):
   `strings … | grep -c AGENTREC_TEST` → **0**. E4 adds no env seam.
+
+## Task F5 — undo `origin` discriminator (2026-08-06, `feat/phase-2-tail`)
+
+### DECLARED / manual — post-ship undo counts by origin (delta decision 11)
+
+| Row | State | Closes when |
+|---|---|---|
+| Executed-undo counts by origin — first reading | **DECLARED, manual, not yet due** | Delta decision 11 waived decision 6's ≥20-human-confirmed-`undo --confirm` gate and demoted it to this row (the same demotion decision 10 applied to decision 7). Count at waiver: **0** — `log.jsonl` held zero `tool: "agentrec"` turns. Closes when, **one month after 2.3 ships**, the counts are read off real `log.jsonl` files and pasted here as three numbers: undo turns with `origin: "mcp"`, with `origin: "cli"`, and with **no `origin` key at all**. 2.3 is **unshipped as of 2026-08-06**, so no absolute date can be written yet; the release that cuts 2.3 fills it in (`claude-setup/skills/agentrec-release`). An empty date means "2.3 has not shipped", never "the reading was forgotten". |
+
+**Three numbers, not two, and the third is why.** §5 says an absent `origin` reads as `"cli"`,
+so the arithmetic answer is to fold absent into cli and report two. Do not: an absent key is a
+**pre-F5** undo turn, and folding it in silently contaminates the post-ship denominator this
+row exists to establish with undos executed before the discriminator existed. Report it
+separately and subtract it, or the row measures a population it did not scope.
+
+**`"cli"` is two populations, and this row cannot separate them.** `origin` names the surface
+that EXECUTED the writes, not the one that requested them, so `"cli"` covers both a human's own
+`agentrec undo --confirm` and an `agentrec approve` of an undo an **agent requested over MCP**.
+Decision 6's gate was about human confirmation, and both of those are human-confirmed — which is
+why `approve` records `"cli"` and why the count is still the right instrument for the gate. But
+a reader wanting *human-initiated* undos specifically must join to `.agentrec/undo-requests.jsonl`
+(an approved undo has a `reserve`+`approve`/`execute` row naming its undo turn; a bare
+`undo --confirm` has no ledger row at all). **A count reported as "N human-initiated undos"
+without that join is wrong**, and this paragraph must travel with any figure derived from the
+field.
+
+**No instrument is committed for this row**, deliberately, and that is a difference from E4's
+sweep: the counts are a `grep`/`jq` over `log.jsonl` files whose locations are not knowable in
+advance (every user's repos), so a script here would measure only the dogfood repo and read as
+if it had measured the population. The reading is manual and its scope must be stated with it.
+
+### Suite
+
+`cargo test --workspace -- --test-threads=3` → **985 passed / 0 failed / 4 ignored**
+(base at `93e43c2`: 981/0/4). The **+4 is exactly the four new
+`cli/tests/undo_origin.rs` tests** and nothing else: F5's other test edits are
+assertions added inside existing tests (`cli/tests/conformance.rs`) or two existing
+assertions inverted (below), neither of which moves a count. clippy `-D warnings`
+debug **and** release: exit 0. `cargo fmt --check`: exit 0.
+
+**Two pre-existing assertions were INVERTED, not deleted, and that is disclosed
+rather than quiet.** F3 and F4 each planted a guard that `origin` must be ABSENT
+("F5 owns `origin`; F3/F4 must not add it early") —
+`the_approved_undo_turn_has_the_shape_cli_undo_produces` (`cli/tests/approve.rs`)
+and `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable`
+(`cli/tests/undo_execute.rs`). Both now assert F5's specified value, `"cli"` and
+`"mcp"` respectively. The guards did their job: both went RED on this change
+before being touched, which is how F5's threading was proven to reach both
+transports and not merely the new test file.
+
+### Verified here (automated)
+
+| AC | Evidence |
+|---|---|
+| AC-F5.1 CLI undo → `"cli"` | `ac_f5_cli_undo_confirm_records_origin_cli` (`cli/tests/undo_origin.rs`) — drives the real binary, asserts the raw `log.jsonl` bytes |
+| AC-F5.2 MCP undo → `"mcp"` | `ac_f5_mcp_execute_records_origin_mcp` — real `agentrec mcp` subprocess, auto-mode token |
+| AC-F5.3 approve → `"cli"` | `ac_f5_approve_of_an_mcp_request_records_origin_cli` — also asserts the request ledger names the undo turn, so the MCP provenance `origin` drops is demonstrably recoverable |
+| AC-F5.4 pre-F5 line parses, reads as cli, round-trips | `ac_f5_a_pre_f5_undo_turn_without_origin_reads_as_cli`; plus `named_fixtures_carry_the_semantics_they_are_named_for` (`cli/tests/conformance.rs`) against a stripped §5 fixture line |
+| Renders/blames identically | `cargo test --test golden` → **33 passed / 0 failed**, and all **30** golden files are byte-identical (`git status --short cli/tests/fixtures/golden/` empty afterwards). Both figures measured here, and they are different things: **30 `.golden` files, 33 golden tests** — CLAUDE.md's bare "33 goldens" is the test count, and quoting it as a file count is the arithmetic this row refuses. Their seeded undo turn keeps `origin` absent **on purpose** — it IS the pre-F5 record, so every log/show/blame golden built from it is the unchanged-rendering proof (`cli/tests/golden.rs`) |

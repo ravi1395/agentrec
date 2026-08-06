@@ -94,6 +94,7 @@ const MANIFEST: &[(&str, &str, Expect)] = &[
     ("valid", "turn_bare.jsonl", Expect::LogTurn),
     ("valid", "turn_git.jsonl", Expect::LogTurn),
     ("valid", "turn_undo.jsonl", Expect::LogTurn),
+    ("valid", "turn_undo_mcp_origin.jsonl", Expect::LogTurn),
     ("valid", "turn_imported_partial.jsonl", Expect::LogTurn),
     ("valid", "turn_absent_v.jsonl", Expect::LogTurn),
     ("valid", "epoch_start.jsonl", Expect::LogEpoch),
@@ -353,6 +354,29 @@ fn named_fixtures_carry_the_semantics_they_are_named_for() {
         "an undo is itself a turn (§8)"
     );
 
+    // §5 F5: the origin discriminator, both values plus the absent reading.
+    assert_eq!(load_turn("valid", "turn_undo.jsonl").origin(), "cli");
+    assert_eq!(
+        load_turn("valid", "turn_undo_mcp_origin.jsonl").origin(),
+        "mcp"
+    );
+    // Absent-means-cli is the reading every pre-F5 undo turn depends on, and
+    // no fixture here can carry it — `turn_undo.jsonl` is emitted by the real
+    // serializer, which always writes the field now. Pinned instead against a
+    // line with no `origin` key at all, in the shape that fixture had before
+    // F5, so the default is exercised on real §5 bytes rather than only in
+    // `cli/tests/undo_origin.rs`.
+    let pre_f5 = read_fixture("valid", "turn_undo.jsonl").replace(",\"origin\":\"cli\"", "");
+    assert!(
+        !pre_f5.contains("origin"),
+        "the stripped line has no origin"
+    );
+    let ParsedLine::Record(LogRecord::Turn(legacy)) = parse_log_line(pre_f5.trim()) else {
+        panic!("a pre-F5 undo turn must still parse");
+    };
+    assert_eq!(legacy.origin, None);
+    assert_eq!(legacy.origin(), "cli", "absent means cli, not unknown");
+
     // §5 D51: the epoch field, present and absent.
     let plain_epoch = load_epoch("valid", "epoch_start.jsonl");
     assert_eq!(plain_epoch.event, "start");
@@ -538,6 +562,7 @@ fn regenerate_conformance_fixtures() {
         merges: vec!["t_01JXR9TZQ0QK3F5T7W9Y1B3D50".into()],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![
             modify.clone(),
             FileEntry {
@@ -612,24 +637,40 @@ fn regenerate_conformance_fixtures() {
         })),
     );
 
+    // An undo turn as `readcmds::append_undo_turn` writes one, `origin`
+    // included (F5, delta decision 11). The two origins get one fixture each
+    // rather than one fixture and a prose note: `origin` is the field a
+    // consumer counting agent-initiated reverts keys on, and a corpus that
+    // only ever shows `"cli"` lets a reader that hardcodes it pass.
+    let undo = TurnRecord {
+        id: "t_01JXR9Y3Q3TN6J8W0Z2B4E6G8J".into(),
+        grade: "rich".into(),
+        tool: Some("agentrec".into()),
+        model: None,
+        prompt_ref: None,
+        prompt_excerpt: None,
+        merges: vec![],
+        origin: Some(TurnRecord::CLI.into()),
+        files: vec![FileEntry {
+            // The revert swaps the hashes of the turn being undone.
+            before: modify.after.clone(),
+            after: modify.before.clone(),
+            ..modify.clone()
+        }],
+        ..rich.clone()
+    };
     write(
         &valid,
         "turn_undo.jsonl",
+        rec(&LogRecord::Turn(undo.clone())),
+    );
+    write(
+        &valid,
+        "turn_undo_mcp_origin.jsonl",
         rec(&LogRecord::Turn(TurnRecord {
-            id: "t_01JXR9Y3Q3TN6J8W0Z2B4E6G8J".into(),
-            grade: "rich".into(),
-            tool: Some("agentrec".into()),
-            model: None,
-            prompt_ref: None,
-            prompt_excerpt: None,
-            merges: vec![],
-            files: vec![FileEntry {
-                // The revert swaps the hashes of the turn being undone.
-                before: modify.after.clone(),
-                after: modify.before.clone(),
-                ..modify.clone()
-            }],
-            ..rich.clone()
+            id: "t_01JXR9Y4S5VQ8M0Y2C4E6G8J0M".into(),
+            origin: Some(TurnRecord::MCP.into()),
+            ..undo.clone()
         })),
     );
 
@@ -646,6 +687,7 @@ fn regenerate_conformance_fixtures() {
             merges: vec![],
             imported: Some(true),
             files_complete: Some(false),
+            origin: None,
             files: vec![FileEntry {
                 after_synthesized: Some(true),
                 baseline_unknown: true,

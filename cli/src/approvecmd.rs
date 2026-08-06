@@ -50,6 +50,7 @@
 
 use std::path::Path;
 
+use agentrec_core::record::UndoOrigin;
 use agentrec_core::undo_coordinator::{
     Claim, PendingStatus, PlanKind, UndoCoordinator, UndoLock, EVENT_EXECUTE, EVENT_FAIL,
 };
@@ -85,7 +86,14 @@ pub fn approve(root: &Path, request: Option<&str>) -> Result<(), String> {
         target,
         plans,
     };
-    let executed = execute_claim(root, &co, lock, &claim)?;
+    // F5: `approve` is the one surface where the requesting and executing
+    // transports differ — the request arrived over MCP, a human runs this.
+    // `origin` names the EXECUTING surface, so it is `cli`; delta decision
+    // 11's post-ship row therefore counts this undo among the human-confirmed
+    // ones, which is what decision 6's gate was always measuring. Which MCP
+    // request it settles is the ledger's `undo-requests.jsonl` row, not this
+    // field.
+    let executed = execute_claim(root, &co, lock, &claim, UndoOrigin::Cli)?;
 
     println!(
         "approved request {}; reverted {} file(s); recorded as turn {}",
@@ -125,11 +133,18 @@ pub struct Executed {
 /// contract: after the terminal row, before [`readcmds::finish_undo_guard`]'s
 /// linger on the success path — the ordering `approve` already had, preserved
 /// exactly.
+/// `origin` (F5, delta decision 11) is the one thing the two callers must
+/// still state for themselves, precisely because it is what differs between
+/// them; it is threaded to BOTH `append_undo_turn` calls below — the success
+/// one and the truncated mid-revert one — from a single parameter, so a
+/// partial undo can never be attributed to a different surface than the
+/// complete undo the same call would have produced.
 pub fn execute_claim(
     root: &Path,
     co: &UndoCoordinator,
     lock: UndoLock,
     claim: &Claim,
+    origin: UndoOrigin,
 ) -> Result<Executed, String> {
     let Claim {
         request,
@@ -185,7 +200,7 @@ pub fn execute_claim(
         // unrecorded, so it gets an honestly-truncated undo turn before the
         // error surfaces — the E1 belt-and-braces `undo --confirm` applies.
         if !inverse.is_empty() {
-            let _ = readcmds::append_undo_turn(root, &short_target, inverse, true);
+            let _ = readcmds::append_undo_turn(root, &short_target, inverse, true, origin);
         }
         let _ = co.append_terminal(&lock, request, EVENT_FAIL, None, Some(e.clone()));
         readcmds::finish_undo_guard(root);
@@ -193,7 +208,7 @@ pub fn execute_claim(
     }
 
     let reverted = inverse.len();
-    let undo_turn = readcmds::append_undo_turn(root, &short_target, inverse, false)?;
+    let undo_turn = readcmds::append_undo_turn(root, &short_target, inverse, false, origin)?;
     co.append_terminal(&lock, request, EVENT_EXECUTE, Some(undo_turn.clone()), None)
         .map_err(|e| e.to_string())?;
     drop(lock);

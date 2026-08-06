@@ -546,6 +546,7 @@ mod e2 {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files,
         }
     }
@@ -2038,6 +2039,7 @@ mod f2 {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files,
         };
         let line = serde_json::to_string(&LogRecord::Turn(t)).unwrap();

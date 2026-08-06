@@ -1731,6 +1731,7 @@ fn base_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }
@@ -2681,6 +2682,7 @@ fn make_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }

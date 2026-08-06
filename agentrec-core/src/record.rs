@@ -286,7 +286,69 @@ pub struct TurnRecord {
     /// completeness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_complete: Option<bool>,
+    /// Which surface EXECUTED an undo's writes (PROTOCOL §5 additive, delta
+    /// decision 11): [`UndoOrigin::CLI`] or [`UndoOrigin::MCP`]. Set only on
+    /// undo turns — the ones this implementation writes with
+    /// `tool: "agentrec"` — and `None` on every other turn, so nothing else
+    /// on the wire moves.
+    ///
+    /// Read through [`TurnRecord::origin`], never bare: an absent value means
+    /// `cli`, which is what every undo turn written before this field existed
+    /// is. Absent is therefore NOT "unknown" and NOT a third state.
+    ///
+    /// It names the surface that *wrote*, never the one that *asked*: an
+    /// `agentrec approve` of an undo an agent requested over MCP is `cli`,
+    /// because a human at a keyboard performed it. The requesting provenance
+    /// lives in `.agentrec/undo-requests.jsonl`, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub files: Vec<FileEntry>,
+}
+
+/// The two values [`TurnRecord::origin`] may carry (PROTOCOL §5).
+///
+/// An enum rather than two `&str` constants at the call sites, because the
+/// whole point of the field is that four `append_undo_turn` call sites across
+/// two transports agree; a typo in a string literal is exactly the drift the
+/// discriminator exists to measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndoOrigin {
+    /// `agentrec undo --confirm` or `agentrec approve` — a human executed it.
+    Cli,
+    /// The MCP `agentrec_undo` `execute` action — an agent spent a token.
+    Mcp,
+}
+
+impl UndoOrigin {
+    /// The wire value. `TurnRecord::CLI`/`MCP` name the same two strings for
+    /// readers, which do not have this enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndoOrigin::Cli => TurnRecord::CLI,
+            UndoOrigin::Mcp => TurnRecord::MCP,
+        }
+    }
+}
+
+impl TurnRecord {
+    /// Wire value for [`UndoOrigin::Cli`].
+    pub const CLI: &'static str = "cli";
+    /// Wire value for [`UndoOrigin::Mcp`].
+    pub const MCP: &'static str = "mcp";
+
+    /// The effective `origin`, applying PROTOCOL §5's absent-means-`cli`
+    /// default. The ONE place that default lives: reading `self.origin`
+    /// directly and matching on `Some("cli")` would silently exclude every
+    /// pre-F5 undo turn, which is the misreading the row this field feeds
+    /// (delta decision 11's post-ship undo counts) would be destroyed by.
+    ///
+    /// Returns an unrecognized value verbatim rather than folding it into
+    /// `cli` — §10 says consumers tolerate unknown values, and quietly
+    /// relabelling a future surface as a human one would be worse than
+    /// surfacing a string the caller does not know.
+    pub fn origin(&self) -> &str {
+        self.origin.as_deref().unwrap_or(Self::CLI)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -654,6 +716,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![FileEntry {
                 path: "src/a.rs".into(),
                 before: None,
@@ -833,6 +896,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         };
         append_log(&log_path, &LogRecord::Turn(turn)).unwrap();
@@ -973,6 +1037,7 @@ mod tests {
             merges: vec!["t_MERGED".into()],
             imported: Some(true),
             files_complete: Some(false),
+            origin: None,
             files: vec![],
         };
         let json = serde_json::to_string(&turn).unwrap();

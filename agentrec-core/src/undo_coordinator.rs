@@ -2133,6 +2133,7 @@ mod coordinator_tests {
                 merges: vec![],
                 imported: imported.then_some(true),
                 files_complete: None,
+                origin: None,
                 files,
             };
             let line = serde_json::to_string(&LogRecord::Turn(t)).unwrap();

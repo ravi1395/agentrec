@@ -1816,6 +1816,7 @@ mod persist {
                 merges: vec![],
                 imported: None,
                 files_complete: None,
+                origin: None,
                 files: vec![agentrec_core::record::FileEntry {
                     path: "bare.txt".into(),
                     before: None,

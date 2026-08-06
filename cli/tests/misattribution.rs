@@ -355,6 +355,7 @@ fn agentrec_own_turn_carries_no_window_caution() {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![FileEntry {
             path: "restored.txt".into(),
             op: "create".into(),
@@ -438,6 +439,7 @@ fn seed_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     };
     agentrec_core::record::append_log(&root.join(".agentrec/log.jsonl"), &LogRecord::Turn(turn))

@@ -65,6 +65,26 @@ here moved — the corpus already exercised all four.
 | `files_complete` | `TurnRecord` (§5) | `valid/turn_imported_partial.jsonl` | same two sites; `false` unconditionally on every imported turn, so it means "imported, therefore partial" and never "entries were dropped here" |
 | `after_synthesized` | `FileEntry` (§5) | `valid/turn_imported_partial.jsonl` | `cli/src/importcmd.rs::persist::classify_and_resolve` only — the Codex importer never derives an `after`, so it never sets it |
 
+## `origin` — two fixtures, and the shape that has none
+
+`origin` (§5, additive, F5 / delta decision 11) gets **one fixture per
+value** — `valid/turn_undo.jsonl` (`"cli"`) and
+`valid/turn_undo_mcp_origin.jsonl` (`"mcp"`) — rather than one fixture and a
+note, because it is the field a consumer counting agent-initiated reverts
+keys on, and a corpus showing only `"cli"` lets a reader that hardcodes that
+value pass. Both are emitted by the real serializer; the writer is
+`cli/src/readcmds.rs::append_undo_turn`, the single site that decides an undo
+turn's shape.
+
+The **third** shape — an undo turn with no `origin` key, which is every one
+written before the field existed and which §5 says reads as `"cli"` — has no
+fixture here on purpose. The serializer cannot emit it (it always writes the
+field now), and hand-authoring it would put a line in `valid/` that no
+producer produces, which is this corpus's stated failure mode. It is pinned
+instead where the reader lives: `cli/tests/conformance.rs` strips the key
+from `turn_undo.jsonl` and asserts the default, and
+`cli/tests/undo_origin.rs` round-trips a key-less line byte-identically.
+
 ## Out of scope
 
 `memory.jsonl` is **not** part of the protocol — §3's repository layout defines
