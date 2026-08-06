@@ -984,6 +984,36 @@ mod tests {
         );
     }
 
+    // The caution ROW's exact bytes, indent included.
+    //
+    // Task F2 moved the caution text into `agentrec_core::undo_coordinator`
+    // (one string for the CLI preview and the MCP preview both) and left the
+    // two-space row indent here — a coordinated edit across a crate boundary
+    // that NOTHING in the suite pinned: deleting the indent from
+    // `render_plan` reds zero tests (measured). `misattribution.rs` asserts
+    // the caution by SUBSTRING, so it cannot see the indent at all. This
+    // pins it. `render_plan_clean_input_is_byte_exact` above cannot: its
+    // turn is `tool: "agentrec"`, the one rich shape `window_caution`
+    // deliberately excludes.
+    #[test]
+    fn render_plan_caution_row_is_byte_exact_including_its_indent() {
+        let t = turn("rich", Some("claude"));
+        let plans = vec![Plan {
+            entry: entry("src/app.rs", "modify"),
+            kind: PlanKind::Revert { warn: None },
+        }];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (claude)\n\
+             \x20 revert  src/app.rs (modify)\n\
+             \x20 CAUTION: this turn's file list is an activity window, not an authorship \
+             record — agentrec cannot distinguish the recorded tool's own writes from \
+             concurrent human edits made in the same window (D6), and every file marked \
+             `revert` above is reverted regardless of who wrote it. Review the list before \
+             confirming.\n"
+        );
+    }
+
     // F8 (redteam round 2), the attack as reported: a second file named
     // `"\x1b[1A\x1b[2Ksrc/decoy.rs"` (cursor-up + erase-line) whose EXCLUDE
     // row, rendered raw, erases the `revert src/prod_config.rs` row above it
