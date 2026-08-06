@@ -2093,6 +2093,11 @@ across binaries) and by the gate itself (twice, clean tree before and after, zer
 
 **Residuals the gate left open, recorded not fixed:** coordinator-layer `allow_modified`
 downgrade (finding 1) stands; the fexit corroboration repo lives in a session scratchpad and
-will vanish — the doc's hashes are the durable evidence; clippy/fmt + release-seam checks on
-this HEAD were run by the orchestrator after the gate, results in the commit that carries this
-section.
+will vanish — the doc's hashes are the durable evidence. Clippy (`-D warnings`, debug and
+release) and `cargo fmt --check` were run clean by the orchestrator after the gate; the
+round-3 re-gate re-ran both clean (`--all-targets`, both profiles) and additionally ran the
+release-seam check itself: `strings target/release/agentrec | grep -i AGENTREC_TEST` → zero
+lines, on a release binary whose mtime postdates the last code commit (`e32d247`; every later
+commit is docs-only, so the artifact corresponds to this HEAD's code). Caveat carried from
+that gate: the seam grep keys on the `AGENTREC_TEST` prefix convention — a seam named outside
+that prefix would evade it (none known).
