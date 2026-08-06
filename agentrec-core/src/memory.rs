@@ -188,7 +188,8 @@ pub fn hash_pin(root: &Path, rel: &str) -> Result<String, String> {
     if let Some(delay) = test_slow_pin_read_delay() {
         std::thread::sleep(delay);
     }
-    let bytes = fs::read(root.join(rel))
+    // fsguard: `rel` is a recorded pin path in the working tree.
+    let bytes = crate::fsguard::read_regular(&root.join(rel))
         .map_err(|e| format!("could not read pin path {rel} for hashing: {e}"))?;
     Ok(crate::store::hash_bytes(&bytes))
 }
@@ -338,7 +339,8 @@ fn load_effective_checked(
     // before F10); only `recall_impl` (the hook's injection path) acts on
     // it.
     let mut store_corrupt = false;
-    let records = match fs::File::open(&path) {
+    // fsguard: `memory.jsonl` lives in `.agentrec/`.
+    let records = match crate::fsguard::open_regular(&path) {
         Ok(file) => {
             let reader = std::io::BufReader::new(file);
             let mut out = Vec::new();

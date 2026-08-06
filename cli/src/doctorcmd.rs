@@ -194,7 +194,7 @@ fn check_daemon(root: &Path) -> Check {
 fn check_hooks(root: &Path) -> Check {
     const REMEDY: &str = "hooks missing/mangled — run `agentrec init`";
     let path = root.join(".claude").join("settings.local.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         return Check::fail("hook presence", REMEDY);
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -551,7 +551,7 @@ fn check_codex_hooks(root: &Path) -> Check {
 }
 
 fn codex_signal_ever_seen(root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(signal_path(root)) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&signal_path(root)) else {
         return false;
     };
     text.lines().any(|line| {
@@ -598,7 +598,7 @@ fn check_codex_hook_flags(root: &Path) -> Check {
         return Check::na(NAME);
     }
     let path = crate::initcmd::codex_config_toml_path(root);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         return Check::pass(NAME); // no config.toml at all -> nothing declares a disable
     };
     let Ok(table) = text.parse::<toml::Table>() else {

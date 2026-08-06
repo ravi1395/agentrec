@@ -729,7 +729,9 @@ impl UndoCoordinator {
 
     /// Every live (unreleased, unexpired) reservation, newest last.
     pub fn live_reservations(&self) -> Result<Vec<LedgerEvent>, UndoError> {
-        let text = match std::fs::read_to_string(self.ledger_path()) {
+        // fsguard: the ledger's READ side. `append_event`'s guard can never
+        // fire first — every flow reads before it writes.
+        let text = match crate::fsguard::read_regular_to_string(&self.ledger_path()) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
@@ -854,7 +856,9 @@ impl UndoCoordinator {
 
     /// Every ledger event, oldest first. Unparseable lines are skipped.
     pub fn events(&self) -> Result<Vec<LedgerEvent>, UndoError> {
-        match std::fs::read_to_string(self.ledger_path()) {
+        // fsguard, same reason as `live_reservations`: reached by
+        // `claim_token`/`deny`/`status`/`pending_requests`/`resolve_request`.
+        match crate::fsguard::read_regular_to_string(&self.ledger_path()) {
             Ok(t) => Ok(parse_ledger(&t)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(UndoError::Io(format!(

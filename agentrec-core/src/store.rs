@@ -76,7 +76,8 @@ impl BlobStore {
             // rewriting. Verify before trusting. Perf-evidence round: this
             // read's length is the `reread_bytes` cost a clean dedup hit
             // pays — captured here rather than dropped on the floor.
-            let existing_bytes = fs::read(&path).ok();
+            // fsguard: same CAS-object hazard as `get`.
+            let existing_bytes = crate::fsguard::read_regular(&path).ok();
             let intact = existing_bytes
                 .as_ref()
                 .is_some_and(|existing| hash_bytes(existing) == hash);

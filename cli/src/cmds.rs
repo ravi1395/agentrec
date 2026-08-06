@@ -651,18 +651,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // count, so the filter is content-aware (keys on `n`), not a raw line
     // count. A capped injection still carries `n` (plus `capped`), so it IS
     // counted here, correctly — it really did inject something.
-    let injections = std::fs::read_to_string(crate::memory_stats_path(root))
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .map(|v| v.get("n").is_some())
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let injections =
+        agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .map(|v| v.get("n").is_some())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
     // F10: memory-store recall failures (a malformed/unreadable NON-EMPTY
     // memory.jsonl, per hook attempt) — same read-only
     // parse-and-count-defensively pattern as `injections` above, keyed on
@@ -670,18 +671,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // itself (any JSON parse failure, or a value that isn't a JSON object)
     // are ignored, never a panic — same `.unwrap_or(false)` posture as
     // `injections`. Never mutates state.json (only the daemon writes that).
-    let mem_failures = std::fs::read_to_string(crate::memory_stats_path(root))
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .map(|v| v.get("failure").and_then(|f| f.as_bool()) == Some(true))
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let mem_failures =
+        agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .map(|v| v.get("failure").and_then(|f| f.as_bool()) == Some(true))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
     out.push_str(&format!(
         "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections, {mem_failures} failures\n",
         state.memory_rejects
@@ -940,7 +942,7 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
         crate::open_path(root),
         agentrec_core::memory::memory_path(root),
     ] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) {
             crate::purgecmd::harvest_refs(&text, &mut out);
         }
     }
@@ -948,7 +950,7 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     // validly-parsed line's hashes are already reachable through
     // `owned_turns`, so re-adding them here would over-protect (see the
     // doc comment above).
-    if let Ok(text) = std::fs::read_to_string(log_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&log_path(root)) {
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {

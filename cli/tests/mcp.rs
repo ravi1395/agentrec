@@ -2193,3 +2193,57 @@ mod f2 {
         );
     }
 }
+
+/// Re-gate round 6, BLOCKER 2 — the lowest-precondition finding in the whole
+/// review series, and the only one that can fire BY ACCIDENT.
+///
+/// `view.rs::blame` read a WIRE-SUPPLIED working-tree path with a bare
+/// `fs::read`. No destructive mode (`mcp_destructive` is the untouched `off`
+/// default), no forged `log.jsonl`, no write to `.agentrec/` at all — a repo
+/// that merely CONTAINS a named pipe hung the MCP server the moment an agent
+/// blamed that path, through a READ-ONLY tool available by default.
+///
+/// HANGS rather than fails on regression.
+#[test]
+#[cfg(unix)]
+fn blame_on_a_fifo_answers_instead_of_hanging() {
+    let root = e2::repo();
+    let fifo = root.join("notes.txt");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+
+    let out = e2::call(
+        &root,
+        "agentrec_blame",
+        serde_json::json!({"path": "notes.txt"}),
+    );
+    assert!(
+        out["result"].is_object() || out["error"].is_object(),
+        "blame must ANSWER a fifo path, not block: {out}"
+    );
+}
+
+/// Re-gate round 6, BLOCKER 1 — the undo ledger's READ side, in the same
+/// module whose WRITE side was guarded a round earlier. `events()` and
+/// `live_reservations()` read `.agentrec/undo-requests.jsonl` directly, and
+/// every flow reads before it writes, so the write-side guard could never
+/// fire first. Reached here through `agentrec_status`, which needs no
+/// destructive mode at all.
+#[test]
+#[cfg(unix)]
+fn a_fifo_undo_ledger_does_not_hang_the_server() {
+    let root = e2::repo();
+    let ledger = root.join(".agentrec/undo-requests.jsonl");
+    let c = std::ffi::CString::new(ledger.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+    let out = e2::call(&root, "agentrec_status", serde_json::json!({}));
+    assert!(
+        out["result"].is_object() || out["error"].is_object(),
+        "status must ANSWER with a fifo ledger on disk: {out}"
+    );
+}

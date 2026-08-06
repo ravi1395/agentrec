@@ -432,7 +432,8 @@ fn print_pin_diff(store: &BlobStore, pin: &Pin, root: &Path) {
     // between the two reads) degrades to silently skipping the diff rather
     // than erroring — the hash-drift line above already told the caller
     // enough to act on.
-    let Ok(current) = std::fs::read(root.join(&pin.path)) else {
+    // fsguard: a recorded pin path in the working tree.
+    let Ok(current) = agentrec_core::fsguard::read_regular(&root.join(&pin.path)) else {
         return;
     };
 
@@ -845,7 +846,8 @@ pub fn memories_stats(root: &Path) -> Result<(), String> {
         return Err("not initialized — run `agentrec init`".to_string());
     }
 
-    let text = std::fs::read_to_string(crate::memory_stats_path(root)).unwrap_or_default();
+    let text = agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+        .unwrap_or_default();
     if text.trim().is_empty() {
         println!("no hook invocations recorded");
         return Ok(());
@@ -1039,7 +1041,8 @@ fn format_drift_line(d: &PinDrift, now_ms: u64) -> String {
 /// has no entry.
 fn latest_retract_reasons(root: &Path) -> HashMap<String, String> {
     let mut out: HashMap<String, (u64, String)> = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(memory::memory_path(root)) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&memory::memory_path(root))
+    else {
         return HashMap::new();
     };
     for line in text.lines() {

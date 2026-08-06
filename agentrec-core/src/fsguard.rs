@@ -14,6 +14,19 @@
 //! regular file". These helpers make that property expressible once, so a new
 //! call site inherits it instead of having to remember it.
 //!
+//! **Three deliberate exemptions**, each justified rather than overlooked.
+//! (1) Character devices agentrec opens BY NAME and by design —
+//! `/dev/urandom` in `id.rs` — must not be guarded: `read_regular` would
+//! refuse them, and refusing the entropy source is a worse failure than the
+//! hang this module prevents. (2) Fixed system paths under `/proc`, which no
+//! local party can replace. (3) `File::open` on a DIRECTORY for fsync
+//! (`store.rs`): opening a real directory cannot block. That third one
+//! carries an assumption worth stating, because "this path is the type I
+//! expect" is the exact assumption class that produced this whole series —
+//! it holds only while the parent really is a directory, and a FIFO
+//! pre-created at a fan-out path would make `create_dir_all` fail first, so
+//! the fsync open is not reached with a FIFO in hand.
+//!
 //! The precondition is the same one that grounds the containment refusals:
 //! an agent sandboxed to the repository can create a FIFO inside the repo
 //! (`mkfifo` needs no privileges), including inside `.agentrec/`, and every
@@ -69,6 +82,17 @@ pub fn read_regular(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     std::fs::read(path)
+}
+
+/// [`std::fs::read_to_string`] with the same guard.
+pub fn read_regular_to_string(path: &Path) -> Result<String> {
+    if is_nonregular(path) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "not a regular file — refusing to read (a fifo would block)",
+        ));
+    }
+    std::fs::read_to_string(path)
 }
 
 /// [`std::fs::File::open`] with the same guard, for callers that stream

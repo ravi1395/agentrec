@@ -164,7 +164,8 @@ fn with_scratch_lock<T>(root: &Path, f: impl FnOnce() -> Result<T, String>) -> R
 /// that finds nothing usable reports `files_written` absent, never an
 /// empty-list fabrication.
 fn read_scratch_entries(root: &Path) -> Vec<ScratchEntry> {
-    let text = std::fs::read_to_string(scratch_path(root)).unwrap_or_default();
+    let text =
+        agentrec_core::fsguard::read_regular_to_string(&scratch_path(root)).unwrap_or_default();
     text.lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()

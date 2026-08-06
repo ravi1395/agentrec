@@ -97,7 +97,8 @@ static UNKNOWN_KEY_WARNED: Once = Once::new();
 /// and are otherwise ignored — never an error.
 pub fn load(root: &Path) -> Result<Config, ConfigError> {
     let path = crate::agentrec_dir(root).join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
+    // fsguard: `config.toml` is inside `.agentrec/`.
+    let text = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(t) => t,
         // Missing file (or unreadable for any other reason, e.g.
         // permissions) — same tolerant posture the hand-rolled scanner had:

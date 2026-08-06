@@ -286,7 +286,9 @@ pub fn load_ledger(path: &std::path::Path) -> Ledger {
     use std::io::BufRead;
 
     let mut ledger = Ledger::default();
-    let Ok(file) = std::fs::File::open(path) else {
+    // fsguard: this is a second log reader that `record::load_log`'s guard
+    // does not cover.
+    let Ok(file) = crate::fsguard::open_regular(path) else {
         return ledger;
     };
     for line in std::io::BufReader::new(file).lines() {
@@ -1170,7 +1172,11 @@ impl RepositoryView {
             .filter(|t| t.files.iter().any(|f| f.path == q.path))
             .collect();
 
-        let disk_bytes = std::fs::read(self.root.join(&q.path)).ok();
+        // fsguard on a WIRE-SUPPLIED working-tree path. This one needed no
+        // hostile precondition at all: default config, read-only tool, and
+        // any repo that merely CONTAINS a named pipe hung the MCP server the
+        // moment an agent blamed that path.
+        let disk_bytes = crate::fsguard::read_regular(&self.root.join(&q.path)).ok();
         let current_hash = disk_bytes.as_deref().map(crate::store::hash_bytes);
 
         let state = match q.line {
