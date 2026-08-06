@@ -1041,6 +1041,18 @@ impl UndoCoordinator {
     /// filters on), so no row is owed for correctness, and AC-F4 asks for
     /// zero side effects on exactly these three. Drift is different and DOES
     /// append its `fail` row — see [`Self::claim_grant`].
+    ///
+    /// **Measured, not assumed:** of [`Self::claim_grant`]'s two rechecks,
+    /// only the SCOPE one is independently load-bearing on this path.
+    /// `allow_modified` is always false in auto mode, so the reserve
+    /// baseline equals the turn's `after` by construction, and any content
+    /// drift turns the entry into a `build_plan` exclusion that the scope
+    /// check then catches. Neutering the content recheck alone leaves every
+    /// F4 test green (it reds three of F3's, where `allow_modified` makes it
+    /// the only detector); neutering the scope check alone reds
+    /// `ac_f4_an_executable_set_that_shrank_after_the_preview_is_preview_stale`;
+    /// neutering both reds the drift test as well. It stays because the code
+    /// is shared with the confirm path, not because this path needs it.
     pub fn claim_token(&self, lock: &UndoLock, token: &str) -> Result<Claim, UndoError> {
         let events = self.events()?;
         let presented = hash_bytes(token.as_bytes());
