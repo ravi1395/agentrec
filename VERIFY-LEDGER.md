@@ -2291,3 +2291,73 @@ primitive today (mitigated only by a human reading a path that shape 2 shows can
 look innocent). This branch's fix lands in shared core, so merging carries it to the CLI too —
 but v0.2.0 is already published with the unfixed CLI, and whether that warrants a security
 note is a founder call. Also unverified by anyone: no Linux leg has run this branch's HEAD.
+
+### Re-gate round 2 — the hardlink escape (a THIRD shape, found by hunting for one)
+
+The scoped re-gate confirmed both original blockers fixed — it rebuilt the exploits from
+scratch in its own repo rather than re-running the orchestrator's, and reported `files: []`,
+one containment refusal each, **`token issued: False`**, victims byte-unchanged, on both legs.
+It also confirmed the RESOLVED check earns its place by a cleaner channel than the mutation
+probe: `linkdir/c.txt` contains no `ParentDir`/`RootDir` component, so the LEXICAL check
+provably cannot be what refused it.
+
+**But the re-gate's brief asked it to hunt for a third escape shape, and it found one — same
+harm, same agent-triggerable path, surviving the fix.** GATE FAIL, one blocker, fixed at
+`ce641c4`.
+
+**HARDLINKS DEFEAT PATH CONTAINMENT, STRUCTURALLY.** `canonicalize` resolves SYMLINKS. A
+hardlink is a second directory entry for the same inode, and there is **no path-level evidence
+that the inode is reachable elsewhere** — so no amount of path checking can see it. A
+repo-internal `hard.txt` hardlinked to a file outside the repo is lexically ordinary,
+canonicalizes inside `root`, and is not a symlink: it passed `escape_refusal` AND
+`symlink_refusal`, and `fs::write` truncated the shared inode in place. Proven by the gate
+through MCP `auto` mode — token issued, `{"reverted":1}`, `outside/hardtarget2.txt` rewritten.
+The confused-deputy argument is unchanged: creating `repo/hard.txt` is a write INSIDE cwd,
+which a path-based agent sandbox permits, while the victim is outside. Net effect before the
+fix: an agent confined to cwd could modify any file its own user can write, anywhere on disk —
+and the fix's own refusal string promised "refusing to write outside the recorded repo",
+so this violated the invariant the fix had just stated.
+
+**Fix (`ce641c4`): `undo_coordinator.rs::hardlink_refusal`, `nlink > 1`, called immediately
+after `escape_refusal` in `build_plan`.** Kept a SEPARATE gate rather than another branch of
+`escape_refusal` precisely because the class is not a path property. `symlink_metadata`
+(lstat), not `metadata` — a symlink is `symlink_refusal`'s to refuse, and following it would
+read the TARGET's link count. The predicate is deliberately NOT "the other name is outside the
+root": we cannot know where it is, and a second name inside the repo is equally a file this
+turn's record does not describe. False positives (deliberately hardlinked files in a repo) are
+rare and degrade to a refusal — the same refuse-to-act-not-guess posture as `link_kind`.
+Unix-only (`nlink` needs `MetadataExt`), stated in the doc comment; the repo targets macOS +
+Linux (D19).
+
+**MINOR 2 also fixed in the same commit — a false cause on a real refusal.** The gate ran a
+preview → swap-parent-to-symlink → execute race with content DELIBERATELY IDENTICAL across the
+swap (same `sha256:90a6517b…`), so drift provably could not be what saved it. Containment
+re-ran inside `claim_grant` and correctly blocked the write, but reported
+*"work/target.txt changed since it was lodged"*. `UndoError::PreviewStale` now carries the
+plan's own refusal reasons; the wire code stays `preview_stale` (the caller's remedy is
+identical) while the text names containment when containment is what fired. Safe direction
+either way — but reporting a blocked attack as a benign content change misdirects the operator
+investigating it, which is this repo's tracked "message contradicted by the facts beside it"
+class.
+
+**Evidence, all run:** live hardlink exploit against the release binary, `auto` mode, real
+JSON-RPC → `files: []`, hardlink refusal, `token issued: False`, `outside/hardtarget.txt`
+byte-unchanged; CLI leg on the same forged record → `REFUSE … nothing to revert`. Mutation
+probe (hardlink gate call neutered) → exactly the 2 hardlink tests red, the `nlink == 1`
+control and all 6 path-containment tests green. Suite **996 / 0 / 4** (993 + 3). Clippy
+`-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean. Release-seam
+grep: 0.
+
+**Residuals the gate stated, recorded NOT fixed:**
+- **TOCTOU between `build_plan`'s canonicalize and `fs::write` is still open.** A parent
+  swapped inside that window is not re-lstat'd. Closing it properly needs `O_NOFOLLOW`/
+  `openat` rather than path re-checks — a larger change than this branch should take, and a
+  founder call. What IS closed: the swap-before-`claim_grant` race, which containment catches
+  on the re-planned entry (that is the race MINOR 2 was observed on).
+- **MINOR 3, over-refusal:** `a/../b.txt` resolves inside root but the lexical component scan
+  rejects it. No producer emits it today (the daemon writes normalized relatives; import
+  lexically normalizes before its own root check), so the cost is zero and the direction is
+  safe. Recorded so a future producer change does not hit a silent refusal.
+- `main`'s published v0.2.0 CLI carries the unfixed primitive; this branch's fix lands in
+  shared core so merging carries it to the CLI too, but whether the published version warrants
+  a security note is a founder call. No Linux leg has run this branch's HEAD.
