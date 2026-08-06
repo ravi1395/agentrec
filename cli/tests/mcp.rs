@@ -380,8 +380,16 @@ fn tools_call_without_a_name_is_invalid_params() {
     assert_eq!(responses[0]["error"]["code"], -32602);
 }
 
-/// A listed tool whose implementation lands in E2/E3 answers with a clean
+/// A listed tool whose implementation lands in E3 answers with a clean
 /// JSON-RPC error naming it, never a panic or a silent empty result.
+///
+/// **Amended by E2**, which implemented `agentrec_log`/`agentrec_diff`/
+/// `agentrec_blame`: the probe tool moved from `agentrec_log` to
+/// `agentrec_recall`, the nearest still-unimplemented listed tool. The
+/// assertion is unweakened — same code, same "names the tool" requirement —
+/// and the property it guards (a listed-but-unimplemented tool is refused by
+/// name, distinctly from one that does not exist) is unchanged. E3 moves it
+/// again or retires it.
 #[test]
 fn listed_but_unimplemented_tool_errors_cleanly() {
     let root = init_root();
@@ -389,14 +397,14 @@ fn listed_but_unimplemented_tool_errors_cleanly() {
         &root,
         &format!(
             "{}\n",
-            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"agentrec_log","arguments":{}}}"#
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"agentrec_recall","arguments":{"query":"x"}}}"#
         ),
     );
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0]["error"]["code"], -32602);
     let msg = responses[0]["error"]["message"].as_str().unwrap();
     assert!(
-        msg.contains("agentrec_log"),
+        msg.contains("agentrec_recall"),
         "error must name the tool, got {msg:?}"
     );
 }
@@ -507,4 +515,509 @@ fn root_is_discovered_by_walking_up_from_cwd() {
         !deep.join(".agentrec").exists(),
         "discovery must not mint a nested .agentrec/ (the O5 defect shape)"
     );
+}
+
+// =========================================================================
+// Task E2 — `agentrec_log` / `agentrec_diff` / `agentrec_blame`
+// =========================================================================
+
+/// The three E2 tools are adapters over `agentrec-core`'s typed views, so
+/// these tests seed a REAL store (blobs + `log.jsonl`) and drive the real
+/// binary — the same transport and the same on-disk state a host would meet.
+mod e2 {
+    use super::*;
+    use agentrec_core::record::{append_log, FileEntry, LogRecord, TurnRecord};
+    use agentrec_core::store::BlobStore;
+    use serde_json::Value;
+
+    /// A tempdir carrying a real `.agentrec/` (objects dir included), created
+    /// by `agentrec init` itself rather than by hand — `--no-hook`/
+    /// `--no-service` so no developer settings file or launchd unit is
+    /// touched.
+    fn repo() -> PathBuf {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.keep();
+        let out = Command::new(bin())
+            .args(["init", "--no-hook", "--no-service", "--root"])
+            .arg(&root)
+            .output()
+            .expect("run agentrec init");
+        assert!(out.status.success(), "init failed: {out:?}");
+        root
+    }
+
+    fn turn(id: &str, files: Vec<FileEntry>) -> TurnRecord {
+        TurnRecord {
+            v: 1,
+            id: id.to_string(),
+            grade: "rich".into(),
+            truncated: false,
+            started: "2026-08-05T00:00:00.000Z".into(),
+            ended: "2026-08-05T00:00:01.000Z".into(),
+            tool: Some("claude".into()),
+            model: None,
+            session: None,
+            root: "/repo".into(),
+            prompt_ref: None,
+            prompt_excerpt: None,
+            merges: vec![],
+            imported: None,
+            files_complete: None,
+            files,
+        }
+    }
+
+    fn entry(path: &str, before: Option<String>, after: Option<String>) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            before,
+            after,
+            op: "modify".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    fn seed(root: &Path, t: &TurnRecord) {
+        append_log(
+            &root.join(".agentrec/log.jsonl"),
+            &LogRecord::Turn(t.clone()),
+        )
+        .expect("append turn");
+    }
+
+    /// Twenty-eight characters after `t_`, matching the recorded id shape.
+    fn turn_id(n: usize) -> String {
+        format!("t_{n:026}E2")
+    }
+
+    /// One `tools/call`, driven through a fresh server process. Returns the
+    /// whole JSON-RPC response.
+    fn call(root: &Path, tool: &str, args: Value) -> Value {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        });
+        let responses = mcp(root, &format!("{frame}\n"));
+        assert_eq!(responses.len(), 1, "one response per call: {responses:#?}");
+        responses.into_iter().next().unwrap()
+    }
+
+    /// The `text` content block of a successful call. Panics (loudly, with the
+    /// payload) on `isError` — a test that silently accepted an error result
+    /// would assert nothing.
+    fn text(root: &Path, tool: &str, args: Value) -> String {
+        let resp = call(root, tool, args);
+        assert!(resp.get("error").is_none(), "JSON-RPC error: {resp}");
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "tool reported a domain failure: {resp}"
+        );
+        let content = resp["result"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no content array: {resp}"));
+        assert_eq!(content.len(), 1, "one text block: {resp}");
+        assert_eq!(content[0]["type"], "text");
+        content[0]["text"]
+            .as_str()
+            .expect("text string")
+            .to_string()
+    }
+
+    /// The error code an `isError: true` result carries in its payload.
+    fn error_code(root: &Path, tool: &str, args: Value) -> String {
+        let resp = call(root, tool, args);
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "expected a domain failure: {resp}"
+        );
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("error payload is JSON");
+        payload["error"].as_str().expect("error code").to_string()
+    }
+
+    /// `agentrec <args> --root <root>` stdout, asserted exit 0. The CLI's
+    /// `println!` adds a trailing newline that the MCP payload does not carry;
+    /// it is stripped EXPLICITLY (not trimmed) so a payload that grows a stray
+    /// newline of its own still reds.
+    fn cli_json(root: &Path, args: &[&str]) -> String {
+        let out = Command::new(bin())
+            .args(args)
+            .args(["--root", root.to_str().unwrap()])
+            .output()
+            .expect("run agentrec");
+        assert!(out.status.success(), "cli failed: {out:?}");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        stdout
+            .strip_suffix('\n')
+            .expect("cli --json output ends in exactly one newline")
+            .to_string()
+    }
+
+    /// AC-E2 parity (diff): the MCP `text` payload is byte-for-byte the
+    /// `diff --json` stdout on the same store. Both sides serialize the SAME
+    /// `view::DiffResult` with the same `serde_json::to_string`; nothing in
+    /// `cli/src` re-renders it. The fixture is deliberately far under the
+    /// payload bound, so nothing truncates and parity is the whole claim.
+    #[test]
+    fn ac_e2_diff_text_payload_byte_equals_diff_json() {
+        let root = repo();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let before = store.put(b"a\nb\nc\n").unwrap();
+        let after = store.put(b"a\nB\nc\n").unwrap();
+        let t = turn(
+            &turn_id(1),
+            vec![entry("src/x.rs", Some(before), Some(after))],
+        );
+        seed(&root, &t);
+
+        let mcp_payload = text(&root, "agentrec_diff", serde_json::json!({"turn": t.id}));
+        let cli_payload = cli_json(&root, &["diff", &t.id, "--json"]);
+        assert_eq!(
+            mcp_payload, cli_payload,
+            "MCP diff payload must be the --json bytes, not a second rendering"
+        );
+        // …and it really is the DiffResult shape, so parity is not two
+        // matching empty strings.
+        assert!(
+            mcp_payload.contains("\"turn_id\"") && mcp_payload.contains("\"total_files\""),
+            "payload is not a DiffResult: {mcp_payload}"
+        );
+    }
+
+    /// AC-E2 parity (blame), including the gap-honesty leg: an uncovered path
+    /// serializes with a `recording_gap` state tag and NO `turn` field, and
+    /// those exact bytes are what the agent receives.
+    #[test]
+    fn ac_e2_blame_text_payload_byte_equals_blame_json() {
+        let root = repo();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let blob = store.put(b"one\n").unwrap();
+        let t = turn(&turn_id(2), vec![entry("src/y.rs", None, Some(blob))]);
+        seed(&root, &t);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/y.rs"), b"one\n").unwrap();
+
+        let mcp_payload = text(
+            &root,
+            "agentrec_blame",
+            serde_json::json!({"path": "src/y.rs"}),
+        );
+        let cli_payload = cli_json(&root, &["blame", "src/y.rs", "--json"]);
+        assert_eq!(
+            mcp_payload, cli_payload,
+            "MCP blame payload must be the --json bytes"
+        );
+        assert!(
+            mcp_payload.contains("\"state\""),
+            "payload is not a BlameResult: {mcp_payload}"
+        );
+
+        // Gap honesty reaches the client: a crash epoch plus an untouched
+        // path is the `no_turn_recording_gap` arm, which carries no attributor
+        // at all. Same bytes on both channels.
+        append_log(
+            &root.join(".agentrec/log.jsonl"),
+            &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                v: 1,
+                event: "start".into(),
+                ts: "2026-08-05T01:00:00.000Z".into(),
+                dropped_signals: 0,
+            }),
+        )
+        .unwrap();
+        append_log(
+            &root.join(".agentrec/log.jsonl"),
+            &LogRecord::Epoch(agentrec_core::record::EpochRecord {
+                v: 1,
+                event: "start".into(),
+                ts: "2026-08-05T02:00:00.000Z".into(),
+                dropped_signals: 0,
+            }),
+        )
+        .unwrap();
+        let gap_mcp = text(
+            &root,
+            "agentrec_blame",
+            serde_json::json!({"path": "src/untouched.rs"}),
+        );
+        let gap_cli = cli_json(&root, &["blame", "src/untouched.rs", "--json"]);
+        assert_eq!(gap_mcp, gap_cli);
+        let parsed: Value = serde_json::from_str(&gap_mcp).unwrap();
+        assert_eq!(
+            parsed["state"]["type"], "no_turn_recording_gap",
+            "recording-gap honesty must reach the MCP client: {gap_mcp}"
+        );
+        assert!(
+            parsed["state"].get("turn").is_none(),
+            "a gap state must name no attributor: {gap_mcp}"
+        );
+    }
+
+    /// AC-E2 shape: `agentrec_log` returns `Page<TurnSummary>` (P4b decision
+    /// 12), NOT `log --json`'s protocol JSONL. Asserted by exact key set at
+    /// both levels, so a field added to either struct shows up here.
+    #[test]
+    fn ac_e2_log_payload_is_page_of_turn_summary() {
+        let root = repo();
+        let t = turn(&turn_id(3), vec![]);
+        seed(&root, &t);
+
+        let payload = text(&root, "agentrec_log", serde_json::json!({}));
+        let v: Value = serde_json::from_str(&payload).expect("payload is JSON");
+        let top: std::collections::BTreeSet<&str> =
+            v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            top,
+            ["items", "next"].into_iter().collect(),
+            "Page<T> shape: {payload}"
+        );
+        assert!(v["next"].is_null(), "one page, no continuation: {payload}");
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let summary: std::collections::BTreeSet<&str> = items[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                "id",
+                "grade",
+                "tool",
+                "started",
+                "ended",
+                "file_count",
+                "imported"
+            ]
+            .into_iter()
+            .collect(),
+            "TurnSummary shape: {payload}"
+        );
+        assert_eq!(items[0]["id"], t.id);
+        assert_eq!(items[0]["grade"], "rich");
+        // Not the protocol record: a `TurnRecord` would carry these.
+        assert!(items[0].get("v").is_none() && items[0].get("files").is_none());
+    }
+
+    /// AC-E2 cursor: a PURE APPEND between two pages re-delivers nothing.
+    ///
+    /// The ledger deliberately holds a DUPLICATE id (the pre-fix daemon's
+    /// orphan-recovery shape `Cursor::after_occurrence` exists for), and the
+    /// first page ends on the SECOND occurrence. A cursor round-trip that
+    /// dropped `after_occurrence` would resolve to the first occurrence and
+    /// re-deliver two already-seen turns — so this also pins the ordinal
+    /// passing through the MCP boundary, not just the view's own semantics.
+    ///
+    /// Two separate server processes, with the append in between: the cursor
+    /// must survive a restart, which is strictly stronger than surviving a
+    /// session.
+    #[test]
+    fn ac_e2_cursor_pure_append_does_not_redeliver() {
+        let root = repo();
+        let dup = turn_id(10);
+        seed(&root, &turn(&dup, vec![])); // occurrence 0
+        seed(&root, &turn(&turn_id(11), vec![]));
+        seed(&root, &turn(&dup, vec![])); // occurrence 1
+        seed(&root, &turn(&turn_id(12), vec![]));
+
+        let first: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_log",
+            serde_json::json!({"limit": 3}),
+        ))
+        .unwrap();
+        let ids: Vec<&str> = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![dup.as_str(), turn_id(11).as_str(), dup.as_str()]);
+        let cursor = first["next"].clone();
+        assert!(!cursor.is_null(), "a bounded page must continue: {first}");
+        assert_eq!(
+            cursor["after_occurrence"], 1,
+            "the page ended on the second occurrence of {dup}: {cursor}"
+        );
+
+        // Pure append — nothing rewritten.
+        seed(&root, &turn(&turn_id(13), vec![]));
+
+        let second: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_log",
+            serde_json::json!({"cursor": cursor}),
+        ))
+        .unwrap();
+        let ids: Vec<&str> = second["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![turn_id(12).as_str(), turn_id(13).as_str()],
+            "only the unseen turns come back; a dropped `after_occurrence` would \
+             resolve to occurrence 0 and re-deliver two already-delivered turns: {second}"
+        );
+        assert!(second["next"].is_null());
+    }
+
+    /// AC-E2 cursor: a LEDGER REWRITE (the `purge --log-duplicates` shape —
+    /// the record the cursor named is gone) surfaces as `stale_cursor` the
+    /// agent can read, never as a page with a silent hole.
+    #[test]
+    fn ac_e2_ledger_rewrite_yields_stale_cursor() {
+        let root = repo();
+        seed(&root, &turn(&turn_id(20), vec![]));
+        seed(&root, &turn(&turn_id(21), vec![]));
+
+        let first: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_log",
+            serde_json::json!({"limit": 1}),
+        ))
+        .unwrap();
+        let cursor = first["next"].clone();
+        assert_eq!(cursor["after_id"], turn_id(20));
+
+        // Rewrite: drop the record the cursor named.
+        let log = root.join(".agentrec/log.jsonl");
+        let kept: String = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains(&turn_id(20)))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&log, kept).unwrap();
+
+        assert_eq!(
+            error_code(&root, "agentrec_log", serde_json::json!({"cursor": cursor})),
+            "stale_cursor"
+        );
+    }
+
+    /// AC-E2 bounds: the 201st turn paginates. An unbounded request is capped
+    /// at the server's 200 summaries and hands back a cursor that yields the
+    /// remainder — the cap is the server's, not the client's to raise.
+    #[test]
+    fn ac_e2_201st_turn_paginates() {
+        let root = repo();
+        for n in 0..201 {
+            seed(&root, &turn(&turn_id(100 + n), vec![]));
+        }
+
+        let first: Value =
+            serde_json::from_str(&text(&root, "agentrec_log", serde_json::json!({}))).unwrap();
+        assert_eq!(
+            first["items"].as_array().unwrap().len(),
+            200,
+            "server bound is 200 summaries"
+        );
+        let cursor = first["next"].clone();
+        assert!(!cursor.is_null(), "201 turns must continue past page 1");
+
+        // A client asking for more than the bound still gets the bound.
+        let greedy: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_log",
+            serde_json::json!({"limit": 5000}),
+        ))
+        .unwrap();
+        assert_eq!(greedy["items"].as_array().unwrap().len(), 200);
+
+        let second: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_log",
+            serde_json::json!({"cursor": cursor}),
+        ))
+        .unwrap();
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["id"], turn_id(300));
+        assert!(second["next"].is_null());
+    }
+
+    /// The `agentrec_diff` payload bound binds on a diff too big for one
+    /// page, and the continuation is minted by the view's own walk (so it
+    /// resolves) rather than by trimming the result here.
+    #[test]
+    fn diff_payload_bound_pages_a_large_turn() {
+        let root = repo();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        // Three files, ~1,200 payload lines each: two fit the 2,000-line
+        // bound only one at a time.
+        let body: String = std::iter::repeat_n("line\n", 1_200).collect();
+        let files: Vec<FileEntry> = (0..3)
+            .map(|i| {
+                let blob = store.put(body.as_bytes()).unwrap();
+                entry(&format!("f{i}.txt"), None, Some(blob))
+            })
+            .collect();
+        let t = turn(&turn_id(30), files);
+        seed(&root, &t);
+
+        let page1: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_diff",
+            serde_json::json!({"turn": t.id}),
+        ))
+        .unwrap();
+        assert_eq!(page1["total_files"], 3, "the header reports the whole turn");
+        assert_eq!(
+            page1["files"]["items"].as_array().unwrap().len(),
+            1,
+            "one 1,200-line file at a time under the 2,000-line bound: {page1}"
+        );
+        let cursor = page1["files"]["next"].clone();
+        assert!(!cursor.is_null(), "a bounded diff must continue: {page1}");
+
+        let page2: Value = serde_json::from_str(&text(
+            &root,
+            "agentrec_diff",
+            serde_json::json!({"turn": t.id, "cursor": cursor}),
+        ))
+        .unwrap();
+        assert_eq!(page2["files"]["items"][0]["path"], "f1.txt");
+    }
+
+    /// Protocol-shape failures stay on the JSON-RPC channel (`-32602`),
+    /// distinctly from domain outcomes, which ride `isError` — the split
+    /// `tools_call` documents.
+    #[test]
+    fn malformed_arguments_are_invalid_params_not_tool_errors() {
+        let root = repo();
+        // Required argument missing.
+        let resp = call(&root, "agentrec_diff", serde_json::json!({}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // Wrong type.
+        let resp = call(&root, "agentrec_blame", serde_json::json!({"path": 5}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // Out-of-range limit (schema says minimum 1).
+        let resp = call(&root, "agentrec_log", serde_json::json!({"limit": 0}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // A cursor that is not one.
+        let resp = call(&root, "agentrec_log", serde_json::json!({"cursor": "nope"}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        // A turn that does not exist is a DOMAIN outcome, not a bad frame.
+        assert_eq!(
+            error_code(
+                &root,
+                "agentrec_diff",
+                serde_json::json!({"turn": "t_NOSUCHTURN"})
+            ),
+            "turn_not_found"
+        );
+    }
 }

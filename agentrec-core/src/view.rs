@@ -7,7 +7,7 @@
 
 use crate::memory::{self, Pin};
 use crate::record::{FileEntry, LogRecord, TurnRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Why an interval of wall time carries no recording coverage.
 ///
@@ -385,7 +385,12 @@ pub struct Page<T> {
 /// such a cursor by first match re-delivers every record between the two
 /// occurrences. `after_occurrence` disambiguates: it is the 0-based index of
 /// this id among the records sharing it, in ledger order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `Deserialize` (E2): the MCP read tools hand the cursor to the agent as
+/// data and take it back on the next call, so the round-trip needs a reader
+/// as well as a writer. Purely additive — no CLI path deserializes a cursor
+/// (no CLI verb accepts one), and the field set is unchanged, so nothing the
+/// serializer emits moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub after_id: String,
     /// Which record bearing `after_id` this cursor sits after, counting from
@@ -433,7 +438,14 @@ impl TurnQuery {
 }
 
 /// A turn, reduced to what a list renders.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (E2): `agentrec_log` returns `Page<TurnSummary>` verbatim
+/// (P4b decision 12 — the MCP log tool mirrors `list()`, NOT `log --json`,
+/// which emits protocol JSONL). Additive and CLI-invisible: the only CLI
+/// reader of this type is `cmds.rs`'s rich-rate window, which counts `grade`
+/// and `imported` and never serializes a summary
+/// (`grep -rn TurnSummary cli/src/`).
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnSummary {
     pub id: String,
     pub grade: String,

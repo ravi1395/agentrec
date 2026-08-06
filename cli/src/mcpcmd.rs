@@ -23,6 +23,8 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use agentrec_core::view;
+
 use crate::config::{self, Config};
 
 /// MCP protocol revisions this build speaks, pinned at build time (decision
@@ -65,6 +67,31 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+
+/// `agentrec_log`'s server bound (parent spec §8: "≤200 turn summaries +
+/// cursor"). A client `limit` narrows it; nothing widens it.
+const MAX_LOG_SUMMARIES: usize = 200;
+
+/// `agentrec_diff`'s server bound (parent spec §8: "≤2,000 diff lines").
+///
+/// **Unit recorded, because the spec's unit does not exist on this wire.**
+/// The §8 row was written against a rendered unified diff; what this tool
+/// emits is [`view::DiffResult`], whose `FileDiffState::Text` carries the raw
+/// `before`/`after` blobs, not hunks. There are therefore no "diff lines" in
+/// the payload to count. This build counts **payload lines** — the newline
+/// count of the content each admitted file entry carries — which is the same
+/// order of magnitude and is the figure that actually bounds the bytes an
+/// agent receives. It deliberately does NOT equal `agentrec diff`'s rendered
+/// unified-diff line count, and no attempt is made to make it: computing
+/// rendered hunks here would put diff interpretation back in `cli/src`, which
+/// is precisely the seam P4/P5 closed.
+///
+/// The bound is applied by choosing how many whole FILE ENTRIES fit (the unit
+/// [`view::DiffQuery::limit`] pages in), always admitting at least one so a
+/// single oversized file cannot stall pagination. When the whole diff fits,
+/// the unpaginated result is returned untouched — which is what keeps the
+/// payload byte-identical to `diff --json`.
+const MAX_DIFF_PAYLOAD_LINES: usize = 2_000;
 
 /// One `tools/list` entry. Descriptions state capability and data shape only
 /// — never instructions to the model (P7: tool output and metadata are data,
@@ -152,10 +179,6 @@ const READ_TOOLS: &[ToolSpec] = &[
 /// path, and E3's `agentrec_status` is what surfaces a since-changed file as
 /// restart-required.
 struct Server {
-    #[allow(
-        dead_code,
-        reason = "read by agentrec_status (E3) and undo gating (F1)"
-    )]
     root: std::path::PathBuf,
     config: Config,
     negotiated_revision: Option<String>,
@@ -315,7 +338,7 @@ fn handle_line(server: &mut Server, line: &str) -> Option<Value> {
     Some(match method {
         "initialize" => initialize(server, id, params),
         "tools/list" => success(id, json!({"tools": server.visible_tools()})),
-        "tools/call" => tools_call(id, params),
+        "tools/call" => tools_call(server, id, params),
         // `ping` is part of MCP's base protocol and costs nothing to answer.
         "ping" => success(id, json!({})),
         other => error_response(
@@ -354,23 +377,348 @@ fn initialize(server: &mut Server, id: Value, params: Option<&Value>) -> Value {
     )
 }
 
-/// `tools/call` dispatch. Every read tool's implementation lands in E2/E3;
-/// until then a call to a listed tool is refused by name, distinctly from a
-/// call to a tool that does not exist at all.
-fn tools_call(id: Value, params: Option<&Value>) -> Value {
+/// `tools/call` dispatch.
+///
+/// **Two error channels, kept apart on purpose** (they are read by different
+/// things and mean different things):
+///
+/// * A malformed *call* — no `name`, a missing required argument, an argument
+///   of the wrong type — is a JSON-RPC `-32602`, exactly as E1 already
+///   answers an unknown tool. The client's frame was wrong; there is no
+///   result.
+/// * A *domain outcome* — the turn ref did not resolve, the cursor went stale
+///   under a ledger rewrite — is a normal `tools/call` result carrying
+///   `isError: true` and a machine-readable code in the text payload
+///   (`stale_cursor`, `query_mismatch`, `not_found`, …). This is the shape
+///   the parent spec's "rewrite/truncation returns `stale_cursor`" needs: the
+///   agent must be able to *read* the code and restart its query, which a
+///   transport-level error does not reliably surface to a model.
+fn tools_call(server: &Server, id: Value, params: Option<&Value>) -> Value {
     let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
     let Some(name) = name else {
         return error_response(id, INVALID_PARAMS, "tools/call requires \"name\"", None);
     };
-    if READ_TOOLS.iter().any(|t| t.name == name) {
-        return error_response(
-            id,
-            INVALID_PARAMS,
-            &format!("tool {name:?} is registered but not implemented in this build"),
-            None,
-        );
+    // Absent `arguments` is the same as `{}` — a no-argument tool is called
+    // that way by real hosts.
+    let empty = Value::Object(Map::new());
+    let args = params
+        .and_then(|p| p.get("arguments"))
+        .cloned()
+        .unwrap_or(empty);
+    if !args.is_object() {
+        return error_response(id, INVALID_PARAMS, "\"arguments\" must be an object", None);
     }
-    error_response(id, INVALID_PARAMS, &format!("unknown tool {name:?}"), None)
+    let outcome = match name {
+        "agentrec_log" => log_tool(&server.root, &args),
+        "agentrec_diff" => diff_tool(&server.root, &args),
+        "agentrec_blame" => blame_tool(&server.root, &args),
+        // E3's, still listed-but-unimplemented. Refused by name, distinctly
+        // from a tool that does not exist at all.
+        other if READ_TOOLS.iter().any(|t| t.name == other) => {
+            return error_response(
+                id,
+                INVALID_PARAMS,
+                &format!("tool {other:?} is registered but not implemented in this build"),
+                None,
+            )
+        }
+        other => {
+            return error_response(id, INVALID_PARAMS, &format!("unknown tool {other:?}"), None)
+        }
+    };
+    match outcome {
+        Ok(payload) => tool_result(id, &payload, false),
+        Err(ToolFailure::BadParams(message)) => error_response(id, INVALID_PARAMS, &message, None),
+        Err(ToolFailure::Domain { code, message }) => tool_result(
+            id,
+            &json!({"error": code, "message": message}).to_string(),
+            true,
+        ),
+    }
+}
+
+/// How a read tool can fail. See [`tools_call`] for why the two channels are
+/// not collapsed.
+enum ToolFailure {
+    /// The call frame was wrong → JSON-RPC `-32602`.
+    BadParams(String),
+    /// The repository answered, and the answer is a refusal the agent can act
+    /// on → `isError: true` result carrying `code`.
+    Domain { code: &'static str, message: String },
+}
+
+/// A `tools/call` result. The payload is delivered as a single `text` content
+/// block holding compact JSON — the SAME bytes `--json` prints (see
+/// [`diff_tool`]/[`blame_tool`]), never a re-rendering. `structuredContent`
+/// is deliberately not also emitted: it would duplicate the payload in every
+/// response for hosts that already read `text`, and a second copy is a second
+/// thing that can drift.
+fn tool_result(id: Value, payload: &str, is_error: bool) -> Value {
+    success(
+        id,
+        json!({
+            "content": [{"type": "text", "text": payload}],
+            "isError": is_error,
+        }),
+    )
+}
+
+fn open_view(root: &Path) -> Result<view::RepositoryView, ToolFailure> {
+    view::RepositoryView::open(root).map_err(|e| ToolFailure::Domain {
+        code: "repo_error",
+        message: e.to_string(),
+    })
+}
+
+/// `CursorError` → the wire codes the parent spec names.
+fn cursor_failure(e: &view::CursorError) -> ToolFailure {
+    match e {
+        view::CursorError::Stale => ToolFailure::Domain {
+            code: "stale_cursor",
+            message: "the record this cursor names is no longer in the ledger — restart the query"
+                .into(),
+        },
+        view::CursorError::QueryMismatch => ToolFailure::Domain {
+            code: "query_mismatch",
+            message: "this cursor was minted against a different query".into(),
+        },
+        // Unreachable from here: a zero `limit` is refused as `-32602` by
+        // [`bounded_limit`] before any query is built. Mapped anyway so the
+        // arm cannot silently become a panic if that guard ever moves.
+        view::CursorError::ZeroLimit => ToolFailure::Domain {
+            code: "zero_limit",
+            message: "limit must be at least 1".into(),
+        },
+    }
+}
+
+// ---- argument reading ---------------------------------------------------
+
+fn str_arg(args: &Value, key: &str) -> Result<Option<String>, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(ToolFailure::BadParams(format!("{key:?} must be a string"))),
+    }
+}
+
+fn required_str_arg(args: &Value, key: &str) -> Result<String, ToolFailure> {
+    str_arg(args, key)?.ok_or_else(|| ToolFailure::BadParams(format!("{key:?} is required")))
+}
+
+fn bool_arg(args: &Value, key: &str) -> Result<bool, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(ToolFailure::BadParams(format!("{key:?} must be a boolean"))),
+    }
+}
+
+/// A positive-integer argument. Zero and negatives are `-32602` rather than a
+/// clamp: the schema says `minimum: 1`, and silently turning `limit: 0` into
+/// a full page would answer a question the client did not ask.
+fn positive_usize_arg(args: &Value, key: &str) -> Result<Option<usize>, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+            _ => Err(ToolFailure::BadParams(format!(
+                "{key:?} must be an integer >= 1"
+            ))),
+        },
+    }
+}
+
+/// The client's `limit`, narrowed to the server bound. Absent = the bound.
+fn bounded_limit(args: &Value, cap: usize) -> Result<usize, ToolFailure> {
+    Ok(positive_usize_arg(args, "limit")?.unwrap_or(cap).min(cap))
+}
+
+/// A `cursor` argument, accepted in EITHER shape a client can plausibly hold:
+/// the JSON text of a [`view::Cursor`], or the `next` object lifted verbatim
+/// out of a previous payload. The second form matters because the payload the
+/// agent just read carries `next` as an object (it is the serialized
+/// `Page::next`, and parity with `--json` forbids rewriting it into a
+/// string), so demanding a string would make the obvious move fail.
+fn cursor_arg(args: &Value) -> Result<Option<view::Cursor>, ToolFailure> {
+    let raw = match args.get("cursor") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => serde_json::from_str::<view::Cursor>(s).map_err(|e| {
+            ToolFailure::BadParams(format!("\"cursor\" is not a valid cursor: {e}"))
+        })?,
+        Some(v @ Value::Object(_)) => {
+            serde_json::from_value::<view::Cursor>(v.clone()).map_err(|e| {
+                ToolFailure::BadParams(format!("\"cursor\" is not a valid cursor: {e}"))
+            })?
+        }
+        Some(_) => {
+            return Err(ToolFailure::BadParams(
+                "\"cursor\" must be the string or object a previous page returned".into(),
+            ))
+        }
+    };
+    Ok(Some(raw))
+}
+
+fn string_list_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| {
+                i.as_str().map(str::to_string).ok_or_else(|| {
+                    ToolFailure::BadParams(format!("{key:?} must be an array of strings"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(ToolFailure::BadParams(format!(
+            "{key:?} must be an array of strings"
+        ))),
+    }
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<String, ToolFailure> {
+    serde_json::to_string(value).map_err(|e| ToolFailure::Domain {
+        code: "serialize_failed",
+        message: e.to_string(),
+    })
+}
+
+// ---- the three read tools ------------------------------------------------
+
+/// `agentrec_log` → `Page<TurnSummary>` (P4b decision 12).
+///
+/// Deliberately NOT `log --json`, which emits protocol JSONL records; there
+/// is no `--json` byte-parity to pin here and none is claimed. The payload is
+/// the serialized [`view::Page`] the view returned, so a field added to
+/// [`view::TurnSummary`] reaches the agent with no edit here.
+///
+/// `include_git` maps to [`view::TurnQuery::include_all`], the one knob the
+/// view offers — which also unhides turns superseded by a retroactive merge.
+/// That is a widening the parameter name does not advertise, and it is the
+/// honest mapping: the alternative is a second filter implemented here, i.e.
+/// adapter-owned interpretation of the ledger.
+fn log_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
+    let q = view::TurnQuery {
+        include_all: bool_arg(args, "include_git")?,
+        limit: Some(bounded_limit(args, MAX_LOG_SUMMARIES)?),
+        after: cursor_arg(args)?,
+    };
+    let page = open_view(root)?.list(&q).map_err(|e| cursor_failure(&e))?;
+    encode(&page)
+}
+
+/// `agentrec_diff` → [`view::DiffResult`], byte-identical to `diff --json`
+/// whenever the payload bound does not bind (`readcmds::diff` serializes the
+/// same typed value with the same `serde_json::to_string`; neither side
+/// renders).
+///
+/// The bound is applied by re-asking the view for a limited page rather than
+/// by trimming the result here — the cursor must be minted by the same walk
+/// that would mint it for any other paging caller, or it would not resolve.
+fn diff_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
+    let budget = bounded_limit(args, MAX_DIFF_PAYLOAD_LINES)?;
+    let mut q = view::DiffQuery {
+        turn: required_str_arg(args, "turn")?,
+        paths: string_list_arg(args, "paths")?,
+        limit: None,
+        after: cursor_arg(args)?,
+    };
+    let view = open_view(root)?;
+    let full = view.diff(&q).map_err(|e| diff_failure(&e))?;
+
+    // How many whole entries fit the payload bound. At least one always does
+    // — a single file bigger than the budget must still be delivered, or a
+    // pager sits on it forever.
+    let mut used = 0usize;
+    let mut admitted = 0usize;
+    for file in &full.files.items {
+        let cost = payload_lines(&file.state);
+        if admitted > 0 && used + cost > budget {
+            break;
+        }
+        used += cost;
+        admitted += 1;
+    }
+    if admitted >= full.files.items.len() {
+        // Everything fits: the unpaginated value, untouched. This is the
+        // `--json` parity path.
+        return encode(&full);
+    }
+    q.limit = Some(admitted);
+    let bounded = view.diff(&q).map_err(|e| diff_failure(&e))?;
+    encode(&bounded)
+}
+
+/// One file entry's contribution to the payload bound — see
+/// [`MAX_DIFF_PAYLOAD_LINES`] for why this counts content lines and not
+/// rendered unified-diff lines. States that carry no content still cost 1:
+/// they occupy a row in the answer, and costing them 0 would let an unbounded
+/// number of them into one page.
+fn payload_lines(state: &view::FileDiffState) -> usize {
+    match state {
+        view::FileDiffState::Text { before, after, .. } => {
+            before.lines().count() + after.lines().count()
+        }
+        view::FileDiffState::BaselineUnknown { after } => after.lines().count(),
+        view::FileDiffState::Withheld
+        | view::FileDiffState::Skipped { .. }
+        | view::FileDiffState::Unresolvable { .. }
+        | view::FileDiffState::Binary { .. } => 1,
+    }
+    .max(1)
+}
+
+fn diff_failure(e: &view::DiffError) -> ToolFailure {
+    match e {
+        view::DiffError::Cursor(c) => cursor_failure(c),
+        view::DiffError::Lookup { err, .. } => ToolFailure::Domain {
+            code: "turn_not_found",
+            message: match err {
+                view::LookupError::NoTurns => "no turns are recorded in this repository".into(),
+                view::LookupError::Ambiguous { .. } => {
+                    "that turn ref matches more than one recorded turn".into()
+                }
+                view::LookupError::Unknown => "no recorded turn matches that ref".into(),
+            },
+        },
+        view::DiffError::Io(message) => ToolFailure::Domain {
+            code: "io_error",
+            message: message.clone(),
+        },
+    }
+}
+
+/// `agentrec_blame` → [`view::BlameResult`], byte-identical to
+/// `blame --json`.
+///
+/// Gap honesty rides on the value itself and needs nothing added here: the
+/// `no_turn_recording_gap` / `line_recording_gap` / `line_origin_gap` arms of
+/// [`view::BlameState`] are internally tagged and carry NO `turn` field, so
+/// "attribution stale — recording gap" reaches the agent as structure rather
+/// than as prose it would have to parse (and a guessed attributor is
+/// impossible to emit, not merely unlikely).
+fn blame_tool(root: &Path, args: &Value) -> Result<String, ToolFailure> {
+    let q = view::BlameQuery {
+        path: required_str_arg(args, "path")?,
+        line: positive_usize_arg(args, "line")?,
+    };
+    let result = open_view(root)?.blame(&q).map_err(|e| match e {
+        view::BlameError::FileNotFound => ToolFailure::Domain {
+            code: "file_not_found",
+            message: "that path is not on disk and no recorded turn touches it".into(),
+        },
+        view::BlameError::LineOutOfRange { lines } => ToolFailure::Domain {
+            code: "line_out_of_range",
+            message: format!("that file has {lines} line(s)"),
+        },
+        view::BlameError::Io(message) => ToolFailure::Domain {
+            code: "io_error",
+            message,
+        },
+    })?;
+    encode(&result)
 }
 
 fn success(id: Value, result: Value) -> Value {
