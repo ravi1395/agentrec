@@ -1879,7 +1879,10 @@ if it had measured the population. The reading is manual and its scope must be s
 (base at `93e43c2`: 981/0/4). The **+4 is exactly the four new
 `cli/tests/undo_origin.rs` tests** and nothing else: F5's other test edits are
 assertions added inside existing tests (`cli/tests/conformance.rs`) or two existing
-assertions inverted (below), neither of which moves a count. clippy `-D warnings`
+assertions inverted (below), neither of which moves a count. The conformance half
+of that was verified rather than reasoned: `cargo test --test conformance -- --list`
+returns the same **4** test names as before, because the new `MANIFEST` row is data
+iterated by one existing `#[test]`, not a new one. clippy `-D warnings`
 debug **and** release: exit 0. `cargo fmt --check`: exit 0.
 
 **Two pre-existing assertions were INVERTED, not deleted, and that is disclosed
@@ -1891,6 +1894,19 @@ and `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable`
 `"mcp"` respectively. The guards did their job: both went RED on this change
 before being touched, which is how F5's threading was proven to reach both
 transports and not merely the new test file.
+
+### There is no fifth undo-turn writer — checked, not assumed
+
+Four `append_undo_turn` call sites were threaded, but "four" came from grepping
+`append_undo_turn` itself, which cannot find a writer that bypasses it. The
+discriminating check is the other direction: `git grep -n 'Some("agentrec"' --
+cli/src agentrec-core/src` returns **exactly one constructor**,
+`cli/src/readcmds.rs::append_undo_turn`. Every other hit is a *reader* predicate
+(`readcmds.rs::…is_synthetic`, `undo_coordinator.rs`'s rich-coverage test) or an
+unrelated `initcmd` string. So no path appends an `agentrec`-tooled turn without
+stating an origin, and the eleven mechanical `origin: None` insertions into other
+`TurnRecord` literals are all on non-undo turns, where `None` is the correct and
+required value.
 
 ### Mutation probes (run at `2706704`, on a clean tree, after `cargo build`)
 
