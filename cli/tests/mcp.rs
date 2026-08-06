@@ -2137,4 +2137,59 @@ mod f2 {
         );
         assert!(ledger.contains(&hash_bytes(token.as_bytes())));
     }
+
+    /// AC-F4 wire leg for `revert_failed` — the ONE code `agentrec_undo`
+    /// emits for a repository-side failure discovered mid-write, and the one
+    /// producing site in `mcpcmd.rs`. Same injection as
+    /// `approve.rs::a_mid_revert_failure_records_what_landed_and_releases_the_reservation`:
+    /// the second file is made read-only AFTER the preview issued its token,
+    /// so nothing the token binds (paths, hashes, the plan) changes and the
+    /// failure can only surface at `fs::write`. Proves the failure reaches an
+    /// agent as a DOMAIN refusal carrying the cause, not as a `-32602` or a
+    /// success payload with a short `files` list.
+    #[cfg(unix)]
+    #[test]
+    fn a_mid_revert_failure_crosses_the_wire_as_revert_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root_with_mode("auto");
+        seed(
+            &root,
+            vec![revertible(&root, "a.rs"), revertible(&root, "b.rs")],
+        );
+
+        let preview = ok_payload(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": TURN}),
+        ));
+        let token = preview["token"]
+            .as_str()
+            .expect("auto issues a token")
+            .to_string();
+
+        let b = root.join("b.rs");
+        let mut perms = std::fs::metadata(&b).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&b, perms).unwrap();
+
+        let (code, message) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "execute", "token": token}),
+        ));
+        assert_eq!(code, "revert_failed", "{message}");
+        assert!(
+            message.contains("b.rs") && message.contains("failed to write"),
+            "the refusal must carry the repository's own cause: {message:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "old a.rs",
+            "the file written before the failure stays written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "new b.rs",
+            "the failed file is untouched"
+        );
+    }
 }

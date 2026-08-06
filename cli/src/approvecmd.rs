@@ -126,8 +126,11 @@ pub struct Executed {
 /// second copy behind the token seam is exactly the drift the coordinator
 /// exists to prevent. What differs between the two is only how the grant was
 /// authorized, and that is entirely inside `UndoCoordinator::claim` /
-/// `claim_token`. This function prints nothing: the MCP transport owns
-/// stdout.
+/// `claim_token`. This function prints nothing to STDOUT: the MCP transport
+/// owns it, and `mcp` is a stdio JSON-RPC server whose frames are stdout
+/// lines. The two mid-revert persistence warnings below go to STDERR, which
+/// that transport does not read and which `mcp.rs`'s harness captures
+/// separately — a warning there cannot corrupt a frame.
 ///
 /// Takes the lock BY VALUE, because where it is released is part of the
 /// contract: after the terminal row, before [`readcmds::finish_undo_guard`]'s
@@ -158,11 +161,21 @@ pub fn execute_claim(
         .filter(|p| matches!(p.kind, PlanKind::Revert { .. }))
         .collect();
     if revertible.is_empty() {
-        // Defensive only: both claim paths refuse any grant whose executable
-        // set no longer equals the granted one, and the empty set is the
-        // extreme case of that, so this is unreachable. It writes NO terminal
-        // row — the claim already appended one for every divergence it
-        // refused, and a second would be a duplicate resolution.
+        // Defensive only: unreachable, and the premise the claim paths supply
+        // is not by itself sufficient, so it is spelled out here rather than
+        // asserted. `undo_coordinator::claim_grant`'s scope recheck refuses a
+        // grant whose executable set no longer equals the granted one, but it
+        // computes that as "granted paths NOT in the executable set" — which
+        // is vacuously empty when the GRANT carries no paths, so it alone
+        // does not exclude an empty executable set. What does is the pair of
+        // gates above it, on both authorizing paths: `preview` reserves (and
+        // issues a token) only under `!files.is_empty()`, and `request_human`
+        // returns `NothingExecutable` before appending its row on the same
+        // condition. So no `reserve` or `request` row can carry empty paths,
+        // the vacuous case never arises, and a shrunk-to-empty set is caught
+        // as ordinary scope drift. It writes NO terminal row — the claim
+        // already appended one for every divergence it refused, and a second
+        // would be a duplicate resolution.
         return Err(format!(
             "undo request {} no longer has anything to revert — nothing was written",
             request.id
@@ -200,10 +213,49 @@ pub fn execute_claim(
         // Anything already reverted is a real write and must not go
         // unrecorded, so it gets an honestly-truncated undo turn before the
         // error surfaces — the E1 belt-and-braces `undo --confirm` applies.
+        //
+        // Neither recovery write may mask the revert failure — `e` is what
+        // this function returns either way — but neither may be swallowed
+        // either. Both were `let _ =`, and each has its own consequence:
+        //
+        //   * the truncated turn failing to persist loses the record of
+        //     writes that really landed. Nothing here can un-write them, and
+        //     inventing recovery machinery for a path that is already the
+        //     second failure in a row would be worse than saying so — so it
+        //     names every file it reverted, loudly, on stderr, and the fail
+        //     row is still attempted;
+        //   * the fail row failing to persist leaves the reservation live
+        //     until its TTL lapses, blocking any overlapping request for up
+        //     to `REQUEST_TTL_MS`, which otherwise reads as a mystery
+        //     `undo_conflict` minutes later.
+        //
+        // Paths come from a turn record and are attacker-controllable in
+        // exactly the way `render_plan`'s F8 comment describes, so they are
+        // sanitized here as they are on every other human-facing line.
         if !inverse.is_empty() {
-            let _ = readcmds::append_undo_turn(root, &short_target, inverse, true, origin);
+            let written: Vec<String> = inverse
+                .iter()
+                .map(|f| fmt::sanitize_terminal(&f.path))
+                .collect();
+            if let Err(turn_err) =
+                readcmds::append_undo_turn(root, &short_target, inverse, true, origin)
+            {
+                eprintln!(
+                    "agentrec: warning: failed to persist the truncated undo turn: {turn_err}; \
+                     {} file(s) WERE reverted and are now unrecorded: {}",
+                    written.len(),
+                    written.join(", ")
+                );
+            }
         }
-        let _ = co.append_terminal(&lock, request, EVENT_FAIL, None, Some(e.clone()));
+        if let Err(row_err) = co.append_terminal(&lock, request, EVENT_FAIL, None, Some(e.clone()))
+        {
+            eprintln!(
+                "agentrec: warning: failed to record the fail row for undo request {}: \
+                 {row_err}; its reservation stays live until the TTL expires",
+                request.id
+            );
+        }
         readcmds::finish_undo_guard(root);
         return Err(e);
     }

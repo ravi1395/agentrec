@@ -898,3 +898,92 @@ fn an_executable_set_that_shrank_after_the_request_is_preview_stale() {
     assert!(undo_turns(&root).is_empty());
     assert_eq!(state(&root, &id), "failed");
 }
+
+// ---- AC: mid-revert failure (Phase F review finding 11) ---------------------
+
+/// A revert that fails PARTWAY — the branch in `approvecmd::execute_claim`
+/// that both of the review's swallowed `let _ =` writes live in.
+///
+/// **Injection: the second file is made read-only (0o444) after the request
+/// is lodged.** Every cheaper-looking injection is refused before this branch
+/// is reachable, which is the point: removing the before-blob turns the entry
+/// into a `build_plan` refusal and `claim_grant` answers `preview_stale`
+/// (pinned by `an_executable_set_that_shrank_after_the_request_is_preview_stale`
+/// directly above), and anything that changes the file's BYTES trips the
+/// content recheck. A mode bit changes neither the plan nor any hash — the
+/// claim admits the file, and `restore_from_before`'s `fs::write` is the
+/// first thing that sees it. That is exactly the shape this branch exists
+/// for: a failure only the working tree can report, discovered after other
+/// files have already been written.
+#[cfg(unix)]
+#[test]
+fn a_mid_revert_failure_records_what_landed_and_releases_the_reservation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = root_with_mode("confirm");
+    seed(
+        &root,
+        vec![revertible(&root, "a.rs"), revertible(&root, "b.rs")],
+    );
+    let id = lodge(&root, None, false);
+
+    let b = root.join("b.rs");
+    let mut perms = std::fs::metadata(&b).unwrap().permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(&b, perms).unwrap();
+
+    let out = run(&root, &["approve", &id]);
+    assert!(
+        !out.status.success(),
+        "a partial revert must not report success: {}",
+        stdout(&out)
+    );
+    let msg = stderr(&out);
+    assert!(
+        msg.contains("b.rs") && msg.contains("failed to write"),
+        "the error must carry the REVERT failure, not the bookkeeping: {msg}"
+    );
+
+    // a.rs was written before b.rs failed; b.rs was not.
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "old a.rs\n",
+        "the first file's revert really landed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&b).unwrap(),
+        "new b.rs\n",
+        "the failed file must be untouched"
+    );
+
+    // The write that landed is RECORDED, truncated, and names only a.rs.
+    let turns = undo_turns(&root);
+    assert_eq!(
+        turns.len(),
+        1,
+        "the partial revert must mint exactly one turn"
+    );
+    assert!(turns[0].truncated, "a partial undo turn must say so");
+    let recorded: Vec<&str> = turns[0].files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        recorded,
+        vec!["a.rs"],
+        "the truncated turn must record only what was actually written"
+    );
+
+    // The reservation is resolved, not left to lapse at TTL.
+    assert_eq!(state(&root, &id), "failed");
+    let fail_rows: Vec<Value> = ledger(&root)
+        .into_iter()
+        .filter(|e| e["event"] == "fail" && e["id"] == id.as_str())
+        .collect();
+    assert_eq!(fail_rows.len(), 1, "exactly one terminal fail row");
+    assert!(
+        fail_rows[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("b.rs"),
+        "the fail row must carry the cause: {}",
+        fail_rows[0]
+    );
+}
