@@ -133,6 +133,7 @@ pub struct Executed {
 /// contract: after the terminal row, before [`readcmds::finish_undo_guard`]'s
 /// linger on the success path — the ordering `approve` already had, preserved
 /// exactly.
+///
 /// `origin` (F5, delta decision 11) is the one thing the two callers must
 /// still state for themselves, precisely because it is what differs between
 /// them; it is threaded to BOTH `append_undo_turn` calls below — the success

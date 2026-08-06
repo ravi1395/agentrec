@@ -1892,6 +1892,21 @@ and `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable`
 before being touched, which is how F5's threading was proven to reach both
 transports and not merely the new test file.
 
+### Mutation probes (run at `2706704`, on a clean tree, after `cargo build`)
+
+Both are **per-site** and both discriminate: an all-sites-fail probe cannot
+distinguish three independently-wired call sites from one shared default.
+
+| Probe | Result |
+|---|---|
+| `mcpcmd.rs` execute → `UndoOrigin::Cli` | `ac_f5_mcp_execute_records_origin_mcp` RED (`left: "cli"`, `right: "mcp"`); the other **three** `undo_origin` tests stay GREEN. `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable` also REDs — the F4 guard covers the same site |
+| `approvecmd.rs::approve` → `UndoOrigin::Mcp` | `ac_f5_approve_of_an_mcp_request_records_origin_cli` RED (`left: "mcp"`, `right: "cli"`); the CLI-undo and MCP-execute tests stay GREEN, proving `approve` is wired separately and does not inherit either |
+
+Pre-implementation RED, for the record: with the field present but nothing
+writing it, the three behavior tests failed on `left: Null` against their
+expected values while the legacy-reading test already passed — i.e. they
+failed as assertions, not as compile errors.
+
 ### Verified here (automated)
 
 | AC | Evidence |
