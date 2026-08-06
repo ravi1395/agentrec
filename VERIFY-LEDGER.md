@@ -2137,17 +2137,38 @@ Per-box refs, then this round's own measurements.
 
 **Release-profile suite, run for the first time in this repo's recorded history — and the
 checklist box's "debug+release" cannot be read as "the full suite passes under
-`--release`":** `cargo test --release --workspace --no-fail-fast -- --test-threads=3` →
-**964 passed / 24 failed / 4 ignored** (debug: 987/0/4). All 24 failures were individually
-classified against source (Opus classification round, table preserved in the session
-transcript; spot-anchors below): **24 SEAM / 0 TIMING / 0 REAL** — every failure is a test
-driving a `#[cfg(debug_assertions)]`-gated seam that release strips BY DESIGN (the same
-design the release-seam `strings` check exists to enforce). Five distinct seams:
-`importcmd.rs::debug_dump_entries_enabled` (11 tests), `importcmd.rs::t2_oracle_enabled`
-(2), `purgecmd.rs` test-pause sleeps (3), `cmds.rs::effective_store_budget` +
-`daemon.rs::effective_evict_interval` overrides (4), `cmds.rs::recall_deadline` forced
-deadline + `memory.rs::test_slow_pin_read_delay` (3), `import_codex.rs` key-parity list
-hardcoding `debug_entries` (counted in the 11+2 families). Positive control:
+`--release`". THREE runs, stated separately** (the plan-exit gate's round-1 blocker was an
+earlier version of this paragraph conflating them into one figure — the doctorcmd
+observations below came from run 1, while `964/24/4` is run 3's; no verdict assignment could
+reconcile the two, and the gate proved it by reproducing 964/24/4 at HEAD with zero
+`doctorcmd` names among the 24):
+
+1. **Run 1, PRE-doctorcmd-gating, fail-fast:** aborted inside the `agentrec` bin's unit
+   tests at **355 passed / 3 failed / 1 ignored** (partial — cargo stopped at the first
+   failing binary). The 3 failures were the `doctorcmd` service-unit tests; this run is the
+   evidence behind the gating fix below. Its full-suite totals were never measured and are
+   unrecoverable.
+2. **Run 2, POST-gating, fail-fast:** aborted at the known recorded flake
+   `approve.rs::a_killed_approve_never_leaves_a_phantom_approval` — **369 / 1 / 1**
+   (partial). The flake's rates and disposition are already recorded above (Phase F gate
+   round 1); this was one more observation of it, in release.
+3. **Run 3, POST-gating, `--no-fail-fast` (the complete measurement):**
+   `cargo test --release --workspace --no-fail-fast -- --test-threads=3` →
+   **964 passed / 24 failed / 4 ignored** (debug at the same tree: 987/0/4). The known
+   approve flake did NOT fire in this run.
+
+All 24 of run 3's failures were individually classified against source (Opus classification
+round; table persisted durably in `docs/verify/release-seam-classification.md`, and the
+plan-exit gate independently reproduced the totals, the 24 names, 3 seams read in source,
+and 1 empirical probe + positive control): **24 SEAM / 0 TIMING / 0 REAL** — every failure
+is a test driving a `#[cfg(debug_assertions)]`-gated seam that release strips BY DESIGN (the
+same design the release-seam `strings` check exists to enforce). Family arithmetic, summing
+to exactly 24: hardening_cli 3 (`purgecmd.rs` test-pause sleeps) + import_claude 11 (9 ×
+`importcmd.rs::debug_dump_entries_enabled` + 2 × `importcmd.rs::t2_oracle_enabled`) +
+import_codex 3 (debug_entries family, incl. the key-parity list hardcoding `debug_entries`)
++ integration 7 (3 × `cmds.rs::effective_store_budget`/`daemon.rs::effective_evict_interval`
++ 3 × `cmds.rs::recall_deadline`/`memory.rs::test_slow_pin_read_delay` + 1 ×
+json_contracts budget). Positive control:
 `persist::ac5b_oracle_seam_disabled_in_release_even_with_env_set` PASSES in release.
 **No release-only product defect found.** Honest coverage statement: ~20 of the 24 fail at a
 seam-gated precondition, so their subject invariant is UNEXERCISED in release (not proven
@@ -2155,6 +2176,17 @@ equivalent) — notably the zero-write status parity assertion; four others' inv
 visibly confirmed in the captured release output despite the test failing (daemon degrades
 to defaults on mid-tick corruption; codex/claude report key parity at 14 keys; two
 tier-classification runs print correct `tier_counts`).
+
+**Seam-caveat correction (plan-exit gate round-1 blocker 2):** the round-3 caveat above
+("a seam named outside the `AGENTREC_TEST` prefix would evade it — none known") is FALSE:
+`AGENTREC_CLAUDE_PROJECTS_DIR` (`doctorcmd.rs::claude_projects_dir`) is an UNGATED env
+override present in release `strings`, whose own doc comment says it exists "so this check
+is hermetically testable". Pre-existing since the repo's initial commit (`5c3a915`, on
+`main`); low severity — it redirects a read-only doctor advisory's scan directory, writes
+nothing. Recorded, not changed: whether to gate it `#[cfg(debug_assertions)]` (making the
+doctor check untestable in release builds) or sanction it as a production knob (documenting
+it) is a founder call. Until then, "no seams in release strings" must be read as "no
+`AGENTREC_TEST`-prefix seams, plus this one named exception".
 
 **Fix landed this round (code, small):** the three `doctorcmd` service-unit tests that
 FAILED in release (`orphaned_unit_is_advisory_not_fail`,
