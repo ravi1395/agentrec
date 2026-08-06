@@ -1206,7 +1206,11 @@ mod tests {
         let abs = tmp.path().join("elsewhere.txt");
         std::fs::write(&abs, b"VICTIM\n").unwrap();
 
-        let (_, plans) = plan_for(root, vec![entry(&abs.display().to_string(), "modify")], true);
+        let (_, plans) = plan_for(
+            root,
+            vec![entry(&abs.display().to_string(), "modify")],
+            true,
+        );
         assert_eq!(refusal_reason(&plans), ESCAPE);
     }
 
