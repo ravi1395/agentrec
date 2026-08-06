@@ -2656,3 +2656,35 @@ channel, and widening that signature reaches far outside this fix.
    stray — one leaked `agentrec mcp` blocked on the probe's fifo — was then killed by EXACT
    PID after inspecting `ps` output. **Kill by pid; if a pattern is unavoidable, anchor it to
    the binary path, never to a substring that can appear in an unrelated command line.**
+
+### The mechanical audit, finished — and why "the class is closed" was still not true
+
+After fixing round 6's two blockers, the orchestrator ran the gate's own prescribed grep
+rather than declaring the class closed. **It was not closed.** 22 non-test bare reads remained
+OUTSIDE the MCP/undo/read-tool surface: `daemon.rs` 7, `importcmd.rs` 8, `purgecmd.rs` 6,
+`state.rs` 1. Stopping at the two reported blockers would have reproduced the round-6 ledger's
+own false claim one round later, with a smaller scope and the same wording.
+
+All 22 guarded (`ea8650e`), by category: `daemon.rs` — the undo-guard read, **the SNAPSHOT
+READ of a watched file (`daemon.rs:1173`)**, the journal and signal-inbox opens, three
+`.agentrec` reads; `state.rs` — `state.json`; `purgecmd.rs` — `memory.jsonl`, the rewrite
+source, a CAS blob, `log.jsonl`; `importcmd.rs` — the transcript readers and both
+file-history blob reads.
+
+**The daemon FIFO exposure is now closed BY CONSTRUCTION, and that is deliberately not the
+same claim as "demonstrated and fixed".** A FOURTH probe attempt — this one forcing a writer
+to `exec 3>` the fifo and close it, so the watcher would see a mutation on that exact path —
+STILL could not get a fifo into a turn (4 attempts now, across both parties). The exploit
+remains **undemonstrated**. What changed is that `daemon.rs:1173` no longer performs a bare
+read, so the guard holds whether or not anyone ever reproduces the path. Recorded this way on
+purpose: a guard that does not depend on a reproduction is stronger evidence than a
+reproduction, and conflating the two would be the overclaim this repo keeps catching.
+
+Suite **1007 / 0 / 4** across the change (unchanged — 22 guarded sites, zero regressions,
+which is itself the evidence that no legitimate read was broken). Clippy `-D warnings`
+`--all-targets` debug AND release, `cargo fmt --check`: clean.
+
+**Remaining raw reads are now, by inspection, the three documented exemption classes
+(`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code.** That is a
+falsifiable statement and the grep in `fsguard`'s module doc is how to re-check it after any
+future change.
