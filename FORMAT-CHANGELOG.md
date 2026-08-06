@@ -13,6 +13,32 @@ the freeze entry directly beneath this paragraph. Those notes are left in
 place verbatim: they were true when written, and this file is a history.
 Conformance fixtures now exist, at `docs/fixtures/conformance/`.
 
+## §8 `allow_modified` text corrected to match founder decision 6 (2026-08-06)
+
+**No wire change, and not an additive change either — a correction of stale
+normative prose.** No schema is touched, no `v` bumps, no field is added,
+removed, or retyped; no serializer, golden, `Cargo.toml`, or conformance
+fixture moves. Consumers are unaffected: nothing on the wire changes shape.
+The §8 tool table is untouched — the `agentrec_undo` row already exists.
+
+One sentence in §8's "Rails that hold in every mode" paragraph said
+`allow_modified: true` is "honored only in `auto` mode or with human approval
+in `confirm` mode". That inverts the `auto` half of founder decision 6
+(parent spec `2026-07-18-agentrec-phase-2-design.md` :676-681): **auto mode
+refuses `allow_modified: true` outright** — an agent must never be able to
+lower its own rail, and a token-bound auto grant is still the agent granting
+itself. The only override path is explicit human approval in `confirm` mode.
+The sentence now says that, in RFC 2119 terms.
+
+The freeze binds the two *schemas* (§4, §5) to additive-only change; it does
+not license normative prose that contradicts the decision register, and
+leaving it would have meant the first implementation of the flag either
+matched the document and violated decision 6, or matched decision 6 and
+violated the document. Ordered first deliberately (delta decision 15,
+`2026-08-05-phase-2-tail-codex-mcp-design.md`): the text is fixed **before**
+any code parses the flag, so no commit ever ships a parser disagreeing with
+§8. The rail itself lands in the next commit (plan task F1).
+
 ## `agentrec_status` added to the §8 MCP table (2026-08-06)
 
 **No wire change** — neither the signal schema (§4) nor the record schema
