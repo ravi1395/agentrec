@@ -2496,3 +2496,80 @@ data loss. It also contaminated that round's first suite run (707/2/3, both fail
 daemon/FSEvents tests); the gate re-ran clean at 999/0/4 and correctly attributed the two
 failures to itself rather than to the branch. **This is the broad-pattern `pkill` hazard this
 repo already records in memory, hit anyway** — kill by exact pid.
+
+### Re-gate round 5 — the blocking-read CLASS, closed by audit instead of by another point fix
+
+Round 5 PASSED items 1, 2, 4 and 5. The round-4 blocker is closed, and the gate established
+its probe's precondition BEFORE drawing a conclusion — exactly the trap the orchestrator's
+invalid probe fell into: CAS layout checked (`objects/<2-char fan>/<62-char rest>`), token
+checked real (`len=40`, `[0-9a-f]{40}`), and **cryptographically bound** to the ledger
+(`sha256(token)` = the reserve row's `token_sha256`). Then regular file → `mkfifo` → execute
+returned in **1 s** with `preview_stale`, against zero frames and a live process at 25 s
+before the fix. The symlink semantic change was independently judged safe: `None` reads as
+modified (the cautious direction), and the one edge worth checking — `entry.after == None`
+AND a non-regular file on disk, where both sides are `None` — is unreachable because the three
+refusal gates run before the modified-since comparison.
+
+**GATE FAIL on a SIXTH shape, and the gate's disposition was to stop patching sites. Taken —
+fixed at `88967f4`.**
+
+**`store.rs::get` was a bare `fs::read`, and it is worse-placed than round 4's.** A FIFO
+planted at a CAS object path hangs `build_plan`'s deliberate integrity read, so **every undo
+leg blocks at once** — preview, CLI `undo`, `approve`, `execute` — and no token is ever
+issued. Measured by the gate: MCP preview timed out at 90 s. `.agentrec/objects/` is inside
+the repo, so the precondition is the same sandboxed-agent write that grounds every containment
+refusal. Availability only; no escape or integrity consequence.
+
+**Four rounds found this class at four sites, one per round, each fix correct and each
+insufficient** — `inode_refusal` in the planner (round 3), `read_current_hash`'s lstat
+(round 4), this (round 5). The gate's own words: fixing one `fs::read` per round is not
+converging. **The property is not "this path is safe" but "we never open something that is not
+a regular file"**, so this round makes it expressible once.
+
+**`agentrec-core/src/fsguard.rs`** — `read_regular` / `open_regular` / `is_nonregular` —
+applied at EVERY blocking-I/O site on the undo path, from the gate's own inspection list plus
+two it did not name:
+- `store.rs::get` — the demonstrated blocker.
+- `record.rs::load_log` — `open_regular`, deliberately streamed: this file is multi-MB in a
+  dogfooded repo and slurping it to gain the guard would be a real regression.
+- `execute_revert`'s `pre_bytes` read, and `restore_from_before`'s post-write readback.
+- `read_current_hash` — now delegates, so there is ONE lstat rather than two.
+- **The WRITE side, which nobody had probed:** `UndoLock::acquire` and the
+  `undo-requests.jsonl` append. Opening a FIFO for WRITE blocks until a **reader** appears —
+  the mirror of the read hazard, and it would wedge every leg before any gate ran.
+The two remaining `File::open` calls in `store.rs` (`:95`, `:323`) are **directory** fsyncs;
+opening a directory cannot block, so they are deliberately unguarded.
+
+**What fsguard does NOT fix, stated in the module rather than implied:** lstat-then-open is
+**not atomic**. A path swapped between the check and the open still reaches the raw call;
+closing that needs `O_NONBLOCK`/`openat` on the descriptor itself. What the guards remove is
+the DURABLE hazard — a FIFO sitting on disk when the read arrives — which is every case
+observed across all five rounds. The residual shares its shape with the
+`build_plan`→`fs::write` TOCTOU already recorded.
+
+**A signature-defect instance introduced BY this change and caught before commit:** once the
+lstat moved into `fsguard`, `read_current_hash`'s comment still claimed the function did the
+lstat itself. Rewritten to describe what the code now does. Recorded because the defect arrived
+inside the very commit that was closing a class of them.
+
+**Evidence, all run:** new integration test
+(`a_fifo_planted_in_the_cas_refuses_instead_of_hanging`) — preview ANSWERS, `files: []`,
+`token: null` — passes in 0.54 s; its mutation probe, `is_nonregular` neutered to `false`,
+**HUNG at 25 s**, so the test is load-bearing and hangs rather than fails on regression. Suite
+**1005 / 0 / 4** (1000 + 5: one integration test + four `fsguard` unit tests). Clippy
+`-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean. Error kind is
+`InvalidInput`, so no caller learns a new shape — which is what let one change land at six
+sites without moving any of their behavior for ordinary files.
+
+**The gate's low-signal note, recorded not fixed:** the swapped-fifo refusal reads "changed
+since it was lodged", so an operator cannot tell a FIFO was swapped in — an attack signature
+that is not surfaced. Judged (by the gate) not a defect and not a MINOR 2 regression, since
+the refusal genuinely comes from the drift check rather than a plan refusal. A missed
+opportunity, deliberately not taken here.
+
+**Still unrefuted after three probe attempts across two parties:** the daemon FIFO exposure.
+Neither the orchestrator nor the gate has managed to get a FIFO into a turn, so the snapshot
+read path remains unexercised; `daemon.rs` has no regular-file check, so the exposure is
+plausible on inspection. `fsguard` now EXISTS for the daemon to adopt, but this round did not
+adopt it there — that is a deliberate scope line, not an oversight, and the daemon's reads are
+outside the undo surface this review is scoped to.
