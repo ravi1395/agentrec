@@ -1,6 +1,7 @@
 //! agentrec CLI: init, record (daemon), log, status, diff, blame, undo, hook
 //! (called by agent lifecycle hooks), doctor.
 
+mod approvecmd;
 mod cmds;
 mod config;
 mod daemon;
@@ -148,6 +149,18 @@ enum Command {
         /// the turn are left untouched.
         #[arg(long, value_delimiter = ',')]
         files: Vec<String>,
+    },
+    /// Approve a pending agent undo request (confirm mode) and execute it.
+    /// With no id, lists the requests still awaiting a decision (D23).
+    Approve {
+        /// Request id, full or an unambiguous prefix. Omit to list pending
+        /// requests instead of approving one.
+        id: Option<String>,
+    },
+    /// Deny a pending agent undo request. Nothing is written to the worktree.
+    Deny {
+        /// Request id, full or an unambiguous prefix.
+        id: String,
     },
     /// Internal: invoked by agent lifecycle hooks; reads the hook payload on stdin.
     #[command(hide = true)]
@@ -502,6 +515,8 @@ fn main() {
             allow_modified,
             files,
         } => readcmds::undo(&root, turn.as_deref(), confirm, allow_modified, &files),
+        Command::Approve { id } => approvecmd::approve(&root, id.as_deref()),
+        Command::Deny { id } => approvecmd::deny(&root, &id),
         Command::Hook { tool } => {
             let hook_root = resolve_hook_root(explicit_root.as_deref(), &root);
             cmds::hook(&hook_root, &tool)

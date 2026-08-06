@@ -1788,9 +1788,18 @@ mod f1 {
             "the refusal must name the rail — which mode execute belongs to: {message:?}"
         );
 
-        // Positive control: confirm's own path is legal, merely unbuilt.
-        let (code, _) = domain(&undo(&root, serde_json::json!({"action": "request"})));
-        assert_eq!(code, "not_implemented", "request is legal in confirm mode");
+        // Positive control: confirm's own path is legal. F3 built the body,
+        // so "legal" now reads as the COORDINATOR answering about the
+        // repository (this fixture has no turns) rather than
+        // `not_implemented`. Still fails for any build that refuses `request`
+        // at the router, which is what the control is for. `turn` is supplied
+        // because the built body requires it — without it the call is a
+        // malformed frame (`-32602`), which is not a mode statement at all.
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "request", "turn": "abc"}),
+        ));
+        assert_eq!(code, "no_turns", "request is legal in confirm mode");
     }
 
     /// AC-F1 (d): `auto` rejects `request`, with the mirror-image control.
@@ -1870,7 +1879,7 @@ mod f1 {
             serde_json::json!({"action": "request", "turn": "abc", "allow_modified": true}),
         ));
         assert_eq!(
-            code, "not_implemented",
+            code, "no_turns",
             "confirm mode is the sanctioned override path — the rail must not fire here"
         );
     }
@@ -1909,17 +1918,21 @@ mod f1 {
         for mode in ["confirm", "auto"] {
             let root = root_with_mode(mode);
             for action in ["preview", "status"] {
-                let (code, message) = domain(&undo(
-                    &root,
-                    serde_json::json!({"action": action, "turn": "abc"}),
-                ));
-                // "Legal" = not refused by the mode matrix or the rail. The
-                // per-action legal answer differs now that F2 built preview:
-                // `status` is still unbuilt, `preview` reaches the
-                // coordinator and reports this empty fixture's `no_turns`.
+                // Each sub-action's own required argument, since both bodies
+                // are built as of F3 and a missing one is `-32602` — a
+                // malformed frame, which says nothing about the mode matrix.
+                let args = match action {
+                    "preview" => serde_json::json!({"action": action, "turn": "abc"}),
+                    _ => serde_json::json!({"action": action, "request_id": "nope"}),
+                };
+                let (code, message) = domain(&undo(&root, args));
+                // "Legal" = not refused by the mode matrix or the rail. Both
+                // bodies now reach the coordinator, so the legal answer is the
+                // REPOSITORY's in both cases: an empty fixture has no turns,
+                // and an empty ledger has no such request.
                 let legal = match action {
                     "preview" => "no_turns",
-                    _ => "not_implemented",
+                    _ => "unknown_request",
                 };
                 if code != legal {
                     refused.push(format!("{mode}/{action}: {code} — {message}"));

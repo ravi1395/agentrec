@@ -7,7 +7,7 @@ use crate::cmds::wall_now_ms;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
-use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
+use agentrec_core::store::{BlobStore, StoreError};
 use agentrec_core::view;
 use std::collections::HashSet;
 use std::io::Write;
@@ -575,28 +575,7 @@ pub fn undo(
         // mutations), so append a partial, honestly-truncated undo turn
         // covering them before surfacing the error.
         if !inverse_entries.is_empty() {
-            let now = wall_now_ms();
-            let partial = TurnRecord {
-                v: 1,
-                id: agentrec_core::id::turn_id(),
-                grade: "rich".to_string(),
-                truncated: true,
-                started: agentrec_core::time::rfc3339(now),
-                ended: agentrec_core::time::rfc3339(now),
-                tool: Some("agentrec".to_string()),
-                model: None,
-                session: None,
-                root: root.to_string_lossy().to_string(),
-                prompt_ref: None,
-                prompt_excerpt: Some(format!(
-                    "undo of {short_target} (partial — aborted mid-revert)"
-                )),
-                merges: vec![],
-                imported: None,
-                files_complete: None,
-                files: inverse_entries,
-            };
-            let _ = crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(partial));
+            let _ = append_undo_turn(root, &short_target, inverse_entries, true);
         }
         // Any entries already reverted are real writes a concurrent daemon
         // must still not misattribute, so this waits out the same linger as
@@ -605,12 +584,41 @@ pub fn undo(
         return Err(e);
     }
 
+    let reverted_n = inverse_entries.len();
+    let new_id = append_undo_turn(root, &short_target, inverse_entries, false)?;
+    let new_short_id = fmt::short_id(&new_id);
+
+    finish_undo_guard(root);
+
+    println!("reverted {reverted_n} file(s); recorded as turn {new_short_id}");
+    Ok(())
+}
+
+/// Build and append the undo turn for a completed (or, with `truncated`, an
+/// aborted) revert, returning its id.
+///
+/// The ONE place this record's shape is decided. `agentrec approve` (task F3)
+/// appends through it too, so "an approved undo is recorded exactly as
+/// `undo --confirm` records one" is true by construction rather than by two
+/// struct literals someone has to keep in agreement. F5's `origin`
+/// discriminator belongs here when it lands, for the same reason.
+pub(crate) fn append_undo_turn(
+    root: &Path,
+    short_target: &str,
+    files: Vec<FileEntry>,
+    truncated: bool,
+) -> Result<String, String> {
     let now = wall_now_ms();
-    let undo_record = TurnRecord {
+    let excerpt = if truncated {
+        format!("undo of {short_target} (partial — aborted mid-revert)")
+    } else {
+        format!("undo of {short_target}")
+    };
+    let record = TurnRecord {
         v: 1,
         id: agentrec_core::id::turn_id(),
         grade: "rich".to_string(),
-        truncated: false,
+        truncated,
         started: agentrec_core::time::rfc3339(now),
         ended: agentrec_core::time::rfc3339(now),
         tool: Some("agentrec".to_string()),
@@ -618,20 +626,15 @@ pub fn undo(
         session: None,
         root: root.to_string_lossy().to_string(),
         prompt_ref: None,
-        prompt_excerpt: Some(format!("undo of {short_target}")),
+        prompt_excerpt: Some(excerpt),
         merges: vec![],
         imported: None,
         files_complete: None,
-        files: inverse_entries,
+        files,
     };
-    let reverted_n = undo_record.files.len();
-    let new_short_id = fmt::short_id(&undo_record.id);
-    crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(undo_record))?;
-
-    finish_undo_guard(root);
-
-    println!("reverted {reverted_n} file(s); recorded as turn {new_short_id}");
-    Ok(())
+    let id = record.id.clone();
+    crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(record))?;
+    Ok(id)
 }
 
 /// Panic-mode target resolution (Z+1/D42): the most recent turn, excluding
@@ -659,7 +662,9 @@ fn resolve_panic_target<'a>(
 
 // `Plan`/`PlanKind`/`build_plan` and its helpers (`read_current_hash`,
 // `is_symlink_on_disk`, `symlink_refusal`, `modified_cause`) plus
-// `window_caution` MOVED to `agentrec_core::undo_coordinator` (task F2).
+// `window_caution` MOVED to `agentrec_core::undo_coordinator` (task F2);
+// `execute_revert`/`restore_from_before` followed in task F3, so `agentrec
+// approve` reverts through THIS function rather than a second copy.
 // The MCP `agentrec_undo` preview has to reach exactly the same refusal
 // interpretation the CLI's preview does — D42 panic mode, D49 caution, F2
 // symlink refusal, K2 imported-unreconstructible — and reimplementing any
@@ -669,9 +674,7 @@ fn resolve_panic_target<'a>(
 // their original names so this module's renderer and its whole test module
 // resolve unchanged — an untouched test passing against a moved
 // implementation is the behavior-preservation proof.
-use agentrec_core::undo_coordinator::{
-    build_plan, is_symlink_on_disk, window_caution, Plan, PlanKind,
-};
+use agentrec_core::undo_coordinator::{build_plan, execute_revert, window_caution, Plan, PlanKind};
 
 /// The exact bytes of the pre-`--confirm` undo plan, one `\n`-terminated line
 /// per emitted row. Split out of [`print_plan`] so the text a user reads
@@ -703,7 +706,7 @@ use agentrec_core::undo_coordinator::{
 /// log-writer) threat model, and [`fmt::turn_list_line`] renders the same id
 /// unsanitized, so treating it here alone would split the treatment without
 /// closing anything.
-fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
+pub(crate) fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
     let mut out = String::new();
     let tool = fmt::sanitize_terminal(target.tool.as_deref().unwrap_or("—"));
     out.push_str(&format!("undo {} ({tool})\n", fmt::short_id(&target.id)));
@@ -739,119 +742,8 @@ fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
     out
 }
 
-fn print_plan(target: &TurnRecord, plans: &[Plan]) {
+pub(crate) fn print_plan(target: &TurnRecord, plans: &[Plan]) {
     print!("{}", render_plan(target, plans));
-}
-
-/// Apply one file's revert and return the inverse `FileEntry` for the new
-/// undo turn. Snapshots the CURRENT (pre-undo) bytes first — that becomes the
-/// inverse entry's `before`, so the undo is itself re-revertible (AC H6).
-/// Every write is verified by re-reading and re-hashing before returning Ok;
-/// a mismatch is a hard error, never a silent partial revert.
-fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<FileEntry, String> {
-    let path = root.join(&entry.path);
-    let pre_bytes = match std::fs::read(&path) {
-        Ok(b) => Some(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{}: cannot read before revert: {e}", entry.path)),
-    };
-    let new_before = match &pre_bytes {
-        Some(b) => Some(store.put(b).ok_or_else(|| {
-            format!(
-                "{}: failed to snapshot current content before revert",
-                entry.path
-            )
-        })?),
-        None => None,
-    };
-
-    let (new_after, inverse_op) = match entry.op.as_str() {
-        "create" => {
-            // E1: idempotent — a file already absent (deleted by something
-            // else since the turn) means the goal state ("file gone") is
-            // already reached; NotFound is success, not an error.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{}: failed to delete: {e}", entry.path)),
-            }
-            if path.exists() {
-                return Err(format!(
-                    "{}: still present after delete (revert of create)",
-                    entry.path
-                ));
-            }
-            (None, "delete")
-        }
-        "delete" => {
-            let restored = restore_from_before(&path, store, entry)?;
-            (Some(restored), "create")
-        }
-        _ => {
-            // "modify"
-            let restored = restore_from_before(&path, store, entry)?;
-            (Some(restored), "modify")
-        }
-    };
-
-    Ok(FileEntry {
-        path: entry.path.clone(),
-        before: new_before,
-        after: new_after,
-        op: inverse_op.to_string(),
-        skipped: false,
-        withheld: false,
-        baseline_unknown: false,
-        skipped_reason: None,
-        after_synthesized: None,
-        link_kind: None,
-        attribution: None,
-    })
-}
-
-/// Write `entry.before`'s blob to `path` (creating parent dirs), then verify
-/// by re-reading and re-hashing. Returns the (already-known) `before` hash on
-/// success — the content is byte-identical by construction, verified.
-fn restore_from_before(
-    path: &Path,
-    store: &BlobStore,
-    entry: &FileEntry,
-) -> Result<String, String> {
-    // F2, second gate. `build_plan::symlink_refusal` already keeps every
-    // link-involved entry out of the revert set; this repeats the check at
-    // the write primitive itself so no future caller of `restore_from_before`
-    // can reach `fs::write` on a link by skipping the planner. The `create`
-    // arm's `remove_file` is covered by the planner gate only — `remove_file`
-    // unlinks the link rather than following it, so it destroys a link but
-    // cannot truncate a file outside the plan.
-    if entry.link_kind.is_some() || is_symlink_on_disk(path) {
-        return Err(format!(
-            "{}: symlink — refusing to restore (writing here would replace the link or \
-             truncate its target)",
-            entry.path
-        ));
-    }
-    let before_hash = entry
-        .before
-        .as_deref()
-        .ok_or_else(|| format!("{}: no prior snapshot to restore", entry.path))?;
-    let bytes = store
-        .get(before_hash)
-        .map_err(|e| format!("{}: {e}", entry.path))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{}: failed to create parent dirs: {e}", entry.path))?;
-    }
-    std::fs::write(path, &bytes).map_err(|e| format!("{}: failed to write: {e}", entry.path))?;
-    let readback = std::fs::read(path)
-        .map_err(|e| format!("{}: failed to verify after write: {e}", entry.path))?;
-    if hash_bytes(&readback) != before_hash {
-        return Err(format!(
-            "{}: verification failed after restore (byte mismatch)",
-            entry.path
-        ));
-    }
-    Ok(before_hash.to_string())
 }
 
 /// E8: `Some(reason)` when an unexpired H7 coordination guard already exists
@@ -859,7 +751,7 @@ fn restore_from_before(
 /// it (clobbering would let the first undo's in-flight writes be mistaken
 /// for a bare turn, and the two guards would delete each other on cleanup).
 /// An absent, malformed, or expired guard is not live: `None`.
-fn live_undo_guard_reason(root: &Path) -> Option<String> {
+pub(crate) fn live_undo_guard_reason(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(undo_guard_path(root)).ok()?;
     let guard: UndoGuard = serde_json::from_str(&text).ok()?;
     if guard.until_ms > wall_now_ms() {
@@ -873,7 +765,7 @@ fn live_undo_guard_reason(root: &Path) -> Option<String> {
 }
 
 /// Write the H7 coordination guard before any file mutation begins.
-fn write_undo_guard(root: &Path, paths: &[String]) -> Result<(), String> {
+pub(crate) fn write_undo_guard(root: &Path, paths: &[String]) -> Result<(), String> {
     let guard = UndoGuard {
         paths: paths.to_vec(),
         until_ms: wall_now_ms() + 30_000,
@@ -901,7 +793,7 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 /// Wait out [`GUARD_LINGER`], then best-effort remove the guard — the
 /// `until_ms` deadline written alongside it is the backstop if this doesn't
 /// run at all (e.g. the process is killed mid-revert).
-fn finish_undo_guard(root: &Path) {
+pub(crate) fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
 }
@@ -909,6 +801,9 @@ fn finish_undo_guard(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Moved to core in F3 alongside `execute_revert`; used only by this
+    // module's tests, which are the behavior-preservation proof for the move.
+    use agentrec_core::undo_coordinator::restore_from_before;
 
     fn entry(path: &str, op: &str) -> FileEntry {
         FileEntry {

@@ -1170,17 +1170,47 @@ fn undo_tool(
                 }),
             }
         }
-        UndoAction::Request | UndoAction::Status | UndoAction::Execute => {
-            Err(ToolFailure::Domain {
-                code: "not_implemented",
-                message: format!(
-                    "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
-                     version of agentrec",
-                    action.as_str(),
-                    mode_str(mode)
-                ),
-            })
+        // F3. Confirm mode only (the matrix above already enforced it); the
+        // coordinator re-checks the mode itself rather than trusting the
+        // router. Same shape as `Preview`: parse, call the seam, encode the
+        // typed value through the shared `encode`.
+        UndoAction::Request => {
+            let req = undo_coordinator::UndoRequest {
+                turn: required_str_arg(args, "turn")?,
+                paths: string_array_arg(args, "paths")?
+                    .map(|v| v.into_iter().map(std::path::PathBuf::from).collect()),
+                allow_modified: bool_arg(args, "allow_modified")?,
+            };
+            match undo_coordinator::UndoCoordinator::new(root).request_human(req, mode) {
+                Ok(pending) => encode(&pending),
+                Err(e) => Err(ToolFailure::Domain {
+                    code: e.code(),
+                    message: e.to_string(),
+                }),
+            }
         }
+        // F3. A pure read — this is the ONLY thing an agent may do to a
+        // lodged request after lodging it (":641-697: The agent only polls
+        // `status` and can never execute a merely-approved request").
+        UndoAction::Status => {
+            let request_id = required_str_arg(args, "request_id")?;
+            match undo_coordinator::UndoCoordinator::new(root).status(&request_id) {
+                Ok(status) => encode(&status),
+                Err(e) => Err(ToolFailure::Domain {
+                    code: e.code(),
+                    message: e.to_string(),
+                }),
+            }
+        }
+        UndoAction::Execute => Err(ToolFailure::Domain {
+            code: "not_implemented",
+            message: format!(
+                "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
+                 version of agentrec",
+                action.as_str(),
+                mode_str(mode)
+            ),
+        }),
     }
 }
 
@@ -1278,7 +1308,7 @@ mod tests {
         let code = |mode, args: Value| match undo_tool(tmp.path(), mode, &args) {
             Err(ToolFailure::Domain { code, .. }) => code,
             Err(ToolFailure::BadParams(m)) => panic!("unexpected -32602: {m}"),
-            Ok(payload) => panic!("F1 implements no sub-action; got {payload}"),
+            Ok(payload) => panic!("every cell probed here must refuse; got {payload}"),
         };
         let (confirm, auto) = (
             config::McpDestructive::Confirm,
@@ -1290,13 +1320,17 @@ mod tests {
             code(auto, json!({"action": "preview", "allow_modified": true})),
             "allow_modified_refused"
         );
-        // The override path decision 6 keeps open.
+        // The override path decision 6 keeps open. F3 made this cell live, so
+        // it now reaches the coordinator and answers with the REPOSITORY's
+        // refusal (an empty root has no turns) rather than the router's — the
+        // same shift `preview` made in F2. What is still pinned here is that
+        // the flag is NOT refused in confirm mode.
         assert_eq!(
             code(
                 confirm,
-                json!({"action": "request", "allow_modified": true})
+                json!({"action": "request", "turn": "t_NOPE", "allow_modified": true})
             ),
-            "not_implemented"
+            "no_turns"
         );
         // Rail before matrix: both would fire; the rail wins.
         assert_eq!(
@@ -1304,8 +1338,13 @@ mod tests {
             "allow_modified_refused"
         );
         for mode in [confirm, auto] {
-            // `status` is still F3's.
-            assert_eq!(code(mode, json!({"action": "status"})), "not_implemented");
+            // `status` is live as of F3, in BOTH modes (F1's matrix put no
+            // mode qualifier on it). An unknown id is the repository
+            // answering, not the router refusing.
+            assert_eq!(
+                code(mode, json!({"action": "status", "request_id": "nope"})),
+                "unknown_request"
+            );
             // `preview` is F2's and now reaches the coordinator in BOTH
             // modes — the refusal it returns is the repository's, not the
             // router's.
@@ -1314,6 +1353,10 @@ mod tests {
                 "no_turns"
             );
         }
+        // `execute` is the one sub-action F3 leaves unbuilt (it is F4's), and
+        // in the mode that permits it the answer is still `not_implemented`
+        // rather than the matrix's `wrong_mode`.
+        assert_eq!(code(auto, json!({"action": "execute"})), "not_implemented");
         // The rail still precedes the (now live) preview body: an auto-mode
         // preview carrying the flag never reaches the coordinator at all.
         assert_eq!(

@@ -1,9 +1,43 @@
 //! `UndoCoordinator` — the seam every destructive decision goes through,
 //! independent of CLI or MCP transport (parent spec :286-318).
 //!
-//! **Task F2 ships `preview` + path reservations only.** `execute`,
-//! `request_human`, `resolve` and `status` are F3/F4's; nothing here writes
-//! to the working tree, and nothing here appends an undo turn.
+//! **Task F2 shipped `preview` + path reservations. Task F3 adds the
+//! confirm-mode request ledger** — `request_human`, `status`, the terminal
+//! writers (`deny`/`expire`/`execute`/`fail`) and the revert primitive
+//! [`execute_revert`], moved here from `cli/src/readcmds.rs` so `agentrec
+//! approve` and the CLI's own `undo --confirm` share one execution path. The
+//! undo-*turn* append still belongs to the CLI (`cli/src/approvecmd.rs`, via
+//! `loglock`); core owns the decision and the writes, not the log writer.
+//! `execute` (the auto-mode tokened path) is still F4's.
+//!
+//! ## The five states, and why one of them is never written here
+//!
+//! Parent :641-697 wants `status` to distinguish pending / approved /
+//! denied / expired / executed. F3 derives them from the append-only event
+//! stream, plus a sixth — `failed` — because the spec also says "Deny,
+//! expiry, failure, or successful execution appends the terminal transition
+//! that releases the reservation", and a drift-aborted approval has to land
+//! somewhere honest rather than being reported as one of the other five.
+//!
+//! **`approved` is recognized on read and never written by F3, on purpose.**
+//! The durable approval event is appended only AFTER the working-tree writes
+//! and the undo turn's `sync_all`, so at every instant a crash can occur the
+//! ledger reads either "pending" (nothing was approved) or "executed" (the
+//! whole thing landed). That is exactly the parent spec's "restart cannot
+//! convert an unapproved request into an approval": nothing that is not a
+//! durably-written human decision may ever read as approved. Writing
+//! `approve` *before* executing would create the phantom the rule forbids.
+//! The status stays in the vocabulary because a host-native approval UI
+//! (D23's A4) may one day separate the decision from the execution, and a
+//! reader that did not recognize the event would silently report such a
+//! request as pending. F2 set this precedent: it recognized all six
+//! transitions on read while writing exactly one.
+//!
+//! The two crash consequences are both correct, and neither is a bug: a
+//! crash before any file was written leaves the request re-approvable, and a
+//! re-approve legitimately executes; a crash part-way through the writes
+//! makes the recorded per-path hashes disagree with the disk, so the next
+//! approve aborts with `preview_stale` and requires a fresh request.
 //!
 //! ## Why the plan interpretation lives in this crate now
 //!
@@ -47,11 +81,13 @@
 //! pre-sanction the file — "the 2.3 request ledger is a NEW append-only file
 //! under `.agentrec/`, not a rewrite class".
 //!
-//! **In F2 the only thing that ends a reservation is TTL expiry.** The event
-//! vocabulary below names all six transitions the spec lists, but F2 writes
-//! exactly one of them (`reserve`); there is no terminal-event writer until
-//! F3's deny/expire and F4's execute/fail. A 60-second auto token therefore
-//! holds its paths for at most 60 seconds and then lapses on its own.
+//! In F2 the only thing that ended a reservation was TTL expiry. **F3 adds
+//! the terminal writers** — `deny`, `expire` (appended lazily, by whichever
+//! approve/deny first observes a lapsed request), `execute`, and `fail` —
+//! so a resolved request releases its paths immediately instead of holding
+//! them for the rest of its TTL. A confirm-mode `request` is a reservation
+//! too, not only F2's auto `reserve`: an auto preview must not hand out a
+//! token overlapping paths a human is being asked to approve.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -99,6 +135,17 @@ pub type TurnId = String;
 /// How long an auto-mode confirm token stays valid (parent :286-318, and
 /// :641-697's "single-use 60 s token").
 pub const TOKEN_TTL_MS: u64 = 60_000;
+
+/// How long a confirm-mode pending request stays approvable.
+///
+/// **Ten minutes, from D23 itself** (IMPLEMENTATION.md decision register):
+/// "`confirm` mode approval UX (v2): `agentrec approve` lists pending undo
+/// requests; approve/deny by id; **pending requests expire after 10
+/// minutes**." Deliberately its own constant rather than a reuse of
+/// [`TOKEN_TTL_MS`]: an auto token and a human approval window are different
+/// deadlines for different actors, and folding them into one would silently
+/// expire every request in 60 seconds while an expiry test still passed.
+pub const REQUEST_TTL_MS: u64 = 600_000;
 
 /// The request/reservation ledger's schema version. Independent of
 /// PROTOCOL.md's `v`: this file is agentrec-internal, never a wire surface,
@@ -224,6 +271,35 @@ pub enum UndoError {
     },
     /// No usable entropy source for a consent token — see [`crate::id::random_token`].
     TokenUnavailable,
+    /// F3: `request_human` outside confirm mode. Defence in depth — the MCP
+    /// matrix already refuses it with `wrong_mode`, and the coordinator
+    /// refuses independently rather than trusting one caller.
+    ConfirmModeOnly(&'static str),
+    /// F3: nothing in the turn is executable, so there is nothing to lodge.
+    /// A pending request granting zero writes is a decision a human would be
+    /// asked to make for no effect — the same reasoning that keeps auto from
+    /// issuing a token for an empty executable set.
+    NothingExecutable,
+    /// F3: no `request` event carries this id.
+    UnknownRequest(String),
+    /// F3: an id PREFIX matching more than one request.
+    AmbiguousRequest {
+        request_ref: String,
+        matched: usize,
+    },
+    /// F3: the request exists but is no longer approvable. Carries the state
+    /// it is actually in, so a second `approve` says "already executed"
+    /// rather than a generic failure.
+    NotPending {
+        request: String,
+        state: &'static str,
+    },
+    /// F3: the working tree moved between the request and the approval. No
+    /// writes happened; a fresh request is required.
+    PreviewStale {
+        request: String,
+        paths: Vec<String>,
+    },
     Io(String),
 }
 
@@ -239,6 +315,15 @@ impl UndoError {
             UndoError::UnknownPaths(_) => "unknown_path",
             UndoError::Conflict { .. } => "undo_conflict",
             UndoError::TokenUnavailable => "token_unavailable",
+            UndoError::ConfirmModeOnly(_) => "wrong_mode",
+            UndoError::NothingExecutable => "nothing_to_revert",
+            UndoError::UnknownRequest(_) => "unknown_request",
+            UndoError::AmbiguousRequest { .. } => "ambiguous_request",
+            UndoError::NotPending { .. } => "not_pending",
+            // The name the parent spec gives approval drift, unchanged:
+            // ":641-697 Approval drift records `preview_stale` and requires a
+            // new request."
+            UndoError::PreviewStale { .. } => "preview_stale",
             UndoError::Io(_) => "repo_error",
         }
     }
@@ -271,6 +356,33 @@ impl std::fmt::Display for UndoError {
             UndoError::TokenUnavailable => write!(
                 f,
                 "cannot issue a confirm token: no system entropy source available"
+            ),
+            UndoError::ConfirmModeOnly(mode) => write!(
+                f,
+                "agent-undo mode is {mode:?}: lodging a request for human approval requires \
+                 \"confirm\" mode"
+            ),
+            UndoError::NothingExecutable => write!(
+                f,
+                "nothing in this turn is executable — no request was lodged"
+            ),
+            UndoError::UnknownRequest(r) => write!(f, "no undo request matches {r:?}"),
+            UndoError::AmbiguousRequest {
+                request_ref,
+                matched,
+            } => write!(
+                f,
+                "{request_ref:?} matches {matched} undo requests — use a longer prefix"
+            ),
+            UndoError::NotPending { request, state } => write!(
+                f,
+                "undo request {request} is {state}, not pending — nothing was written"
+            ),
+            UndoError::PreviewStale { request, paths } => write!(
+                f,
+                "undo request {request} is stale: {} changed since it was lodged — nothing was \
+                 written; ask for a fresh preview and a new request",
+                paths.join(", ")
             ),
             UndoError::Io(m) => write!(f, "{m}"),
         }
@@ -546,7 +658,7 @@ impl UndoCoordinator {
             .map_err(|e| UndoError::Io(format!("cannot create {}: {e}", dir.display())))?;
         crate::perms::lock_dir(&dir);
 
-        let _guard = LockGuard::acquire(&self.lock_path())?;
+        let _guard = UndoLock::acquire(&self.lock_path())?;
 
         let existing = self.live_reservations()?;
         let wanted: HashSet<&str> = paths.iter().map(String::as_str).collect();
@@ -578,6 +690,10 @@ impl UndoCoordinator {
             token_sha256: Some(hash_bytes(token.as_bytes())),
             expires_unix_ms: now + TOKEN_TTL_MS,
             at_unix_ms: now,
+            hashes: Vec::new(),
+            allow_modified: false,
+            undo_turn: None,
+            reason: None,
         };
         self.append_event(&event)?;
         Ok(Reservation {
@@ -605,6 +721,341 @@ impl UndoCoordinator {
         crate::perms::lock_file(&path);
         Ok(())
     }
+
+    // ---- F3: the confirm-mode request ledger ------------------------------
+
+    /// Take `.agentrec/undo.lock`. Public because `agentrec approve` has to
+    /// hold ONE lock across recheck → working-tree writes → undo-turn
+    /// append/fsync → terminal append (parent :286-318), and the undo-turn
+    /// append is the CLI's (`loglock`), not core's. Handing the caller the
+    /// guard is what lets the two crates share a single critical section
+    /// without core learning about the log writer.
+    pub fn lock(&self) -> Result<UndoLock, UndoError> {
+        let dir = self.agentrec_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| UndoError::Io(format!("cannot create {}: {e}", dir.display())))?;
+        crate::perms::lock_dir(&dir);
+        UndoLock::acquire(&self.lock_path())
+    }
+
+    /// Every ledger event, oldest first. Unparseable lines are skipped.
+    pub fn events(&self) -> Result<Vec<LedgerEvent>, UndoError> {
+        match std::fs::read_to_string(self.ledger_path()) {
+            Ok(t) => Ok(parse_ledger(&t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(UndoError::Io(format!(
+                "cannot read {}: {e}",
+                self.ledger_path().display()
+            ))),
+        }
+    }
+
+    /// Lodge a pending request for a human to approve or deny out of band
+    /// (parent :641-697 `request`; D23).
+    ///
+    /// The lock is taken FIRST and the preview computed under it, so the
+    /// conflict check and the append cannot straddle a window in which
+    /// another process reserved the same paths. That is safe only because a
+    /// confirm-mode `preview` reserves nothing and therefore never re-enters
+    /// [`Self::reserve`] — an auto-mode preview would deadlock on its own
+    /// lock, which is why this method refuses any other mode outright.
+    pub fn request_human(
+        &self,
+        req: UndoRequest,
+        mode: McpDestructive,
+    ) -> Result<PendingUndo, UndoError> {
+        if mode != McpDestructive::Confirm {
+            return Err(UndoError::ConfirmModeOnly(mode.as_str()));
+        }
+        let lock = self.lock()?;
+
+        let preview = self.preview(req, mode)?;
+        if preview.files.is_empty() {
+            return Err(UndoError::NothingExecutable);
+        }
+        let paths: Vec<String> = preview.files.iter().map(|f| f.path.clone()).collect();
+
+        // Conflict check under the lock, against BOTH reservation kinds.
+        let live = self.live_reservations()?;
+        let wanted: HashSet<&str> = paths.iter().map(String::as_str).collect();
+        for ev in &live {
+            let overlap: Vec<String> = ev
+                .paths
+                .iter()
+                .filter(|p| wanted.contains(p.as_str()))
+                .cloned()
+                .collect();
+            if !overlap.is_empty() {
+                return Err(UndoError::Conflict {
+                    reservation: ev.id.clone(),
+                    paths: overlap,
+                });
+            }
+        }
+
+        // The drift baseline: what each path holds RIGHT NOW, which is what
+        // the human is being shown. Recorded as `Option`, so absent → present
+        // is drift and absent → absent is not.
+        let hashes: Vec<Option<String>> = paths
+            .iter()
+            .map(|p| read_current_hash(&self.root, p))
+            .collect();
+
+        let now = now_ms();
+        let event = LedgerEvent {
+            v: LEDGER_V,
+            event: EVENT_REQUEST.to_string(),
+            id: crate::id::ulid(),
+            turn: preview.turn.clone(),
+            paths,
+            token_sha256: None,
+            expires_unix_ms: now + REQUEST_TTL_MS,
+            at_unix_ms: now,
+            hashes,
+            allow_modified: preview.allow_modified_effective,
+            undo_turn: None,
+            reason: None,
+        };
+        self.append_event(&event)?;
+        drop(lock);
+
+        Ok(PendingUndo {
+            status: PendingStatus {
+                request: event.id.clone(),
+                state: RequestState::Pending,
+                turn: event.turn.clone(),
+                paths: event.paths.clone(),
+                allow_modified: event.allow_modified,
+                requested_unix_ms: event.at_unix_ms,
+                expires_unix_ms: event.expires_unix_ms,
+                undo_turn: None,
+                reason: None,
+            },
+            preview,
+        })
+    }
+
+    /// Resolve a request id — full, or an unambiguous prefix — to its
+    /// `request` event. A prefix matching two requests is refused rather
+    /// than resolved to the first, exactly as [`view::resolve_turn`] refuses
+    /// an ambiguous turn prefix.
+    pub fn resolve_request(
+        &self,
+        events: &[LedgerEvent],
+        request_ref: &str,
+    ) -> Result<LedgerEvent, UndoError> {
+        let matches: Vec<&LedgerEvent> = events
+            .iter()
+            .filter(|e| e.event == EVENT_REQUEST)
+            .filter(|e| e.id == request_ref || e.id.starts_with(request_ref))
+            .collect();
+        match matches.len() {
+            0 => Err(UndoError::UnknownRequest(request_ref.to_string())),
+            1 => Ok(matches[0].clone()),
+            n => Err(UndoError::AmbiguousRequest {
+                request_ref: request_ref.to_string(),
+                matched: n,
+            }),
+        }
+    }
+
+    /// One request's current state (parent :641-697 `status`).
+    pub fn status(&self, request_ref: &str) -> Result<PendingStatus, UndoError> {
+        let events = self.events()?;
+        let request = self.resolve_request(&events, request_ref)?;
+        Ok(self.status_of(&request, &events, now_ms()))
+    }
+
+    /// [`Self::status`] against an already-read event list — the form the
+    /// approve path uses so it reports the state it decided on, not a state
+    /// re-read after the fact.
+    pub fn status_of(
+        &self,
+        request: &LedgerEvent,
+        events: &[LedgerEvent],
+        now: u64,
+    ) -> PendingStatus {
+        let state = state_from_events(request, events, now);
+        let resolution = events
+            .iter()
+            .rev()
+            .find(|e| e.id == request.id && TERMINAL_EVENTS.contains(&e.event.as_str()));
+        PendingStatus {
+            request: request.id.clone(),
+            state,
+            turn: request.turn.clone(),
+            paths: request.paths.clone(),
+            allow_modified: request.allow_modified,
+            requested_unix_ms: request.at_unix_ms,
+            expires_unix_ms: request.expires_unix_ms,
+            undo_turn: resolution.and_then(|e| e.undo_turn.clone()),
+            reason: resolution.and_then(|e| e.reason.clone()),
+        }
+    }
+
+    /// Every request that is still awaiting a human, oldest first — what
+    /// bare `agentrec approve` lists (D23: "`agentrec approve` lists pending
+    /// undo requests").
+    pub fn pending_requests(&self) -> Result<Vec<PendingStatus>, UndoError> {
+        let events = self.events()?;
+        let now = now_ms();
+        Ok(events
+            .iter()
+            .filter(|e| e.event == EVENT_REQUEST)
+            .map(|e| self.status_of(e, &events, now))
+            .filter(|s| s.state == RequestState::Pending)
+            .collect())
+    }
+
+    /// Claim a pending request for execution, under a lock the CALLER
+    /// already holds.
+    ///
+    /// Returns the request event and the plan its approval would apply. Every
+    /// refusal here is terminal-appending where the spec says it should be —
+    /// a lapsed request gets its `expire` row, approval drift gets its `fail`
+    /// row with reason `preview_stale` — and **none of them writes to the
+    /// working tree**. The caller does the writes; this decides whether there
+    /// are any.
+    pub fn claim(&self, lock: &UndoLock, request_ref: &str) -> Result<Claim, UndoError> {
+        let events = self.events()?;
+        let request = self.resolve_request(&events, request_ref)?;
+        let now = now_ms();
+        match state_from_events(&request, &events, now) {
+            RequestState::Pending => {}
+            RequestState::Expired => {
+                // Record the lapse the clock already decided, then refuse.
+                self.append_terminal(lock, &request, EVENT_EXPIRE, None, None)?;
+                return Err(UndoError::NotPending {
+                    request: request.id.clone(),
+                    state: RequestState::Expired.as_str(),
+                });
+            }
+            other => {
+                return Err(UndoError::NotPending {
+                    request: request.id.clone(),
+                    state: other.as_str(),
+                })
+            }
+        }
+
+        // Drift: compare each path's CURRENT bytes against what it held when
+        // the request was lodged. Not a re-run of the planner — with
+        // `allow_modified` the planner admits an already-modified file, so it
+        // cannot see this at all.
+        let drifted: Vec<String> = request
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| request.hashes.get(*i) != Some(&read_current_hash(&self.root, p)))
+            .map(|(_, p)| p.clone())
+            .collect();
+        if !drifted.is_empty() {
+            self.append_terminal(
+                lock,
+                &request,
+                EVENT_FAIL,
+                None,
+                Some("preview_stale".to_string()),
+            )?;
+            return Err(UndoError::PreviewStale {
+                request: request.id.clone(),
+                paths: drifted,
+            });
+        }
+
+        let records = crate::record::load_log(&self.log_path());
+        let turns: Vec<&TurnRecord> = records
+            .iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+        let target = view::resolve_turn(&turns, &request.turn)
+            .map_err(|_| UndoError::UnknownTurn(request.turn.clone()))?;
+        let target_idx = turns.iter().position(|t| t.id == target.id).unwrap_or(0);
+        let store = BlobStore::new(self.objects_dir());
+        let plans = build_plan(
+            &self.root,
+            &store,
+            target,
+            target_idx,
+            &turns,
+            &records,
+            &request.paths,
+            request.allow_modified,
+        );
+        Ok(Claim {
+            target: target.clone(),
+            plans,
+            request,
+        })
+    }
+
+    /// Deny a pending request: a terminal row, and not one byte written to
+    /// the working tree (parent :641-697, D23).
+    pub fn deny(&self, request_ref: &str) -> Result<PendingStatus, UndoError> {
+        let lock = self.lock()?;
+        let events = self.events()?;
+        let request = self.resolve_request(&events, request_ref)?;
+        let now = now_ms();
+        match state_from_events(&request, &events, now) {
+            RequestState::Pending => {}
+            RequestState::Expired => {
+                self.append_terminal(&lock, &request, EVENT_EXPIRE, None, None)?;
+                return Err(UndoError::NotPending {
+                    request: request.id.clone(),
+                    state: RequestState::Expired.as_str(),
+                });
+            }
+            other => {
+                return Err(UndoError::NotPending {
+                    request: request.id.clone(),
+                    state: other.as_str(),
+                })
+            }
+        }
+        self.append_terminal(&lock, &request, EVENT_DENY, None, None)?;
+        let events = self.events()?;
+        Ok(self.status_of(&request, &events, now_ms()))
+    }
+
+    /// Append the terminal row that resolves `request`. Caller must hold
+    /// [`Self::lock`] — the `&UndoLock` parameter is how that is stated in
+    /// the type system rather than in a comment.
+    pub fn append_terminal(
+        &self,
+        _lock: &UndoLock,
+        request: &LedgerEvent,
+        event: &str,
+        undo_turn: Option<String>,
+        reason: Option<String>,
+    ) -> Result<(), UndoError> {
+        let mut ev = LedgerEvent::terminal(event, request, now_ms());
+        ev.undo_turn = undo_turn;
+        ev.reason = reason;
+        self.append_event(&ev)
+    }
+
+    /// Apply one file's revert, snapshotting its current bytes first. Thin
+    /// re-export of [`execute_revert`] bound to this coordinator's root and
+    /// store, so a caller that already has a coordinator does not have to
+    /// rebuild either.
+    pub fn revert_file(&self, entry: &FileEntry) -> Result<FileEntry, String> {
+        let store = BlobStore::new(self.objects_dir());
+        execute_revert(&self.root, &store, entry)
+    }
+}
+
+/// What [`UndoCoordinator::claim`] hands back: the request it claimed, the
+/// turn that request targets, and the per-file plan an approval applies. The
+/// target travels with the plan because the caller has to RENDER it, and
+/// re-resolving the turn on the CLI side would be a second lookup that could
+/// disagree with the one the plan was built from.
+pub struct Claim {
+    pub request: LedgerEvent,
+    pub target: TurnRecord,
+    pub plans: Vec<Plan>,
 }
 
 /// What [`UndoCoordinator::reserve`] hands back: the ledger row's id, the
@@ -617,15 +1068,44 @@ struct Reservation {
 
 // ---- the event ledger ------------------------------------------------------
 
-/// The reservation event. F2 writes this one only.
+/// The auto-mode reservation event (F2): a token was issued for these paths.
 pub const EVENT_RESERVE: &str = "reserve";
 
-/// Terminal transitions the parent spec names — "request, approve, deny,
-/// expire, execute, and fail are state transitions" — recognized as
-/// reservation-releasing when reading the ledger so an F3/F4 writer needs no
-/// change here. **F2 writes none of them**: today a reservation is released
-/// by TTL expiry alone.
-pub const TERMINAL_EVENTS: &[&str] = &["deny", "expire", "execute", "fail"];
+/// The confirm-mode pending-request event (F3): a human has been asked to
+/// approve these paths.
+pub const EVENT_REQUEST: &str = "request";
+
+/// A human said yes. **Never written by F3** — see the module header: the
+/// durable approval is [`EVENT_EXECUTE`], appended only after the writes and
+/// the undo turn's fsync, so an interrupted approval can never read as one.
+pub const EVENT_APPROVE: &str = "approve";
+/// A human said no (F3). Terminal; no working-tree write happened.
+pub const EVENT_DENY: &str = "deny";
+/// The approval window lapsed (F3). Appended lazily by whichever `approve`
+/// or `deny` first observes it, so the ledger records the lapse rather than
+/// leaving it implicit in a timestamp comparison.
+pub const EVENT_EXPIRE: &str = "expire";
+/// The revert ran to completion and its undo turn is in `log.jsonl` (F3).
+pub const EVENT_EXECUTE: &str = "execute";
+/// The approval was abandoned without completing (F3): today only approval
+/// drift, whose `reason` is `preview_stale`.
+pub const EVENT_FAIL: &str = "fail";
+
+/// The two events that CREATE a reservation. Both, not just F2's `reserve`:
+/// a confirm-mode pending request holds its paths exactly as an auto token
+/// does, and if it did not, an auto preview could mint a token overlapping
+/// the paths a human is being asked to approve — two live grants over one
+/// file, which is the state P6 exists to make impossible.
+pub const RESERVING_EVENTS: &[&str] = &[EVENT_RESERVE, EVENT_REQUEST];
+
+/// The transitions that RELEASE a reservation. The parent spec's list is
+/// "Deny, expiry, failure, or successful execution appends the terminal
+/// transition that releases the reservation" — `approve` is deliberately
+/// absent even though it is a state transition, because an approved-but-not-
+/// yet-executed request still intends to write to its paths, and releasing
+/// them would let an overlapping grant exist alongside it. F3 writes all four
+/// of these.
+pub const TERMINAL_EVENTS: &[&str] = &[EVENT_DENY, EVENT_EXPIRE, EVENT_EXECUTE, EVENT_FAIL];
 
 /// One append-only line of `.agentrec/undo-requests.jsonl`. Unknown fields on
 /// a known event are tolerated (the additive-only consumer contract), and an
@@ -642,17 +1122,73 @@ pub struct LedgerEvent {
     pub token_sha256: Option<String>,
     pub expires_unix_ms: u64,
     pub at_unix_ms: u64,
+
+    // ---- F3, additive; every one defaults so an F2-written line still
+    // ---- deserializes unchanged.
+    /// Parallel to [`Self::paths`]: the on-disk content hash each path had
+    /// when the request was lodged, `None` for an absent file. This — not a
+    /// re-run of `build_plan` — is what detects approval drift, because with
+    /// `allow_modified: true` the planner deliberately admits a file whose
+    /// content already differs from the turn's `after`, so the planner alone
+    /// would see no drift at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hashes: Vec<Option<String>>,
+    /// The `allow_modified` the request was lodged with, so the approval
+    /// rebuilds the SAME executable set a human was shown rather than a
+    /// stricter or looser one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_modified: bool,
+    /// On [`EVENT_EXECUTE`]: the id of the undo turn appended to
+    /// `log.jsonl`, so a resolved request points at its own evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_turn: Option<String>,
+    /// On [`EVENT_FAIL`]: why. Today only `preview_stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl LedgerEvent {
+    /// A terminal event resolving `request`. Carries the same `id` — F2's
+    /// convention, on which [`live_from_ledger`] already depends ("a
+    /// `reserve` event is live iff nothing terminal carries its id") — plus
+    /// the turn, so a ledger line is readable without joining to its
+    /// request.
+    fn terminal(event: &str, request: &LedgerEvent, now: u64) -> Self {
+        LedgerEvent {
+            v: LEDGER_V,
+            event: event.to_string(),
+            id: request.id.clone(),
+            turn: request.turn.clone(),
+            paths: request.paths.clone(),
+            token_sha256: None,
+            expires_unix_ms: request.expires_unix_ms,
+            at_unix_ms: now,
+            hashes: Vec::new(),
+            allow_modified: false,
+            undo_turn: None,
+            reason: None,
+        }
+    }
+}
+
+/// Parse the ledger, skipping unparseable lines. See [`LedgerEvent`] for why
+/// a corrupt tail must not fail the whole read.
+fn parse_ledger(text: &str) -> Vec<LedgerEvent> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<LedgerEvent>(l).ok())
+        .collect()
 }
 
 /// Pure reader, split out so the liveness rule is testable without a
-/// filesystem: a `reserve` event is live iff nothing terminal carries its id
-/// and its expiry is still in the future.
+/// filesystem: a reservation-creating event ([`RESERVING_EVENTS`]) is live
+/// iff nothing terminal carries its id and its expiry is still in the future.
 fn live_from_ledger(text: &str, now: u64) -> Vec<LedgerEvent> {
-    let events: Vec<LedgerEvent> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<LedgerEvent>(l).ok())
-        .collect();
+    let events = parse_ledger(text);
     let released: HashSet<&str> = events
         .iter()
         .filter(|e| TERMINAL_EVENTS.contains(&e.event.as_str()))
@@ -660,11 +1196,106 @@ fn live_from_ledger(text: &str, now: u64) -> Vec<LedgerEvent> {
         .collect();
     events
         .iter()
-        .filter(|e| e.event == EVENT_RESERVE)
+        .filter(|e| RESERVING_EVENTS.contains(&e.event.as_str()))
         .filter(|e| !released.contains(e.id.as_str()))
         .filter(|e| e.expires_unix_ms > now)
         .cloned()
         .collect()
+}
+
+// ---- F3: request states ----------------------------------------------------
+
+/// What a lodged request currently is. The parent spec's five, plus
+/// `Failed` — see the module header for why `Approved` is recognized here and
+/// never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+    Executed,
+    Failed,
+}
+
+impl RequestState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestState::Pending => "pending",
+            RequestState::Approved => "approved",
+            RequestState::Denied => "denied",
+            RequestState::Expired => "expired",
+            RequestState::Executed => "executed",
+            RequestState::Failed => "failed",
+        }
+    }
+}
+
+/// Derive one request's state from every event carrying its id.
+///
+/// Precedence is by finality, not by file order: `execute` outranks
+/// everything (the writes landed and the undo turn exists, whatever else was
+/// appended), then the other terminals, then a bare `approve`. Only with no
+/// terminal at all does the clock decide, so a request whose window lapsed
+/// reads `expired` even before any `expire` event has been appended — the
+/// event records the lapse, it does not cause it.
+fn state_from_events(request: &LedgerEvent, events: &[LedgerEvent], now: u64) -> RequestState {
+    let mine = || events.iter().filter(|e| e.id == request.id);
+    if mine().any(|e| e.event == EVENT_EXECUTE) {
+        return RequestState::Executed;
+    }
+    if mine().any(|e| e.event == EVENT_DENY) {
+        return RequestState::Denied;
+    }
+    if mine().any(|e| e.event == EVENT_FAIL) {
+        return RequestState::Failed;
+    }
+    if mine().any(|e| e.event == EVENT_EXPIRE) {
+        return RequestState::Expired;
+    }
+    if mine().any(|e| e.event == EVENT_APPROVE) {
+        return RequestState::Approved;
+    }
+    if request.expires_unix_ms <= now {
+        return RequestState::Expired;
+    }
+    RequestState::Pending
+}
+
+/// What `request` returns to the agent and what `status` reports back.
+///
+/// `requested_unix_ms` is [`LedgerEvent::at_unix_ms`] and `turn` is
+/// [`LedgerEvent::turn`] — both were written but unread by F2, and both are
+/// what makes a pending row legible ("which turn, lodged when").
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingStatus {
+    /// The request id, which is also `agentrec approve`'s argument.
+    pub request: String,
+    pub state: RequestState,
+    /// The resolved turn this request would revert.
+    pub turn: String,
+    /// Exactly the paths an approval would write.
+    pub paths: Vec<String>,
+    pub allow_modified: bool,
+    pub requested_unix_ms: u64,
+    pub expires_unix_ms: u64,
+    /// Present once executed: the undo turn's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo_turn: Option<String>,
+    /// Present on a failed request: why (today, `preview_stale`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What `request_human` hands back: the freshly lodged request's status,
+/// with the bound preview alongside it so an agent does not have to call
+/// `preview` again to learn what a human is being asked to allow.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingUndo {
+    #[serde(flatten)]
+    pub status: PendingStatus,
+    pub preview: UndoPreview,
 }
 
 fn now_ms() -> u64 {
@@ -676,17 +1307,22 @@ fn now_ms() -> u64 {
 
 /// An exclusive advisory lock on `.agentrec/undo.lock`, released on drop.
 ///
+/// Public since F3: `agentrec approve` holds ONE of these across recheck,
+/// working-tree writes, the undo-turn append, and the terminal ledger row,
+/// and the undo-turn append lives in the CLI crate. Constructed only through
+/// [`UndoCoordinator::lock`].
+///
 /// `std::fs::File::lock` (stabilized in std; `flock(LOCK_EX)` on unix) rather
 /// than `libc` — `agentrec-core` has no `libc` dependency and adding one to a
 /// published crate to reach a primitive std already exposes is the wrong
 /// trade. The CLI's `loglock.rs`/`memlock.rs` predate the stable API and are
 /// deliberately left alone; this is not a second locking convention so much
 /// as the same `flock` reached without a dep.
-struct LockGuard {
+pub struct UndoLock {
     file: std::fs::File,
 }
 
-impl LockGuard {
+impl UndoLock {
     fn acquire(path: &Path) -> Result<Self, UndoError> {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -698,11 +1334,11 @@ impl LockGuard {
         crate::perms::lock_file(path);
         file.lock()
             .map_err(|e| UndoError::Io(format!("cannot lock {}: {e}", path.display())))?;
-        Ok(LockGuard { file })
+        Ok(UndoLock { file })
     }
 }
 
-impl Drop for LockGuard {
+impl Drop for UndoLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
@@ -728,6 +1364,132 @@ fn refusal_class(root: &Path, entry: &FileEntry) -> RefusalClass {
         return RefusalClass::Skipped;
     }
     RefusalClass::NoSnapshot
+}
+
+// ---- moved verbatim from `cli/src/readcmds.rs` (task F3) ------------------
+//
+// The revert PRIMITIVE, moved for the same reason F2 moved the planner: the
+// confirm-mode `agentrec approve` and the CLI's own `undo --confirm` must
+// write through one implementation, and a second one behind the approval
+// seam is exactly what this module exists to prevent. Bodies are
+// byte-for-byte the originals apart from the visibility widening this crate
+// boundary requires; `readcmds` re-imports `execute_revert` under its
+// original name, so its untouched test module resolves against the moved
+// code and its passing is the behavior-preservation proof.
+
+/// Apply one file's revert and return the inverse `FileEntry` for the new
+/// undo turn. Snapshots the CURRENT (pre-undo) bytes first — that becomes the
+/// inverse entry's `before`, so the undo is itself re-revertible (AC H6).
+/// Every write is verified by re-reading and re-hashing before returning Ok;
+/// a mismatch is a hard error, never a silent partial revert.
+pub fn execute_revert(
+    root: &Path,
+    store: &BlobStore,
+    entry: &FileEntry,
+) -> Result<FileEntry, String> {
+    let path = root.join(&entry.path);
+    let pre_bytes = match std::fs::read(&path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: cannot read before revert: {e}", entry.path)),
+    };
+    let new_before = match &pre_bytes {
+        Some(b) => Some(store.put(b).ok_or_else(|| {
+            format!(
+                "{}: failed to snapshot current content before revert",
+                entry.path
+            )
+        })?),
+        None => None,
+    };
+
+    let (new_after, inverse_op) = match entry.op.as_str() {
+        "create" => {
+            // E1: idempotent — a file already absent (deleted by something
+            // else since the turn) means the goal state ("file gone") is
+            // already reached; NotFound is success, not an error.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: failed to delete: {e}", entry.path)),
+            }
+            if path.exists() {
+                return Err(format!(
+                    "{}: still present after delete (revert of create)",
+                    entry.path
+                ));
+            }
+            (None, "delete")
+        }
+        "delete" => {
+            let restored = restore_from_before(&path, store, entry)?;
+            (Some(restored), "create")
+        }
+        _ => {
+            // "modify"
+            let restored = restore_from_before(&path, store, entry)?;
+            (Some(restored), "modify")
+        }
+    };
+
+    Ok(FileEntry {
+        path: entry.path.clone(),
+        before: new_before,
+        after: new_after,
+        op: inverse_op.to_string(),
+        skipped: false,
+        withheld: false,
+        baseline_unknown: false,
+        skipped_reason: None,
+        after_synthesized: None,
+        link_kind: None,
+        attribution: None,
+    })
+}
+
+/// Write `entry.before`'s blob to `path` (creating parent dirs), then verify
+/// by re-reading and re-hashing. Returns the (already-known) `before` hash on
+/// success — the content is byte-identical by construction, verified.
+pub fn restore_from_before(
+    path: &Path,
+    store: &BlobStore,
+    entry: &FileEntry,
+) -> Result<String, String> {
+    // F2, second gate. `build_plan::symlink_refusal` already keeps every
+    // link-involved entry out of the revert set; this repeats the check at
+    // the write primitive itself so no future caller of `restore_from_before`
+    // can reach `fs::write` on a link by skipping the planner. The `create`
+    // arm's `remove_file` is covered by the planner gate only — `remove_file`
+    // unlinks the link rather than following it, so it destroys a link but
+    // cannot truncate a file outside the plan.
+    if entry.link_kind.is_some() || is_symlink_on_disk(path) {
+        return Err(format!(
+            "{}: symlink — refusing to restore (writing here would replace the link or \
+             truncate its target)",
+            entry.path
+        ));
+    }
+    let before_hash = entry
+        .before
+        .as_deref()
+        .ok_or_else(|| format!("{}: no prior snapshot to restore", entry.path))?;
+    let bytes = store
+        .get(before_hash)
+        .map_err(|e| format!("{}: {e}", entry.path))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{}: failed to create parent dirs: {e}", entry.path))?;
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("{}: failed to write: {e}", entry.path))?;
+    let readback = std::fs::read(path)
+        .map_err(|e| format!("{}: failed to verify after write: {e}", entry.path))?;
+    if hash_bytes(&readback) != before_hash {
+        return Err(format!(
+            "{}: verification failed after restore (byte mismatch)",
+            entry.path
+        ));
+    }
+    Ok(before_hash.to_string())
 }
 
 // ---- moved verbatim from `cli/src/readcmds.rs` (task F2) ------------------
@@ -1533,6 +2295,10 @@ mod coordinator_tests {
                 token_sha256: None,
                 expires_unix_ms: expires,
                 at_unix_ms: 0,
+                hashes: Vec::new(),
+                allow_modified: false,
+                undo_turn: None,
+                reason: None,
             })
             .unwrap()
         };
