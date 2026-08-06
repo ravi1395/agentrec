@@ -1585,3 +1585,363 @@ mod e3 {
         );
     }
 }
+
+// =========================================================================
+// Task F1 — `agentrec_undo` mode gating + sub-action matrix
+// =========================================================================
+
+/// The mode matrix, and the one rail that fires before it.
+///
+/// **The matrix is read off the parent spec (:641-697), not off the plan's
+/// one-line shorthand, and the two differ.** The plan summarises confirm as
+/// "request/status path" and auto as "preview/execute path"; the normative
+/// source is wider in two cells and is what these tests pin:
+///
+/// * `preview` — **both** modes. ":641-697" describes it per-mode rather than
+///   per-permission: "In auto mode, successful preview atomically reserves
+///   executable paths and issues the token. In confirm mode it does not
+///   reserve until `request`." A confirm-mode preview is normative; it just
+///   reserves nothing.
+/// * `status` — **both** modes. It is the only sub-action carrying no mode
+///   qualifier at all, where `request` says "confirm mode only" and `execute`
+///   says "auto mode only". The confirm paragraph's "The agent only polls
+///   `status`" settles confirm; nothing anywhere forbids it in auto.
+///
+/// So: `preview` both, `status` both, `request` confirm-only, `execute`
+/// auto-only. F1 ships the matrix; F2-F4 ship the sub-actions, which is why
+/// every legal cell here answers `not_implemented`. A build implementing the
+/// shorthand instead reds `preview_and_status_are_legal_in_both_modes` on two
+/// of its four cells — measured, not inferred; see that test's own comment.
+mod f1 {
+    use super::*;
+    use serde_json::Value;
+
+    /// A minimal read-consumer root pinned to one `mcp_destructive` mode.
+    /// No store is seeded: F1's router refuses or defers before touching one.
+    fn root_with_mode(mode: &str) -> PathBuf {
+        let root = init_root();
+        std::fs::write(
+            root.join(".agentrec/config.toml"),
+            format!("mcp_destructive = \"{mode}\"\n"),
+        )
+        .expect("write config.toml");
+        root
+    }
+
+    fn tool_names(root: &Path) -> Vec<String> {
+        let responses = mcp(
+            root,
+            &format!("{}\n", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        );
+        responses[0]["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tools array missing: {}", responses[0]))
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn listed_tool(root: &Path, name: &str) -> Value {
+        let responses = mcp(
+            root,
+            &format!("{}\n", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+        );
+        responses[0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed: {}", responses[0]))
+            .clone()
+    }
+
+    /// One `tools/call` of `agentrec_undo` with the given arguments object.
+    fn undo(root: &Path, arguments: Value) -> Value {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "agentrec_undo", "arguments": arguments},
+        });
+        let responses = mcp(root, &format!("{frame}\n"));
+        assert_eq!(responses.len(), 1, "one response per call: {responses:#?}");
+        responses[0].clone()
+    }
+
+    /// The machine-readable `code` out of a domain refusal, asserting the
+    /// domain channel was used at all (`isError: true` result, not `-32602`).
+    fn domain(resp: &Value) -> (String, String) {
+        assert!(
+            resp.get("error").is_none(),
+            "expected a domain refusal, got a JSON-RPC error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "a refusal must set isError: {resp}"
+        );
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("refusal payload is JSON");
+        (
+            payload["error"].as_str().unwrap().to_string(),
+            payload["message"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// AC-F1 (a): `off` hides the tool.
+    ///
+    /// Two halves, because hiding a tool from `tools/list` while still
+    /// answering it would be a gate that only looks closed. The call's error
+    /// is asserted to be the UNKNOWN-tool refusal specifically — a build that
+    /// listed undo in a shared array and gated only the dispatch would answer
+    /// "registered but not implemented" here, which tells an agent the tool
+    /// exists.
+    #[test]
+    fn ac_f1_off_hides_the_undo_tool() {
+        let root = root_with_mode("off");
+        let names = tool_names(&root);
+        assert_eq!(names, READ_TOOLS, "off exposes exactly the five read tools");
+
+        let resp = undo(&root, serde_json::json!({"action": "preview"}));
+        assert!(
+            resp.get("result").is_none(),
+            "a hidden tool must not answer: {resp}"
+        );
+        assert_eq!(resp["error"]["code"], -32602);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("unknown tool") && msg.contains("agentrec_undo"),
+            "off must refuse undo as UNKNOWN, not as registered-but-unimplemented: {msg:?}"
+        );
+    }
+
+    /// AC-F1 (b): `confirm` and `auto` both list six tools, and the sixth
+    /// carries destructive annotations with the same key set the read tools
+    /// declare.
+    #[test]
+    fn ac_f1_confirm_and_auto_list_six_tools_with_destructive_annotations() {
+        for mode in ["confirm", "auto"] {
+            let root = root_with_mode(mode);
+            let names = tool_names(&root);
+            assert_eq!(
+                names.len(),
+                6,
+                "{mode}: five read tools + undo, got {names:?}"
+            );
+            assert_eq!(
+                names[..5],
+                READ_TOOLS[..],
+                "{mode}: the read tools keep their §8 table order"
+            );
+            assert_eq!(
+                names[5], "agentrec_undo",
+                "{mode}: undo is last, as in the §8 table"
+            );
+
+            let undo_tool = listed_tool(&root, "agentrec_undo");
+            let a = &undo_tool["annotations"];
+            assert_eq!(a["readOnlyHint"], false, "{mode}: {undo_tool}");
+            assert_eq!(a["destructiveHint"], true, "{mode}: {undo_tool}");
+            assert_eq!(a["idempotentHint"], false, "{mode}: {undo_tool}");
+            assert_eq!(a["openWorldHint"], false, "{mode}: {undo_tool}");
+
+            // Same key set as a read tool's annotations — a host reading four
+            // keys on five tools and two on the sixth is reading a bug.
+            let log_tool = listed_tool(&root, "agentrec_log");
+            let log_a = &log_tool["annotations"];
+            let read_keys: Vec<&String> = log_a.as_object().unwrap().keys().collect();
+            let undo_keys: Vec<&String> = a.as_object().unwrap().keys().collect();
+            assert_eq!(read_keys, undo_keys, "{mode}: annotation key sets differ");
+
+            // The read tools are unchanged by undo joining the list.
+            assert_eq!(log_a["readOnlyHint"], true, "{mode}");
+            assert_eq!(log_a["destructiveHint"], false, "{mode}");
+
+            assert_eq!(undo_tool["inputSchema"]["type"], "object");
+            assert!(undo_tool["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()));
+        }
+    }
+
+    /// AC-F1 (c): `confirm` rejects `execute`.
+    ///
+    /// The positive control is in the same test and the same config: a build
+    /// that refused every sub-action would satisfy the refusal assertion
+    /// alone. `request` — confirm's own sub-action — must reach the
+    /// not-yet-implemented answer instead.
+    #[test]
+    fn ac_f1_confirm_rejects_execute() {
+        let root = root_with_mode("confirm");
+
+        let (code, message) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "execute", "token": "t"}),
+        ));
+        assert_eq!(code, "wrong_mode", "{message}");
+        assert!(
+            message.contains("confirm") && message.contains("execute"),
+            "the refusal must name the effective mode and the sub-action: {message:?}"
+        );
+        assert!(
+            message.contains("auto"),
+            "the refusal must name the rail — which mode execute belongs to: {message:?}"
+        );
+
+        // Positive control: confirm's own path is legal, merely unbuilt.
+        let (code, _) = domain(&undo(&root, serde_json::json!({"action": "request"})));
+        assert_eq!(code, "not_implemented", "request is legal in confirm mode");
+    }
+
+    /// AC-F1 (d): `auto` rejects `request`, with the mirror-image control.
+    #[test]
+    fn ac_f1_auto_rejects_request() {
+        let root = root_with_mode("auto");
+
+        let (code, message) = domain(&undo(&root, serde_json::json!({"action": "request"})));
+        assert_eq!(code, "wrong_mode", "{message}");
+        assert!(
+            message.contains("auto") && message.contains("request"),
+            "the refusal must name the effective mode and the sub-action: {message:?}"
+        );
+        assert!(
+            message.contains("confirm"),
+            "the refusal must name the rail — which mode request belongs to: {message:?}"
+        );
+
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "execute", "token": "t"}),
+        ));
+        assert_eq!(code, "not_implemented", "execute is legal in auto mode");
+    }
+
+    /// AC-F1 (e): auto + `allow_modified: true` is refused (decision 6 /
+    /// PROTOCOL §8 as corrected by delta decision 15).
+    ///
+    /// Control: the byte-identical call WITHOUT the flag is legal. Without
+    /// it, a build refusing every auto preview would pass.
+    #[test]
+    fn ac_f1_auto_refuses_allow_modified() {
+        let root = root_with_mode("auto");
+
+        let (code, message) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": "abc", "allow_modified": true}),
+        ));
+        assert_eq!(code, "allow_modified_refused", "{message}");
+        assert!(
+            message.contains("auto"),
+            "the refusal must name the effective mode: {message:?}"
+        );
+        assert!(
+            message.contains("confirm"),
+            "the refusal must name the only override path: {message:?}"
+        );
+
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": "abc"}),
+        ));
+        assert_eq!(code, "not_implemented", "preview without the flag is legal");
+
+        // `false` is not "set" — an explicit false must behave as absence.
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "preview", "turn": "abc", "allow_modified": false}),
+        ));
+        assert_eq!(
+            code, "not_implemented",
+            "allow_modified: false is not the rail"
+        );
+    }
+
+    /// The rail keys on `auto`, NOT on the flag: decision 6 keeps an override
+    /// path open, and it is explicit human approval in confirm mode. Without
+    /// this test, "refuse `allow_modified: true` always" satisfies AC-F1's
+    /// four cases while deleting the only sanctioned override.
+    #[test]
+    fn confirm_does_not_refuse_allow_modified() {
+        let root = root_with_mode("confirm");
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "request", "turn": "abc", "allow_modified": true}),
+        ));
+        assert_eq!(
+            code, "not_implemented",
+            "confirm mode is the sanctioned override path — the rail must not fire here"
+        );
+    }
+
+    /// Ordering, pinned rather than left to accident: the `allow_modified`
+    /// rail is evaluated BEFORE the mode matrix, so the invariant "no
+    /// auto-mode call carrying `allow_modified: true` proceeds past argument
+    /// validation, for any sub-action" holds without an exception for
+    /// wrong-mode calls.
+    #[test]
+    fn the_allow_modified_rail_precedes_the_mode_matrix() {
+        let root = root_with_mode("auto");
+        let (code, _) = domain(&undo(
+            &root,
+            serde_json::json!({"action": "request", "allow_modified": true}),
+        ));
+        assert_eq!(
+            code, "allow_modified_refused",
+            "the rail fires first; `wrong_mode` here would leave the invariant holed"
+        );
+    }
+
+    /// `preview` and `status` are legal in BOTH modes (see this module's doc
+    /// comment for the derivation from parent :641-697).
+    ///
+    /// **All four cells are evaluated before anything is asserted, so the
+    /// failure names every cell that broke rather than only the first.** A
+    /// short-circuiting `assert_eq!` per cell would make any statement about
+    /// *how many* cells a mutation breaks unmeasurable by this test —
+    /// measured under the plan-shorthand mutation (`preview` auto-only,
+    /// `status` confirm-only), this form reports exactly two: `confirm`/
+    /// `preview` and `auto`/`status`.
+    #[test]
+    fn preview_and_status_are_legal_in_both_modes() {
+        let mut refused = Vec::new();
+        for mode in ["confirm", "auto"] {
+            let root = root_with_mode(mode);
+            for action in ["preview", "status"] {
+                let (code, message) = domain(&undo(
+                    &root,
+                    serde_json::json!({"action": action, "turn": "abc"}),
+                ));
+                if code != "not_implemented" {
+                    refused.push(format!("{mode}/{action}: {code} — {message}"));
+                }
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "preview and status must be legal in both modes; {} cell(s) refused:\n{}",
+            refused.len(),
+            refused.join("\n")
+        );
+    }
+
+    /// A sub-action outside the four is a malformed call (`-32602`), not a
+    /// domain refusal: the schema declares the enum, so the client's frame is
+    /// wrong. Same channel as a missing `action`.
+    #[test]
+    fn an_unknown_or_missing_action_is_a_malformed_call() {
+        let root = root_with_mode("auto");
+
+        let resp = undo(&root, serde_json::json!({"action": "obliterate"}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("obliterate"));
+
+        let resp = undo(&root, serde_json::json!({}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+        let resp = undo(&root, serde_json::json!({"action": 7}));
+        assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    }
+}

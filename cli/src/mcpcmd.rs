@@ -10,11 +10,14 @@
 //!
 //! E1 shipped the *skeleton* (framing, handshake, `tools/list` metadata and
 //! read-only annotations); E2 implemented `agentrec_log`/`agentrec_diff`/
-//! `agentrec_blame`; **E3 implements the last two, `agentrec_recall` and
-//! `agentrec_status`, so all five 2.2 read tools now answer.** The
-//! listed-but-unimplemented refusal path survives for F1's `agentrec_undo`
-//! (see [`tools_call`]) — a listed tool must never answer a silent empty
-//! result, which an agent would read as "no history".
+//! `agentrec_blame`; E3 implemented `agentrec_recall` and `agentrec_status`,
+//! so all five 2.2 read tools answer. **F1 adds the 2.3 destructive tool's
+//! gating**: `agentrec_undo` is listed iff `mcp_destructive != off`, carries
+//! destructive annotations, and routes four sub-actions through a per-mode
+//! allow matrix plus the auto-mode `allow_modified` rail (PROTOCOL §8). Its
+//! sub-action bodies are F2-F4's; every cell the matrix permits answers a
+//! named `not_implemented` refusal rather than a silent empty result, which
+//! an agent would read as "nothing to revert".
 //!
 //! Reads are file-based (P3), so nothing here touches the daemon: the server
 //! is fully functional with `agentrec record` stopped.
@@ -103,11 +106,26 @@ struct ToolSpec {
     /// JSON-Schema `properties` object, rendered into `inputSchema`.
     properties: fn() -> Value,
     required: &'static [&'static str],
+    /// Drives the whole `annotations` object (see [`Server::visible_tools`]).
+    /// A `bool` rather than a tier enum on purpose: `McpDestructive` is THE
+    /// mode type in this codebase and a second enum here would be a second
+    /// thing to keep in agreement with it. Today the split is binary — five
+    /// read tools, one destructive tool — which is exactly what PROTOCOL §8's
+    /// two-tier table says.
+    destructive: bool,
 }
 
 /// The five Phase 2.2 read tools, in the parent spec's §8 table order.
-/// `agentrec_undo` is Phase 2.3's (Task F1) and is deliberately absent: it
-/// joins this list only when `mcp_destructive != off`.
+///
+/// `agentrec_undo` is deliberately NOT a member even now that F1 has built it
+/// — it lives in [`UNDO_TOOL`], and the separation is load-bearing rather
+/// than tidy. Two call sites read this array as "the tools that exist in
+/// every mode": [`Server::visible_tools`] and the unimplemented-tool guard in
+/// [`tools_call`]. Folding undo in would make an `off`-mode
+/// `tools/call agentrec_undo` answer "registered but not implemented" — which
+/// tells an agent the tool exists and is merely unbuilt, when the truth under
+/// `off` is that this server does not offer it at all. Pinned by
+/// `mcp.rs::f1::ac_f1_off_hides_the_undo_tool`, which asserts the message.
 const READ_TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "agentrec_log",
@@ -123,6 +141,7 @@ const READ_TOOLS: &[ToolSpec] = &[
             })
         },
         required: &[],
+        destructive: false,
     },
     ToolSpec {
         name: "agentrec_diff",
@@ -138,6 +157,7 @@ const READ_TOOLS: &[ToolSpec] = &[
             })
         },
         required: &["turn"],
+        destructive: false,
     },
     ToolSpec {
         name: "agentrec_blame",
@@ -151,6 +171,7 @@ const READ_TOOLS: &[ToolSpec] = &[
             })
         },
         required: &["path"],
+        destructive: false,
     },
     ToolSpec {
         name: "agentrec_recall",
@@ -168,6 +189,7 @@ const READ_TOOLS: &[ToolSpec] = &[
             })
         },
         required: &["query"],
+        destructive: false,
     },
     ToolSpec {
         name: "agentrec_status",
@@ -176,8 +198,57 @@ const READ_TOOLS: &[ToolSpec] = &[
                       revision.",
         properties: || json!({}),
         required: &[],
+        destructive: false,
     },
 ];
+
+/// PROTOCOL §8's one destructive-tier tool, listed only when
+/// `mcp_destructive != off` (P1).
+///
+/// **The description states capability and data shape only** — the P7 rule on
+/// [`ToolSpec`] bites hardest here, because a destructive tool's description
+/// is exactly where "call this to fix your own mistakes" would get written.
+/// It is not written. Nothing here tells a model when to reach for undo; the
+/// text says what the sub-actions are, what each returns, and which mode each
+/// requires, so a wrong-mode call is avoidable from `tools/list` alone rather
+/// than only from a refusal.
+///
+/// `required` is `["action"]` and nothing else, deliberately. Per-action
+/// argument requirements (`turn` for preview, `token` for execute, a request
+/// id for status) belong with the sub-actions F2-F4 build; declaring them now
+/// would mean tests those tasks then have to change, and it would put the
+/// `allow_modified` rail *behind* a `turn`-missing `-32602`, so an auto-mode
+/// caller could learn nothing about the rail without first satisfying a
+/// schema this build cannot yet act on.
+const UNDO_TOOL: ToolSpec = ToolSpec {
+    name: "agentrec_undo",
+    description: "Revert the file changes of one recorded turn. Four sub-actions, selected \
+                  by `action`, whose availability depends on this repository's configured \
+                  agent-undo mode (reported as `agent_undo_mode` by agentrec_status): \
+                  `preview` (both modes) returns the per-file plan, refusals and warnings \
+                  and writes nothing; `request` (confirm mode) lodges the plan for a human \
+                  to approve or deny out of band; `status` (both modes) reports a lodged \
+                  request as pending, approved, denied, expired or executed; `execute` \
+                  (auto mode) performs a previously previewed revert against a one-time \
+                  token. Files without snapshot content, and files changed since the turn, \
+                  are refused.",
+    properties: || {
+        json!({
+            "action": {
+                "type": "string",
+                "enum": ["preview", "request", "status", "execute"],
+                "description": "Which sub-action to perform. `request` requires confirm mode; `execute` requires auto mode; `preview` and `status` are available in both."
+            },
+            "turn": {"type": "string", "description": "Turn id, full or an unambiguous prefix. Names the turn whose changes would be reverted."},
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "Restrict the revert to these repo-relative paths. Omit for the whole turn."},
+            "allow_modified": {"type": "boolean", "description": "Include files whose content changed since the turn. Available only through human approval in confirm mode; in auto mode a call setting this is refused, not ignored (PROTOCOL §8)."},
+            "token": {"type": "string", "description": "The one-time token a prior auto-mode preview returned. Required by `execute`."},
+            "request_id": {"type": "string", "description": "Identifies a lodged confirm-mode request, for `status`."}
+        })
+    },
+    required: &["action"],
+    destructive: true,
+};
 
 /// Long-lived server state. Config is read ONCE, at startup (parent spec:
 /// "config loads once at startup; changing destructive mode requires restart
@@ -201,33 +272,47 @@ impl Server {
         self.config.mcp_destructive
     }
 
-    /// Tools visible to `tools/list`. E1 exposes the five read tools in every
-    /// mode; `agentrec_undo` joins the list in F1, gated on
-    /// [`Self::destructive_mode`] being other than `Off`.
+    /// Tools visible to `tools/list`: the five read tools in every mode, plus
+    /// [`UNDO_TOOL`] iff [`Self::destructive_mode`] is other than `Off` (P1).
+    ///
+    /// The list is computed per call but the mode behind it is not: config is
+    /// read once at startup, so a `tools/list` after an `off` → `auto` edit
+    /// still returns five tools until the server restarts. That is the parent
+    /// spec's restart-required semantics, and `agentrec_status` is what says
+    /// so out loud (`restart_required`).
     fn visible_tools(&self) -> Vec<Value> {
-        READ_TOOLS
-            .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": (t.properties)(),
-                        "required": t.required,
-                    },
-                    // Read-only annotations (parent spec :636). Every tool in
-                    // 2.2 reads; none writes, none reaches the network.
-                    "annotations": {
-                        "readOnlyHint": true,
-                        "destructiveHint": false,
-                        "idempotentHint": true,
-                        "openWorldHint": false,
-                    },
-                })
-            })
-            .collect()
+        let undo = (self.destructive_mode() != config::McpDestructive::Off).then_some(&UNDO_TOOL);
+        READ_TOOLS.iter().chain(undo).map(describe_tool).collect()
     }
+}
+
+/// One `tools/list` entry, annotations included.
+///
+/// All four annotation keys are emitted for every tool, destructive or not:
+/// a host reading four keys on five tools and two on the sixth is reading a
+/// bug, and an absent hint is not the same wire fact as a false one. The read
+/// tools' values are unchanged from E1 (parent spec :636) — none writes, none
+/// reaches the network. Undo inverts exactly the two that describe effect:
+/// it writes (`readOnlyHint: false`, `destructiveHint: true`) and reverting
+/// twice is not reverting once (`idempotentHint: false` — the second undo
+/// re-reverts, which is the point of undo being itself a turn, PROTOCOL §8).
+/// `openWorldHint` stays false: undo touches this repository and nothing else.
+fn describe_tool(t: &ToolSpec) -> Value {
+    json!({
+        "name": t.name,
+        "description": t.description,
+        "inputSchema": {
+            "type": "object",
+            "properties": (t.properties)(),
+            "required": t.required,
+        },
+        "annotations": {
+            "readOnlyHint": !t.destructive,
+            "destructiveHint": t.destructive,
+            "idempotentHint": !t.destructive,
+            "openWorldHint": false,
+        },
+    })
 }
 
 /// Entry point for the `mcp` subcommand.
@@ -435,15 +520,23 @@ fn tools_call(server: &Server, id: Value, params: Option<&Value>) -> Value {
         "agentrec_blame" => blame_tool(&server.root, &args),
         "agentrec_recall" => recall_tool(&server.root, &args),
         "agentrec_status" => status_tool(server),
-        // **Kept, though E3 leaves it unreachable from `READ_TOOLS` alone.**
-        // All five listed read tools now dispatch above, so nothing in
-        // `READ_TOOLS` reaches this arm today. It is retained rather than
-        // deleted because F1 adds `agentrec_undo` to the listed set gated on
-        // `mcp_destructive`, and the window in which a tool is listed but not
-        // yet dispatched is exactly when this arm matters: without it that
-        // call falls through to "unknown tool", which tells an agent the tool
-        // does not exist when `tools/list` just said it does. The two
-        // refusals are deliberately distinct messages.
+        // `agentrec_undo` dispatches only in the modes that LIST it. Under
+        // `off` this guard does not match and the call falls through to the
+        // unknown-tool arm below, which is the honest answer: `off` is not
+        // "this tool is unbuilt", it is "this server does not offer it".
+        "agentrec_undo" if server.destructive_mode() != config::McpDestructive::Off => {
+            undo_tool(server.destructive_mode(), &args)
+        }
+        // **Unreachable today, and no longer for the reason E3 recorded.**
+        // E3's comment here said this arm was retained *because* F1 would add
+        // a listed-but-undispatched `agentrec_undo`. F1 landed and that did
+        // not happen: undo dispatches above in every mode that lists it, and
+        // is not in `READ_TOOLS`, so no listed tool reaches this arm in any
+        // mode. It is kept as a guard against the shape recurring — a tool
+        // added to `READ_TOOLS` without a dispatch arm answers "registered
+        // but not implemented" instead of "unknown tool", because telling an
+        // agent a tool does not exist when `tools/list` just said it does is
+        // the worse of the two lies. No test pins it; nothing can reach it.
         other if READ_TOOLS.iter().any(|t| t.name == other) => {
             return error_response(
                 id,
@@ -922,6 +1015,142 @@ fn status_tool(server: &Server) -> Result<String, ToolFailure> {
     })
 }
 
+// ---- F1: the undo tool's mode gating and sub-action matrix ----------------
+
+/// The four sub-actions of `agentrec_undo` (parent spec :641-697). F1 ships
+/// the router and the matrix; F2-F4 ship the bodies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UndoAction {
+    Preview,
+    Request,
+    Status,
+    Execute,
+}
+
+impl UndoAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            UndoAction::Preview => "preview",
+            UndoAction::Request => "request",
+            UndoAction::Status => "status",
+            UndoAction::Execute => "execute",
+        }
+    }
+
+    /// The mode this sub-action requires, or `None` when it is available in
+    /// both non-`off` modes.
+    ///
+    /// **Read off parent :641-697 directly, which is WIDER than the plan's
+    /// one-line shorthand in two cells — recorded rather than silently
+    /// resolved.** The plan (task F1) summarises confirm as "request/status
+    /// path, no execute" and auto as "preview/execute path, no request". The
+    /// normative source qualifies only two of the four:
+    ///
+    /// * `request` — ":641-697: `request`: confirm mode only".
+    /// * `execute` — ":641-697: `execute`: auto mode only".
+    ///
+    /// `preview` is described *per mode* rather than restricted to one — "In
+    /// auto mode, successful preview atomically reserves executable paths and
+    /// issues the token. In confirm mode it does not reserve until `request`"
+    /// — so a confirm-mode preview is normative and merely reserves nothing.
+    /// `status` carries no mode qualifier at all, and confirm's paragraph
+    /// ("The agent only polls `status`") requires it there; nothing anywhere
+    /// forbids it in auto, where it is how an agent reads back an executed
+    /// token. Narrowing either to match the shorthand would refuse a call the
+    /// spec permits, which is a rail in the wrong direction: it teaches an
+    /// agent that preview is unavailable and pushes it toward `execute`.
+    fn required_mode(self) -> Option<config::McpDestructive> {
+        match self {
+            UndoAction::Request => Some(config::McpDestructive::Confirm),
+            UndoAction::Execute => Some(config::McpDestructive::Auto),
+            UndoAction::Preview | UndoAction::Status => None,
+        }
+    }
+}
+
+/// `agentrec_undo` — F1 ships gating only; every legal cell answers
+/// `not_implemented`.
+///
+/// Reached only when the mode is not `Off` (see [`tools_call`]), so `mode`
+/// here is `Confirm` or `Auto`.
+///
+/// **Two refusals, in a fixed order, and the order is a decision.** The
+/// `allow_modified` rail is evaluated BEFORE the mode matrix so the invariant
+/// can be stated without an exception: *no auto-mode call carrying
+/// `allow_modified: true` proceeds past argument validation, for any
+/// sub-action.* Matrix-first would leave that hole (an auto-mode `request`
+/// carrying the flag would refuse on the wrong ground) — harmless today,
+/// widenable by a later refactor. Pinned by
+/// `mcp.rs::f1::the_allow_modified_rail_precedes_the_mode_matrix`.
+///
+/// Both refusals go out on the DOMAIN channel (`isError: true` + a code), not
+/// as `-32602`: the call frame was well formed and the repository answered
+/// "no". An agent must be able to read `wrong_mode` and stop retrying, which
+/// a transport error does not reliably surface to a model. A bad `action`, by
+/// contrast, IS a malformed frame — the schema declares the enum — and stays
+/// `-32602`.
+fn undo_tool(mode: config::McpDestructive, args: &Value) -> Result<String, ToolFailure> {
+    let action = match required_str_arg(args, "action")?.as_str() {
+        "preview" => UndoAction::Preview,
+        "request" => UndoAction::Request,
+        "status" => UndoAction::Status,
+        "execute" => UndoAction::Execute,
+        other => {
+            return Err(ToolFailure::BadParams(format!(
+                "unknown undo action {other:?}: must be one of \"preview\", \"request\", \
+                 \"status\", \"execute\""
+            )))
+        }
+    };
+
+    // Rail (PROTOCOL §8, as corrected by delta decision 15 to match founder
+    // decision 6): in auto mode `allow_modified: true` is REFUSED, not
+    // honored and not silently ignored. The refusal names the effective mode
+    // and the one override path that exists, so an agent learns the rail
+    // cannot be lowered from here rather than retrying variations. An
+    // explicit `false` is not "set" — `bool_arg` maps absent and false alike.
+    if mode == config::McpDestructive::Auto && bool_arg(args, "allow_modified")? {
+        return Err(ToolFailure::Domain {
+            code: "allow_modified_refused",
+            message: format!(
+                "agent-undo mode is \"{}\": `allow_modified: true` is refused, not ignored — \
+                 files changed since the turn stay excluded. Reverting a modified file is \
+                 available only through explicit human approval in \"confirm\" mode. Retry \
+                 without `allow_modified`.",
+                mode_str(mode)
+            ),
+        });
+    }
+
+    // Matrix.
+    if let Some(required) = action.required_mode() {
+        if required != mode {
+            return Err(ToolFailure::Domain {
+                code: "wrong_mode",
+                message: format!(
+                    "agent-undo mode is \"{}\": the {:?} sub-action requires \"{}\" mode. \
+                     `agentrec_status` reports this repository's effective mode as \
+                     `agent_undo_mode`; changing it is a `config.toml` edit plus a server \
+                     restart, which this agent cannot do.",
+                    mode_str(mode),
+                    action.as_str(),
+                    mode_str(required)
+                ),
+            });
+        }
+    }
+
+    Err(ToolFailure::Domain {
+        code: "not_implemented",
+        message: format!(
+            "the {:?} sub-action is permitted in \"{}\" mode but is not built in this \
+             version of agentrec",
+            action.as_str(),
+            mode_str(mode)
+        ),
+    })
+}
+
 fn success(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -949,19 +1178,78 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_config_means_undo_stays_off() {
-        // B1's `McpDestructive` is the only mode type in play; F1 gates
-        // `agentrec_undo` on it. Today the read-tool list is mode-independent
-        // and carries no destructive tool at all.
-        assert_eq!(server().destructive_mode(), config::McpDestructive::Off);
-        let names: Vec<String> = server()
-            .visible_tools()
+    fn names(s: &Server) -> Vec<String> {
+        s.visible_tools()
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn default_config_means_undo_stays_off() {
+        // B1's `McpDestructive` is the only mode type in play, and F1 gates
+        // `agentrec_undo` on it. The DEFAULT is `off` (D16), so a repository
+        // that never wrote the key sees the five read tools and no
+        // destructive tool — the property this test exists for. The
+        // mode-dependent half is `undo_joins_the_list_only_outside_off`.
+        assert_eq!(server().destructive_mode(), config::McpDestructive::Off);
+        let names = names(&server());
         assert!(!names.iter().any(|n| n == "agentrec_undo"));
         assert_eq!(names.len(), 5);
+    }
+
+    #[test]
+    fn undo_joins_the_list_only_outside_off() {
+        for mode in [
+            config::McpDestructive::Confirm,
+            config::McpDestructive::Auto,
+        ] {
+            let mut s = server();
+            s.config.mcp_destructive = mode;
+            let names = names(&s);
+            assert_eq!(names.len(), 6, "{mode:?}: {names:?}");
+            assert_eq!(names[5], "agentrec_undo", "{mode:?}");
+        }
+    }
+
+    /// The rail and the matrix at the unit level, alongside the integration
+    /// tests that drive the real binary — this is where the ORDER between
+    /// them is cheapest to read.
+    #[test]
+    fn undo_router_refusal_codes() {
+        let code = |mode, args: Value| match undo_tool(mode, &args) {
+            Err(ToolFailure::Domain { code, .. }) => code,
+            Err(ToolFailure::BadParams(m)) => panic!("unexpected -32602: {m}"),
+            Ok(payload) => panic!("F1 implements no sub-action; got {payload}"),
+        };
+        let (confirm, auto) = (
+            config::McpDestructive::Confirm,
+            config::McpDestructive::Auto,
+        );
+        assert_eq!(code(confirm, json!({"action": "execute"})), "wrong_mode");
+        assert_eq!(code(auto, json!({"action": "request"})), "wrong_mode");
+        assert_eq!(
+            code(auto, json!({"action": "preview", "allow_modified": true})),
+            "allow_modified_refused"
+        );
+        // The override path decision 6 keeps open.
+        assert_eq!(
+            code(
+                confirm,
+                json!({"action": "request", "allow_modified": true})
+            ),
+            "not_implemented"
+        );
+        // Rail before matrix: both would fire; the rail wins.
+        assert_eq!(
+            code(auto, json!({"action": "request", "allow_modified": true})),
+            "allow_modified_refused"
+        );
+        for mode in [confirm, auto] {
+            for action in ["preview", "status"] {
+                assert_eq!(code(mode, json!({"action": action})), "not_implemented");
+            }
+        }
     }
 
     #[test]
