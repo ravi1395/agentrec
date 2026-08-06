@@ -1822,11 +1822,13 @@ pub fn build_plan(
             });
             continue;
         }
-        // Hardlink containment, immediately after path containment because it
-        // is the same harm through a channel paths cannot express: a second
-        // name for the target's inode, possibly outside the repo, that
-        // `fs::write`'s in-place truncate would rewrite too.
-        if let Some(kind) = hardlink_refusal(root, entry) {
+        // Inode containment, immediately after path containment because it is
+        // the same harm through channels paths cannot express: a second name
+        // for the target's inode (possibly outside the repo) that
+        // `fs::write`'s in-place truncate would rewrite too, or a non-regular
+        // file that cannot be read or written as file content at all — a FIFO
+        // here BLOCKS the process forever.
+        if let Some(kind) = inode_refusal(root, entry) {
             plans.push(Plan {
                 entry: entry.clone(),
                 kind,
@@ -2061,41 +2063,69 @@ fn escape_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
     refuse()
 }
 
-/// Hardlink containment: `Some(PlanKind::Refused)` when the target file's
-/// inode has more than one name, `None` otherwise.
+/// Inode-level containment: `Some(PlanKind::Refused)` when the target is not
+/// an ordinary, singly-named regular file, `None` otherwise.
 ///
-/// PATH CONTAINMENT CANNOT CLOSE THIS CLASS, which is why it is a separate
-/// gate rather than another branch of [`escape_refusal`]. `canonicalize`
-/// resolves SYMLINKS; a hardlink is a second directory entry for the same
-/// inode, and there is no path-level evidence that the inode is reachable
-/// anywhere else. A repo-internal `hard.txt` hardlinked to a file outside the
-/// repo is lexically ordinary, canonicalizes inside `root`, and is not a
-/// symlink — so it passes every check in `escape_refusal` and
-/// [`symlink_refusal`] — yet `fs::write` truncates the SHARED INODE in place
-/// and the outside name sees the new bytes. Proven end-to-end through
-/// `agentrec_undo` in `auto` mode (branch review, PR #20), same
-/// confused-deputy shape as the `..` and symlinked-parent escapes: creating
-/// the link is a write INSIDE cwd, which a path-based agent sandbox permits,
-/// while the victim is outside it.
+/// TWO refusals, because path containment cannot express either one:
 ///
-/// `nlink > 1` is the whole predicate: it does not matter WHERE the other
-/// name is, because we cannot know, and a second name inside the repo is
-/// equally a file this turn's record does not describe. False positives
-/// (deliberately hardlinked files within a repo) are rare and degrade to a
-/// refusal, which is the safe direction — this is the same
-/// refuse-to-act-not-guess posture as `link_kind`.
+/// 1. **HARDLINK.** `canonicalize` resolves SYMLINKS; a hardlink is a second
+///    directory entry for the same inode, and there is no path-level evidence
+///    it exists. A repo-internal `hard.txt` hardlinked to a file outside the
+///    repo is lexically ordinary, canonicalizes inside `root`, and is not a
+///    symlink — so it passes every check in [`escape_refusal`] and
+///    [`symlink_refusal`] — yet `fs::write` truncates the SHARED INODE in
+///    place and the outside name sees the new bytes. Proven end-to-end
+///    through `agentrec_undo` in `auto` mode (branch review, PR #20), the
+///    same confused-deputy shape as the `..` and symlinked-parent escapes:
+///    creating the link is a write INSIDE cwd, which a path-based agent
+///    sandbox permits, while the victim is outside it.
+///    `nlink > 1` is the whole predicate — it does not matter WHERE the other
+///    name is, because we cannot know, and a second name inside the repo is
+///    equally a file this turn's record does not describe.
+///
+/// 2. **NOT A REGULAR FILE.** This branch is written as "refuse unless it is
+///    a regular file", NEVER as "skip unless it is a regular file". The
+///    earlier form guarded the hardlink check on `is_file()` and thereby let
+///    every OTHER inode type through untouched — and a FIFO target then
+///    HUNG the process: `fs::read` on a fifo blocks until a writer appears,
+///    which for the single-threaded stdio MCP loop kills the whole
+///    agent-facing surface for that session, and hangs `agentrec undo` for a
+///    human identically (branch review re-gate, MAJOR 1; `mkfifo` needs no
+///    privileges and creating one is a write inside cwd, so the sandboxed
+///    agent precondition is the same as every shape above). It also covers a
+///    directory recorded as a `modify` entry, which the plan previously
+///    rendered as a performable `revert` and then failed at execution with
+///    `Is a directory (os error 21)` — a plan promising an action it cannot
+///    take.
+///
+/// A symlink returns `None` here DELIBERATELY: it is [`symlink_refusal`]'s to
+/// refuse, with its own distinct wording, and stealing it would make that
+/// gate's tests pass for the wrong reason. An absent path also returns `None`
+/// — `create` reverts and delete-restores legitimately target paths that do
+/// not exist yet, and there is no inode to judge.
 ///
 /// Unix-only: `nlink` needs [`std::os::unix::fs::MetadataExt`]. On a
 /// non-unix target this returns `None` (no refusal) — stated rather than
 /// silently implied. The repo targets macOS + Linux (D19).
-fn hardlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
+fn inode_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         // lstat, not stat: a symlink is `symlink_refusal`'s to refuse, and
-        // following it here would read the TARGET's link count instead.
+        // following it here would read the TARGET's link count and type.
         let meta = std::fs::symlink_metadata(root.join(&entry.path)).ok()?;
-        if meta.file_type().is_file() && meta.nlink() > 1 {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            return None;
+        }
+        if !ft.is_file() {
+            return Some(PlanKind::Refused {
+                reason: "path is not a regular file (directory, fifo, socket or device) — \
+                         reverting cannot read or write it as file content"
+                    .to_string(),
+            });
+        }
+        if meta.nlink() > 1 {
             return Some(PlanKind::Refused {
                 reason:
                     "path is a hardlink — its inode has another name, which reverting would also \

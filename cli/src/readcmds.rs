@@ -1315,6 +1315,70 @@ mod tests {
         );
     }
 
+    // A FIFO target HUNG the process before this gate: `fs::read` on a fifo
+    // blocks until a writer appears, which for the single-threaded stdio MCP
+    // loop kills the whole agent-facing surface for the session, and hangs
+    // `agentrec undo` for a human identically. `mkfifo` needs no privileges
+    // and creating one is a write inside cwd — same sandboxed-agent
+    // precondition as every escape shape above. This test would HANG, not
+    // fail, if the gate regressed to skipping non-regular files.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_fifo_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fifo = root.join("pipe");
+        let rc = unsafe {
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            libc::mkfifo(c.as_ptr(), 0o600)
+        };
+        assert_eq!(rc, 0, "fixture must actually create a fifo");
+
+        let (_, plans) = plan_for(root, vec![entry("pipe", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is not a regular file (directory, fifo, socket or device) — reverting cannot \
+             read or write it as file content"
+        );
+    }
+
+    // A directory recorded as a `modify` entry used to be rendered as a
+    // performable `revert`, then failed at execution with `Is a directory` —
+    // a plan promising an action it cannot take.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_directory_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("adir")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("adir", "modify")], true);
+        assert!(
+            refusal_reason(&plans).starts_with("path is not a regular file"),
+            "a plan must not promise a revert it cannot perform"
+        );
+    }
+
+    // The non-regular-file branch must NOT steal the symlink refusal: that is
+    // `symlink_refusal`'s, with its own distinct wording, and stealing it
+    // would make its tests pass for the wrong reason. (The symlink tests
+    // above are the assertion; this one names the intent.)
+    #[test]
+    #[cfg(unix)]
+    fn inode_gate_leaves_symlinks_to_the_symlink_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", root.join("link.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("link.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link",
+            "the inode gate must not shadow the symlink gate's distinct wording"
+        );
+    }
+
     // Discriminating control for the hardlink gate specifically: an ordinary
     // single-named file at nlink == 1 must pass it and reach the store gate.
     #[test]
