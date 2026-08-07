@@ -2688,3 +2688,84 @@ which is itself the evidence that no legitimate read was broken). Clippy `-D war
 (`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code.** That is a
 falsifiable statement and the grep in `fsguard`'s module doc is how to re-check it after any
 future change.
+
+### Re-gate round 7 — GATE FAIL; the guard itself had over-rejected, silently
+
+Round 7 confirmed both round-6 blockers closed (probes rebuilt from scratch: blame-on-fifo in
+the DEFAULT config answered in 1 s; fifo `undo-requests.jsonl` answered in 1 s with a clean
+`repo_error`) and confirmed `fsguard` broke nothing at the suite level. It also judged the
+daemon's **"closed by construction, NOT demonstrated-and-fixed"** framing honest and said it
+would not change it — the claim states exactly what is held, and declines the available
+overclaim. **It still returned GATE FAIL, on three findings. Two are fixed at `371d63b`; the
+third is recorded below and NOT fixed.**
+
+**MAJOR 2 — a REGRESSION introduced by this review's OWN round-6 work, and it silently lost
+user history.** `fsguard::is_nonregular` used `symlink_metadata` (an lstat), so it refused
+EVERY symlink — including a symlink to a perfectly ordinary regular file. A symlink cannot
+block on open; only the resolved target can, so this was pure over-rejection. Because
+`load_log` converts a refusal into an empty ledger, an `.agentrec/log.jsonl` relocated behind
+a symlink (moving the store to another volume is an ordinary setup) made `log`/`diff`/`blame`/
+`undo` all report **"no turns recorded"** with the real data one hop away. Fixed to
+`std::fs::metadata` (a `stat`, which follows the link): a symlink TO a fifo still resolves to
+a fifo and is still refused, and a broken symlink still reads as `NotFound` rather than a
+refusal.
+
+**The asymmetry that hid it is the durable lesson.** The suite passed **1007/0/4 the entire
+time the regression existed**, because every test written for this guard asserted a case that
+must be **REFUSED** and NOT ONE asserted a case that must still be **ALLOWED**. Over-rejection
+fails silently and looks like safety; over-permission is loud. Three tests added to close the
+asymmetry: `a_symlink_to_an_ordinary_file_reads_normally` (the missing allow-case),
+`a_symlink_to_a_fifo_is_still_refused` (so the fix cannot become a new bypass), and
+`a_broken_symlink_reads_as_not_found_not_refused`. **Rule going forward: a refusal predicate
+ships with its allow-case test in the same commit.**
+
+This predicate is deliberately NOT what the undo WRITE path uses. Where following a symlink is
+itself the hazard — reverting through a link writes the pointed-to file —
+`undo_coordinator.rs::symlink_refusal` handles that separately with its own distinct refusal
+text and must keep doing so; merging the two would make that gate's tests pass for the wrong
+reason.
+
+**BLOCKER 1 — a SEVENTH site of the original class, and diagnostic of how round 6 was
+applied.** `readcmds.rs::live_undo_guard_reason` read the undo-guard file with a bare
+`read_to_string`, reachable from all three undo legs — CLI `undo`, `agentrec approve`, and
+**MCP `execute` (agent-triggerable)** — and the gate hung all of them at 18 s with a fifo at
+that path. What makes it diagnostic rather than merely one more site: **`daemon.rs:992` reads
+the very same file through `fsguard::read_regular_to_string`.** Same path, guarded in one
+module and bare in another — direct evidence the round-6 pass was applied **per-FILE rather
+than per-PATH**. Now guarded. **Residual, disclosed: no regression test was written for this
+one** — the gate demonstrated it live, but that was never ported into a test before the round
+ended. Owed.
+
+**MAJOR 3 — this file's own completeness claim is FALSE, and is NOT yet corrected.** The
+"mechanical audit, finished" section above states that remaining raw reads are only the three
+documented exemption classes plus test code. Round 7 measured, by `#[cfg(test)]` boundary:
+**35 non-test bare reads remain, 8 are the documented exemptions, 27 are NOT** — `initcmd.rs`
+13, `uninstallcmd.rs` 5, `importcmd.rs` 4, `purgecmd.rs` 2, `service.rs` 2, `readcmds.rs` 1
+(that last one is BLOCKER 1, now fixed, so 26 remain). Severity is genuinely lower — these sit
+in human-invoked verbs (`init`/`uninstall`/`import`/`purge`/`service`), not the agent-facing
+surface — but **the sentence was offered as falsifiable and it is false**, and a future reader
+will trust it instead of re-running the grep. **Correcting that sentence is owed regardless of
+whether the 26 sites are guarded.**
+
+**An attempt to guard all 26 mechanically FAILED and was reverted, which is itself worth
+recording.** A regex bulk-edit rewrote `std::fs::read_to_string(...)` into
+`std::agentrec_core::fsguard::read_regular_to_string(...)` — the pattern did not account for
+some call sites carrying a `std::` prefix and others not. `cargo build` caught it immediately
+(`E0433: cannot find agentrec_core in std`) and all five files were reverted with
+`git checkout --`. **Do that work by hand, one file at a time, building after each.**
+
+**Round 7's structural recommendation, NOT yet implemented and the most valuable item
+outstanding:** seven rounds of "find sites, guard sites" have not converged because the method
+is ENUMERATIVE — it depends on correctly guessing the reachable set every round. Add
+`disallowed-methods` to `clippy.toml` for `std::fs::read`, `std::fs::read_to_string` and
+`std::fs::File::open`, with `#[allow(clippy::disallowed_methods)]` plus a one-line
+justification at each exemption and inside `fsguard` itself. Clippy already runs `-D warnings`
+on both profiles in CI, so a reintroduced bare call becomes a **build failure** rather than a
+question for the next review round. Sequence matters: do it AFTER the 26 sites are guarded, or
+the lint fails the build on all of them at once.
+
+**Evidence for what IS fixed (`371d63b`):** suite **1010 / 0 / 4** (1007 + 3 new `fsguard`
+tests). Clippy `-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean.
+Doc drift corrected in the same commit — the module and `read_regular` still described the
+predicate as an lstat after the code moved to `stat`, which is this repo's signature defect
+class appearing inside the commit that fixes another one.
