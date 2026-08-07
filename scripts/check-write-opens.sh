@@ -114,8 +114,9 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     # therefore: (1) collapses string literals ESCAPE-AWARE
     # (`"a\"test\"b"` is one literal — round 4 measured the naive
     # `"[^"]*"` regex leaving a `test` residue that classified test-only,
-    # silently), (2) drops `//` line comments and single-line `/* ... */`
-    # block comments, (3) returns exactly the `#[cfg(` ... first `)]` span,
+    # silently), (2) drops `//` line comments and `/* ... */` block comments
+    # DEPTH-COUNTED (Rust block comments nest — see strip_block_comments),
+    # (3) returns exactly the `#[cfg(` ... first `)]` span,
     # or "" when no complete span remains on the line (multi-line attributes
     # open no region and arm no channel — over-scan, loud, disclosed in the
     # header).
@@ -124,9 +125,30 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
         gsub(/"(\\.|[^"\\])*"/, "\"\"", c)
         return c
     }
+    # Rust block comments NEST (`/* a /* b */ c */` is ONE comment), which no
+    # awk ERE can express — a sixth gate round measured the regex version
+    # stopping at the first `*/` and leaking a `test` residue into the
+    # classified span (and stranding a region close) on rustfmt-stable
+    # input. Depth-counted scan instead. Callers strip strings FIRST so a
+    # `/*` inside a literal cannot open a phantom comment. An opener left
+    # unclosed at end of line drops the remainder: for cfg extraction that
+    # yields no complete span (nothing armed — over-scan, loud); for the
+    # close line the residue is the bare `}` and the region closes, with the
+    # comment continuation scanned as code, where comment prose can only
+    # produce a FALSE VIOLATION, never a silent pass.
+    function strip_block_comments(s,  out, i, n, depth, two) {
+        out = ""; depth = 0; n = length(s); i = 1
+        while (i <= n) {
+            two = substr(s, i, 2)
+            if (two == "/*") { depth++; i += 2; continue }
+            if (depth > 0 && two == "*/") { depth--; i += 2; if (depth == 0) out = out " "; continue }
+            if (depth == 0) out = out substr(s, i, 1)
+            i++
+        }
+        return out
+    }
     function cfg_extract(line,  c) {
-        c = strip_strings(line)
-        gsub(/\/\*([^*]|\*+[^*\/])*\*+\//, " ", c)
+        c = strip_block_comments(strip_strings(line))
         sub(/\/\/.*$/, "", c)
         if (match(c, /#\[cfg\(/)) {
             c = substr(c, RSTART)
@@ -238,8 +260,7 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     # surfaces as unclosed-test-region at EOF, loud.
     in_test == 1 {
         if ($0 ~ /^\}/) {
-            cl = $0
-            gsub(/\/\*([^*]|\*+[^*\/])*\*+\//, " ", cl)
+            cl = strip_block_comments(strip_strings($0))
             sub(/\/\/.*$/, "", cl)
             gsub(/[ \t\r]+/, "", cl)
             if (cl == "}") in_test = 0
