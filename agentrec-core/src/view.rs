@@ -956,6 +956,29 @@ impl RepositoryView {
             next: page.next,
         })
     }
+
+    /// Per-repository analytics (Phase 3.0 T1) — turn census, file churn,
+    /// agent-vs-human share, and the normative rework rate with every
+    /// exclusion bucket beside it. Definitions live in
+    /// [`crate::stats`] and, normatively, in the phase-3 design §3.0.1.
+    ///
+    /// A pure read of three surfaces: `log.jsonl`, the CAS (blob sizes), and
+    /// the current working tree (live content hashes — `excluded_unknown_mtime`
+    /// and the human share are uncomputable from the ledger alone). Writes
+    /// nothing.
+    ///
+    /// The wall clock is read here and passed down, so the fold itself is
+    /// deterministic and its right-censoring boundary is testable.
+    pub fn stats(
+        &self,
+        opts: &crate::stats::StatsOptions,
+    ) -> Result<crate::stats::StatsResult, crate::stats::StatsError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        crate::stats::compute_stats(&self.ledger(), &self.root, opts, now_ms)
+    }
 }
 
 /// The one selection + pagination walk behind [`RepositoryView::list_of`] and

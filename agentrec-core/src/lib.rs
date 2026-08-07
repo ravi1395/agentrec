@@ -19,6 +19,7 @@ pub mod perms;
 pub mod record;
 pub mod retention;
 pub mod scrub;
+pub mod stats;
 pub mod store;
 pub mod text;
 pub mod time;
