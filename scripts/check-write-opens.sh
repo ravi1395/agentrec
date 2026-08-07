@@ -36,21 +36,25 @@
 # SCOPE. Production source under agentrec-core/src and cli/src. Test-ONLY
 # regions and cli/tests/ are exempt: test code writes its own tempdir
 # fixtures. "Test-only" is decided by classifying the cfg attribute, not by a
-# substring match — `#[cfg(test)]` and `#[cfg(all(test, ...))]` (containing
-# no `any(` and no `not(`) open an exempt region, and ONLY when the
-# attribute attaches to a col-0 `mod` (attributes/line comments may sit
-# between); `#[cfg(any(..., test))]` and `#[cfg(not(test))]` gate PRODUCTION
-# code (a disjunction with `test` still compiles into real binaries —
-# `doctorcmd.rs::estimate_watch_count` is the live example, caught by a gate
-# round when a substring match silently exempted it) and are scanned. String
-# literals are stripped before classification: `feature = "test-util"` is a
-# feature name, not the test predicate (third-gate-round bypass). Any other
-# col-0 cfg form carrying a `test` token — `all(` forms nesting `any(` or
-# `not(` (second-round bypass), a test-only cfg attached to a non-module
-# item — is an INTEGRITY abort rather than a guess. An INDENTED unrecognized
-# form arms no channel and is scanned: an inner attribute cannot open a
-# col-0 region, so the failure direction is over-scan (a false VIOLATION
-# that fails loud), never a silent exemption.
+# substring match — the classifier sees only the EXTRACTED `#[cfg(...)]`
+# span, with string literals collapsed (escape-aware) and comments removed,
+# because four gate rounds each measured non-predicate text reaching the
+# decision: raw substring (r1), `all(` nesting `any(` (r2), string contents
+# like `feature = "test-util"` (r3), trailing-comment words (r4).
+# `#[cfg(test)]` and `#[cfg(all(test, ...))]` (containing no `any(` and no
+# `not(`) open an exempt region, and ONLY when the attribute attaches to a
+# col-0 `mod` line ENDING IN `{` (attributes/line comments may sit between)
+# — `mod x;` out-of-line test modules open nothing, and their files are
+# scanned as production (over-scan, loud). `#[cfg(any(..., test))]` and
+# `#[cfg(not(test))]` gate PRODUCTION code (a disjunction with `test` still
+# compiles into real binaries — `doctorcmd.rs::estimate_watch_count` is the
+# live example) and are scanned. Any other col-0 cfg form carrying a `test`
+# token — `all(` nesting `any(`/`not(`, a test-only cfg attached to a
+# non-module or unbounded item — is an INTEGRITY abort rather than a guess.
+# An INDENTED unrecognized form, or a multi-line cfg attribute, arms no
+# channel and is scanned: neither can open a col-0 region, so the failure
+# direction is over-scan (a false VIOLATION that fails loud), never a
+# silent exemption.
 #
 # KNOWN COLLAPSE, disclosed: allowlist keys are `path::fn`, so two same-named
 # functions in one file (e.g. the cfg-paired `create_tmp_file` arms) share
@@ -102,22 +106,36 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     awk -v F="$f" '
     FNR == 1 { in_test = 0; pending_test = 0; saw_cfg_test = 0; cfgtest_present = 0; curfn = "<toplevel>" }
 
-    # String literals are stripped BEFORE any token or class decision: the
-    # `test` in `feature = "test-util"` is a feature NAME, not the `test` cfg
-    # predicate, and a third gate round measured
-    # `#[cfg(all(unix, feature = "test-util"))]` being classified test-only
-    # off that string content — a silently exempted region on code that
-    # compiles into a real binary under `--features test-util`. Escaped
-    # quotes inside cfg strings do not occur in idiomatic Rust cfg
-    # attributes; if one ever appears, the residue fails toward "unknown",
-    # which is loud, not silent.
+    # Classification operates on the EXTRACTED ATTRIBUTE, never on the raw
+    # line. Four gate rounds each found a channel by which non-predicate text
+    # reached the classifier: a substring match (round 1), then string
+    # literal contents (`feature = "test-util"`, round 3), then trailing
+    # comment text (`#[cfg(...)] // test harness ...`, round 4). cfg_extract
+    # therefore: (1) collapses string literals ESCAPE-AWARE
+    # (`"a\"test\"b"` is one literal — round 4 measured the naive
+    # `"[^"]*"` regex leaving a `test` residue that classified test-only,
+    # silently), (2) drops `//` line comments and single-line `/* ... */`
+    # block comments, (3) returns exactly the `#[cfg(` ... first `)]` span,
+    # or "" when no complete span remains on the line (multi-line attributes
+    # open no region and arm no channel — over-scan, loud, disclosed in the
+    # header).
     function strip_strings(line,  c) {
         c = line
-        gsub(/"[^"]*"/, "\"\"", c)
+        gsub(/"(\\.|[^"\\])*"/, "\"\"", c)
         return c
     }
-    # Classify a cfg attribute line carrying a standalone `test` token
-    # (string literals already stripped by the caller).
+    function cfg_extract(line,  c) {
+        c = strip_strings(line)
+        gsub(/\/\*([^*]|\*+[^*\/])*\*+\//, " ", c)
+        sub(/\/\/.*$/, "", c)
+        if (match(c, /#\[cfg\(/)) {
+            c = substr(c, RSTART)
+            if (match(c, /\)\]/)) return substr(c, 1, RSTART + 1)
+        }
+        return ""
+    }
+    # Classify an EXTRACTED cfg attribute (cfg_extract output) carrying a
+    # standalone `test` token.
     #   "testonly"   — compiled ONLY under cfg(test): `#[cfg(test)]`, or an
     #                  `all(...)` containing the bare token with NO `any(`
     #                  and NO `not(` anywhere inside. Conjunction nesting
@@ -149,7 +167,7 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     }
     # `test` as a standalone token (not `latest`, not `test_util` — those are
     # different cfgs and none of this scanner s business). Callers pass the
-    # string-stripped form.
+    # cfg_extract form (strings collapsed, comments gone).
     function has_test_token(line) {
         return (line ~ /[^A-Za-z0-9_]test[^A-Za-z0-9_]/ || line ~ /\(test\)/)
     }
@@ -161,9 +179,9 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     # must say so rather than scan on. (Production-class forms — any/not —
     # deliberately do not arm this channel: they open no region.)
     /#\[cfg\(/ && $0 !~ /^[ \t]*\/\// {
-        stripped = strip_strings($0)
-        if (has_test_token(stripped)) {
-            cls = cfg_class(stripped)
+        attr = cfg_extract($0)
+        if (attr != "" && has_test_token(attr)) {
+            cls = cfg_class(attr)
             if (cls == "testonly") cfgtest_present = 1
             if (cls == "unknown" && $0 ~ /^#\[cfg\(/) {
                 printf "!!INTEGRITY\t%s\tunrecognized-test-cfg-form:FNR=%d\n", F, FNR
@@ -172,17 +190,22 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     }
 
     # A col-0 TEST-ONLY cfg arms a PENDING region: the region actually opens
-    # only when the attribute attaches to a col-0 `mod` item. A third gate
-    # round measured why the attachment check matters: a col-0 `#[cfg(test)]`
-    # on a `const` (or any non-brace item) used to open a region that
-    # swallowed every following production item up to the next col-0 `}`.
-    # Between the cfg and its `mod`, only further col-0 attributes and col-0
-    # line comments may appear (record.rs has comment lines there today);
-    # anything else means the attribute gates a non-module item, which this
-    # scanner cannot bound — INTEGRITY, not a guess.
+    # only when the attribute attaches to a col-0 `mod` item WHOSE LINE ENDS
+    # IN `{` — the brace is what the region-closing `^}$` anchor pairs with.
+    # A third gate round measured why the attachment check matters (a
+    # `#[cfg(test)]` on a `const` swallowed every following production item
+    # up to the next col-0 `}`), and a fourth measured why the BRACE matters:
+    # `mod extra_tests;` (out-of-line) and `mod t { }` (self-closing) both
+    # passed the kind check while bounding nothing, so the "region" ran to
+    # some unrelated closing brace — or the whole file. Now: `mod x {` opens
+    # a region; `mod x;` opens NOTHING (the out-of-line file is scanned as
+    # ordinary production — over-scan, loud, never a silent pass); any other
+    # attachment is INTEGRITY. Between the cfg and its `mod`, only further
+    # col-0 attributes and col-0 line comments may appear (record.rs has
+    # comment lines there today).
     /^#\[cfg\(/ {
-        stripped = strip_strings($0)
-        if (has_test_token(stripped) && cfg_class(stripped) == "testonly") {
+        attr = cfg_extract($0)
+        if (attr != "" && has_test_token(attr) && cfg_class(attr) == "testonly") {
             pending_test = 1
             next
         }
@@ -190,15 +213,19 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     pending_test == 1 {
         if ($0 ~ /^#\[/ || $0 ~ /^\/\//) {
             # attribute or comment between the cfg and its item: keep waiting
-        } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_]/) {
+        } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{[ \t]*$/) {
             in_test = 1; saw_cfg_test = 1; pending_test = 0
+        } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;[ \t]*$/) {
+            # Out-of-line test module: nothing on this side to bound. The
+            # module file itself is scanned as production — over-scan.
+            saw_cfg_test = 1; pending_test = 0
         } else {
             printf "!!INTEGRITY\t%s\ttest-cfg-on-non-module-item:FNR=%d\n", F, FNR
             pending_test = 0
         }
         next
     }
-    in_test == 1 { if ($0 ~ /^\}$/) { in_test = 0 } ; next }
+    in_test == 1 { if ($0 ~ /^\}[ \t]*$/) { in_test = 0 } ; next }
 
     # Track the enclosing function. Declaration forms only (optional
     # visibility / const / async / unsafe / extern), never a call.
@@ -216,7 +243,7 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     # The write-open surface. `fs::write`/`fs::copy`/`File::create` block on a
     # FIFO directly; the OpenOptions builder flags below are how every other
     # write-open in this tree is spelled. `fs::copy` blocks on its SOURCE.
-    /fs::write\(|fs::copy\(|File::create\(|\.write\(true\)|\.append\(true\)|\.create\(true\)|\.create_new\(true\)|\.truncate\(true\)/ {
+    /fs::write\(|fs::copy\(|File::create\(|File::create_new\(|\.write\(true\)|\.append\(true\)|\.create\(true\)|\.create_new\(true\)|\.truncate\(true\)/ {
         printf "%s\t%s\t%d\t%s\n", F, curfn, FNR, $0
     }
 
