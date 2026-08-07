@@ -37,17 +37,20 @@
 # regions and cli/tests/ are exempt: test code writes its own tempdir
 # fixtures. "Test-only" is decided by classifying the cfg attribute, not by a
 # substring match — `#[cfg(test)]` and `#[cfg(all(test, ...))]` (containing
-# no `any(` and no `not(`) open an exempt region; `#[cfg(any(..., test))]`
-# and `#[cfg(not(test))]` gate PRODUCTION code (a disjunction with `test`
-# still compiles into real binaries — `doctorcmd.rs::estimate_watch_count`
-# is the live example, caught by a gate round when a substring match
-# silently exempted it) and are scanned; any other col-0 cfg form carrying a
-# `test` token — including `all(` forms nesting `any(` or `not(`, which a
-# second gate round measured reopening the same hole one level down — is an
-# INTEGRITY abort rather than a guess. An INDENTED unrecognized form arms no
-# channel and is scanned: an inner attribute cannot open a col-0 region, so
-# the failure direction is over-scan (a false VIOLATION that fails loud),
-# never a silent exemption.
+# no `any(` and no `not(`) open an exempt region, and ONLY when the
+# attribute attaches to a col-0 `mod` (attributes/line comments may sit
+# between); `#[cfg(any(..., test))]` and `#[cfg(not(test))]` gate PRODUCTION
+# code (a disjunction with `test` still compiles into real binaries —
+# `doctorcmd.rs::estimate_watch_count` is the live example, caught by a gate
+# round when a substring match silently exempted it) and are scanned. String
+# literals are stripped before classification: `feature = "test-util"` is a
+# feature name, not the test predicate (third-gate-round bypass). Any other
+# col-0 cfg form carrying a `test` token — `all(` forms nesting `any(` or
+# `not(` (second-round bypass), a test-only cfg attached to a non-module
+# item — is an INTEGRITY abort rather than a guess. An INDENTED unrecognized
+# form arms no channel and is scanned: an inner attribute cannot open a
+# col-0 region, so the failure direction is over-scan (a false VIOLATION
+# that fails loud), never a silent exemption.
 #
 # KNOWN COLLAPSE, disclosed: allowlist keys are `path::fn`, so two same-named
 # functions in one file (e.g. the cfg-paired `create_tmp_file` arms) share
@@ -97,19 +100,35 @@ candidates="$tmpdir/candidates"
 # detection did not behave, which pass 2 escalates.
 find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     awk -v F="$f" '
-    FNR == 1 { in_test = 0; saw_cfg_test = 0; cfgtest_present = 0; curfn = "<toplevel>" }
+    FNR == 1 { in_test = 0; pending_test = 0; saw_cfg_test = 0; cfgtest_present = 0; curfn = "<toplevel>" }
 
-    # Classify a cfg attribute line carrying a standalone `test` token.
+    # String literals are stripped BEFORE any token or class decision: the
+    # `test` in `feature = "test-util"` is a feature NAME, not the `test` cfg
+    # predicate, and a third gate round measured
+    # `#[cfg(all(unix, feature = "test-util"))]` being classified test-only
+    # off that string content — a silently exempted region on code that
+    # compiles into a real binary under `--features test-util`. Escaped
+    # quotes inside cfg strings do not occur in idiomatic Rust cfg
+    # attributes; if one ever appears, the residue fails toward "unknown",
+    # which is loud, not silent.
+    function strip_strings(line,  c) {
+        c = line
+        gsub(/"[^"]*"/, "\"\"", c)
+        return c
+    }
+    # Classify a cfg attribute line carrying a standalone `test` token
+    # (string literals already stripped by the caller).
     #   "testonly"   — compiled ONLY under cfg(test): `#[cfg(test)]`, or an
-    #                  `all(...)` containing the token with NO `any(` and NO
-    #                  `not(` anywhere inside. Conjunction nesting preserves
-    #                  test-only-ness (`all(unix, all(test))` still requires
-    #                  `test`), so with disjunction and negation excluded,
-    #                  any `test` token inside the `all` is a conjunct the
-    #                  whole attribute depends on. `any(` breaks that (a gate
-    #                  round measured `all(unix, any(test, feature = "x"))`
-    #                  classified test-only while compiling into a real
-    #                  binary under `--features x`); `not(` can invert it.
+    #                  `all(...)` containing the bare token with NO `any(`
+    #                  and NO `not(` anywhere inside. Conjunction nesting
+    #                  preserves test-only-ness (`all(unix, all(test))`
+    #                  still requires `test`), so with disjunction and
+    #                  negation excluded — and string contents already
+    #                  stripped — a `test` token inside the `all` is a cfg
+    #                  predicate the whole attribute depends on. `any(`
+    #                  breaks that (gate-measured:
+    #                  `all(unix, any(test, feature = "x"))` compiles under
+    #                  `--features x`); `not(` can invert it.
     #   "production" — carries the token but still compiles into real
     #                  binaries: `#[cfg(any(...))]` (disjunction) and
     #                  `#[cfg(not(...))]` (negation) at top level.
@@ -129,7 +148,8 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
         return "unknown"
     }
     # `test` as a standalone token (not `latest`, not `test_util` — those are
-    # different cfgs and none of this scanner s business).
+    # different cfgs and none of this scanner s business). Callers pass the
+    # string-stripped form.
     function has_test_token(line) {
         return (line ~ /[^A-Za-z0-9_]test[^A-Za-z0-9_]/ || line ~ /\(test\)/)
     }
@@ -140,19 +160,43 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     # never fired, the scanner has stopped understanding this codebase and
     # must say so rather than scan on. (Production-class forms — any/not —
     # deliberately do not arm this channel: they open no region.)
-    /#\[cfg\(/ && $0 !~ /^[ \t]*\/\// && has_test_token($0) {
-        cls = cfg_class($0)
-        if (cls == "testonly") cfgtest_present = 1
-        if (cls == "unknown" && $0 ~ /^#\[cfg\(/) {
-            printf "!!INTEGRITY\t%s\tunrecognized-test-cfg-form:FNR=%d\n", F, FNR
+    /#\[cfg\(/ && $0 !~ /^[ \t]*\/\// {
+        stripped = strip_strings($0)
+        if (has_test_token(stripped)) {
+            cls = cfg_class(stripped)
+            if (cls == "testonly") cfgtest_present = 1
+            if (cls == "unknown" && $0 ~ /^#\[cfg\(/) {
+                printf "!!INTEGRITY\t%s\tunrecognized-test-cfg-form:FNR=%d\n", F, FNR
+            }
         }
     }
 
-    # A col-0 TEST-ONLY cfg opens a test region. rustfmt keeps every line
-    # inside `mod tests { ... }` indented, so the region ends at the next
-    # col-0 `}` — which is why the closing brace below is anchored.
-    /^#\[cfg\(/ && has_test_token($0) && cfg_class($0) == "testonly" {
-        in_test = 1; saw_cfg_test = 1
+    # A col-0 TEST-ONLY cfg arms a PENDING region: the region actually opens
+    # only when the attribute attaches to a col-0 `mod` item. A third gate
+    # round measured why the attachment check matters: a col-0 `#[cfg(test)]`
+    # on a `const` (or any non-brace item) used to open a region that
+    # swallowed every following production item up to the next col-0 `}`.
+    # Between the cfg and its `mod`, only further col-0 attributes and col-0
+    # line comments may appear (record.rs has comment lines there today);
+    # anything else means the attribute gates a non-module item, which this
+    # scanner cannot bound — INTEGRITY, not a guess.
+    /^#\[cfg\(/ {
+        stripped = strip_strings($0)
+        if (has_test_token(stripped) && cfg_class(stripped) == "testonly") {
+            pending_test = 1
+            next
+        }
+    }
+    pending_test == 1 {
+        if ($0 ~ /^#\[/ || $0 ~ /^\/\//) {
+            # attribute or comment between the cfg and its item: keep waiting
+        } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_]/) {
+            in_test = 1; saw_cfg_test = 1; pending_test = 0
+        } else {
+            printf "!!INTEGRITY\t%s\ttest-cfg-on-non-module-item:FNR=%d\n", F, FNR
+            pending_test = 0
+        }
+        next
     }
     in_test == 1 { if ($0 ~ /^\}$/) { in_test = 0 } ; next }
 
@@ -178,6 +222,7 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
 
     END {
         if (in_test == 1) printf "!!INTEGRITY\t%s\tunclosed-test-region\n", F
+        if (pending_test == 1) printf "!!INTEGRITY\t%s\ttest-cfg-at-eof\n", F
         # A file carrying a test attribute that never opened a region means
         # the anchored patterns above stopped matching this codebase.
         if (saw_cfg_test == 0 && cfgtest_present == 1) printf "!!INTEGRITY\t%s\tcfg-test-not-detected\n", F
