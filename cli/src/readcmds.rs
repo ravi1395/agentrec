@@ -1435,4 +1435,42 @@ mod tests {
             "a symlinked root is ordinary, not an escape"
         );
     }
+
+    /// `write_undo_guard` writes `.agentrec/undo-guard.json` with `fs::write`
+    /// (create+truncate), which blocks forever on a FIFO at that fixed
+    /// in-repo path. It runs BEFORE any file mutation begins, so a hang here
+    /// wedges the undo silently — the operator sees a command that never
+    /// returns, with nothing written and nothing logged.
+    /// HANGS rather than fails on regression: terminating is the property.
+    #[test]
+    #[cfg(unix)]
+    fn write_undo_guard_refuses_a_fifo_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = undo_guard_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+
+        let err = write_undo_guard(root, &["a.rs".to_string()]).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary guard path must still be written and must
+        // read back as a live guard. Without this, a refuse-everything
+        // mutation of the guard passes the assert above while disabling H7
+        // undo coordination entirely.
+        let ok_tmp = tempfile::tempdir().unwrap();
+        let ok = ok_tmp.path();
+        write_undo_guard(ok, &["a.rs".to_string()])
+            .expect("an ordinary guard path must still be written");
+        let text = std::fs::read_to_string(undo_guard_path(ok)).unwrap();
+        assert!(text.contains("a.rs"), "guard must carry its paths: {text}");
+    }
 }

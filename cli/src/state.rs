@@ -789,4 +789,43 @@ mod tests {
         );
         assert_eq!(state.last_emitter_turn_fingerprint, None);
     }
+
+    /// `write_state`'s tmp name is `state.json.tmp.<pid>` — predictable
+    /// enough for a sandboxed agent to plant a FIFO at it, and `fs::write`
+    /// opens create+truncate, which blocks until a reader appears. This is
+    /// the daemon's hot path (every offset/nonce persist), so a hang here
+    /// stops recording entirely. HANGS rather than fails on regression.
+    #[test]
+    #[cfg(unix)]
+    fn write_state_refuses_a_fifo_tmp_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        let tmp_path = state_path(root).with_extension(format!("json.tmp.{}", std::process::id()));
+        let c = std::ffi::CString::new(tmp_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+
+        let err = write_state(root, &State::default()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+        assert!(
+            !state_path(root).exists(),
+            "a refused write must not rename anything into place"
+        );
+
+        // ALLOW half: without the fifo the same call must still persist, or a
+        // refuse-everything guard would pass the asserts above while silently
+        // disabling every state write.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        write_state(ok.path(), &State::default()).expect("an ordinary tmp path must still write");
+        assert!(state_path(ok.path()).exists());
+    }
 }

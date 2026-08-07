@@ -16,8 +16,18 @@
 # matches the method, and `OpenOptions::open` is the same method for a
 # guarded read and an unguarded write, so listing it would fire on every
 # lock-file open in the tree. Those sites call `fsguard::is_nonregular`
-# inline instead; `fsguard`'s module doc carries the registry of which ones,
-# and a newly added write-open can still be unguarded without CI noticing.
+# inline instead, and `fsguard`'s module doc carries the registry of which
+# ones.
+#
+# The write half is NO LONGER an open forward gap: `scripts/check-write-opens.sh`
+# (wired into the CI lint job beside this lint) scans production source for
+# write-open call sites and fails on any that is not in
+# `scripts/write-open-allowlist.txt`, so a NEWLY ADDED unguarded write-open
+# reds the build. The allowlist is bidirectional — an entry matching no call
+# site is also a failure — because the script's correctness rests on excluding
+# `#[cfg(test)]` regions, and a silently over-greedy exclusion must announce
+# itself rather than pass. What that script does NOT do is verify that an
+# allowlisted guard is CORRECT; the rationale per entry is human-reviewed.
 #
 # Clippy matches the RESOLVED path, so one entry covers both `std::fs::read`
 # and a `use std::fs;` + `fs::read(..)` call form.

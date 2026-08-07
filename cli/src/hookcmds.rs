@@ -581,4 +581,64 @@ mod tests {
             "expired entry must have been GC'd before this drain, not delivered late"
         );
     }
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    /// `open_scratch_lock` opens `.agentrec/codex-scratch.lock` for WRITE
+    /// before the flock is even attempted, so a FIFO there wedges the Codex
+    /// hook process — and a hook that never returns stalls the whole agent
+    /// turn, which is strictly worse than a lost signal.
+    /// HANGS rather than fails on regression.
+    #[test]
+    #[cfg(unix)]
+    fn open_scratch_lock_refuses_a_fifo_lock_instead_of_hanging() {
+        let tmp = tmp_root();
+        mkfifo_at(&scratch_lock_path(tmp.path()));
+
+        let err = open_scratch_lock(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary lock path must still open.
+        let ok = tmp_root();
+        drop(open_scratch_lock(ok.path()).expect("an ordinary lock path must still open"));
+    }
+
+    /// `write_scratch_entries` stages through `codex-scratch.jsonl.tmp.<pid>`
+    /// and `fs::write` opens create+truncate, which blocks on a FIFO planted
+    /// at that name. Same wedged-hook consequence as the lock above.
+    #[test]
+    #[cfg(unix)]
+    fn write_scratch_entries_refuses_a_fifo_tmp_instead_of_hanging() {
+        let tmp = tmp_root();
+        let tmp_path =
+            scratch_path(tmp.path()).with_extension(format!("jsonl.tmp.{}", std::process::id()));
+        mkfifo_at(&tmp_path);
+
+        let err = write_scratch_entries(tmp.path(), &[]).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+        assert!(
+            !scratch_path(tmp.path()).exists(),
+            "a refused write must not rename anything into place"
+        );
+
+        // ALLOW half: without the fifo the rewrite must still land.
+        let ok = tmp_root();
+        write_scratch_entries(ok.path(), &[]).expect("an ordinary tmp path must still write");
+        assert!(scratch_path(ok.path()).exists());
+    }
 }

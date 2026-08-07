@@ -568,8 +568,19 @@ pub fn install(root: &Path, exec: &Path) -> Result<Vec<String>, String> {
     };
 
     let mut actions = Vec::new();
-    // Guarded; refusal folds into the existing `unwrap_or(false)`, i.e. the
-    // unit is treated as not-up-to-date and rewritten.
+    // A non-regular file at the unit path (FIFO, socket, directory) would
+    // make the `fs::write` below block or fail confusingly — refuse instead
+    // of proceeding. An absent path is the normal first-install case, and
+    // `is_nonregular` returns false for it.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "refusing to write service unit: {} exists and is not a regular file",
+            path.display()
+        ));
+    }
+    // Guarded; a read error on the now-known-regular file folds into
+    // `unwrap_or(false)`, i.e. the unit is treated as not-up-to-date and
+    // rewritten.
     let unchanged = agentrec_core::fsguard::read_regular_to_string(&path)
         .map(|existing| existing == content)
         .unwrap_or(false);
@@ -1354,6 +1365,131 @@ mod tests {
         assert!(
             unparseable.is_empty(),
             "every unit this tool installed must be parseable; unreadable: {unparseable:?}"
+        );
+    }
+
+    // A FIFO at the unit path makes `fs::write` block forever on
+    // `open(O_WRONLY)` with no reader — `install` must refuse on the type
+    // check instead of hanging `init`. The whole assertion is "this test
+    // returns at all"; the message check only pins WHICH refusal fired.
+    //
+    // Env is restored before any assertion so a failure cannot leak
+    // AGENTREC_TEST_SERVICE_DIR into the rest of the process or poison
+    // ENV_LOCK for every other test that takes it.
+    #[test]
+    #[cfg(unix)]
+    fn install_refuses_when_unit_path_is_a_fifo() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("AGENTREC_TEST_SERVICE_DIR").ok();
+
+        let service_dir = tempfile::tempdir().unwrap();
+        let root_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AGENTREC_TEST_SERVICE_DIR", service_dir.path());
+
+        // `install` computes the unit path from the RESOLVED root, and `slug`
+        // keys on that canonicalized path — deriving the FIFO path any other
+        // way puts it at a filename `install` never touches, which would let
+        // the test sail past the guard into `launchctl`.
+        let resolved = resolve_root(root_dir.path());
+        let path = unit_path(&resolved).unwrap();
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let is_fifo = std::fs::symlink_metadata(&path)
+            .map(|m| !m.file_type().is_file())
+            .unwrap_or(false);
+
+        let result = if mkfifo && is_fifo {
+            Some(install(
+                root_dir.path(),
+                Path::new("/usr/local/bin/agentrec"),
+            ))
+        } else {
+            None
+        };
+
+        // Remove the FIFO before the tempdir drops (and before any assert).
+        let _ = std::fs::remove_file(&path);
+        match prev {
+            Some(v) => std::env::set_var("AGENTREC_TEST_SERVICE_DIR", v),
+            None => std::env::remove_var("AGENTREC_TEST_SERVICE_DIR"),
+        }
+
+        assert!(mkfifo && is_fifo, "fixture failed: no FIFO at {path:?}");
+        let err = result
+            .unwrap()
+            .expect_err("install must refuse a non-regular unit path");
+        assert!(
+            err.contains("not a regular file"),
+            "wrong refusal reason: {err}"
+        );
+        assert!(err.contains(&path.display().to_string()), "{err}");
+    }
+
+    // ALLOW control for the guard above: with the unit path ABSENT, `install`
+    // must get past the type check and reach `fs::write`.
+    //
+    // It deliberately does NOT let a successful write happen: `install` then
+    // shells `launchctl load -w`, and this repo has already leaked ~39 real
+    // LaunchAgents from tests. So the unit directory is made unwritable
+    // (0o500) — `create_dir_all` is a no-op on an existing dir, the guard
+    // passes, and `fs::write` dies with EACCES. A permission-denied error is
+    // therefore positive proof that execution reached the write, while
+    // `launchctl` is provably unreachable.
+    #[test]
+    #[cfg(unix)]
+    fn install_proceeds_past_guard_when_unit_path_is_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("AGENTREC_TEST_SERVICE_DIR").ok();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let service_dir = tmp.path().join("units");
+        std::fs::create_dir_all(&service_dir).unwrap();
+        let root_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(&service_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Probe FIRST: if the filesystem/uid does not enforce the mode (root,
+        // odd FS), `install` would succeed and reach `launchctl`. Skip rather
+        // than risk that.
+        let enforced = std::fs::write(service_dir.join(".perm_probe"), b"x").is_err();
+
+        let outcome = if enforced {
+            std::env::set_var("AGENTREC_TEST_SERVICE_DIR", &service_dir);
+            let resolved = resolve_root(root_dir.path());
+            let path = unit_path(&resolved).unwrap();
+            let absent = !path.exists();
+            let guarded = agentrec_core::fsguard::is_nonregular(&path);
+            let r = install(root_dir.path(), Path::new("/usr/local/bin/agentrec"));
+            Some((absent, guarded, r))
+        } else {
+            None
+        };
+
+        match prev {
+            Some(v) => std::env::set_var("AGENTREC_TEST_SERVICE_DIR", v),
+            None => std::env::remove_var("AGENTREC_TEST_SERVICE_DIR"),
+        }
+        // Restore write permission so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&service_dir, std::fs::Permissions::from_mode(0o700));
+
+        let Some((absent, guarded, result)) = outcome else {
+            // Not enforced (likely root): the control cannot run safely.
+            return;
+        };
+        assert!(absent, "fixture: unit path must start absent");
+        assert!(!guarded, "an absent path is not non-regular");
+        let err = result.expect_err("the unwritable unit dir must fail the write");
+        assert!(
+            !err.contains("not a regular file"),
+            "the refusal guard fired on an absent path: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("permission denied"),
+            "expected the fs::write EACCES, got: {err}"
         );
     }
 

@@ -6105,4 +6105,132 @@ mod tests {
         );
         assert!(!open_path(root).exists());
     }
+
+    // ---- write-side fsguard: the three inline `is_nonregular` guards in
+    // ---- this file (`acquire_lock`, `daemon_is_running`, `sync_journal`).
+    // ---- All three landed evidenced only by the green suite.
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    /// `acquire_lock` opens `.agentrec/daemon.lock` for WRITE before the
+    /// flock, so a FIFO there wedges `agentrec record` at startup — the
+    /// recorder never begins, and nothing reports why.
+    /// HANGS rather than fails on regression: terminating is the property.
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lock_refuses_a_fifo_lock_file_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&lock_path(tmp.path()));
+
+        let err = acquire_lock(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary lock path must still be acquirable, or a
+        // refuse-everything guard passes the assert above while making the
+        // daemon permanently unstartable.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        drop(acquire_lock(ok.path()).expect("an ordinary lock path must still be acquirable"));
+    }
+
+    /// `daemon_is_running` opens the same lock path for WRITE as a liveness
+    /// probe, so a FIFO there hangs `status` and `doctor` — read verbs that
+    /// need no daemon at all.
+    ///
+    /// Its return value is deliberately NOT the discriminator: `false` is
+    /// also what a missing lock file yields, so the assertion below could
+    /// not tell a working guard from a vanished one. What this test pins is
+    /// TERMINATION — it hangs rather than fails on regression. The two
+    /// controls that follow are what make the `false` meaningful: an
+    /// ordinary lock file with nobody holding it must also read `false`, and
+    /// one this test holds must read `true`.
+    #[test]
+    #[cfg(unix)]
+    fn daemon_is_running_terminates_with_a_fifo_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&lock_path(tmp.path()));
+        assert!(
+            !daemon_is_running(tmp.path()),
+            "a non-regular lock path is a can't-determine case: report not-running"
+        );
+
+        // ALLOW half, both directions.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        let held = acquire_lock(ok.path()).expect("fixture must take the lock");
+        assert!(
+            daemon_is_running(ok.path()),
+            "a held ordinary lock must still read as running"
+        );
+        drop(held);
+        assert!(
+            !daemon_is_running(ok.path()),
+            "a released ordinary lock must read as not running"
+        );
+    }
+
+    /// `sync_journal`'s tmp name is FIXED (`open.json.tmp`), so a FIFO
+    /// planted at it would block the daemon's journal write forever — the
+    /// strongest case in the class, since it fires on the recorder's own
+    /// loop rather than on a user-invoked verb. The guard's response is to
+    /// skip the write (a `()` return), so the discriminating evidence is
+    /// that the call RETURNED, the fifo is still a fifo (nothing was written
+    /// through it), and `open.json` was never created.
+    #[test]
+    #[cfg(unix)]
+    fn sync_journal_skips_a_fifo_tmp_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::objects_dir(root)).unwrap();
+        let tmp_path = open_path(root).with_extension("json.tmp");
+        mkfifo_at(&tmp_path);
+
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, None);
+        let recorder = Recorder::scan(root, BlobStore::new(crate::objects_dir(root)));
+        let clock = Clock::start();
+        let mut cache = None;
+
+        sync_journal(root, &engine, &recorder, &clock, &mut cache);
+
+        assert!(
+            !open_path(root).exists(),
+            "a refused journal write must not rename anything into place"
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&tmp_path)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the fifo must be untouched — nothing may have been written through it"
+        );
+        assert!(cache.is_none(), "a skipped write must not prime the cache");
+
+        // ALLOW half: the identical call without the fifo must actually
+        // write the journal and prime the cache.
+        let ok_tmp = tempfile::tempdir().unwrap();
+        let ok = ok_tmp.path();
+        std::fs::create_dir_all(crate::objects_dir(ok)).unwrap();
+        let ok_recorder = Recorder::scan(ok, BlobStore::new(crate::objects_dir(ok)));
+        let mut ok_cache = None;
+        sync_journal(ok, &engine, &ok_recorder, &clock, &mut ok_cache);
+        assert!(
+            open_path(ok).exists(),
+            "an ordinary tmp path must still produce open.json"
+        );
+        assert!(ok_cache.is_some(), "a completed write must prime the cache");
+    }
 }

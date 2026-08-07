@@ -48,6 +48,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: write-open guard (fsguard write half)
+        # clippy.toml closes the blocking-READ half of the fsguard hazard.
+        # The WRITE half is not expressible as a `disallowed-methods` entry
+        # (`OpenOptions::open` is the same method for a guarded read and an
+        # unguarded write), so it is gated by this script against an explicit
+        # allowlist instead. Invoked via `bash` deliberately, per repo
+        # convention, so the gate cannot depend on git recording mode 100755.
+        run: bash scripts/check-write-opens.sh
 
   test:
     name: test (${{ matrix.os }})

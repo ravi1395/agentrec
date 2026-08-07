@@ -1,0 +1,68 @@
+# Reviewed production write-open call sites — the allowlist for
+# `bash scripts/check-write-opens.sh`. See that script's header for why this
+# is a file keyed on `path::fn` rather than marker comments or line numbers.
+#
+# FORMAT:  <path>::<fn>  <expected-line-count>  # <rationale>
+#
+# The count is the number of matched write-open LINES in that function (an
+# `OpenOptions` builder contributes one per flag, e.g. `.create(true)` plus
+# `.append(true)` == 2). It is deliberately part of the key's contract: a new
+# unguarded write added inside an already-reviewed function is the single most
+# likely way this gate gets bypassed, and only the count catches it.
+#
+# Every entry must match at least one site — an entry matching none is a
+# VIOLATION, not a no-op, because that is how a broken scanner announces
+# itself instead of silently passing.
+#
+# FOUR RATIONALE CLASSES (see agentrec-core/src/fsguard.rs's module doc):
+#   [guard]     `fsguard::is_nonregular` is called on the same path, in the
+#               same function, before the open.
+#   [excl]      `create_new(true)` — O_CREAT|O_EXCL fails with EEXIST on ANY
+#               pre-existing inode including a FIFO, and never blocks. The
+#               path is a freshly-minted tmp name in either case.
+#   [upstream]  Unreachable with a non-regular file in hand because a guarded
+#               READ earlier on the same path already refused it. Weaker than
+#               [guard]: it depends on a caller-side invariant. Each one is
+#               spelled out.
+#   [nonexist]  Reached only when the path does not exist, so no FIFO can be
+#               sitting there. `exists()` follows symlinks, so this class is
+#               sound for the BLOCKING hazard only; it is not a symlink guard.
+
+# ---- [guard] inline is_nonregular on the same path ------------------------
+agentrec-core/src/record.rs::open_append          2  # is_nonregular(path); the one primitive behind every log/signal/memory append
+agentrec-core/src/undo_coordinator.rs::append_event 2  # is_nonregular(&path) on the undo event ledger
+agentrec-core/src/undo_coordinator.rs::acquire    2  # UndoLock::acquire; is_nonregular(path) on the lock file
+cli/src/daemon.rs::sync_journal                   1  # is_nonregular(&tmp) before the open.json tmp write
+cli/src/daemon.rs::acquire_lock                   2  # is_nonregular(&path) on the daemon lock file
+cli/src/daemon.rs::daemon_is_running              1  # is_nonregular(&path) before the liveness probe open
+cli/src/hookcmds.rs::open_scratch_lock            2  # is_nonregular(&path) on the hook scratch lock
+cli/src/hookcmds.rs::write_scratch_entries        1  # is_nonregular(&tmp) before the tmp-then-rename write
+cli/src/loglock.rs::open_lock_file                2  # is_nonregular(&path) on the log lock
+cli/src/memlock.rs::open_lock_file                2  # is_nonregular(&path) on the memory lock
+cli/src/purgecmd.rs::append_lines_synced          2  # is_nonregular(path) before the archive append
+cli/src/purgecmd.rs::write_full_file_synced       3  # is_nonregular(path) before the archive rewrite
+cli/src/readcmds.rs::write_undo_guard             1  # is_nonregular(&path) before the undo-guard write
+cli/src/service.rs::install                       1  # is_nonregular(&path) before the service-unit write
+cli/src/state.rs::write_state                     1  # is_nonregular(&tmp) before the state tmp write
+
+# ---- [excl] create_new: EEXIST on any pre-existing inode ------------------
+agentrec-core/src/store.rs::create_tmp_file       4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh CAS tmp name
+cli/src/purgecmd.rs::create_tmp_file              4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh rewrite tmp name
+
+# ---- [upstream] refused by a guarded read earlier on the same path --------
+agentrec-core/src/store.rs::put_result            1  # mtime touch on a dedup HIT: reached only after fsguard::read_regular returned bytes hashing to the expected value, which a FIFO cannot do
+agentrec-core/src/undo_coordinator.rs::restore_from_before 1  # [guard] inline is_nonregular second gate beside the symlink gate (2026-08-07 fix); the planner (build_plan -> fsguard-guarded reads) also drops non-regular targets for callers that go through it.
+cli/src/initcmd.rs::ensure_gitignore              1  # merge-write: read_regular_to_string first, and a non-regular path is escalated to a hard error before the write
+cli/src/initcmd.rs::install_claude_hooks          2  # fs::copy backup + merge write; read_regular_to_string first, aborts on any non-NotFound error
+cli/src/initcmd.rs::install_codex_hooks_json      2  # same read-then-copy-then-write config merge
+cli/src/initcmd.rs::install_codex_hooks_toml      2  # same read-then-copy-then-write config merge
+cli/src/initcmd.rs::install_mcp_json              2  # same read-then-copy-then-write config merge
+cli/src/initcmd.rs::install_codex_mcp             2  # same read-then-copy-then-write config merge
+cli/src/uninstallcmd.rs::remove_claude_hooks      2  # same read-then-copy-then-write config merge
+cli/src/uninstallcmd.rs::remove_codex_hooks_json  2  # same read-then-copy-then-write config merge
+cli/src/uninstallcmd.rs::remove_codex_hooks_toml  2  # same read-then-copy-then-write config merge
+cli/src/uninstallcmd.rs::remove_mcp_json          2  # same read-then-copy-then-write config merge
+cli/src/uninstallcmd.rs::remove_codex_mcp         2  # same read-then-copy-then-write config merge
+
+# ---- [nonexist] guarded by a non-existence precondition -------------------
+cli/src/initcmd.rs::run                           1  # default config.toml written only inside `if !config.exists()`, so a FIFO at that path makes exists() true and the write is skipped

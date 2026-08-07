@@ -60,21 +60,31 @@
 //! `daemon.rs::acquire_lock`, `daemon.rs::daemon_is_running`, the daemon's
 //! `open.json` journal write, `loglock.rs`/`memlock.rs`/`hookcmds.rs`
 //! lock-file opens, `hookcmds.rs::write_scratch_entries`,
-//! `state.rs::write_state`, `readcmds.rs::write_undo_guard`, and purgecmd's
-//! `append_lines_synced`/`write_full_file_synced` archive writers. Because
-//! that is a convention rather than a lint, a NEW write-open can still be
-//! added unguarded — a disclosed open class, not a closed one.
+//! `state.rs::write_state`, `readcmds.rs::write_undo_guard`,
+//! `undo_coordinator.rs::restore_from_before` (second gate beside its
+//! symlink one), purgecmd's `append_lines_synced`/`write_full_file_synced`
+//! archive writers, and `service.rs::install`'s service-unit write under
+//! `~/Library/LaunchAgents` (or the XDG systemd dir — outside the repo
+//! threat model, guarded anyway). The convention is enforced forward by
+//! `scripts/check-write-opens.sh` in CI: every write-open call site must
+//! match an entry in `scripts/write-open-allowlist.txt`, so a NEW
+//! write-open fails the lint job until it is guarded (or justified) and
+//! allowlisted. The script checks presence, not correctness — whether an
+//! allowlisted guard actually protects its site is what the per-site FIFO
+//! tests pin.
 //!
-//! Two production write-sites are deliberately NOT guarded inline, each
+//! Some production write-sites are deliberately NOT guarded inline, each
 //! because a guard upstream makes the site unreachable with a FIFO in hand:
-//! `store.rs::put`'s mtime touch (reached only after `read_regular` returned
-//! bytes that hash to the expected value, which a FIFO cannot do) and
+//! `store.rs::put_result`'s mtime touch (reached only after `read_regular`
+//! returned bytes that hash to the expected value, which a FIFO cannot do),
 //! `initcmd.rs`/`uninstallcmd.rs`'s `fs::copy`-then-`fs::write` config
 //! merges (each reads the target through `read_regular_to_string` first and
-//! aborts on any non-`NotFound` error before the copy). Outside the repo
-//! threat model entirely, and unguarded: `service.rs`'s service-unit write
-//! under `~/Library/LaunchAgents` (or the XDG systemd dir), whose read
-//! refusal folds into `unwrap_or(false)` and proceeds to write.
+//! aborts on any non-`NotFound` error before the copy),
+//! `initcmd.rs::ensure_gitignore` (same read-first shape), and
+//! `initcmd.rs::run`'s config write (gated on `!config.exists()` — a FIFO
+//! at the path makes `exists()` true, so the write is skipped; sound
+//! against blocking, though not an `is_nonregular` guard). The allowlist
+//! records each with its basis.
 //!
 //! The precondition is the same one that grounds the containment refusals:
 //! an agent sandboxed to the repository can create a FIFO inside the repo

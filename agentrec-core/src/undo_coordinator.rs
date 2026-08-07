@@ -1761,6 +1761,19 @@ pub fn restore_from_before(
             entry.path
         ));
     }
+    // Same second-gate rationale for the FIFO/socket/device shape: the
+    // planner's guarded reads (`inode_refusal`, `read_current_hash`) already
+    // refuse non-regular files, but a fifo is not a symlink, so the inline
+    // gate above does not cover it — without this check a caller that skips
+    // the planner reaches `fs::write` on a fifo and blocks until a reader
+    // appears.
+    if crate::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "{}: not a regular file — refusing to restore (writing here would block or \
+             write through a special file)",
+            entry.path
+        ));
+    }
     let before_hash = entry
         .before
         .as_deref()
@@ -2968,5 +2981,133 @@ mod coordinator_tests {
         let co2 = fx2.coord();
         let lock2 = co2.lock().unwrap();
         assert_eq!(refusal(co2.claim_token(&lock2, &token2)), "token_expired");
+    }
+
+    // ---- write-side fsguard: the two inline `is_nonregular` guards in this
+    // ---- module (`append_event`, `UndoLock::acquire`). Both were landed
+    // ---- evidenced only by the green suite; the module's existing fifo
+    // ---- coverage (`cli/tests/mcp.rs`, `cli/tests/undo_execute.rs`) is all
+    // ---- READ-side, and every flow reads before it writes, so a read guard
+    // ---- fires first and the write guards were never exercised.
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    #[cfg(unix)]
+    fn a_ledger_event() -> LedgerEvent {
+        LedgerEvent {
+            v: 1,
+            event: EVENT_RESERVE.to_string(),
+            id: "r_fifo".to_string(),
+            turn: "t_1".to_string(),
+            paths: vec!["a.rs".to_string()],
+            token_sha256: None,
+            expires_unix_ms: 0,
+            at_unix_ms: 0,
+            hashes: vec![],
+            allow_modified: false,
+            undo_turn: None,
+            reason: None,
+        }
+    }
+
+    /// `append_event` opens `.agentrec/undo-requests.jsonl` create+append.
+    /// Opening a FIFO for append blocks until a READER appears — no timeout,
+    /// no error — and `.agentrec/` is inside the repo the sandboxed agent can
+    /// write, so `mkfifo` there wedges every undo leg that lodges a
+    /// reservation. HANGS rather than fails on regression: this test
+    /// TERMINATING is the primary property.
+    #[test]
+    #[cfg(unix)]
+    fn append_event_refuses_a_fifo_ledger_instead_of_hanging() {
+        let fx = Fx::new();
+        let co = fx.coord();
+        mkfifo_at(&co.ledger_path());
+
+        let err = co.append_event(&a_ledger_event()).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not a regular file"),
+            "refusal must name the reason: {msg}"
+        );
+
+        // The ALLOW half, and the half this repo has been burned by omitting:
+        // a refuse-everything mutation of `is_nonregular` passes the assert
+        // above and silently breaks every real append. An ordinary ledger
+        // path must still take the write.
+        let fx_ok = Fx::new();
+        let co_ok = fx_ok.coord();
+        co_ok
+            .append_event(&a_ledger_event())
+            .expect("an ordinary ledger path must still be appendable");
+        let text = std::fs::read_to_string(co_ok.ledger_path()).unwrap();
+        assert_eq!(text.lines().count(), 1, "the event must be on disk: {text}");
+    }
+
+    /// `UndoLock::acquire` opens `.agentrec/undo.lock` for WRITE, before any
+    /// gate runs, so a FIFO there blocks every undo leg at the earliest
+    /// possible point. Same hang-not-fail shape.
+    #[test]
+    #[cfg(unix)]
+    fn undo_lock_refuses_a_fifo_lock_file_instead_of_hanging() {
+        let fx = Fx::new();
+        let co = fx.coord();
+        mkfifo_at(&co.lock_path());
+
+        let err = co.lock().err().expect("a fifo lock path must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not a regular file"),
+            "refusal must name the reason: {msg}"
+        );
+
+        // ALLOW half: an ordinary lock path must still be acquirable.
+        let fx_ok = Fx::new();
+        let co_ok = fx_ok.coord();
+        drop(
+            co_ok
+                .lock()
+                .expect("an ordinary lock path must still be lockable"),
+        );
+    }
+
+    /// `restore_from_before` writes the `before` blob with `fs::write`. Its
+    /// symlink gate does not cover a FIFO (a fifo is not a link), and its
+    /// planner-side protection (`inode_refusal` / `read_current_hash`) only
+    /// holds for callers that go through `build_plan` — the write primitive
+    /// itself needs the second gate, same rationale as the symlink one above
+    /// it. Without it, `fs::write` on a fifo blocks until a reader appears.
+    #[test]
+    #[cfg(unix)]
+    fn restore_from_before_refuses_a_fifo_instead_of_hanging() {
+        let fx = Fx::new();
+        let e = fx.revertible("a.rs");
+        let full = fx.root().join("a.rs");
+        std::fs::remove_file(&full).unwrap();
+        mkfifo_at(&full);
+
+        let err = restore_from_before(&full, &fx.store(), &e).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary revertible file must still restore.
+        let fx_ok = Fx::new();
+        let e_ok = fx_ok.revertible("b.rs");
+        let full_ok = fx_ok.root().join("b.rs");
+        let restored = restore_from_before(&full_ok, &fx_ok.store(), &e_ok)
+            .expect("an ordinary revertible path must still restore");
+        assert_eq!(restored, e_ok.before.clone().unwrap());
+        let text = std::fs::read_to_string(&full_ok).unwrap();
+        assert_eq!(text, "old b.rs", "on-disk bytes must be the before blob");
     }
 }

@@ -10156,21 +10156,20 @@ impl Drop for SingleDaemonGuard {
 ///
 /// **The fixture REPLACES a watched regular file with a fifo rather than
 /// creating a fifo outright. That choice is for determinism, not necessity.**
-/// Fresh-FIFO delivery was measured by two gate rounds (2026-08-07, one macOS
-/// machine each) and their results DISAGREE on one row; neither is treated as
-/// authoritative here. Bare `mkfifo` with no writer: no delivery (round 8,
-/// single run; round 9 did not run this shape). `mkfifo` + read-write open,
-/// no byte written: no delivery (one round, single run). `mkfifo` + read-write open + a byte written: round 8
-/// saw 2/2 turns delivered; round 9's reconstruction saw 0/3, and got 2/2
-/// only after adding an explicit `touch` on the fifo (a metadata syscall) —
-/// round 8's exact probe commands were not persisted, so which stimulus
-/// governs delivery is UNDETERMINED. `scripts/probe-fresh-fifo-delivery.sh`
-/// now persists the probe shapes so a future run can settle it. Two things
-/// hold either way: all no-delivery figures are few-run negatives (FSEvents
-/// false-negatives are the plausible flake direction), and every delivered
-/// fifo turn in both rounds rendered `op: "create", skipped_reason:
-/// "unreadable"` — the guard handles the fresh-FIFO shape end-to-end whenever
-/// it is reached.
+/// Fresh-FIFO delivery was settled by a persisted 4x4 probe matrix
+/// (2026-08-07, `scripts/probe-fresh-fifo-delivery.sh`, 4 runs per shape, one
+/// macOS machine; raw tallies in `docs/verify/fresh-fifo-delivery-probe.txt`):
+/// `bare` 0/4, `rw-open` 0/4, `byte` 0/4, `byte-touch` 4/4. The governing
+/// stimulus is the METADATA event (`touch`) — writing a byte into a fifo
+/// moves data through the kernel pipe buffer without touching on-disk file
+/// data, so FSEvents emits nothing for it. Two earlier gate rounds had
+/// disagreed on the byte row; round 8's "2/2 delivered without touch" does
+/// not reproduce under the persisted shapes and its own commands were never
+/// persisted — superseded by this matrix. Caveats that stand: the negatives
+/// are 12 consistent runs on ONE machine (FSEvents false-negatives remain
+/// the plausible flake direction), and every delivered fifo turn in the
+/// earlier rounds rendered `op: "create", skipped_reason: "unreadable"` —
+/// the guard handles the fresh-FIFO shape end-to-end whenever it is reached.
 ///
 /// Mechanism, verified against this repo's source rather than notify
 /// internals: file staging on macOS is kind-agnostic — every watched-class

@@ -3026,4 +3026,57 @@ mod tests {
         assert!(path_matches("secrets/*", "secrets/prod.yaml"));
         assert!(!path_matches("secrets/*", "secrets/sub/prod.yaml"));
     }
+
+    // ---- write-side fsguard: the two archive writers. The existing fifo
+    // ---- test in this module (`purge_refuses_a_fifo_liveness_input_…`)
+    // ---- covers the READ side (`read_liveness_input`) only, and it fires
+    // ---- first on the ordinary flow, so neither writer was ever exercised
+    // ---- with a fifo in hand.
+
+    /// `append_lines_synced` opens the archive create+append. A FIFO at an
+    /// archive name blocks that open until a reader appears — and every
+    /// caller is holding `memlock`/`loglock` while it waits, so the hang
+    /// takes the lock with it and wedges every other writer too.
+    /// HANGS rather than fails on regression.
+    #[test]
+    #[cfg(unix)]
+    fn append_lines_synced_refuses_a_fifo_archive_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = agentrec_dir(tmp.path()).join("memory.archived.1.jsonl");
+        mkfifo_at(&path);
+
+        let err = append_lines_synced(&path, &["a"]).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary archive name must still be written, or a
+        // refuse-everything guard would pass the assert above while silently
+        // making every purge un-archivable.
+        let ok = agentrec_dir(tmp.path()).join("memory.archived.2.jsonl");
+        append_lines_synced(&ok, &["a", "b"]).expect("an ordinary archive path must still write");
+        assert_eq!(std::fs::read_to_string(&ok).unwrap(), "a\nb\n");
+    }
+
+    /// `write_full_file_synced` opens the archive create+write+truncate,
+    /// which blocks on a FIFO identically. Same held-lock consequence.
+    #[test]
+    #[cfg(unix)]
+    fn write_full_file_synced_refuses_a_fifo_archive_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = agentrec_dir(tmp.path()).join("log.archived.1.jsonl");
+        mkfifo_at(&path);
+
+        let err = write_full_file_synced(&path, b"x").unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half.
+        let ok = agentrec_dir(tmp.path()).join("log.archived.2.jsonl");
+        write_full_file_synced(&ok, b"payload").expect("an ordinary archive path must still write");
+        assert_eq!(std::fs::read(&ok).unwrap(), b"payload");
+    }
 }
