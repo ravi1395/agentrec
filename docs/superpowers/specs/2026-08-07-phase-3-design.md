@@ -98,14 +98,15 @@ Per-repo analytics over the turn ledger:
     — daemon-restart gaps are seconds–minutes and every 7-day window
     contains one; same defect class as the bisect gap-fatality fixed at
     round 2). Instead: gap-overlapped windows stay measurable, the output
-    counts them (`gap_overlapped`), and the rework rate is labeled a
+    counts them (`gap_overlapped`), and the rework rate is labeled
     an **approximate lower bound** — two disclosed channels, opposite
     directions: an edit hidden inside a gap is invisible to the ledger
     (undercount), and a gap can strip bracket coverage — a dropped `start`
     signal (PROTOCOL `dropped_signals`) means post-restart agent activity
     mints bare turns that clause (a) then counts as rework (overcount;
     the §4 fold is bracket-scoped and cannot retroactively cover them).
-    Undercount dominates in practice; the output names both channels.
+    Undercount is expected to dominate but NEITHER channel has been
+    measured; the output names both channels.
   - Unevaluable events: current hash ≠ last recorded `after` with no subsequent
     turn AND no recorded gap (missed-watch / noise-glob shadow) — the
     modification time is unknowable → `excluded_unknown_mtime`. Both printed.

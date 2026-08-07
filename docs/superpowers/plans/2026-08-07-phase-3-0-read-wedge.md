@@ -131,8 +131,11 @@ prints the bucket table; doc committed. Commit:
   `{ measurable, reworked, rate: Option<f64>, censored_recent,
   excluded_imported, gap_overlapped, excluded_unknown_mtime, undo_unevaluable_c }`
   — `gap_overlapped` is a DISCLOSURE count, not an exclusion (T0 amendment,
-  founder-ruled: gap-overlapped windows stay measurable; rate labeled lower
-  bound in both text and `--json` — a `rate_is_lower_bound: true` key)
+  founder-ruled: gap-overlapped windows stay measurable; rate labeled
+  **approximate lower bound** — two disclosed channels, spec §3.0.1 — in
+  both text and `--json` via a string-typed key `rate_bound: "approx_lower"`;
+  string not boolean so a future measured direction change is an additive
+  value, not a key break)
   — `rate: None` when `measurable == 0` (renders "no measurable events").
   **`undo_unevaluable_c` definition (P3 fix):** count of `tool:"agentrec"`
   undo turns whose `ended` falls inside any denominator event's window but
@@ -158,7 +161,8 @@ test, expected numbers hand-derived in comments:
   younger is `censored_recent` (pin the ≥ comparison).
 - deletion-by-uncovered-change counts as rework (clause b).
 - gap overlapping one event's window → event STAYS measurable,
-  `gap_overlapped` incremented, result labeled lower bound (T0 amendment).
+  `gap_overlapped` incremented, result labeled approximate lower bound
+  (T0 amendment; `rate_bound: "approx_lower"` asserted in the json case).
 - zero-denominator ledger → `rate: None`.
 - on-disk file whose current hash ≠ last recorded `after`, no subsequent
   turn, no recorded gap → `excluded_unknown_mtime` (fixture writes the
