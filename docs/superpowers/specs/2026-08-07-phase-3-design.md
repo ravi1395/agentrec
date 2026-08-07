@@ -89,8 +89,17 @@ Per-repo analytics over the turn ledger:
     checkpoint, not a turn) and are deliberately not counted by (c).
     A rename observed as delete+create counts via (b) — no
     rename tracking exists in the ledger and none is invented here.
-  - Unevaluable events: window overlapped by a recording gap →
-    `excluded_gap`; current hash ≠ last recorded `after` with no subsequent
+  - **Gaps are TOLERATED, not excluding (T0 spike amendment, founder-ruled
+    2026-08-07):** the original any-gap-in-window exclusion measured
+    `measurable=0` on the dogfood corpus (`docs/verify/p30-rework-spike.md`
+    — daemon-restart gaps are seconds–minutes and every 7-day window
+    contains one; same defect class as the bisect gap-fatality fixed at
+    round 2). Instead: gap-overlapped windows stay measurable, the output
+    counts them (`gap_overlapped`), and the rework rate is labeled a
+    **lower bound** — an edit hidden inside a gap is invisible to the
+    ledger, so rework can be undercounted, never overcounted, and the
+    output says so.
+  - Unevaluable events: current hash ≠ last recorded `after` with no subsequent
     turn AND no recorded gap (missed-watch / noise-glob shadow) — the
     modification time is unknowable → `excluded_unknown_mtime`. Both printed.
   Every exclusion bucket prints beside the rate; the rate is

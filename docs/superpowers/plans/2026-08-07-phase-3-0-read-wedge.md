@@ -84,8 +84,8 @@ before building.
 **Work:** a standalone script folding the dogfood `~/Projects/agentrec`
 `.agentrec/log.jsonl` implementing spec §3.0.1's event-level definition
 (denominator events, buckets: `censored_recent`, `excluded_imported`,
-`excluded_gap`; numerator clauses (a) and (b) only — (c) is structurally 0
-pre-3.1). `excluded_unknown_mtime` requires live working-tree hashing, which
+`gap_overlapped` disclosure; numerator clauses (a) and (b) only — (c) is
+structurally 0 pre-3.1). `excluded_unknown_mtime` requires live working-tree hashing, which
 this log-only spike does NOT do: the spike prints that bucket as literally
 `not computed by this spike`, never 0. Report all bucket counts + measurable
 count + rate.
@@ -129,7 +129,10 @@ prints the bucket table; doc committed. Commit:
   all `Serialize`; `RepositoryView::stats(&self, opts: &StatsOptions) ->
   Result<StatsResult, StatsError>`. `ReworkRate` carries
   `{ measurable, reworked, rate: Option<f64>, censored_recent,
-  excluded_imported, excluded_gap, excluded_unknown_mtime, undo_unevaluable_c }`
+  excluded_imported, gap_overlapped, excluded_unknown_mtime, undo_unevaluable_c }`
+  — `gap_overlapped` is a DISCLOSURE count, not an exclusion (T0 amendment,
+  founder-ruled: gap-overlapped windows stay measurable; rate labeled lower
+  bound in both text and `--json` — a `rate_is_lower_bound: true` key)
   — `rate: None` when `measurable == 0` (renders "no measurable events").
   **`undo_unevaluable_c` definition (P3 fix):** count of `tool:"agentrec"`
   undo turns whose `ended` falls inside any denominator event's window but
@@ -154,7 +157,8 @@ test, expected numbers hand-derived in comments:
 - right-censoring boundary: event exactly at N days is IN denominator; N-ε
   younger is `censored_recent` (pin the ≥ comparison).
 - deletion-by-uncovered-change counts as rework (clause b).
-- gap overlapping one event's window → that event in `excluded_gap` only.
+- gap overlapping one event's window → event STAYS measurable,
+  `gap_overlapped` incremented, result labeled lower bound (T0 amendment).
 - zero-denominator ledger → `rate: None`.
 - on-disk file whose current hash ≠ last recorded `after`, no subsequent
   turn, no recorded gap → `excluded_unknown_mtime` (fixture writes the
