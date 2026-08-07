@@ -1,6 +1,12 @@
 # Phase 3 design — leverage the ledger (analytics, search, annotate, bisect, undo power, digest, policy signals)
 
 Date: 2026-08-07. Status: DRAFT — pending skeptic gate + founder approval.
+Gate history: round 1 GATE FAIL (B1 partial-undo already shipped in Phase F —
+section rewritten as delta; B2 restore gate violated frozen predicate-2 MUST
+NOTs — replaced with recorded-state-hash gate; B3 checkpoints didn't store
+bytes — creation now snapshots; B4 rework-rate under-defined — event-level
+definition with exclusion buckets; B5 bisect walk self-contradictory — single
+reverse-apply algorithm; advisories A1–A8 folded).
 Author: brainstormed with founder; decisions below are founder-confirmed in-session.
 
 ## Vision
@@ -38,36 +44,62 @@ Per-repo analytics over the turn ledger:
 - Files touched, ranked by churn bytes (sum over turns of byte-delta between
   before/after blobs; files with `skipped`/`withheld` entries contribute 0 for
   those entries and are footnoted as undercounted).
-- Agent-vs-human share of change: agent = union of rich-turn coverage;
-  human = `human-edited-since` windows; **recording gaps render as a third
-  bucket, "unattributable" — never allocated to either side.** Bare turns are
-  unattributable by definition (never rendered as agent activity).
-- **Rework rate** (the headline metric), defined precisely:
-  numerator = files written by a rich agent turn T that are subsequently
-  modified within N days (default 7, `--rework-window`) by a change NOT covered
-  by any rich turn (i.e. `human-edited-since` fires for that span);
-  denominator = all files written by rich agent turns at least N days before
-  the query time (files younger than N days are excluded from BOTH sides —
-  right-censoring, not silent inclusion). Bare turns count in neither side.
-  Undo turns (`tool: "agentrec"`) count as agent coverage, not as rework.
-  If a recording gap overlaps a file's window, that file is excluded and
-  counted in an `excluded_gap` figure the output must print.
+- Agent-vs-human share of change: agent = union of rich-turn coverage
+  EXCLUDING `tool:"git"` turns (a checkout is not agent authorship) and
+  imported turns (no epoch coverage; reported in their own `imported`
+  bucket); human = `human-edited-since` windows; **recording gaps render as
+  a third bucket, "unattributable" — never allocated to either side.** Bare
+  turns are unattributable by definition (never rendered as agent activity).
+- **Rework rate** (the headline metric). Unit of analysis is the
+  **(turn, file) write event**, not the file — a file written twice enters
+  the denominator twice, each event judged over its own window. Definition:
+  - Denominator: every write event (create or write op) by a rich agent turn
+    whose `ended` is ≥ N days (default 7, `--rework-window`) before query
+    time. Younger events are right-censored: excluded from both sides,
+    counted in `censored_recent`. Excluded from the denominator entirely:
+    bare turns; `tool:"git"` turns; `tool:"agentrec"` (undo) turns; imported
+    turns (`files_complete`-marked — import history has no epoch coverage,
+    so their windows are all-gap by construction; counted in
+    `excluded_imported`). On import-heavy repos this can empty the metric —
+    the output prints the exclusion counts and, when the denominator is 0,
+    says "no measurable events" instead of rendering 0%.
+  - Numerator: a denominator event is rework iff, within its N-day window,
+    the file is subsequently (a) modified by a change not covered by any
+    rich turn (`human-edited-since` fires for that span — display-predicate
+    use, which is its sanctioned role; nothing destructive keys on it), or
+    (b) **deleted** by any non-agent change (deletion is rework), or
+    (c) reverted by an undo turn targeting that write's turn (an undo of
+    agent work is rework by the human's hand). A rename observed as
+    delete+create counts via (b) — no rename tracking exists in the ledger
+    and none is invented here.
+  - Unevaluable events: window overlapped by a recording gap →
+    `excluded_gap`; current hash ≠ last recorded `after` with no subsequent
+    turn AND no recorded gap (missed-watch / noise-glob shadow) — the
+    modification time is unknowable → `excluded_unknown_mtime`. Both printed.
+  Every exclusion bucket prints beside the rate; the rate is
+  numerator/denominator over MEASURABLE events only, and the output must
+  render the measurable count.
 
 Honesty rules: every figure that has an exclusion (gaps, skipped, withheld,
-right-censored) must print its exclusion count next to it. No figure may be
-rendered without its denominator.
+right-censored, **dangling blob refs** — TTL/eviction-legalized per PROTOCOL
+§6, they undercount churn bytes) must print its exclusion count next to it.
+No figure may be rendered without its denominator.
 
 ### 3.0.2 `agentrec search <query> [--regex] [--json]`
 
 Substring (default) or regex match over: stored prompt text (scrubbed form —
-the only form persisted), turn metadata (tool, model), and turn file paths.
-Returns turn ids + matched-field snippet + timestamp. Paged with the existing
-`Page<T>`/cursor machinery (occurrence-ordinal cursors — same-id duplicate
-turns are a documented reality).
+the only form persisted; prompts live in CAS via `prompt_ref`, so search DOES
+read CAS blobs for prompts — a dangling `prompt_ref` is handled gracefully
+per PROTOCOL and counted in the output, never a crash or silent skip), turn
+metadata (tool, model), and turn file paths. Returns turn ids + matched-field
+snippet + timestamp. Paged with the existing `Page<T>`/cursor machinery
+(occurrence-ordinal cursors — same-id duplicate turns are a documented
+reality).
 
-Non-goal: content search over CAS blobs (cost/scope; revisit on demand — a
-future `--content` flag slot is reserved in the interface but MUST error
-"not implemented" if passed, not silently degrade to metadata search).
+Non-goal, worded precisely: content search over **file snapshot** blobs
+(cost/scope; revisit on demand — a future `--content` flag slot is reserved
+in the interface but MUST error "not implemented" if passed, not silently
+degrade to metadata search). Prompt blobs are in scope as above.
 
 ### 3.0.3 `agentrec annotate <git-range> [--json|--md]`
 
@@ -91,12 +123,29 @@ Output is local only. Posting to a PR is the user's/CI's job.
 
 Binary search over the turn sequence for the first turn where `<cmd>` fails.
 
-- Materializes each probe state into a **scratch directory** (never the working
-  tree): start from current working tree copy, then for each turn after the
-  probe point, restore touched files to their state as of the probe turn's
-  `after` snapshots, walking the ledger. Files without snapshots at the needed
-  point (skipped/withheld/gap) make that probe **unanswerable**: bisect reports
-  the ambiguous span instead of guessing (mirror of blame's gap honesty).
+- Materializes each probe state into a **scratch directory** (never the
+  working tree). **Single algorithm (rewritten after gate B5 — round 1 gave
+  two contradictory descriptions):** copy the current working tree, then
+  walk turns AFTER the probe point in reverse order (latest first),
+  reverse-applying each: for every file entry, write the entry's `before`
+  bytes (or delete the file for a create op, recreate for a delete op).
+  Latest-first order makes each file's final scratch state the `before` of
+  the EARLIEST post-probe turn touching it — exactly "working tree minus
+  later agent turns".
+  - Sequence membership: **rich, non-imported turns only** by default. Bare
+    turns are never subtracted (their bytes may be human work) and never
+    probe candidates; `--include-bare` exists for completeness, prints a
+    misattribution warning, and subtracts them like any turn.
+  - A probe is **unanswerable** when any needed `before` is absent
+    (skipped/withheld/dangling blob), when a recording gap intersects the
+    span being subtracted, or when any needed blob is `after_synthesized`
+    (derived bytes are not recorded fact — PROTOCOL §import-honesty — and
+    MUST NOT silently materialize into a probe state). Unanswerable probes
+    are reported; bisect returns the narrowest answerable span instead of
+    guessing (mirror of blame's gap honesty).
+  - `--good`/`--bad` turn refs resolve through the same ambiguity path as
+    `show`/`diff`: a same-id duplicate ref is a hard "ambiguous turn id"
+    error, never first-match.
 - Runs `<cmd>` with cwd = scratch dir; exit 0 = good, nonzero = bad,
   configurable `--flaky-retries N` (default 0; retried disagreement =
   unanswerable probe, reported).
@@ -111,47 +160,105 @@ Binary search over the turn sequence for the first turn where `<cmd>` fails.
 
 ## Sub-phase 3.1 — undo power
 
-### 3.1.1 File-level partial undo — `agentrec undo <turn> --file <path> ...`
+### 3.1.1 File-level partial undo — ALREADY SHIPPED (Phase F); scope is a delta, not a build
 
-- Reverts only the named files from the turn's snapshot set; other files in
-  the turn untouched. Unknown path (not in turn) → hard error listing the
-  turn's files, before any write.
-- Invariants preserved (not amended): undo-is-a-turn — the revert appends a
-  new turn (`tool: "agentrec"`) recording exactly the reverted files;
-  `modified-since` gates per file. Default: any refused file aborts the whole
-  operation before any write (no surprise partial results). Explicit
-  `--continue-on-refusal` proceeds on the clean subset and lists refusals.
-- `skipped`/`withheld` files remain non-revertible — unchanged rule.
-- MCP: the existing destructive request payload gains an optional `files`
-  array (additive, PROTOCOL §8). All existing gating (mcp_destructive modes,
-  two-phase token, path reservations, `origin` discriminator) applies
-  unchanged; no new mode, no new bypass.
+**Correction from gate round 1: this capability exists on both surfaces.**
+CLI `undo --files` (`main.rs` undo args → `readcmds::undo(..., &files)`) and
+MCP `paths` on the destructive request (`mcpcmd.rs` input schema;
+`UndoRequest.paths: Option<Vec<PathBuf>>`; path-level reservations;
+`UndoError::UnknownPaths` for typos). Shipped semantics are normative and
+MUST NOT be silently changed:
+
+- Per-file classification: proceed on the `Revert` subset, list
+  `Excluded`/`Refused` rows (`readcmds.rs` rendering). There is NO
+  abort-on-any-refusal default; introducing one would be a behavior break to
+  a live verb and is NOT in scope.
+- Unknown paths error lists the unmatched inputs (shipped `UnknownPaths`),
+  not the turn's file inventory.
+- No new `files` field anywhere — the existing `paths` field IS the subset
+  mechanism; adding a second subset field is banned (undefined conflict
+  semantics + redundant §8 row).
+
+Remaining 3.1.1 scope (the actual deltas):
+
+1. **Imported-turn interaction statement + test:** the pinned imported-K2
+   invariant ("never a partial revert of the other genuinely-revertible
+   entries in the same turn", `undo_coordinator.rs::same-turn` refusal path)
+   must be traced against `--files` on an imported turn; the resolved
+   behavior (whole-turn refusal wins over path subsetting) gets a
+   refusal-matrix test and a doc sentence. If the trace shows subsetting can
+   bypass the K2 refusal, that is a defect fix, not a design choice.
+2. **Confirm-mode visibility trace:** verify (and test) that the MCP `paths`
+   subset is rendered in the confirm-mode `approve` view, so the human
+   approves the actual subset, not the whole turn.
+3. **User docs:** README/help surface for `--files` (currently undocumented
+   for end users).
 
 ### 3.1.2 Checkpoints — `agentrec checkpoint <name>` / `restore <name>`
 
 - `checkpoint <name>`: appends a new record type `type:"checkpoint"` to
-  `log.jsonl` (additive within PROTOCOL v1; unknown-type tolerance is already
-  normative for consumers) pinning `{name, ts, files: [{path, hash}]}` for the
-  **agent-touched set** (files appearing in any turn's entries whose current
-  on-disk hash is computable). Explicit boundary: files never touched by any
-  turn are OUT of checkpoint scope — git covers them; the spec bans marketing
-  checkpoints as full-repo snapshots.
+  `log.jsonl` pinning `{name, ts, files: [{path, hash}]}` for the
+  **agent-touched set** (files appearing in any turn's entries). Explicit
+  boundary: files never touched by any turn are OUT of checkpoint scope —
+  git covers them; the spec bans marketing checkpoints as full-repo snapshots.
+  - **Additive-protocol note (gate A1):** PROTOCOL v1's freeze clause
+    enumerates open enums but not `type`; the tolerated conformance fixture
+    (`log_unknown_record_type.jsonl`) already anticipates `type:"checkpoint"`.
+    The implementation plan must include the explicit §5 amendment adding
+    checkpoint + tombstone record rows (with fixtures, same commit), not rely
+    on tolerance alone.
+  - **Checkpoint creation STORES bytes (gate B3):** for each in-scope file
+    whose current content hash is not already present in the CAS, checkpoint
+    writes the blob at creation time — otherwise a checkpoint can be
+    unrestorable at birth (human-edited-since files, `skipped` over-cap
+    entries, daemon-down windows all leave live bytes unsnapshotted). These
+    writes obey the SAME persist rules as turn snapshots: secret-pattern
+    files are excluded from the checkpoint set and listed in the record as
+    `withheld` (never read, never stored); files over the blob cap are
+    listed as `skipped` (pinned by neither hash nor bytes). `checkpoint`
+    prints the excluded lists; a checkpoint whose set is partially excluded
+    says so at creation, not at restore.
 - Checkpoint records pin blobs: the eviction protect-set gains checkpoint-
   referenced hashes (same mechanism as open-turn/memory-pin protection).
   Unbounded pinning is real cost — `purge --checkpoints-expired` is NOT built
   in this phase; instead `checkpoint --delete <name>` appends a tombstone
   record (append-only discipline; the pair drops out of the protect set).
-- `restore <name> [--dry-run]`: computes per-file revert plan (current hash vs
-  pinned hash; identical → skip; pinned blob present in CAS → revert;
-  modified-since semantics: restore IS a modification-tolerant operation by
-  intent, but files whose current state is not covered by any turn since the
-  checkpoint (human-edited) are refused by default, `--continue-on-refusal`
-  as above). Executes as ONE undo turn listing all reverted files. Rides
-  `UndoCoordinator` preview + failure-path persistence (Phase F, incl. the
-  11(b) mid-revert fix). Missing CAS blob → refuse that file, list it, never
-  silent-partial.
+- `restore <name> [--dry-run]`: computes per-file revert plan: current hash
+  == pinned hash → skip; else revert from the pinned blob. **Safety gate
+  (rewritten after gate B2 — round 1's coverage-based gate violated
+  PROTOCOL's frozen MUST NOTs at §"two predicates", which ban keying any
+  destructive op on `human-edited-since`):** a file may be reverted only if
+  its CURRENT content hash equals some recorded snapshot in the ledger (any
+  turn's `before` or `after`, or a checkpoint pin) — i.e. the state being
+  destroyed is provably recorded and re-restorable. Current bytes matching
+  nothing in the ledger → refuse that file by default (unrecorded work would
+  be destroyed); `--allow-unrecorded` proceeds after snapshotting the
+  current bytes first (the restore turn's own `before` entries make even
+  this reversible — undo-is-a-turn does the work). This gate never consults
+  coverage/`human-edited-since` and never treats bare turns as attribution.
+  Executes as ONE undo turn listing all reverted files, per-file
+  Revert/Refused/Excluded classification matching the shipped `undo --files`
+  rendering. Missing CAS blob → refuse that file, list it, never
+  silent-partial (rare post-B3 — only TTL/purge can remove a pinned blob,
+  and pins protect against eviction).
+  - **Coordinator note (gate A8):** `UndoCoordinator::preview`/`build_plan`
+    are turn-keyed today; restore needs a non-turn-keyed plan entry point.
+    The plan must budget this as a real coordinator extension (new entry
+    point sharing the classification/persist internals), not "rides
+    preview". Failure-path persistence (11(b)) requirements apply to the new
+    path identically and get their own fault-injection test.
 - Name rules: unique among live (non-tombstoned) checkpoints; collision →
-  error. Daemon ignores checkpoint records entirely (no behavior change).
+  error. Name reuse after tombstoning is allowed; the pair-matching rule is
+  replay order — a tombstone retires the LATEST live checkpoint of that name
+  at its point in the log, so any fold over `log.jsonl` resolves liveness
+  deterministically. Daemon ignores checkpoint records entirely (no behavior
+  change).
+- Protect-set edit site named (gate A2): checkpoint pins enter eviction
+  protection via the parsed-record path — `cmds.rs::extra_protected_refs`
+  only raw-harvests unparseable lines today and must gain a checkpoint arm
+  (its own doc comment predicts exactly this edit). Old binaries fail to
+  parse checkpoint records and over-protect via raw harvest — safe
+  direction, noted not relied on.
 
 ## Sub-phase 3.2 — digest + policy signals
 
@@ -181,7 +288,11 @@ into a next agent session's context ("what happened here lately").
   bug. Gatekeeper posture unreachable by design, not by discipline.
 - Rule hit → append `{id, ts, turn_id, rule, matched_paths}` to a new
   append-only `alerts.jsonl` (same discipline as signal/log: append-only,
-  no rewrite class, torn-tail tolerated).
+  no rewrite class, torn-tail tolerated). **Debt recorded at birth (gate
+  A6):** `alerts.jsonl` is unbounded, same class as the recorded
+  `undo-requests.jsonl` debt; reclaim needs a future decision-register
+  entry and is NOT built here. `status` inbox-style byte accounting
+  includes it so growth is visible.
 - Surfacing: `status` prints open-alert count; `digest` includes open alerts;
   new `agentrec alerts [--json]` lists, `alerts --ack <id>` appends an ack
   record (never rewrites).
