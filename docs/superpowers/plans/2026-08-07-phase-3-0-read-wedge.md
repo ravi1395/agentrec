@@ -10,13 +10,17 @@
 round 3; founder questions resolved: stats default `--since 30d`, no bisect
 sandbox).
 
-**Architecture:** every feature is a pure fold over `log.jsonl` + CAS through
-`agentrec-core`'s `RepositoryView` (view.rs). New core logic lives in
-`agentrec-core` (new modules beside `view.rs`); CLI verbs are thin adapters in
-`cli/src`, mirroring the P5 pattern (typed core value → text + `--json`
-serializer). Zero new write paths; zero PROTOCOL changes in 3.0 (the `reverts`
-field is 3.1 scope — rework clause (c) in 3.0 reports its exclusion note with
-count 0 until then).
+**Architecture:** every feature is a read-only fold over `log.jsonl` + CAS +
+— for stats only — current working-tree content hashes (the normative
+`excluded_unknown_mtime` bucket and the human-share predicate both compare
+live file hashes against recorded `after` hashes; a log-only fold cannot
+compute them). All ledger access through `agentrec-core`'s `RepositoryView`
+(view.rs). New core logic lives in `agentrec-core` (new modules beside
+`view.rs`); CLI verbs are thin adapters in `cli/src`, mirroring the P5
+pattern (typed core value → text + `--json` serializer). Zero new write
+paths; zero PROTOCOL changes in 3.0 (the `reverts` field is 3.1 scope —
+rework clause (c) structurally cannot fire in 3.0; see the
+`undo_unevaluable_c` disclosure figure in T1).
 
 **Decisions log (founder-confirmed, not re-litigable):**
 1. Output surface CLI-only, text + `--json`. No network.
@@ -49,8 +53,16 @@ count 0 until then).
 - Analytics figures: hand-computed fixture corpus — the test file computes
   expected numbers BY HAND in comments, never by running the same code path
   twice (self-checking fixture, defends the signature-defect class).
-- Merge order: T0 → T1 → T2 → T3 → T4 → T5 → exit. T3/T4/T5 are mutually
-  independent after T1 (parallelizable in worktrees if desired).
+- Merge order: T0 → T1 → T2 → T3 → T4 → T5 → exit, SERIALIZED — T3/T4/T5
+  all modify `main.rs` (clap enum + dispatch), so worktree parallelism
+  guarantees conflicts there; do not parallelize.
+- Task commit discipline: T3/T4/T5 each land TWO commits — (1) core module
+  (+ view.rs method + lib.rs export), (2) CLI adapter (+ main.rs + goldens +
+  integration tests). Reviewer gates each commit; keeps every reviewed unit
+  within the ≤2–3-file house rule.
+- Plan-start endpoints recorded at T0 (same ledger row as the suite
+  baseline): plan-start commit hash (for exit item 6's `git diff --stat`)
+  and `rg 'load_log' cli/src` count (for exit item 5).
 
 ---
 
@@ -68,9 +80,11 @@ before building.
 **Work:** a standalone script folding the dogfood `~/Projects/agentrec`
 `.agentrec/log.jsonl` implementing spec §3.0.1's event-level definition
 (denominator events, buckets: `censored_recent`, `excluded_imported`,
-`excluded_gap`, `excluded_unknown_mtime`; numerator clauses (a) and (b) only —
-(c) is structurally 0 pre-3.1). Report all bucket counts + measurable count +
-rate.
+`excluded_gap`; numerator clauses (a) and (b) only — (c) is structurally 0
+pre-3.1). `excluded_unknown_mtime` requires live working-tree hashing, which
+this log-only spike does NOT do: the spike prints that bucket as literally
+`not computed by this spike`, never 0. Report all bucket counts + measurable
+count + rate.
 
 **Exit criteria (gate, binding):**
 - Bucket counts + rate recorded in `docs/verify/p30-rework-spike.md` with the
@@ -97,23 +111,40 @@ prints the bucket table; doc committed. Commit:
 **Interfaces:**
 - Consumes: `RepositoryView::list_records_of` / ledger iteration (existing,
   view.rs), `view::recording_gaps` (existing — gap windows),
-  `BlobStore::size(hash)` (existing, used by retention.rs::plan_eviction).
+  `BlobStore::size(hash)` (existing, used by retention.rs::plan_eviction),
+  **current working-tree content hashing** — the seam
+  `undo_coordinator::read_current_hash` (undo_coordinator.rs) is the
+  existing helper; reuse or extract it, do NOT re-implement hashing.
+  `excluded_unknown_mtime` and the human-share predicate are uncomputable
+  without disk reads; a log-only implementation is a decision-4 defect.
 - Produces (T2 relies on these exact names):
+  `pub struct StatsOptions { pub since: Option<Duration>, pub rework_window_days: u32 }`
+  (default window 7 — carries T2's `--rework-window` flag; P1 fix);
   `pub struct StatsResult { pub window: StatsWindow, pub turns: TurnCounts,
   pub files: Vec<FileChurn>, pub share: ChangeShare, pub rework: ReworkRate }`,
-  all `Serialize`; `RepositoryView::stats(&self, since: Option<Duration>) ->
+  all `Serialize`; `RepositoryView::stats(&self, opts: &StatsOptions) ->
   Result<StatsResult, StatsError>`. `ReworkRate` carries
   `{ measurable, reworked, rate: Option<f64>, censored_recent,
-  excluded_imported, excluded_gap, excluded_unknown_mtime, excluded_undo_pre_reverts }`
+  excluded_imported, excluded_gap, excluded_unknown_mtime, undo_unevaluable_c }`
   — `rate: None` when `measurable == 0` (renders "no measurable events").
+  **`undo_unevaluable_c` definition (P3 fix):** count of `tool:"agentrec"`
+  undo turns whose `ended` falls inside any denominator event's window but
+  which carry no `reverts` field (all pre-3.1 undo turns) — clause (c)
+  cannot be evaluated against them. Disclosure-only: it does NOT shrink
+  `measurable` and does NOT add to `reworked` (the spec keeps such events
+  measurable; (c) simply cannot fire). Nonzero on real corpora today.
   `ChangeShare` buckets: `agent`, `human`, `unattributable`, `imported`
   (spec: git-tool and imported turns never in `agent`).
-  `FileChurn` carries `{ path, churn_bytes, dangling_refs }`.
+  `FileChurn` carries `{ path, churn_bytes, dangling_refs, skipped_entries,
+  withheld_entries }` — the last two feed the spec's "footnoted as
+  undercounted" honesty rule (A1 fix).
 
 **Test-first (acceptance):** unit tests in `stats.rs` against a hand-computed
-fixture ledger (built in-test with the existing fixture helpers used by
-view.rs tests). Required cases, each its own test, expected numbers hand-derived
-in comments:
+fixture — a ledger PLUS on-disk working-tree state in a tempdir (the
+`excluded_unknown_mtime` and human-share cases are undecidable from the
+ledger alone; the fixture writes real files whose hashes match or diverge
+from recorded `after` hashes by construction). Required cases, each its own
+test, expected numbers hand-derived in comments:
 - rich/bare/git/imported/undo turn mix → each exclusion bucket hits at least
   once; denominator/numerator counted by hand.
 - right-censoring boundary: event exactly at N days is IN denominator; N-ε
@@ -121,12 +152,21 @@ in comments:
 - deletion-by-uncovered-change counts as rework (clause b).
 - gap overlapping one event's window → that event in `excluded_gap` only.
 - zero-denominator ledger → `rate: None`.
+- on-disk file whose current hash ≠ last recorded `after`, no subsequent
+  turn, no recorded gap → `excluded_unknown_mtime` (fixture writes the
+  divergent bytes to disk).
+- pre-`reverts` undo turn inside a denominator window → `undo_unevaluable_c`
+  incremented; `measurable` and `reworked` unchanged (both asserted).
 - churn: dangling blob ref → counted in `dangling_refs`, contributes 0 bytes.
+- churn: `skipped`/`withheld` entries → contribute 0 bytes, counted in
+  `skipped_entries`/`withheld_entries`.
 - share: git turn's files land in neither `agent` nor `human`.
+- share: bare turn's window lands in `unattributable`, never `agent` or
+  `human` (spec sentence gets its test row — A7 fix).
 
 ```rust
 // shape of the hand-computed assertions (executor writes real fixtures):
-let s = view.stats(Some(days(30)))?;
+let s = view.stats(&StatsOptions { since: Some(days(30)), rework_window_days: 7 })?;
 assert_eq!(s.rework.measurable, 3);      // hand count: events e1,e2,e5
 assert_eq!(s.rework.reworked, 1);        // e2: deleted by uncovered change
 assert_eq!(s.rework.excluded_imported, 2);
@@ -142,12 +182,14 @@ rework-rate and exclusion buckets`.
 
 **Files:** Modify: `cli/src/main.rs` (clap verb), `cli/src/cmds.rs` or new
 `cli/src/statscmd.rs` (follow the thinnest existing read-verb pattern —
-`readcmds.rs` status/diff adapters); Create: goldens under the existing golden
+`status` adapter at `cmds.rs::status`, `diff` adapter in `readcmds.rs`); Create: goldens under the existing golden
 test layout; Test: `cli/tests/` new integration file `stats.rs`.
 
-**Interfaces:** Consumes T1's `RepositoryView::stats` + `StatsResult`
-(Serialize). Produces: `agentrec stats [--since <dur|all>] [--rework-window
-<days>] [--json]`; default since = 30d (founder decision).
+**Interfaces:** Consumes T1's `RepositoryView::stats(&StatsOptions)` +
+`StatsResult` (Serialize) — `--rework-window` maps to
+`StatsOptions.rework_window_days`, `--since` to `StatsOptions.since`
+(`all` → `None`). Produces: `agentrec stats [--since <dur|all>]
+[--rework-window <days>] [--json]`; default since = 30d (founder decision).
 
 **Acceptance:**
 - Text output prints every figure WITH its exclusion counts beside it (spec
@@ -177,11 +219,14 @@ lib.rs; Modify: `cli/src/main.rs` + thin adapter; Test: core unit +
   ordinals, P4b), CAS blob read for `prompt_ref` (existing store read used by
   show/fmt paths).
 - Produces: `RepositoryView::search(&self, q: &SearchQuery, cursor:
-  Option<Cursor>) -> Result<Page<SearchHit>, SearchError>`;
+  Option<Cursor>) -> Result<SearchPage, SearchError>`;
   `SearchQuery { pattern: String, regex: bool }`;
   `SearchHit { turn_id, ts, field: MatchedField, snippet }`,
-  `MatchedField ∈ {Prompt, Tool, Model, Path}`; page carries
-  `dangling_prompt_refs: u64` count.
+  `MatchedField ∈ {Prompt, Tool, Model, Path}`;
+  **`SearchPage { page: Page<SearchHit>, dangling_prompt_refs: u64 }`** —
+  a wrapper, NOT a field added to the shared generic `Page<T>` (that would
+  additively change every existing `Page` serialization — log/recall
+  `--json` goldens; P2 fix, decided here not by the executor).
 
 **Acceptance (each a test):**
 - substring match across prompt text (read from CAS via prompt_ref), tool,
@@ -195,7 +240,7 @@ lib.rs; Modify: `cli/src/main.rs` + thin adapter; Test: core unit +
 - file-snapshot blobs never read (test: fixture with searchable content ONLY
   inside a file blob → zero hits).
 - CLI: `agentrec search <q> [--regex] [--json]`, `--json` parity with
-  `Page<SearchHit>`, zero-write assertion.
+  `SearchPage`, zero-write assertion.
 - `--content` flag exists in clap and errors `content search not implemented`
   (spec-reserved slot; test pins the error, guarding against silent
   degradation to metadata search).
@@ -220,7 +265,10 @@ git fixture repo).
 - Produces: `agentrec annotate <git-range> [--json|--md]`;
   `AnnotateResult { files: Vec<AnnotatedFile>, line_precision: &'static str
   ("best_effort"), evicted_ranges: u64 }`; per-range attribution
-  `∈ {Turn{id, tool, model, ts, prompt_excerpt}, Human, Unattributable{reason}}`.
+  `∈ {Turns(Vec<TurnRef>), Human, Unattributable{reason}}` where
+  `TurnRef { id, tool, model, ts, prompt_excerpt }` — a Vec because multiple
+  turns can overlap one blame range (spec says "which turn(s)"; A2 fix);
+  single-turn is a one-element Vec, render collapses it.
 
 **Acceptance:**
 - disclaimer line present in text AND `--md`; `"line_precision":
@@ -291,9 +339,13 @@ suite; clippy+fmt debug+release. Commit:
 
 1. Suite green, zero regression from the T0-recorded baseline; figure recorded.
 2. clippy `--all-features -D warnings` + fmt, debug AND release.
-3. All four verbs run against the REAL dogfood repo read-only (commands +
-   outputs into `docs/verify/p30-exit.md`); `.agentrec/` hashed before/after
-   each — byte-identical (read-only proven on the real corpus, not fixtures).
+3. All four verbs run against a **FROZEN CLONE** of the dogfood repo
+   (`cp -R` of `~/Projects/agentrec` incl. `.agentrec/`, no daemon attached —
+   the live repo has a running writer, pid-checked at plan time, so hashing
+   the live `.agentrec/` false-fails on daemon ticks; frozen-clone is the
+   P4b E2E precedent). Commands + outputs into `docs/verify/p30-exit.md`;
+   clone's `.agentrec/` hashed before/after each verb — byte-identical
+   (read-only proven on the real corpus, not fixtures).
 4. `stats` rework headline decision from T0 honored (headline or demoted).
 5. No new `load_log` callers in `cli/src` (`rg 'load_log' cli/src` count
    unchanged from plan start; record both counts).
