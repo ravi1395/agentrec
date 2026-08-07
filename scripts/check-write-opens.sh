@@ -36,13 +36,18 @@
 # SCOPE. Production source under agentrec-core/src and cli/src. Test-ONLY
 # regions and cli/tests/ are exempt: test code writes its own tempdir
 # fixtures. "Test-only" is decided by classifying the cfg attribute, not by a
-# substring match — `#[cfg(test)]` and `#[cfg(all(test, ...))]` (no `not(`)
-# open an exempt region; `#[cfg(any(..., test))]` and `#[cfg(not(test))]`
-# gate PRODUCTION code (a disjunction with `test` still compiles into real
-# binaries — `doctorcmd.rs::estimate_watch_count` is the live example, caught
-# by a gate round when a substring match silently exempted it) and are
-# scanned; any other col-0 cfg form carrying a `test` token is an INTEGRITY
-# abort rather than a guess.
+# substring match — `#[cfg(test)]` and `#[cfg(all(test, ...))]` (containing
+# no `any(` and no `not(`) open an exempt region; `#[cfg(any(..., test))]`
+# and `#[cfg(not(test))]` gate PRODUCTION code (a disjunction with `test`
+# still compiles into real binaries — `doctorcmd.rs::estimate_watch_count`
+# is the live example, caught by a gate round when a substring match
+# silently exempted it) and are scanned; any other col-0 cfg form carrying a
+# `test` token — including `all(` forms nesting `any(` or `not(`, which a
+# second gate round measured reopening the same hole one level down — is an
+# INTEGRITY abort rather than a guess. An INDENTED unrecognized form arms no
+# channel and is scanned: an inner attribute cannot open a col-0 region, so
+# the failure direction is over-scan (a false VIOLATION that fails loud),
+# never a silent exemption.
 #
 # KNOWN COLLAPSE, disclosed: allowlist keys are `path::fn`, so two same-named
 # functions in one file (e.g. the cfg-paired `create_tmp_file` arms) share
@@ -95,22 +100,31 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     FNR == 1 { in_test = 0; saw_cfg_test = 0; cfgtest_present = 0; curfn = "<toplevel>" }
 
     # Classify a cfg attribute line carrying a standalone `test` token.
-    #   "testonly"   — compiled ONLY under cfg(test): `#[cfg(test)]`, or
-    #                  `#[cfg(all(test, ...))]` with no `not(` anywhere (a
-    #                  `not(` inside an `all` can invert the test conjunct).
+    #   "testonly"   — compiled ONLY under cfg(test): `#[cfg(test)]`, or an
+    #                  `all(...)` containing the token with NO `any(` and NO
+    #                  `not(` anywhere inside. Conjunction nesting preserves
+    #                  test-only-ness (`all(unix, all(test))` still requires
+    #                  `test`), so with disjunction and negation excluded,
+    #                  any `test` token inside the `all` is a conjunct the
+    #                  whole attribute depends on. `any(` breaks that (a gate
+    #                  round measured `all(unix, any(test, feature = "x"))`
+    #                  classified test-only while compiling into a real
+    #                  binary under `--features x`); `not(` can invert it.
     #   "production" — carries the token but still compiles into real
     #                  binaries: `#[cfg(any(...))]` (disjunction) and
-    #                  `#[cfg(not(...))]` (negation).
-    #   "unknown"    — anything else; the scanner must not guess.
-    # A substring match here is exactly the defect a gate round caught:
-    # `#[cfg(any(target_os = "linux", test))]` was treated as a test region
-    # and a production function silently vanished from the scan.
+    #                  `#[cfg(not(...))]` (negation) at top level.
+    #   "unknown"    — anything else, including `all(` forms carrying `any(`
+    #                  or `not(`; the scanner must not guess — col-0 unknown
+    #                  is an INTEGRITY abort.
+    # A substring match here is exactly the defect the first gate round
+    # caught: `#[cfg(any(target_os = "linux", test))]` was treated as a test
+    # region and a production function silently vanished from the scan.
     function cfg_class(line,  c) {
         c = line
         sub(/^[ \t]*#\[cfg\(/, "", c)
         sub(/\)\][ \t]*$/, "", c)
         if (c == "test") return "testonly"
-        if (c ~ /^all\(/ && c !~ /not\(/) return "testonly"
+        if (c ~ /^all\(/ && c !~ /not\(/ && c !~ /any\(/) return "testonly"
         if (c ~ /^any\(/ || c ~ /^not\(/) return "production"
         return "unknown"
     }
