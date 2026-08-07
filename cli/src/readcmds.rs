@@ -763,7 +763,12 @@ pub(crate) fn print_plan(target: &TurnRecord, plans: &[Plan]) {
 /// for a bare turn, and the two guards would delete each other on cleanup).
 /// An absent, malformed, or expired guard is not live: `None`.
 pub(crate) fn live_undo_guard_reason(root: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(undo_guard_path(root)).ok()?;
+    // fsguard (round-7 blocker): this read is on all three undo legs — CLI
+    // undo, `agentrec approve`, and MCP execute (agent-triggerable) — and a
+    // fifo at this path hung every one of them. `daemon.rs:992` already
+    // guards the SAME file; this was the mirror site the per-file pass
+    // missed.
+    let text = agentrec_core::fsguard::read_regular_to_string(&undo_guard_path(root)).ok()?;
     let guard: UndoGuard = serde_json::from_str(&text).ok()?;
     if guard.until_ms > wall_now_ms() {
         Some(format!(

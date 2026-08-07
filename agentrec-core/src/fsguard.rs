@@ -6,9 +6,10 @@
 //! can create, that is a hang, and for the single-threaded stdio MCP server a
 //! hang is the whole agent-facing surface dying for that session.
 //!
-//! The class was found four times across two branch-review rounds, one site
-//! per round, each fix correct and each insufficient — `inode_refusal` in the
-//! planner, then `read_current_hash`'s lstat, then this. Patching the site
+//! The class was found at one site per round across five branch-review
+//! rounds, each fix correct and each insufficient — `inode_refusal` in the
+//! planner, then `read_current_hash`, then this module, then the read tools
+//! and the undo ledger. Patching the site
 //! the last probe happened to hit does not converge, because the property is
 //! not "this path is safe" but "we never open something that is not a
 //! regular file". These helpers make that property expressible once, so a new
@@ -32,8 +33,8 @@
 //! (`mkfifo` needs no privileges), including inside `.agentrec/`, and every
 //! path below lives there.
 //!
-//! **lstat-then-open is not atomic** and is not claimed to be: a path swapped
-//! between the check and the open still reaches the raw call. Closing that
+//! **check-then-open is not atomic** and is not claimed to be: a path swapped
+//! between the type check and the open still reaches the raw call. Closing that
 //! properly needs `O_NONBLOCK`/`openat` on the descriptor itself. What these
 //! guards remove is the *durable* hazard — a FIFO sitting on disk when the
 //! read arrives — which is every case observed so far. The residual race is
@@ -43,20 +44,37 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
-/// `true` when `path` exists and is something other than a regular file.
-/// A missing path is `false` — absence is the caller's business (a `create`
-/// revert legitimately targets one), and only an existing non-regular file
-/// can block a read.
+/// `true` when `path` RESOLVES to something other than a regular file.
+/// A missing path — including a broken symlink — is `false`: absence is the
+/// caller's business (a `create` revert legitimately targets one), and only
+/// an existing non-regular file can block a read.
 ///
-/// `symlink_metadata` is an lstat: it describes the link itself, where
-/// `metadata` would describe (and a read would follow to) the target. A
-/// symlink therefore counts as non-regular here — callers that want the
-/// pointed-to file must resolve it deliberately, which is the safe default
-/// for every current caller.
+/// `std::fs::metadata` is a `stat`: it FOLLOWS a symlink and describes the
+/// TARGET, which is deliberate — a symlink itself can never block on open,
+/// only the thing it eventually resolves to can (round-7 branch-review
+/// blocker: an earlier version of this function used `symlink_metadata`
+/// (an lstat) and therefore refused every symlink outright, including a
+/// symlink to an ordinary file. `.agentrec/log.jsonl` relocated behind a
+/// symlink — an ordinary setup, e.g. moving the store to another volume —
+/// then made `load_log` return an EMPTY ledger, and `log`/`diff`/`blame`/
+/// `undo` all silently reported "no history" with the real data one hop
+/// away. The full test suite passed throughout, because every test written
+/// for this guard asserted a case that must be REFUSED and none asserted a
+/// case that must still be ALLOWED.) The blocking hazard this module exists
+/// for — FIFO, socket, device — is unchanged by following the link: a
+/// symlink TO a fifo still resolves to a fifo and is still refused, which
+/// `a_symlink_to_a_fifo_is_still_refused` below pins.
+///
+/// This is deliberately NOT what the undo WRITE path uses. Where following a
+/// symlink is itself the hazard — reverting through a link would write the
+/// pointed-to file — `symlink_refusal` in `undo_coordinator.rs` handles that
+/// separately, with its own distinct refusal text, and must keep doing so;
+/// merging the two predicates would make that gate's tests pass for the
+/// wrong reason.
 pub fn is_nonregular(path: &Path) -> bool {
     #[cfg(unix)]
     {
-        std::fs::symlink_metadata(path)
+        std::fs::metadata(path)
             .map(|m| !m.file_type().is_file())
             .unwrap_or(false)
     }
@@ -67,8 +85,9 @@ pub fn is_nonregular(path: &Path) -> bool {
     }
 }
 
-/// [`std::fs::read`] that refuses to block: lstat first, and error rather
-/// than open anything that is not a regular file.
+/// [`std::fs::read`] that refuses to block: resolve the path's type first
+/// (see [`is_nonregular`]), and error rather than open anything that does not
+/// resolve to a regular file.
 ///
 /// The error is [`ErrorKind::InvalidInput`] so callers can keep treating a
 /// failure the way they already treat an unreadable file — no caller learns a
@@ -161,5 +180,63 @@ mod tests {
             read_regular(tmp.path()).unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
+    }
+
+    // Round-7 blocker: a symlink CANNOT block on open — only the resolved
+    // target can — so refusing a symlink to an ordinary file was pure
+    // over-rejection. `load_log`'s empty-ledger-on-refusal fallback turned
+    // this into a SILENT loss of the user's entire history.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_an_ordinary_file_reads_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.txt");
+        std::fs::write(&real, b"content\n").unwrap();
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            !is_nonregular(&link),
+            "a symlink to a regular file must be allowed"
+        );
+        assert_eq!(read_regular(&link).unwrap(), b"content\n");
+        assert!(open_regular(&link).is_ok());
+    }
+
+    // The predicate resolves the link, so a symlink INTO the blocking
+    // hazard class must still be refused — this is what stops the fix above
+    // from becoming a new bypass.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_a_fifo_is_still_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let link = tmp.path().join("link_to_pipe");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+
+        assert!(
+            is_nonregular(&link),
+            "following the link must still land on the fifo"
+        );
+        assert_eq!(
+            read_regular(&link).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    // A broken symlink must read as ABSENT (NotFound), not as a refusal —
+    // `std::fs::metadata` errors on a dangling target, and `unwrap_or(false)`
+    // must keep that case out of `is_nonregular`.
+    #[test]
+    #[cfg(unix)]
+    fn a_broken_symlink_reads_as_not_found_not_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("does-not-exist"), &link).unwrap();
+
+        assert!(!is_nonregular(&link));
+        assert_eq!(read_regular(&link).unwrap_err().kind(), ErrorKind::NotFound);
     }
 }
