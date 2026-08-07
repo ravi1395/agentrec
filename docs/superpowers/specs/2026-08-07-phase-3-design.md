@@ -7,6 +7,10 @@ NOTs — replaced with recorded-state-hash gate; B3 checkpoints didn't store
 bytes — creation now snapshots; B4 rework-rate under-defined — event-level
 definition with exclusion buckets; B5 bisect walk self-contradictory — single
 reverse-apply algorithm; advisories A1–A8 folded).
+Round 2 GATE FAIL (NB1 stale cross-cutting clauses contradicting B1 fix —
+deleted; NB2 gap-fatal bisect probes near-inoperative — gaps now tolerated
+with caveat line; NB3 rework clause (c) uncomputable — additive `reverts`
+field chosen; NA1–NA6 folded).
 Author: brainstormed with founder; decisions below are founder-confirmed in-session.
 
 ## Vision
@@ -58,7 +62,8 @@ Per-repo analytics over the turn ledger:
     time. Younger events are right-censored: excluded from both sides,
     counted in `censored_recent`. Excluded from the denominator entirely:
     bare turns; `tool:"git"` turns; `tool:"agentrec"` (undo) turns; imported
-    turns (`files_complete`-marked — import history has no epoch coverage,
+    turns (keyed on `imported: true` — NOT `files_complete`, which is
+    reserved for a future attesting importer — import history has no epoch coverage,
     so their windows are all-gap by construction; counted in
     `excluded_imported`). On import-heavy repos this can empty the metric —
     the output prints the exclusion counts and, when the denominator is 0,
@@ -67,11 +72,18 @@ Per-repo analytics over the turn ledger:
     the file is subsequently (a) modified by a change not covered by any
     rich turn (`human-edited-since` fires for that span — display-predicate
     use, which is its sanctioned role; nothing destructive keys on it), or
-    (b) **deleted** by any non-agent change (deletion is rework), or
-    (c) reverted by an undo turn targeting that write's turn (an undo of
-    agent work is rework by the human's hand). A rename observed as
-    delete+create counts via (b) — no rename tracking exists in the ledger
-    and none is invented here.
+    (b) **deleted** by a change not covered by any rich turn (deletion is
+    rework; phrased like (a) — the ledger cannot attribute a bare deletion
+    to "non-agent", it can only say it is uncovered), or
+    (c) reverted by an undo turn whose new additive `reverts` field names
+    that write's turn id (an undo of agent work is rework by the human's
+    hand). **`reverts` is a new additive field on undo turn records**
+    (PROTOCOL §5 amendment + conformance fixture, same commit) — today the
+    target survives only in display prose (`prompt_excerpt`), which is not
+    computable and MUST NOT be parsed; clause (c) therefore only counts
+    undo turns written by 3.x-era binaries, and the output's exclusion
+    note says so. A rename observed as delete+create counts via (b) — no
+    rename tracking exists in the ledger and none is invented here.
   - Unevaluable events: window overlapped by a recording gap →
     `excluded_gap`; current hash ≠ last recorded `after` with no subsequent
     turn AND no recorded gap (missed-watch / noise-glob shadow) — the
@@ -115,7 +127,10 @@ diffing the turn's before/after blobs and intersecting with blame ranges.
 Renames, reformat-only commits, and interleaved human+agent edits within one
 file between commits WILL misattribute at line granularity. Output must carry
 a one-line disclaimer in text/md modes and a `"line_precision": "best_effort"`
-key in JSON. Any wording implying line-exactness is a defect.
+key in JSON. Any wording implying line-exactness is a defect. Dangling
+turn blobs (TTL/eviction-legalized) degrade line mapping for that turn:
+those ranges render "unattributable (blob evicted)", counted in the
+output — never a crash, never silently attributed file-level-only.
 
 Output is local only. Posting to a PR is the user's/CI's job.
 
@@ -135,14 +150,23 @@ Binary search over the turn sequence for the first turn where `<cmd>` fails.
   - Sequence membership: **rich, non-imported turns only** by default. Bare
     turns are never subtracted (their bytes may be human work) and never
     probe candidates; `--include-bare` exists for completeness, prints a
-    misattribution warning, and subtracts them like any turn.
+    misattribution warning, subtracts them like any turn, AND makes them
+    probe candidates (a bisect result may then name a bare turn — the
+    warning states the attribution caveat).
   - A probe is **unanswerable** when any needed `before` is absent
-    (skipped/withheld/dangling blob), when a recording gap intersects the
-    span being subtracted, or when any needed blob is `after_synthesized`
+    (skipped/withheld/dangling blob) or is `after_synthesized`-derived
     (derived bytes are not recorded fact — PROTOCOL §import-honesty — and
     MUST NOT silently materialize into a probe state). Unanswerable probes
     are reported; bisect returns the narrowest answerable span instead of
-    guessing (mirror of blame's gap honesty).
+    guessing.
+  - **Recording gaps are TOLERATED, not fatal** (round-2 correction: every
+    daemon restart mints a gap, so gap-fatal probes would make bisect
+    near-inoperative on any real repo). This is consistent with the stated
+    fidelity posture: the scratch state already tolerates human edits
+    staying current, and a gap is just a window of possibly-unrecorded
+    edits — same class. Bisect's report lists gap windows intersecting the
+    searched span as a caveat line, mirroring blame's honesty without
+    refusing to answer.
   - `--good`/`--bad` turn refs resolve through the same ambiguity path as
     `show`/`diff`: a same-id duplicate ref is a hard "ambiguous turn id"
     error, never first-match.
@@ -197,8 +221,13 @@ Remaining 3.1.1 scope (the actual deltas):
 ### 3.1.2 Checkpoints — `agentrec checkpoint <name>` / `restore <name>`
 
 - `checkpoint <name>`: appends a new record type `type:"checkpoint"` to
-  `log.jsonl` pinning `{name, ts, files: [{path, hash}]}` for the
-  **agent-touched set** (files appearing in any turn's entries). Explicit
+  `log.jsonl` pinning `{name, ts, files: [{path, hash|null, state}]}` for
+  the **agent-touched set** (files appearing in any turn's entries), where
+  `state` ∈ {`pinned`, `deleted`, `withheld`, `skipped`} — the record
+  carries the exclusion markers its own prose requires. A currently-deleted
+  agent-touched file pins `state:"deleted"` (hash null); restore then
+  deletes the file iff the recorded-state-hash gate passes for its current
+  bytes — absence is a restorable state, not an error. Explicit
   boundary: files never touched by any turn are OUT of checkpoint scope —
   git covers them; the spec bans marketing checkpoints as full-repo snapshots.
   - **Additive-protocol note (gate A1):** PROTOCOL v1's freeze clause
@@ -304,11 +333,14 @@ into a next agent session's context ("what happened here lately").
 
 - **PROTOCOL v1 is frozen; every change here is additive** and lands with
   conformance fixtures in the same commit: checkpoint + tombstone record
-  types, `alerts.jsonl` (documented as implementation file, not wire — decide
-  at freeze-review whether it enters PROTOCOL at all), §8 rows for
-  `agentrec_digest` and the `files` array on destructive requests.
+  types, the additive `reverts` field on undo turn records (see rework
+  clause (c)), `alerts.jsonl` (documented as implementation file, not wire —
+  decide at freeze-review whether it enters PROTOCOL at all), and the §8 row
+  for `agentrec_digest`. NO destructive-request payload change — the shipped
+  `paths` field already carries file subsets (§3.1.1).
 - **Non-goals, recorded:** hunk-level undo (diff/merge machinery + conflict
-  surface; file-level covers the common case); CAS content search; GitHub/
+  surface; file-level covers the common case); content search over file
+  snapshot blobs (prompt blobs ARE searched — §3.0.2); GitHub/
   network posting; team mode; blocking/intercepting anything; memory v1
   coupling; full-repo checkpoint snapshots.
 - **Testing bar:** every verb gets unit + integration (real binary, tempdir
@@ -319,7 +351,9 @@ into a next agent session's context ("what happened here lately").
   countermeasure). Bisect gets adversarial fixtures: flaky test cmd, probe
   with missing snapshots, turn set with human interleaving. Partial undo +
   restore get refusal-matrix tests (modified/skipped/withheld/missing-blob ×
-  default/continue-on-refusal). Real-corpus checks where shape claims are
+  CLI/MCP surface, asserting the shipped per-file Revert/Refused/Excluded
+  classification; restore additionally × recorded/unrecorded current state
+  and `--allow-unrecorded`). Real-corpus checks where shape claims are
   made (fixture-only evidence cannot close corpus-shape claims — recorded
   lesson).
 - **Sequencing & gating:** 3.0 → 3.1 → 3.2; each sub-phase independently
