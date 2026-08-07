@@ -36,7 +36,7 @@
 //! annotation exists for the Linux leg.
 //!
 //! (3) `File::open` on a DIRECTORY for fsync, five sites:
-//! `store.rs::put` (the dedup-hit arm), `store.rs::finish_stored`,
+//! `store.rs::put_result` (the dedup-hit arm), `store.rs::finish_stored`,
 //! `purgecmd.rs::rewrite_memory_atomic`, `purgecmd.rs::rewrite_log_atomic`,
 //! and `purgecmd.rs::rewrite_signal_atomic`. Opening a real directory cannot
 //! block. That third class carries an assumption worth stating, because

@@ -33,9 +33,21 @@
 # region would make production sites VANISH. A vanished site turns its entry
 # stale and reds the build, instead of passing silently.
 #
-# SCOPE. Production source under agentrec-core/src and cli/src. `#[cfg(test)]`
-# (and `#[cfg(all(test, ...))]`) modules and cli/tests/ are exempt: test code
-# writes its own tempdir fixtures.
+# SCOPE. Production source under agentrec-core/src and cli/src. Test-ONLY
+# regions and cli/tests/ are exempt: test code writes its own tempdir
+# fixtures. "Test-only" is decided by classifying the cfg attribute, not by a
+# substring match — `#[cfg(test)]` and `#[cfg(all(test, ...))]` (no `not(`)
+# open an exempt region; `#[cfg(any(..., test))]` and `#[cfg(not(test))]`
+# gate PRODUCTION code (a disjunction with `test` still compiles into real
+# binaries — `doctorcmd.rs::estimate_watch_count` is the live example, caught
+# by a gate round when a substring match silently exempted it) and are
+# scanned; any other col-0 cfg form carrying a `test` token is an INTEGRITY
+# abort rather than a guess.
+#
+# KNOWN COLLAPSE, disclosed: allowlist keys are `path::fn`, so two same-named
+# functions in one file (e.g. the cfg-paired `create_tmp_file` arms) share
+# one entry and one count. A write-open MOVING between same-named twins is
+# invisible to the count check; adding or removing one still trips it.
 #
 # PORTABILITY. bash 3.2 (the macOS floor: no associative arrays, no mapfile)
 # and POSIX awk/grep only — CI's lint job runs on ubuntu, so a bash-4-ism or a
@@ -82,17 +94,52 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
     awk -v F="$f" '
     FNR == 1 { in_test = 0; saw_cfg_test = 0; cfgtest_present = 0; curfn = "<toplevel>" }
 
-    # Independent channel for the integrity check, evaluated BEFORE any rule
-    # that can `next`: does the file contain a cfg(...test...) attribute at
-    # all, regardless of column or form? If one is present but the anchored
-    # region-opening pattern below never fired, the scanner has stopped
-    # understanding this codebase and must say so rather than scan on.
-    /#\[cfg\(.*test.*\)\]/ && $0 !~ /^[ \t]*\/\// { cfgtest_present = 1 }
+    # Classify a cfg attribute line carrying a standalone `test` token.
+    #   "testonly"   — compiled ONLY under cfg(test): `#[cfg(test)]`, or
+    #                  `#[cfg(all(test, ...))]` with no `not(` anywhere (a
+    #                  `not(` inside an `all` can invert the test conjunct).
+    #   "production" — carries the token but still compiles into real
+    #                  binaries: `#[cfg(any(...))]` (disjunction) and
+    #                  `#[cfg(not(...))]` (negation).
+    #   "unknown"    — anything else; the scanner must not guess.
+    # A substring match here is exactly the defect a gate round caught:
+    # `#[cfg(any(target_os = "linux", test))]` was treated as a test region
+    # and a production function silently vanished from the scan.
+    function cfg_class(line,  c) {
+        c = line
+        sub(/^[ \t]*#\[cfg\(/, "", c)
+        sub(/\)\][ \t]*$/, "", c)
+        if (c == "test") return "testonly"
+        if (c ~ /^all\(/ && c !~ /not\(/) return "testonly"
+        if (c ~ /^any\(/ || c ~ /^not\(/) return "production"
+        return "unknown"
+    }
+    # `test` as a standalone token (not `latest`, not `test_util` — those are
+    # different cfgs and none of this scanner s business).
+    function has_test_token(line) {
+        return (line ~ /[^A-Za-z0-9_]test[^A-Za-z0-9_]/ || line ~ /\(test\)/)
+    }
 
-    # A col-0 `#[cfg(...test...)]` opens a test region. rustfmt keeps every
-    # line inside `mod tests { ... }` indented, so the region ends at the next
+    # Independent channel for the integrity check, evaluated BEFORE any rule
+    # that can `next`: does the file contain a TEST-ONLY cfg attribute at any
+    # column? If one is present but the anchored col-0 region opener below
+    # never fired, the scanner has stopped understanding this codebase and
+    # must say so rather than scan on. (Production-class forms — any/not —
+    # deliberately do not arm this channel: they open no region.)
+    /#\[cfg\(/ && $0 !~ /^[ \t]*\/\// && has_test_token($0) {
+        cls = cfg_class($0)
+        if (cls == "testonly") cfgtest_present = 1
+        if (cls == "unknown" && $0 ~ /^#\[cfg\(/) {
+            printf "!!INTEGRITY\t%s\tunrecognized-test-cfg-form:FNR=%d\n", F, FNR
+        }
+    }
+
+    # A col-0 TEST-ONLY cfg opens a test region. rustfmt keeps every line
+    # inside `mod tests { ... }` indented, so the region ends at the next
     # col-0 `}` — which is why the closing brace below is anchored.
-    /^#\[cfg\(.*test.*\)\]/ { in_test = 1; saw_cfg_test = 1 }
+    /^#\[cfg\(/ && has_test_token($0) && cfg_class($0) == "testonly" {
+        in_test = 1; saw_cfg_test = 1
+    }
     in_test == 1 { if ($0 ~ /^\}$/) { in_test = 0 } ; next }
 
     # Track the enclosing function. Declaration forms only (optional

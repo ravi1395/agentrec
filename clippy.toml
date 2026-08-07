@@ -23,11 +23,14 @@
 # (wired into the CI lint job beside this lint) scans production source for
 # write-open call sites and fails on any that is not in
 # `scripts/write-open-allowlist.txt`, so a NEWLY ADDED unguarded write-open
-# reds the build. The allowlist is bidirectional — an entry matching no call
-# site is also a failure — because the script's correctness rests on excluding
-# `#[cfg(test)]` regions, and a silently over-greedy exclusion must announce
-# itself rather than pass. What that script does NOT do is verify that an
-# allowlisted guard is CORRECT; the rationale per entry is human-reviewed.
+# in an idiomatic call form reds the build (aliased imports evade the grep —
+# ratchet scope, disclosed in the script header). The allowlist is
+# bidirectional — an entry matching no call site is also a failure — because
+# the script's correctness rests on excluding test-ONLY cfg regions, and a
+# silently over-greedy exclusion must announce itself rather than pass
+# (`#[cfg(any(..., test))]` gates production code and is scanned, not
+# exempted). What that script does NOT do is verify that an allowlisted
+# guard is CORRECT; the rationale per entry is human-reviewed.
 #
 # Clippy matches the RESOLVED path, so one entry covers both `std::fs::read`
 # and a `use std::fs;` + `fs::read(..)` call form.
