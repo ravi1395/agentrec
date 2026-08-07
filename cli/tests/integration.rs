@@ -10158,9 +10158,9 @@ impl Drop for SingleDaemonGuard {
 /// creating a fifo outright. That choice is for determinism, not necessity.**
 /// Fresh-FIFO delivery was measured by two gate rounds (2026-08-07, one macOS
 /// machine each) and their results DISAGREE on one row; neither is treated as
-/// authoritative here. Bare `mkfifo` with no writer: no delivery (both
-/// rounds). `mkfifo` + read-write open, no byte written: no delivery (one
-/// round, single run). `mkfifo` + read-write open + a byte written: round 8
+/// authoritative here. Bare `mkfifo` with no writer: no delivery (round 8,
+/// single run; round 9 did not run this shape). `mkfifo` + read-write open,
+/// no byte written: no delivery (one round, single run). `mkfifo` + read-write open + a byte written: round 8
 /// saw 2/2 turns delivered; round 9's reconstruction saw 0/3, and got 2/2
 /// only after adding an explicit `touch` on the fifo (a metadata syscall) —
 /// round 8's exact probe commands were not persisted, so which stimulus
@@ -10175,7 +10175,7 @@ impl Drop for SingleDaemonGuard {
 /// Mechanism, verified against this repo's source rather than notify
 /// internals: file staging on macOS is kind-agnostic — every watched-class
 /// path lands in `pending` via the `Class::Watch` arm's closing
-/// `pending.insert(path)` (`daemon.rs::run`), and the only
+/// `pending.insert(path)` (`daemon.rs::apply_watch_result`), and the only
 /// `EventKind::Create(_)` match in production code is Linux-only directory
 /// admission; the macOS arm deliberately excludes `Create` (pinned by
 /// `create_kind_does_not_admit_on_macos`). So delivery hinges entirely on

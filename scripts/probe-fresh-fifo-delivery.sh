@@ -26,7 +26,12 @@ BIN="$REPO_ROOT/target/debug/agentrec"
 FX="$(mktemp -d)"
 DAEMON_PID=""
 cleanup() {
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
+    if [ -n "$DAEMON_PID" ]; then
+        kill "$DAEMON_PID" 2>/dev/null || true
+        # Wait for the shutdown flush: without this the daemon's final writes
+        # race the rm -rf and can resurrect $FX/.agentrec (seen live, round 10).
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
     exec 3>&- 2>/dev/null || true
     rm -rf "$FX"
 }
