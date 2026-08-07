@@ -14,6 +14,32 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
+  pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
+  four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal
+  shrinking the protect set would let purge delete live blobs); init (12 sites) / uninstall
+  (5) named-error on FIFO config paths, never treat-as-empty (init merges, so empty-on-refusal
+  clobbers); importcmd ×4, service ×2, `record::open_append` (reviewer-found HIGH — `hook
+  claude` hung on a FIFO `signal.jsonl`, the agent-facing surface) plus ten write-open guards
+  (locks, tmp-writers, undo-guard, purge rewrites). `clippy.toml disallowed-methods`
+  (fs::read/read_to_string/File::open) makes reintroduction a build failure — proven live by
+  plant-probe (exit 101), partition of all 24 in-src allows enumerated in the ledger. Tests
+  +9 incl. the daemon FIFO regression test (asserts skipped entry AND control-file survival —
+  the neutered guard loses the whole recorder) — its fixture replaces a watched regular file
+  with a FIFO for determinism. Suite 1019/0/4; clippy `--all-features -D warnings` + fmt clean.
+  - **Rounds 8–10 each failed on PROSE only, never code — three of the false sentences were
+    the orchestrator transcribing a skeptic's claims unverified** (the recorded gate-loop
+    lesson, hit again): a `Create(_)` mechanism citing a cfg'd-out Linux arm, a "2/2
+    byte-written" figure round 9 could not reproduce (0/3; 2/2 only with an explicit touch —
+    stimulus UNDETERMINED, both measurements now stated without adjudication, probe shapes
+    persisted in `scripts/probe-fresh-fifo-delivery.sh`), and a "(both rounds)" attribution
+    for a shape round 9 never ran.
+  - **Known-open, disclosed not fixed:** OpenOptions/fs::write/fs::copy lint gap (write-open
+    class; store.rs:91 named); service.rs unit-file write outside the repo threat model;
+    darwin-only lint census (Linux cfg bodies unlinted locally); nine of ten write-open guards
+    evidenced only by the green suite; fresh-FIFO delivery stimulus undetermined (script
+    settles it when someone runs the matrix); round-8/9/10 probe outputs not persisted to
+    `docs/verify/` (founder option if gradeable figures wanted).
 - **Phase 2 tail execution started (2026-08-05, branch `feat/phase-2-tail`, forked from
   `main`@`dd4238f`, worktree `~/Projects/agentrec-phase2-tail`) — orchestrated: Sonnet
   implementers per task, Fable skeptic gate per phase, no phase advances without GATE PASS.
