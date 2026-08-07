@@ -2893,10 +2893,24 @@ timestamp: `grep -c 'fsguard::'` over those five files returns `uninstallcmd.rs`
 `initcmd.rs` 13, `purgecmd.rs` 5, `importcmd.rs` 7, `service.rs` 2 — guarded call sites where
 bare reads used to be. Two channels, agreeing.
 
+> **SUPERSEDED by the round-8 gate correction below — the sentence was false at the HEAD it
+> shipped in.**
+
 **The honesty split from the 34/26 census survives unchanged and still applies to this
 figure:** `fsguard`'s module doc names only `store.rs` for class 3, so `purgecmd.rs`'s three
 directory fsyncs remain a class-3 site the doc does not name. Fixing that doc is still owed and
 still not done here.
+
+**Round-8 correction (2026-08-07, gate on `44cc06a`):** the paragraph above went stale inside
+the very commit that carried it. `44cc06a` itself rewrote `fsguard`'s module doc to name all
+five class-3 sites by `file:symbol` — including `purgecmd.rs`'s three directory fsyncs — and
+the round-8 skeptic read that doc at `agentrec-core/src/fsguard.rs` (registry block near the
+top of the module doc) while this ledger sentence, added by the same commit, still said the fix
+was "still owed and still not done here". The doc fix and this sentence were authored by two
+concurrent agents in one shared tree; the sentence was written before the doc landed and nobody
+re-read it against the final tree — the same mid-round-measurement staleness this entry's own
+caveat (a) warned about for counts, now demonstrated for a completion claim. The fsguard
+exemption registry is DONE as of `44cc06a`; nothing about it is owed.
 
 **`disallowed-methods` in `clippy.toml` IS implemented.** Verified by reading the file at
 `2026-08-07T02:00:02Z`: all three methods are listed (`std::fs::read`,
@@ -2907,6 +2921,16 @@ having read the config file, and writing "mutation-verified" in this entry's own
 evidence would be a fresh instance of the defect class this entry exists to correct. Whoever
 closes the round owes that probe, run after a `cargo build` (this repo's recorded stale-build
 hazard).
+
+**That owed probe was run by the round-8 gate (2026-08-07, on `44cc06a`):** a bare
+`std::fs::read_to_string` planted in `readcmds.rs::diff` made
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 101 with an error
+naming `disallowed_methods` and the fsguard reason string; the plant was reverted and the
+clean run exits 0. The skeptic also verified no file-wide
+`#![allow(clippy::disallowed_methods)]` exists outside `cli/tests/` (16 files) and that all 24
+in-`src` allows attach to `mod tests {` items or the 8 documented exemption sites. Caveat the
+skeptic itself recorded: the post-revert clean run was incremental (cli crate only, 0.99s); a
+from-clean clippy re-run would remove the cache caveat.
 
 **Miscitation, noted not hunted.** The SUPERSEDED sentence at the top of the mechanical-audit
 section says "the grep in `fsguard`'s module doc is how to re-check it". `fsguard`'s module doc

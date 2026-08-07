@@ -10155,15 +10155,22 @@ impl Drop for SingleDaemonGuard {
 /// stay silent about the far larger failure.
 ///
 /// **The fixture REPLACES a watched regular file with a fifo rather than
-/// creating a fifo outright, and that is load-bearing on macOS.** Measured
-/// live on this branch: `mkfifo` inside the watched tree — at the root or in a
-/// subdirectory, with or without a byte written into it — produces NO notify
-/// event at all (30s waits, log.jsonl holding only the epoch line), because
+/// creating a fifo outright. That choice is for determinism, not necessity.**
+/// The fresh-FIFO delivery matrix, measured live on this branch (round-8 gate,
+/// 2026-08-07, one macOS machine): a bare `mkfifo` with no writer delivers no
+/// event in a 30s wait; `mkfifo` + open read-write with no byte written also
+/// delivered nothing (single-run negatives — FSEvents false-negatives are the
+/// plausible flake direction); but `mkfifo` + open read-write + a byte WRITTEN
+/// delivered a turn 2/2, recorded as `op: "create", skipped_reason:
+/// "unreadable"`. An earlier version of this comment claimed the byte-written
+/// shape delivers nothing — that was false. Mechanism at the notify layer:
 /// FSEvents' `ItemIsFile`/`ItemIsDir`/`ItemIsSymlink` flags do not cover a
-/// FIFO. Deleting an ordinary file DOES deliver an event for that path, and by
-/// the time `stage` resolves it the path is a fifo — so this is the shape that
-/// actually reaches the guarded read on macOS, and it is a realistic one (any
-/// path an agent replaces in-place).
+/// FIFO, and notify emits `Create(Other/Any)` for flag-less creates, which
+/// `daemon.rs`'s `Create(_)` arm accepts — delivery hinges on FSEvents
+/// producing an event for the path at all, not on the missing flag.
+/// Delete-then-mkfifo reliably delivers an event for the path (the delete),
+/// and by the time `stage` resolves it the path is a fifo — a deterministic
+/// shape, and a realistic one (any path an agent replaces in-place).
 ///
 /// The fifo is opened READ-WRITE and the handle held for the rest of the test.
 /// That is what makes the fixture reproduce the hazard without the test itself
