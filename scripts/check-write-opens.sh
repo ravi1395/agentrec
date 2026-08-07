@@ -211,8 +211,10 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
         }
     }
     pending_test == 1 {
-        if ($0 ~ /^#\[/ || $0 ~ /^\/\//) {
-            # attribute or comment between the cfg and its item: keep waiting
+        if ($0 ~ /^#\[/ || $0 ~ /^\/\// || $0 ~ /^[ \t\r]*$/) {
+            # attribute, comment, or blank line between the cfg and its item
+            # (a blank line there compiles and rustfmt preserves it —
+            # gate-round-measured): keep waiting
         } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{[ \t]*$/) {
             in_test = 1; saw_cfg_test = 1; pending_test = 0
         } else if ($0 ~ /^(pub[ \t]+)?mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;[ \t]*$/) {
@@ -225,7 +227,25 @@ find $ROOTS -name '*.rs' -type f | LC_ALL=C sort | while IFS= read -r f; do
         }
         next
     }
-    in_test == 1 { if ($0 ~ /^\}[ \t]*$/) { in_test = 0 } ; next }
+    # Region close: a col-0 `}` whose remainder is nothing but whitespace
+    # and/or comments. Decided STRUCTURALLY (strip comments, trim, compare)
+    # rather than by enumerating spellings — a fifth gate round measured
+    # `} // end of unit tests` stranding the region open, exactly one round
+    # after `}`-plus-trailing-space was fixed as a spelling; the sixth
+    # spelling ends the series. Also tolerates CRLF (`\r` trimmed). A `}`
+    # followed by CODE (e.g. `} else {`) does not close — cannot occur at
+    # col 0 for a rustfmt-formatted mod, and failing toward staying-in-region
+    # surfaces as unclosed-test-region at EOF, loud.
+    in_test == 1 {
+        if ($0 ~ /^\}/) {
+            cl = $0
+            gsub(/\/\*([^*]|\*+[^*\/])*\*+\//, " ", cl)
+            sub(/\/\/.*$/, "", cl)
+            gsub(/[ \t\r]+/, "", cl)
+            if (cl == "}") in_test = 0
+        }
+        next
+    }
 
     # Track the enclosing function. Declaration forms only (optional
     # visibility / const / async / unsafe / extern), never a call.
