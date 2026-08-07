@@ -61,6 +61,30 @@
 # one entry and one count. A write-open MOVING between same-named twins is
 # invisible to the count check; adding or removing one still trips it.
 #
+# KNOWN RESIDUAL, disclosed and deliberately NOT fixed here (gate round 7,
+# fixture measured, rustfmt-stable, compiles): the scanner is LINE-based
+# with no cross-line comment state, so a COMMENTED-OUT opener —
+#     /*
+#     #[cfg(test)]
+#     mod tests {
+#     */
+# — arms the pending/region machinery from inside a block comment, and a
+# following NEW unallowlisted production write is silently swallowed (an
+# already-allowlisted site swallowed the same way DOES red, via the
+# stale-entry direction). Closing this requires cross-line comment state,
+# and an attempted fix demonstrated why that does not stop there: carrying
+# comment depth across lines phantom-opens on `/**` glob text inside
+# MULTI-LINE STRING LITERALS (initcmd.rs config templates), so correctness
+# then needs cross-line string state, raw-string delimiters, and char
+# literals — a Rust lexer, which awk grows one gate-found hole at a time
+# (seven rounds: substring, all(any(, string leak, comment leak, unbounded
+# mod, close-anchor spellings, nested comments). The structural successor
+# is a small Rust checker binary using a real lexer (e.g. proc-macro2);
+# until then this residual is the recorded boundary of what this script
+# can see. The shape requires someone to comment out exactly an opener
+# pair and then add a new unguarded write below it — every simpler
+# spelling is covered and probed above.
+#
 # PORTABILITY. bash 3.2 (the macOS floor: no associative arrays, no mapfile)
 # and POSIX awk/grep only — CI's lint job runs on ubuntu, so a bash-4-ism or a
 # GNU-grep-ism would only ever break on a developer's Mac, never in CI.
