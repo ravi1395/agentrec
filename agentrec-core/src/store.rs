@@ -93,7 +93,12 @@ impl BlobStore {
                 // D34 hole) — fsync it too, since a prior crash could have
                 // lost the directory entry even though this inode survived.
                 if let Some(parent) = path.parent() {
-                    if let Ok(dir) = fs::File::open(parent) {
+                    // Directory handle opened solely for `sync_all`; a
+                    // directory is never a regular file, so the fsguard
+                    // predicate would refuse it, and opening one cannot block.
+                    #[allow(clippy::disallowed_methods)]
+                    let opened = fs::File::open(parent);
+                    if let Ok(dir) = opened {
                         let _ = dir.sync_all();
                     }
                 }
@@ -321,7 +326,10 @@ fn create_tmp_file(path: &std::path::Path) -> std::io::Result<fs::File> {
 /// final name by the time this runs, so a dir-fsync failure past this point
 /// is a durability warning, never a "no snapshot" report.
 fn finish_stored(hash: String, parent: &std::path::Path) -> PutResult {
-    if let Ok(dir) = fs::File::open(parent) {
+    // Directory handle opened solely for `sync_all` (see `put` above).
+    #[allow(clippy::disallowed_methods)]
+    let opened = fs::File::open(parent);
+    if let Ok(dir) = opened {
         if let Err(e) = dir.sync_all() {
             eprintln!("agentrec: snapshot {hash} stored but parent-dir fsync failed: {e}");
         }
@@ -375,6 +383,10 @@ impl std::fmt::Display for StoreError {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

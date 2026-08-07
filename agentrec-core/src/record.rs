@@ -408,7 +408,25 @@ pub fn append_log_line(path: &Path, line: &str) -> Result<(), String> {
 /// Shared open+write for both append paths. Creates parents; writes `line` as
 /// a single `\n`-terminated buffer (one write syscall helps append atomicity
 /// across processes). Returns the open file so callers may fsync it.
+///
+/// Refuses a non-regular target before opening it. This is the WRITE-side
+/// mirror of the [`crate::fsguard`] read guards, and the same hazard: opening
+/// a FIFO for append blocks until a READER appears, indefinitely. Reproduced
+/// live on this branch — `mkfifo .agentrec/signal.jsonl` then piping a `Stop`
+/// event into `agentrec hook claude` hung the hook process forever, and a
+/// hook that never returns is a wedged agent turn, not a lost record. The
+/// sibling write-opens in `undo_coordinator.rs` (`append_event`,
+/// `UndoLock::acquire`) already refuse the same way; this is the one primitive
+/// every `log.jsonl`/`signal.jsonl`/`memory.jsonl` append funnels through, so
+/// guarding it here covers [`append_log`], [`append_log_line`] and
+/// [`append_line_synced`] at once.
 fn open_append(path: &Path, line: &str) -> Result<fs::File, String> {
+    if crate::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to append",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         perms::lock_dir(parent);
@@ -558,6 +576,10 @@ pub fn parse_signals(text: &str) -> Vec<SignalEvent> {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

@@ -1631,6 +1631,10 @@ fn load_text(store: &crate::store::BlobStore, hash: Option<&str>) -> Option<Stri
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::record::{EpochRecord, FileEntry};

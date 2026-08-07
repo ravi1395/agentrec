@@ -330,6 +330,19 @@ pub fn write_state(root: &Path, state: &State) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = state_path(root);
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // Write-side fsguard mirror: `fs::write` opens create+truncate, which
+    // blocks forever on a FIFO pre-created at the tmp name. The pid makes the
+    // name predictable enough to plant one, and this runs on the daemon's
+    // hot path.
+    if agentrec_core::fsguard::is_nonregular(&tmp) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file — refusing to write",
+                tmp.display()
+            ),
+        ));
+    }
     std::fs::write(&tmp, &text)?;
     // Lock down before the rename makes it visible under its final name
     // (D37) — no window where state.json is reachable at 0644.
@@ -431,6 +444,10 @@ pub fn current_epoch_reloads(state: &State) -> u64 {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

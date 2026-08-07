@@ -19,6 +19,11 @@
 //! git repo at test time, same technique `import_claude.rs::
 //! t2_candidate_vs_t3_classification` uses for `/fake/repo2`.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

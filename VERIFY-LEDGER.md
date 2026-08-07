@@ -2684,6 +2684,13 @@ Suite **1007 / 0 / 4** across the change (unchanged — 22 guarded sites, zero r
 which is itself the evidence that no legitimate read was broken). Clippy `-D warnings`
 `--all-targets` debug AND release, `cargo fmt --check`: clean.
 
+> **SUPERSEDED — the sentence below is FALSE and is retained only as the record of what was
+> claimed.** It was offered as falsifiable, it was falsified (round 7, MAJOR 3), and it has
+> since been re-measured independently. Do not read it as current state; see
+> **"Correction — the completeness claim, re-measured"** at the end of this file for the
+> measured figure and its replay command. The audit is INCOMPLETE and remediation is in
+> progress.
+
 **Remaining raw reads are now, by inspection, the three documented exemption classes
 (`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code.** That is a
 falsifiable statement and the grep in `fsguard`'s module doc is how to re-check it after any
@@ -2769,3 +2776,171 @@ tests). Clippy `-D warnings` `--all-targets` debug AND release, `cargo fmt --che
 Doc drift corrected in the same commit — the module and `read_regular` still described the
 predicate as an lstat after the code moved to `stat`, which is this repo's signature defect
 class appearing inside the commit that fixes another one.
+
+### Correction — the completeness claim, re-measured
+
+**The claim corrected here** is the sentence in "The mechanical audit, finished" reading
+*"Remaining raw reads are now, by inspection, the three documented exemption classes
+(`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code."* That sentence
+is FALSE. It is now marked SUPERSEDED in place rather than deleted, and this entry carries the
+measured replacement. **Nothing here is a completion claim: the audit is incomplete and
+remediation is in progress this round.**
+
+**Measured, not inspected.** At `2ed1ce9`, working tree, `2026-08-07T00:39:25Z`:
+
+- **34 non-test bare file reads** across `cli/src` + `agentrec-core/src`, excluding
+  `fsguard.rs` itself.
+- **8 of them match one of the three documented exemption rationales**; **26 do not.**
+
+Non-exempt, by file: `initcmd.rs` **13**, `uninstallcmd.rs` **5**, `purgecmd.rs` **2**
+(`referenced_hashes_outside_log`, `referenced_hashes` — the other 3 `purgecmd.rs` hits are
+directory fsyncs and are exempt), `importcmd.rs` **4**, `service.rs` **2**.
+
+Exempt, by file: `id.rs` **2** (`/dev/urandom`, class 1), `doctorcmd.rs` **1**
+(`/proc/sys/fs/inotify/max_user_watches`, class 2), `store.rs` **2** and `purgecmd.rs` **3**
+(directory `File::open` for fsync, class 3).
+
+**One honesty split inside that arithmetic:** the 8 match the three documented *rationales*,
+but `fsguard`'s module doc names only `store.rs` for class 3. `purgecmd.rs`'s three directory
+fsyncs are a class-3 site the doc does not name — same justification, unnamed. Writing "8 are
+the documented exemptions" flat would smuggle those three in. Naming the doc gap is the
+correction; fixing the doc is owed and not done here.
+
+**Replay command** (this repo's convention: the figure travels with the command that produced
+it). Run from the repository root:
+
+```sh
+for f in $(find cli/src agentrec-core/src -name '*.rs' ! -name fsguard.rs); do
+  b=$(grep -n '#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1); b=${b:-999999}
+  awk -v b="$b" -v f="$f" 'NR<b && $0 !~ /^[[:space:]]*\/\// \
+    && /(std::)?fs::(read|read_to_string|File::open)[[:space:]]*\(|(^|[^:[:alnum:]_])File::open[[:space:]]*\(/ \
+    {print f":"NR}' "$f"
+done | tee /tmp/sites.txt | cut -d: -f1 | sort | uniq -c; wc -l < /tmp/sites.txt
+```
+
+**Four properties of that command, each checked rather than assumed, because a completeness
+claim measured by a narrower instrument is the same defect one layer down:**
+
+1. **`find`, not `cli/src/*.rs`.** A top-level glob would silently skip subdirectory modules.
+   Verified equal at this HEAD (`find … | wc -l` = 36 = `ls …/*.rs | wc -l`, i.e. there are no
+   subdirectory modules today) — but `find` is what is recorded, so the command stays correct
+   the day one is added.
+2. **Unprefixed `fs::read_to_string` is matched.** A first pass keyed only on `std::fs::…`
+   returned 17 sites and made `initcmd.rs`/`uninstallcmd.rs` look already-guarded. They are
+   not. `initcmd.rs` writes `fs::read_to_string` without the `std::` prefix; the narrow pattern
+   missed all 18 of those two files' hits.
+3. **The `#[cfg(test)]` boundary heuristic is "first occurrence, everything after is test
+   code", and it is sound at this HEAD only because every file was checked:** ~~each of the 36
+   files contains **exactly one** `#[cfg(test)]`~~ — **SUPERSEDED, the struck clause is FALSE
+   and is retained as the record of what was claimed; see "Property 3's per-file check did not
+   happen as written" below** — each is immediately followed by
+   `mod tests {` (or `mod coordinator_tests {` in `undo_coordinator.rs`), and no top-level
+   `fn`/`impl`/`struct`/`enum`/`const`/`static` appears after it in any file. An early inline
+   `#[cfg(test)]` on a helper would silently drop every real read below it; that shape does not
+   exist here today and the heuristic must be re-checked, not reused, if it appears.
+4. **Comment lines are excluded** (`^\s*//`). Without that, three doc-comment mentions of
+   `File::open`/`fs::read` inflate the count, as do `Read::read_to_string` calls on **stdin**
+   in `cmds.rs`/`hookcmds.rs`, which are not filesystem opens and cannot block on a FIFO.
+
+**Two caveats that must travel with the figure.** (a) The measurement is of the **working
+tree**, which carried concurrent uncommitted edits from other agents in this same worktree at
+the time — a re-run yielding a different count reads as drift, not as dishonesty. (b) The line
+numbers above are **as-of `2ed1ce9`** and will rot; the file-and-function names are the durable
+handles, which is why `purgecmd.rs`'s two are named by function rather than by line.
+
+**Consistency with round 7's own count:** round 7 measured 35 total / 27 non-exempt, then fixed
+one (`readcmds.rs::live_undo_guard_reason`, BLOCKER 1), predicting 34 / 26. This independent
+re-measure lands exactly there. That agreement is worth stating because it establishes the two
+counts used the same boundary definition — it does **not** establish that either instrument
+sees every reachable bare read, and no such claim is made.
+
+> **SUPERSEDED — the paragraph below was true at its measurement time and is FALSE as a
+> statement of present state.** It is retained as the record of what was written. Remediation
+> landed later in this same round; see **"Present state, re-measured"** immediately below.
+
+**State, stated plainly: 26 non-exempt bare reads remain unguarded.** The severity argument
+from round 7 is unchanged and still holds — these sit in human-invoked verbs (`init`,
+`uninstall`, `import`, `purge`, `service`), not the agent-facing MCP surface — but severity is
+not closure. Round 7's structural recommendation (`disallowed-methods` in `clippy.toml`, after
+the 26 are guarded) remains the item that would end the enumerative loop, and it is still not
+implemented.
+
+### Present state, re-measured
+
+**The 34/26 census above was true at its stated measurement time** —
+`2026-08-07T00:39:25Z`, commit `2ed1ce9` working tree. **Remediation landed within the same
+round**, after that measurement was taken, which is why the paragraph reads false today.
+
+**Re-measured at `2026-08-07T02:00:02Z`, commit `2ed1ce9` working tree** (same commit, later
+working tree; the tree carried concurrent uncommitted edits from another agent throughout, so
+a further re-run yielding different numbers reads as drift, not as dishonesty). The entry's own
+replay command was re-run verbatim from the repository root. Output:
+
+```
+   2 agentrec-core/src/id.rs
+   2 agentrec-core/src/store.rs
+   1 cli/src/doctorcmd.rs
+   3 cli/src/purgecmd.rs
+       8
+```
+
+**8 total bare reads, 0 non-exempt.** All 8 are the three documented exemption classes, by
+file: `id.rs` 2 (`/dev/urandom`, class 1), `doctorcmd.rs` 1 (`/proc/…/max_user_watches`,
+class 2), `store.rs` 2 and `purgecmd.rs` 3 (directory `File::open` for fsync, class 3). The
+five files that held the 26 — `initcmd.rs`, `uninstallcmd.rs`, `importcmd.rs`, `purgecmd.rs`,
+`service.rs` — now return zero non-exempt hits. Corroborated on a second channel at the same
+timestamp: `grep -c 'fsguard::'` over those five files returns `uninstallcmd.rs` 3,
+`initcmd.rs` 13, `purgecmd.rs` 5, `importcmd.rs` 7, `service.rs` 2 — guarded call sites where
+bare reads used to be. Two channels, agreeing.
+
+**The honesty split from the 34/26 census survives unchanged and still applies to this
+figure:** `fsguard`'s module doc names only `store.rs` for class 3, so `purgecmd.rs`'s three
+directory fsyncs remain a class-3 site the doc does not name. Fixing that doc is still owed and
+still not done here.
+
+**`disallowed-methods` in `clippy.toml` IS implemented.** Verified by reading the file at
+`2026-08-07T02:00:02Z`: all three methods are listed (`std::fs::read`,
+`std::fs::read_to_string`, `std::fs::File::open`), each with a reason string pointing at the
+corresponding `agentrec_core::fsguard` wrapper. **The live mutation proof belongs to the commit
+that landed the lint and is NOT re-run here** — this correction's only evidence for the lint is
+having read the config file, and writing "mutation-verified" in this entry's own voice on that
+evidence would be a fresh instance of the defect class this entry exists to correct. Whoever
+closes the round owes that probe, run after a `cargo build` (this repo's recorded stale-build
+hazard).
+
+**Miscitation, noted not hunted.** The SUPERSEDED sentence at the top of the mechanical-audit
+section says "the grep in `fsguard`'s module doc is how to re-check it". `fsguard`'s module doc
+contains no grep. The re-check instrument is the replay command in this entry, not anything in
+that doc. Scope of this note is that one sentence; no wider citation audit was performed.
+
+### Property 3's per-file check did not happen as written
+
+Property 3 above claims, as checked-not-assumed, that "each of the 36 files contains **exactly
+one** `#[cfg(test)]`". **That is false, and was false both in the working tree and at
+`2ed1ce9`.** Verified at `2026-08-07T02:00:02Z` with:
+
+```sh
+for f in $(find cli/src agentrec-core/src -name '*.rs' ! -name fsguard.rs); do
+  printf '%s %s\n' "$(grep -c '#\[cfg(test)\]' "$f")" "$f"
+done | awk '$1!=1{print "  n="$1" "$2} {c[$1]++} END{for(k in c) print "n="k": "c[k]" files"}'
+```
+
+Output: **29 files with exactly one, 6 with zero** — `cli/src/approvecmd.rs`,
+`cli/src/loglock.rs`, `cli/src/memlock.rs`, `agentrec-core/src/perms.rs`,
+`agentrec-core/src/lib.rs`, `agentrec-core/src/text.rs`.
+
+Two things measured alongside it, because the arithmetic in property 3 is off by one against
+the command it describes. The replay's census set **excludes** `fsguard.rs` (its own
+`! -name fsguard.rs`), so the set is **35 files, not 36**; `ls cli/src/*.rs
+agentrec-core/src/*.rs | wc -l` returns 36 **including** `fsguard.rs`, and
+`grep -c '#\[cfg(test)\]' agentrec-core/src/fsguard.rs` returns 1. So a 36-file reading counts
+`fsguard.rs` in, which the replay does not.
+
+**The census conclusion survives, in the conservative direction.** A file with zero
+`#[cfg(test)]` falls through to `b=999999`, so the whole file is scanned — including any test
+module. That **over**-includes rather than dropping real reads, so it cannot hide a non-exempt
+site. It is a live shape, not hypothetical: `agentrec-core/src/perms.rs` does carry a test
+module, gated `#[cfg(all(test, unix))]`, which the literal `#\[cfg(test)\]` pattern does not
+match. Its test module is therefore scanned in full, and contributes zero hits — so the 8/0
+figure is not understated by it. What is false is only the stated verification: the per-file
+check was asserted, not performed as described.

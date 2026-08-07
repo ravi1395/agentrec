@@ -4,6 +4,11 @@
 //! and crash-journal recovery (B2). Spawned-daemon assertions poll with a
 //! timeout because macOS fsevents coalesces events by a second or more.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -10135,6 +10140,227 @@ impl Drop for SingleDaemonGuard {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// The daemon's OWN snapshot read — `agentrec_core::fsguard::read_regular` at
+/// `daemon.rs::Recorder::stage`'s regular-file arm — had no regression test at
+/// all: every other fifo test in this repo pins a CLI or MCP read path.
+///
+/// The blast radius is not one bad entry. Without the guard the daemon blocks
+/// forever inside the snapshot loop, so the turn record is never appended and
+/// EVERY file in that turn is lost, including files nothing was wrong with.
+/// The control file is what detects that: it is written in the same burst as
+/// the fifo so both land in the SAME turn, and a stalled recorder therefore
+/// loses the control entry too. An assertion on the fifo entry alone would
+/// stay silent about the far larger failure.
+///
+/// **The fixture REPLACES a watched regular file with a fifo rather than
+/// creating a fifo outright, and that is load-bearing on macOS.** Measured
+/// live on this branch: `mkfifo` inside the watched tree — at the root or in a
+/// subdirectory, with or without a byte written into it — produces NO notify
+/// event at all (30s waits, log.jsonl holding only the epoch line), because
+/// FSEvents' `ItemIsFile`/`ItemIsDir`/`ItemIsSymlink` flags do not cover a
+/// FIFO. Deleting an ordinary file DOES deliver an event for that path, and by
+/// the time `stage` resolves it the path is a fifo — so this is the shape that
+/// actually reaches the guarded read on macOS, and it is a realistic one (any
+/// path an agent replaces in-place).
+///
+/// The fifo is opened READ-WRITE and the handle held for the rest of the test.
+/// That is what makes the fixture reproduce the hazard without the test itself
+/// blocking: under a neutered guard the daemon's `fs::read` consumes the one
+/// byte and then blocks waiting for an EOF this live writer never delivers.
+///
+/// STALLS the daemon rather than failing it on regression; the bounded polls
+/// below are what turn that stall into a RED.
+#[test]
+#[cfg(unix)]
+fn daemon_snapshots_a_fifo_as_skipped_without_losing_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Phase 1: an ordinary file, recorded normally. This both establishes the
+    // watched path the fifo will later occupy and proves the daemon records at
+    // all — the rest of the test is moot otherwise.
+    std::fs::write(root.join("f.txt"), b"a\n").unwrap();
+    let saw_regular = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_file(t, "f.txt").is_some())
+            .then_some(())
+    });
+    assert!(
+        saw_regular.is_some(),
+        "positive control never recorded — the daemon is not recording, so this \
+         run proves nothing about the fifo guard"
+    );
+
+    // Phase 2: replace that path with a fifo, in the same burst as a fresh
+    // control file. No sleep between them: the 1.5s debounce folds both into
+    // one turn, and that co-location is the whole point of the control.
+    std::fs::remove_file(root.join("f.txt")).unwrap();
+    let fifo = root.join("f.txt");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+    // Named binding, NOT `let _ =`: dropping the handle here closes the write
+    // end, and a neutered guard would then hang at `open` rather than mid-read
+    // — a different hazard than the one this test claims to pin.
+    let mut fifo_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open fifo read-write");
+    fifo_handle.write_all(b"x").expect("write into fifo");
+    std::fs::write(root.join("control.rs"), b"fn control() {}\n").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack. Keyed on ONE turn carrying
+    // BOTH paths: phase 1's turn carries `f.txt` alone and must not satisfy it.
+    let entries = poll_until(Duration::from_secs(30), || {
+        turns(root)
+            .iter()
+            .find_map(|t| Some((turn_file(t, "f.txt")?, turn_file(t, "control.rs")?)))
+    });
+
+    daemon.kill();
+    drop(fifo_handle);
+
+    let (fifo_entry, control_entry) = entries.expect(
+        "no single turn carried both the fifo and the control file within the poll \
+         window. What this timeout OBSERVES is only that: the two paths never \
+         appeared in one turn record. Two causes produce it and the timeout alone \
+         cannot tell them apart — (1) the fsguard regression this pins: the recorder \
+         stalled inside the guarded snapshot read, so the turn was never appended \
+         and every file in it was lost; (2) FSEvents delivered the fifo and the \
+         control file in batches more than the 1.5s debounce apart, splitting them \
+         across two turns that each exist and are each complete. Rerun to \
+         distinguish: (2) is intermittent and leaves both paths present in \
+         log.jsonl in separate turns, (1) reproduces every time and leaves neither",
+    );
+
+    // (1) The fifo is recorded HONESTLY: refused rather than read, and no hash
+    //     fabricated for bytes that were never obtained.
+    assert_eq!(
+        fifo_entry.get("skipped").and_then(|v| v.as_bool()),
+        Some(true),
+        "the fifo must be recorded as skipped: {fifo_entry:?}"
+    );
+    assert_eq!(
+        fifo_entry.get("skipped_reason").and_then(|v| v.as_str()),
+        Some("unreadable"),
+        "the fifo's skip cause must be `unreadable`: {fifo_entry:?}"
+    );
+    assert!(
+        fifo_entry.get("after").map(|v| v.is_null()).unwrap_or(true),
+        "no content hash may be fabricated for a file whose bytes were never \
+         read: {fifo_entry:?}"
+    );
+
+    // (2) The ordinary file mutated in the SAME turn is recorded normally.
+    //     A fifo must cost one entry, never the recorder.
+    // `skipped` is `skip_serializing_if` false on the wire, so absent == false.
+    assert_ne!(
+        control_entry.get("skipped").and_then(|v| v.as_bool()),
+        Some(true),
+        "an ordinary file sharing a turn with a fifo must still be snapshotted: \
+         {control_entry:?}"
+    );
+    assert!(
+        control_entry
+            .get("after")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "the control file must carry a real content hash: {control_entry:?}"
+    );
+}
+
+/// The WRITE-side mirror of the fifo test above, and the half the
+/// `disallowed-methods` lint cannot reach: `record.rs::open_append` is the one
+/// primitive behind every `log.jsonl`/`signal.jsonl`/`memory.jsonl` append, and
+/// it opened its target with a bare `OpenOptions::append`. Opening a FIFO for
+/// APPEND blocks until a READER appears — no timeout, no error — so a named
+/// pipe at `.agentrec/signal.jsonl` (a path the sandboxed agent can create;
+/// `mkfifo` needs no privileges) wedged `agentrec hook claude` forever.
+/// Reproduced live before the guard landed: exit 142 under `alarm`, vs exit 0
+/// with an ordinary file there.
+///
+/// A wedged hook is worse than a lost signal: Claude Code waits on the hook
+/// process, so the whole agent turn stalls on a file nothing needed to read.
+///
+/// HANGS rather than fails on regression — the bounded `try_wait` poll below
+/// is what turns that hang into a RED. No reader is ever opened on the fifo,
+/// which is what makes the block reproducible rather than timing-dependent.
+#[test]
+#[cfg(unix)]
+fn a_fifo_signal_inbox_does_not_wedge_the_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // `init` does not create signal.jsonl, so this occupies the path outright.
+    let sig = root.join(".agentrec/signal.jsonl");
+    assert!(!sig.exists(), "fixture must be the only thing at this path");
+    let c = std::ffi::CString::new(sig.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    // Dropped immediately: the hook reads its event to EOF, and a stdin left
+    // open would stall it for a reason unrelated to the fifo.
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(br#"{"hook_event_name":"Stop","session_id":"s_fifo"}"#)
+            .unwrap();
+    }
+
+    let exited = poll_until(Duration::from_secs(20), || child.try_wait().ok().flatten());
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "`agentrec hook claude` never exited with a fifo at \
+                 .agentrec/signal.jsonl — the append-side fsguard refusal in \
+                 record.rs::open_append is gone and the hook is blocked inside \
+                 `OpenOptions::append().open()` waiting for a reader that never \
+                 comes"
+            );
+        }
+    };
+
+    // The hook must TERMINATE; whether it reports the refusal as a failure
+    // exit or swallows it is not what this pins, so assert only that it did
+    // not die on a signal (which is how a killed-because-blocked process
+    // would look if the poll above were ever loosened).
+    assert!(
+        status.code().is_some(),
+        "hook must exit normally, not die on a signal: {status:?}"
+    );
+}
+
+/// The `files` entry for `path` in turn record `t`, if present.
+fn turn_file(t: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    t.get("files")?
+        .as_array()?
+        .iter()
+        .find(|f| f.get("path").and_then(|p| p.as_str()) == Some(path))
+        .cloned()
 }
 
 // AC-F10.6: the sibling test above only races an IN-PROCESS `append_memory`

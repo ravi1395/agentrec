@@ -2486,6 +2486,14 @@ fn sync_journal(
             }
             let path = open_path(root);
             let tmp = path.with_extension("json.tmp");
+            // Write-side fsguard mirror: this tmp name is FIXED, so a FIFO
+            // planted at it would block the daemon's journal write forever —
+            // the strongest case in the class. Skipping the write leaves the
+            // previous journal in place, which is the same outcome as any
+            // other write failure here.
+            if agentrec_core::fsguard::is_nonregular(&tmp) {
+                return;
+            }
             if std::fs::write(&tmp, &text).is_ok() {
                 // D37: lock down before the rename makes it visible under
                 // its final name.
@@ -2703,6 +2711,15 @@ fn lock_path(root: &Path) -> PathBuf {
 /// display — it is never consulted to decide whether the lock is held.
 fn acquire_lock(root: &Path) -> Result<std::fs::File, String> {
     let path = lock_path(root);
+    // Write-side fsguard mirror: opening a FIFO for write blocks until a
+    // reader appears, so a named pipe left at `.agentrec/daemon.lock` would
+    // wedge `agentrec record` before it ever reached the flock.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to lock",
+            path.display()
+        ));
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         // Never truncate: this file's only role is to be `flock`'d — clearing
@@ -2804,6 +2821,15 @@ fn stamp_watcher_armed(root: &Path) {
 /// annoying.
 pub(crate) fn daemon_is_running(root: &Path) -> bool {
     let path = lock_path(root);
+    // A non-regular lock path is a can't-determine case, and this function's
+    // documented posture is to report "not running" for every one of those —
+    // returning `false` rather than an error is deliberate here, matching the
+    // unopenable-file arm below. Without it, opening a FIFO for write blocks
+    // until a reader appears, so `status`/`doctor` would hang on a liveness
+    // check.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return false;
+    }
     // No `.create(true)`: a lock file that was never written means the
     // daemon has never run here — nothing to probe, and `doctor` must not
     // mutate disk as a side effect of a liveness check.
@@ -2838,6 +2864,10 @@ fn watch_error(e: &notify::Error) -> String {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

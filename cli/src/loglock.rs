@@ -36,6 +36,14 @@ fn lock_path(root: &Path) -> PathBuf {
 
 fn open_lock_file(root: &Path) -> Result<File, String> {
     let path = lock_path(root);
+    // Write-side fsguard mirror: a FIFO here blocks the open until a reader
+    // appears, wedging every log writer before the flock is even attempted.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to lock",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;

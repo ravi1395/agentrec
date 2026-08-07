@@ -8,6 +8,11 @@
 //! another concurrent hardening pass) — helpers below are intentionally
 //! duplicated rather than shared, to avoid touching that file.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;

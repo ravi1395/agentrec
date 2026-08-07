@@ -1,0 +1,33 @@
+# Bare blocking file READS are a build failure.
+#
+# Opening a path that resolves to a FIFO/socket/device blocks the calling
+# thread indefinitely. Eight rounds of enumerate-and-guard never converged on
+# the class, because every round could only fix the sites that existed that
+# day. This lint closes the READ half forward: the guarded wrappers in
+# `agentrec_core::fsguard` (`read_regular`, `read_regular_to_string`,
+# `open_regular`) resolve the path type before opening and error instead of
+# blocking.
+#
+# SCOPE — reads only. The three entries below are the blocking read entry
+# points. The WRITE half of the same hazard is NOT covered by this lint and
+# is a disclosed open class: `OpenOptions::open` with `.write(true)` or
+# `.append(true)`, `fs::write`, and `fs::copy` (which blocks on a FIFO
+# SOURCE) all block identically, and none is expressible here — clippy
+# matches the method, and `OpenOptions::open` is the same method for a
+# guarded read and an unguarded write, so listing it would fire on every
+# lock-file open in the tree. Those sites call `fsguard::is_nonregular`
+# inline instead; `fsguard`'s module doc carries the registry of which ones,
+# and a newly added write-open can still be unguarded without CI noticing.
+#
+# Clippy matches the RESOLVED path, so one entry covers both `std::fs::read`
+# and a `use std::fs;` + `fs::read(..)` call form.
+#
+# Exemptions are per-site `#[allow(clippy::disallowed_methods)]` carrying the
+# reason (fsguard itself; test code reading its own fixtures; the documented
+# `/dev/urandom`, `/proc`, and directory-fsync sites, where the target is
+# deliberately not a regular file).
+disallowed-methods = [
+    { path = "std::fs::read", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::read_regular" },
+    { path = "std::fs::read_to_string", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::read_regular_to_string" },
+    { path = "std::fs::File::open", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::open_regular" },
+]

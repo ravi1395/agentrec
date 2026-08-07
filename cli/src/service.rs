@@ -375,7 +375,10 @@ pub fn scan_units(dir: &Path) -> Vec<InstalledUnit> {
             if !is_agentrec_unit_name(&name) {
                 return None;
             }
-            let content = std::fs::read_to_string(&path).ok();
+            // Guarded: a unit file replaced by a fifo would otherwise hang
+            // `doctor`/`status`. Refusal folds into the same `None` an
+            // unreadable unit already produced -> `UnitState::Unparseable`.
+            let content = agentrec_core::fsguard::read_regular_to_string(&path).ok();
             let state = match content.as_deref().and_then(parse_unit_root) {
                 Some(root) if root.is_dir() => UnitState::Live(root),
                 Some(root) => UnitState::VanishedRoot(root),
@@ -565,7 +568,9 @@ pub fn install(root: &Path, exec: &Path) -> Result<Vec<String>, String> {
     };
 
     let mut actions = Vec::new();
-    let unchanged = std::fs::read_to_string(&path)
+    // Guarded; refusal folds into the existing `unwrap_or(false)`, i.e. the
+    // unit is treated as not-up-to-date and rewritten.
+    let unchanged = agentrec_core::fsguard::read_regular_to_string(&path)
         .map(|existing| existing == content)
         .unwrap_or(false);
     if unchanged {
@@ -673,6 +678,10 @@ fn manual_load_command(path: &Path) -> String {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

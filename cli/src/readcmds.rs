@@ -788,6 +788,15 @@ pub(crate) fn write_undo_guard(root: &Path, paths: &[String]) -> Result<(), Stri
     };
     let text = serde_json::to_string(&guard).map_err(|e| e.to_string())?;
     let path = undo_guard_path(root);
+    // Write-side fsguard mirror: `fs::write` opens create+truncate, which
+    // blocks forever on a FIFO at this fixed in-repo path — and this runs
+    // BEFORE any file mutation, so a hang here wedges the undo silently.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to write",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -815,6 +824,10 @@ pub(crate) fn finish_undo_guard(root: &Path) {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     // Moved to core in F3 alongside `execute_revert`; used only by this

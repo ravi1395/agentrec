@@ -1992,27 +1992,55 @@ pub fn build_plan(
 pub fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
     let abs = root.join(rel);
     // [`crate::fsguard::read_regular`], never a bare `std::fs::read`: the
-    // guard lstats and refuses anything that is not a regular file. This
-    // function needed it before the guard existed, because the call sites
-    // are NOT all downstream of the planner — the planner's own
-    // [`inode_refusal`] cannot protect `claim_grant`, which runs its drift
-    // loop through here BEFORE it ever calls [`build_plan`]. `fs::read` on a
-    // FIFO BLOCKS until a writer appears, so a target swapped for a fifo
-    // between preview and execute hung the process at this line, killing the
-    // single-threaded stdio MCP loop for that whole session (branch review
-    // re-gate round 4; `agentrec approve` shares `claim_grant` and was
-    // exposed identically).
+    // guard RESOLVES the path (`std::fs::metadata`, a `stat`) and refuses
+    // anything that does not resolve to a regular file. This function needed
+    // it before the guard existed, because the call sites are NOT all
+    // downstream of the planner — the planner's own [`inode_refusal`] cannot
+    // protect `claim_grant`, which runs its drift loop through here BEFORE it
+    // ever calls [`build_plan`]. `fs::read` on a FIFO BLOCKS until a writer
+    // appears, so a target swapped for a fifo between preview and execute hung
+    // the process at this line, killing the single-threaded stdio MCP loop for
+    // that whole session (branch review re-gate round 4; `agentrec approve`
+    // shares `claim_grant` and was exposed identically).
     //
     // A non-regular file yielding `None` reads downstream as "no content to
     // compare", i.e. as drift — which surfaces as a clean `preview_stale`
     // refusal instead of a hang. That is the same direction the doc below
     // already describes for an unreadable path, so no caller learns a new
-    // shape. Symlinks are included: this returns `None` for them rather than
-    // the pointed-to file's hash, which only makes the "a symlink is always
-    // modified-since" property (pinned by
-    // `undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified`)
-    // hold more strongly, and the entry is `symlink_refusal`'s to reject
-    // either way.
+    // shape.
+    //
+    // SYMLINKS ARE NOT REFUSED HERE, and that is the deliberate difference
+    // between this READ predicate and undo's two WRITE predicates. The three
+    // do not agree on symlinks BY DESIGN, because they answer different
+    // questions:
+    //
+    //  - HERE (read): the hazard is BLOCKING I/O, and a symlink cannot block —
+    //    only whatever it resolves to can. So the guard follows the link and
+    //    judges the TARGET: a symlink to an ordinary file reads normally and
+    //    returns `Some(target hash)`; a symlink to a fifo still resolves to a
+    //    fifo and is still refused; a broken symlink reads as `NotFound`, i.e.
+    //    `None` by the absent-path rule above. Refusing links outright (the
+    //    pre-`371d63b` `symlink_metadata` form) was pure over-rejection and
+    //    silently emptied the ledger for a store relocated behind a link.
+    //  - [`symlink_refusal`] (write): the hazard is WRITING THROUGH A LINK —
+    //    `restore_from_before` would rewrite the pointed-to file. Only the link
+    //    itself matters, so it lstats ([`is_symlink_on_disk`]) and refuses.
+    //  - [`inode_refusal`] (write): lstats for the same reason, and returns
+    //    `None` on a symlink so `symlink_refusal` owns that rejection with its
+    //    own wording.
+    //
+    // Consequence for the two paths, stated because it is a real behavior
+    // difference and not a wash. Inside [`build_plan`], `symlink_refusal` runs
+    // BEFORE this function, so a link is refused and never reaches here — the
+    // "a symlink is always modified-since" reasoning this comment once leaned
+    // on is dead, and
+    // `undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified`
+    // (a CLI-level test, so it drives `build_plan`) now rests on
+    // `symlink_refusal` ALONE. On the `claim_grant` drift path, which calls
+    // here without a plan, an unchanged symlink to a regular file now compares
+    // EQUAL instead of yielding `None`; that removes a spurious `preview_stale`
+    // and changes no safety property, because the entry is still refused by
+    // `symlink_refusal` when the plan is finally built.
     crate::fsguard::read_regular(&abs)
         .ok()
         .map(|b| hash_bytes(&b))
@@ -2337,6 +2365,10 @@ pub fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod coordinator_tests {
     use super::*;
     use crate::record::skip_reason;

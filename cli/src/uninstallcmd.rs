@@ -12,6 +12,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Read a config file this command may rewrite, refusing a non-regular path.
+///
+/// `Ok(None)` is "there is nothing here to remove" — the meaning the bare
+/// `let Ok(text) = ... else { return Ok(false) }` at each call site already
+/// had for an absent or unreadable file, kept unchanged so no ordinary file
+/// moves. A path that is not a regular file (fifo, socket, device, directory)
+/// is escalated to a named error instead: the bare read BLOCKS forever on a
+/// fifo, and the caller would otherwise report "no agentrec entries found"
+/// about a file it never managed to look at.
+fn read_config_or_skip(path: &Path) -> Result<Option<String>, String> {
+    match agentrec_core::fsguard::read_regular_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(format!(
+            "cannot read existing {} ({e}); not touching it",
+            path.display()
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn run(root: &Path, no_service: bool) -> Result<(), String> {
     let mut actions: Vec<String> = Vec::new();
 
@@ -72,7 +92,7 @@ pub fn run(root: &Path, no_service: bool) -> Result<(), String> {
 /// object are dropped tidily. Returns whether anything changed.
 fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
     let path = root.join(".claude").join("settings.local.json");
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Some(text) = read_config_or_skip(&path)? else {
         return Ok(false);
     };
     let mut settings: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -180,7 +200,7 @@ fn remove_codex_hooks(root: &Path) -> Result<bool, String> {
 /// `remove_claude_hooks` above but over the 3 Codex events and marker.
 fn remove_codex_hooks_json(root: &Path) -> Result<bool, String> {
     let path = codex_hooks_json_path(root);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Some(text) = read_config_or_skip(&path)? else {
         return Ok(false);
     };
     let mut settings: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -260,7 +280,7 @@ fn remove_codex_hooks_json(root: &Path) -> Result<bool, String> {
 /// parsed content per the spike, not raw bytes).
 fn remove_codex_hooks_toml(root: &Path) -> Result<bool, String> {
     let path = codex_config_toml_path(root);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Some(text) = read_config_or_skip(&path)? else {
         return Ok(false);
     };
     let mut doc: toml::Table = text.parse().map_err(|e: toml::de::Error| {
@@ -356,7 +376,7 @@ fn remove_mcp_json(root: &Path) -> Result<bool, String> {
     if mcp_json_state(root)? != McpRegState::Ours {
         return Ok(false);
     }
-    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let text = agentrec_core::fsguard::read_regular_to_string(&path).map_err(|e| e.to_string())?;
     let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         format!(
             "existing {} is not valid JSON ({e}); not touching it",
@@ -385,7 +405,7 @@ fn remove_codex_mcp(root: &Path) -> Result<bool, String> {
     if codex_mcp_state(root)? != McpRegState::Ours {
         return Ok(false);
     }
-    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let text = agentrec_core::fsguard::read_regular_to_string(&path).map_err(|e| e.to_string())?;
     let mut doc: toml::Table = text.parse().map_err(|e: toml::de::Error| {
         format!(
             "existing {} is not valid TOML ({e}); not touching it",
@@ -417,8 +437,84 @@ fn archive_path(root: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    // Every config path `uninstall` reads. A fifo at any of them made the
+    // whole command HANG (a bare `read_to_string` on a fifo blocks until a
+    // writer appears, forever), so this test's first value is that it
+    // TERMINATES; its second is that the refusal names the file rather than
+    // being swallowed into "no agentrec hook entries found".
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_refuses_a_fifo_at_each_config_path() {
+        for rel in [
+            ".claude/settings.local.json",
+            ".codex/hooks.json",
+            ".codex/config.toml",
+            ".mcp.json",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            mkfifo_at(&root.join(rel));
+
+            let err = run(root, true).unwrap_err();
+            assert!(
+                err.contains(rel.rsplit('/').next().unwrap()) && err.contains("not a regular file"),
+                "{rel}: refusal must name the file: {err}"
+            );
+        }
+    }
+
+    // The allow half, and the shape that already burned this guard once: a
+    // config file relocated behind a symlink (a dotfiles repo) is an ordinary
+    // setup and must still be read AND rewritten through the link. A
+    // refuse-only suite stays green through an over-refusal that silently
+    // turns uninstall into a no-op.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_reads_and_rewrites_a_symlinked_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let real = tmp.path().join("dotfiles-settings.json");
+        let settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": "other-tool" } ] },
+                    { "hooks": [ { "type": "command", "command": "agentrec hook claude" } ] }
+                ]
+            }
+        });
+        fs::write(&real, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&real, root.join(".claude/settings.local.json")).unwrap();
+
+        assert!(
+            remove_claude_hooks(root).unwrap(),
+            "a symlinked settings file must still be read and rewritten"
+        );
+
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&real).unwrap())
+            .expect("rewrite must land on the symlink target");
+        let stop = after["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "only the agentrec entry is removed");
+        assert_eq!(stop[0]["hooks"][0]["command"].as_str(), Some("other-tool"));
+    }
 
     #[test]
     fn removes_only_marked_entries_preserves_others() {

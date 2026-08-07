@@ -10,6 +10,11 @@
 //! undo is itself a turn" (P5) only means something if the ordinary human verb
 //! can revert it.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
 use agentrec_core::store::{hash_bytes, BlobStore};
 use agentrec_core::undo_coordinator::{

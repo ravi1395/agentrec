@@ -23,6 +23,11 @@
 //! The corrupt/unknown-field fixtures are necessarily hand-written: they are
 //! shapes no serializer can emit. Their provenance is recorded per row.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use agentrec_core::record::{
     parse_log_line, parse_signals, EpochRecord, FileEntry, LogRecord, ParsedLine, SignalEvent,
     TurnRecord,

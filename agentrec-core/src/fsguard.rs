@@ -15,18 +15,66 @@
 //! regular file". These helpers make that property expressible once, so a new
 //! call site inherits it instead of having to remember it.
 //!
-//! **Three deliberate exemptions**, each justified rather than overlooked.
+//! **Three deliberate exemption CLASSES**, each justified rather than
+//! overlooked. The per-site `#[allow(clippy::disallowed_methods)]`
+//! annotations point back here for their rationale, so this list is the
+//! registry and must name every production site — `grep -rn
+//! 'allow(clippy::disallowed_methods)' agentrec-core/src cli/src` is the
+//! authoritative cross-check (its remaining hits are `#[cfg(test)]` modules
+//! reading their own tempdir fixtures, plus this module's own three wrappers).
+//!
 //! (1) Character devices agentrec opens BY NAME and by design —
-//! `/dev/urandom` in `id.rs` — must not be guarded: `read_regular` would
-//! refuse them, and refusing the entropy source is a worse failure than the
-//! hang this module prevents. (2) Fixed system paths under `/proc`, which no
-//! local party can replace. (3) `File::open` on a DIRECTORY for fsync
-//! (`store.rs`): opening a real directory cannot block. That third one
-//! carries an assumption worth stating, because "this path is the type I
-//! expect" is the exact assumption class that produced this whole series —
-//! it holds only while the parent really is a directory, and a FIFO
-//! pre-created at a fan-out path would make `create_dir_all` fail first, so
-//! the fsync open is not reached with a FIFO in hand.
+//! `/dev/urandom` in `id.rs::os_random_bytes` (two sites: the primary read
+//! and its retry) — must not be guarded: `read_regular` would refuse them,
+//! and refusing the entropy source is a worse failure than the hang this
+//! module prevents.
+//!
+//! (2) Fixed system paths under `/proc`, which no local party can replace:
+//! `doctorcmd.rs::check_inotify` reads
+//! `/proc/sys/fs/inotify/max_user_watches`. That site is
+//! `#[cfg(target_os = "linux")]`, so darwin clippy never lints it and the
+//! annotation exists for the Linux leg.
+//!
+//! (3) `File::open` on a DIRECTORY for fsync, five sites:
+//! `store.rs::put` (the dedup-hit arm), `store.rs::finish_stored`,
+//! `purgecmd.rs::rewrite_memory_atomic`, `purgecmd.rs::rewrite_log_atomic`,
+//! and `purgecmd.rs::rewrite_signal_atomic`. Opening a real directory cannot
+//! block. That third class carries an assumption worth stating, because
+//! "this path is the type I expect" is the exact assumption class that
+//! produced this whole series — it holds only while the parent really is a
+//! directory, and a FIFO pre-created at a fan-out path would make
+//! `create_dir_all` fail first, so the fsync open is not reached with a FIFO
+//! in hand.
+//!
+//! **The lint covers READS only; write-opens are guarded by hand.**
+//! `clippy.toml` disallows the three blocking READ entry points
+//! (`fs::read`, `fs::read_to_string`, `File::open`). It does NOT cover the
+//! write side — `OpenOptions::open` with `write`/`append`, `fs::write`, and
+//! `fs::copy` all block on a FIFO just as hard, and none of them is
+//! expressible as a `disallowed-methods` entry, because `OpenOptions::open`
+//! is the same method for a guarded read and an unguarded write. Every
+//! production write-open onto an in-repo path therefore calls
+//! [`is_nonregular`] inline before opening: `record.rs::open_append` (the one
+//! primitive behind every `log.jsonl`/`signal.jsonl`/`memory.jsonl` append),
+//! `undo_coordinator.rs::append_event`, `UndoLock::acquire`,
+//! `daemon.rs::acquire_lock`, `daemon.rs::daemon_is_running`, the daemon's
+//! `open.json` journal write, `loglock.rs`/`memlock.rs`/`hookcmds.rs`
+//! lock-file opens, `hookcmds.rs::write_scratch_entries`,
+//! `state.rs::write_state`, `readcmds.rs::write_undo_guard`, and purgecmd's
+//! `append_lines_synced`/`write_full_file_synced` archive writers. Because
+//! that is a convention rather than a lint, a NEW write-open can still be
+//! added unguarded — a disclosed open class, not a closed one.
+//!
+//! Two production write-sites are deliberately NOT guarded inline, each
+//! because a guard upstream makes the site unreachable with a FIFO in hand:
+//! `store.rs::put`'s mtime touch (reached only after `read_regular` returned
+//! bytes that hash to the expected value, which a FIFO cannot do) and
+//! `initcmd.rs`/`uninstallcmd.rs`'s `fs::copy`-then-`fs::write` config
+//! merges (each reads the target through `read_regular_to_string` first and
+//! aborts on any non-`NotFound` error before the copy). Outside the repo
+//! threat model entirely, and unguarded: `service.rs`'s service-unit write
+//! under `~/Library/LaunchAgents` (or the XDG systemd dir), whose read
+//! refusal folds into `unwrap_or(false)` and proceeds to write.
 //!
 //! The precondition is the same one that grounds the containment refusals:
 //! an agent sandboxed to the repository can create a FIFO inside the repo
@@ -100,6 +148,8 @@ pub fn read_regular(path: &Path) -> Result<Vec<u8>> {
             "not a regular file — refusing to read (a fifo would block)",
         ));
     }
+    // This IS the guard: the refusal above already ran.
+    #[allow(clippy::disallowed_methods)]
     std::fs::read(path)
 }
 
@@ -111,6 +161,8 @@ pub fn read_regular_to_string(path: &Path) -> Result<String> {
             "not a regular file — refusing to read (a fifo would block)",
         ));
     }
+    // This IS the guard: the refusal above already ran.
+    #[allow(clippy::disallowed_methods)]
     std::fs::read_to_string(path)
 }
 
@@ -124,6 +176,8 @@ pub fn open_regular(path: &Path) -> Result<std::fs::File> {
             "not a regular file — refusing to open (a fifo would block)",
         ));
     }
+    // This IS the guard: the refusal above already ran.
+    #[allow(clippy::disallowed_methods)]
     std::fs::File::open(path)
 }
 

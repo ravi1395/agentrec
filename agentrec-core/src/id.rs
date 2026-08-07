@@ -52,6 +52,10 @@ pub fn ulid_with(ms: u64, rand: &[u8; 10]) -> String {
 /// issue no token at all and let the caller refuse the operation.
 pub fn random_token() -> Option<String> {
     let mut buf = [0u8; 20];
+    // `/dev/urandom` is a character device, never a regular file, so the
+    // fsguard predicate would refuse it by construction. It is also a
+    // fixed kernel path, not attacker-substitutable, and reads never block.
+    #[allow(clippy::disallowed_methods)]
     let mut f = File::open("/dev/urandom").ok()?;
     f.read_exact(&mut buf).ok()?;
     let mut out = String::with_capacity(40);
@@ -63,7 +67,10 @@ pub fn random_token() -> Option<String> {
 
 fn random_bytes() -> [u8; 10] {
     let mut buf = [0u8; 10];
-    if let Ok(mut f) = File::open("/dev/urandom") {
+    // Same exemption as `random_token`: a fixed character-device path.
+    #[allow(clippy::disallowed_methods)]
+    let opened = File::open("/dev/urandom");
+    if let Ok(mut f) = opened {
         if f.read_exact(&mut buf).is_ok() {
             return buf;
         }

@@ -1807,7 +1807,9 @@ mod persist {
         scope: &mut ScopeCounters,
         mut oracle: Option<&mut OracleCounters>,
     ) -> Vec<LogRecord> {
-        let Ok(file) = File::open(path) else {
+        // `--source` is a user-supplied external tree; a fifo there would
+        // hang the import. Refusal folds into the existing skip-and-return.
+        let Ok(file) = agentrec_core::fsguard::open_regular(path) else {
             return vec![];
         };
 
@@ -2211,7 +2213,10 @@ mod persist {
                     t15.rejected_unsafe_path += 1;
                 } else {
                     let blob_path = source.join("file-history").join(sid).join(backup_name);
-                    match fs::read(&blob_path) {
+                    // `file-history` blob under the user-supplied `--source`
+                    // tree; refusal is counted as `t15.blob_missing`, the
+                    // same bucket an unreadable blob already lands in.
+                    match agentrec_core::fsguard::read_regular(&blob_path) {
                         Ok(bytes) => match old_string {
                             Some(old) if !old.is_empty() => {
                                 if bytes_contain(&bytes, old.as_bytes()) {
@@ -2732,7 +2737,9 @@ mod codex {
         debug: &mut DebugSink,
         git_cache: &mut GitTrackCache,
     ) {
-        let file = match File::open(path) {
+        // `--source` is a user-supplied external tree; refusal is counted as
+        // `skipped_io_error`, the same bucket an unopenable session file uses.
+        let file = match agentrec_core::fsguard::open_regular(path) {
             Ok(f) => f,
             Err(e) => {
                 counters.skipped_io_error += 1;
@@ -3038,7 +3045,9 @@ mod codex {
             store: &BlobStore,
             skipped_out_of_root: &mut usize,
         ) -> Vec<LogRecord> {
-            let Ok(file) = File::open(path) else {
+            // `--source` is a user-supplied external tree; refusal folds
+            // into the existing skip-and-return.
+            let Ok(file) = agentrec_core::fsguard::open_regular(path) else {
                 return vec![];
             };
 

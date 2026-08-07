@@ -391,9 +391,25 @@ fn purge_memories_retracted(root: &Path) -> Result<(), String> {
     let cutoff_ms = wall_now_ms().saturating_sub(ttl_days.saturating_mul(DAY_MS));
 
     let mem_path = memory_path(root);
-    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&mem_path) else {
-        println!("purged 0 retracted memory chain(s) (ttl {ttl_days}d) — no memory.jsonl yet");
-        return Ok(());
+    // Absence and refusal are different facts and must not print the same
+    // sentence: `read_regular_to_string` returns `NotFound` when the file is
+    // genuinely missing, but `InvalidInput` when it EXISTS and fsguard refused
+    // it as non-regular (a FIFO/socket/device planted at the path). Reporting
+    // the latter as "no memory.jsonl yet" tells the user their memories were
+    // never written when in fact the purge could not read them.
+    let text = match agentrec_core::fsguard::read_regular_to_string(&mem_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("purged 0 retracted memory chain(s) (ttl {ttl_days}d) — no memory.jsonl yet");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to purge against a file this run could \
+                 not read",
+                mem_path.display()
+            ));
+        }
     };
 
     // Raw (line, id) pairs — the id is parsed only to decide which lines
@@ -508,6 +524,15 @@ fn memory_archive_path(root: &Path) -> PathBuf {
 /// callers must be able to trust the archive is durable the moment this
 /// returns `Ok`, since the source rewrite is only safe to start afterward.
 fn append_lines_synced(path: &Path, lines: &[&str]) -> Result<(), String> {
+    // Write-side fsguard mirror: an archive name pre-created as a FIFO would
+    // block this append until a reader appears, and the caller is holding a
+    // lock while it waits.
+    if agentrec_core::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to append",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -563,7 +588,12 @@ fn rewrite_memory_atomic(mem_path: &Path, lines: &[&str]) -> Result<(), String> 
 
     match write {
         Ok(()) => {
-            if let Ok(dir) = std::fs::File::open(parent) {
+            // Directory handle opened solely for `sync_all`; a directory is
+            // never a regular file, so fsguard would refuse it, and opening
+            // one cannot block.
+            #[allow(clippy::disallowed_methods)]
+            let opened = std::fs::File::open(parent);
+            if let Ok(dir) = opened {
                 let _ = dir.sync_all();
             }
             Ok(())
@@ -662,9 +692,20 @@ fn purge_log_duplicates(root: &Path) -> Result<(), String> {
     let _log_lock = crate::loglock::try_acquire(root)?;
 
     let path = log_path(root);
-    let Ok(original) = agentrec_core::fsguard::read_regular_to_string(&path) else {
-        println!("scanned 0 turn record(s), 0 duplicate(s) removed — no log.jsonl yet");
-        return Ok(());
+    // Absence vs refusal — see the equivalent split in the memory purge above.
+    let original = match agentrec_core::fsguard::read_regular_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("scanned 0 turn record(s), 0 duplicate(s) removed — no log.jsonl yet");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to repair against a file this run could \
+                 not read",
+                path.display()
+            ));
+        }
     };
 
     // Tolerant classify-and-fold over RAW lines (never `load_log`, which
@@ -812,6 +853,14 @@ fn log_archive_path(root: &Path) -> PathBuf {
 /// have written invalid bytes; `String::from_utf8_lossy` would silently
 /// substitute replacement characters into the archive).
 fn write_full_file_synced(path: &Path, content: &[u8]) -> Result<(), String> {
+    // Write-side fsguard mirror: an archive name pre-created as a FIFO would
+    // block the create/truncate open until a reader appears.
+    if agentrec_core::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to write",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -861,7 +910,12 @@ fn rewrite_log_atomic(log_path: &Path, lines: &[&str]) -> Result<(), String> {
 
     match write {
         Ok(()) => {
-            if let Ok(dir) = std::fs::File::open(parent) {
+            // Directory handle opened solely for `sync_all`; a directory is
+            // never a regular file, so fsguard would refuse it, and opening
+            // one cannot block.
+            #[allow(clippy::disallowed_methods)]
+            let opened = std::fs::File::open(parent);
+            if let Ok(dir) = opened {
                 let _ = dir.sync_all();
             }
             Ok(())
@@ -1015,9 +1069,20 @@ fn purge_signals_consumed_inner(
     let offset = crate::state::read_state(root).signal_offset;
 
     let path = signal_path(root);
-    let Ok(bytes) = agentrec_core::fsguard::read_regular(&path) else {
-        println!("scanned 0 B of signal inbox — no signal.jsonl yet");
-        return Ok(());
+    // Absence vs refusal — see the equivalent split in the memory purge above.
+    let bytes = match agentrec_core::fsguard::read_regular(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("scanned 0 B of signal inbox — no signal.jsonl yet");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to reclaim against a file this run could \
+                 not read",
+                path.display()
+            ));
+        }
     };
     let len = bytes.len() as u64;
 
@@ -1175,7 +1240,12 @@ fn rewrite_signal_atomic(sig_path: &Path, tail: &[u8]) -> Result<(), String> {
 
     match write {
         Ok(()) => {
-            if let Ok(dir) = std::fs::File::open(parent) {
+            // Directory handle opened solely for `sync_all`; a directory is
+            // never a regular file, so fsguard would refuse it, and opening
+            // one cannot block.
+            #[allow(clippy::disallowed_methods)]
+            let opened = std::fs::File::open(parent);
+            if let Ok(dir) = opened {
                 let _ = dir.sync_all();
             }
             Ok(())
@@ -1265,7 +1335,7 @@ fn purge_path(root: &Path, pattern: &str) -> Result<(), String> {
         candidates,
         protect,
         matched_entries,
-    } = scan_for_path(root, pattern);
+    } = scan_for_path(root, pattern)?;
 
     if matched_entries == 0 {
         println!("no recorded file entry matches {pattern} — nothing to reclaim");
@@ -1279,7 +1349,7 @@ fn purge_path(root: &Path, pattern: &str) -> Result<(), String> {
     // liveness probe above) between the scan and here still protects its
     // blobs. Narrowed, not closed — and archive-only, so the residual is
     // recoverable by moving the archive directory back.
-    let fresh = scan_for_path(root, pattern);
+    let fresh = scan_for_path(root, pattern)?;
     let mut archivable: Vec<&String> = candidates
         .iter()
         .filter(|h| !protect.contains(*h) && !fresh.protect.contains(*h))
@@ -1340,12 +1410,36 @@ struct Scan {
     matched_entries: usize,
 }
 
-fn scan_for_path(root: &Path, pattern: &str) -> Scan {
+/// Read one file that feeds a purge liveness set, refusing a non-regular path.
+///
+/// Two distinct outcomes, and the split is the whole point. A path that is
+/// not a regular file (fifo, socket, device, directory) is a HARD error: the
+/// bare read would block forever on a fifo, and the obvious "recover by
+/// treating it as empty" is worse than the hang — every one of these files is
+/// evidence that a blob is LIVE, so an empty read shrinks the protect-set and
+/// `--orphans` archives blobs the log still references. Anything else
+/// (absent, unreadable, invalid UTF-8) keeps the pre-existing meaning at every
+/// call site — the empty string — because this change is scoped to the
+/// blocking class and must not move behavior for ordinary files. That leaves
+/// the empty-protect-set hazard open for a permission-denied or non-UTF-8
+/// `log.jsonl`; pre-existing, deliberately untouched here.
+fn read_liveness_input(path: &Path) -> Result<String, String> {
+    if agentrec_core::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "refusing to read {}: not a regular file — purge derives which blobs are \
+             still live from this file, and cannot do that safely without it",
+            path.display()
+        ));
+    }
+    Ok(agentrec_core::fsguard::read_regular_to_string(path).unwrap_or_default())
+}
+
+fn scan_for_path(root: &Path, pattern: &str) -> Result<Scan, String> {
     let mut candidates: HashSet<String> = HashSet::new();
     let mut protect: HashSet<String> = HashSet::new();
     let mut matched_entries = 0usize;
 
-    let text = agentrec_core::fsguard::read_regular_to_string(&log_path(root)).unwrap_or_default();
+    let text = read_liveness_input(&log_path(root))?;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -1381,29 +1475,27 @@ fn scan_for_path(root: &Path, pattern: &str) -> Scan {
     // `open.json` + `memory.jsonl` (and `log.jsonl` again, harmlessly — this
     // primitive scans all three). Anything it finds is protected: an in-flight
     // turn or a memory pin is not a matching file entry.
-    for hash in referenced_hashes_outside_log(root) {
+    for hash in referenced_hashes_outside_log(root)? {
         protect.insert(hash);
     }
 
-    Scan {
+    Ok(Scan {
         candidates,
         protect,
         matched_entries,
-    }
+    })
 }
 
 /// The `open.json` + `memory.jsonl` half of [`referenced_hashes`] — the refs
 /// that exist OUTSIDE `log.jsonl`. `purge_path` needs these separately because
 /// it derives its own per-entry view of `log.jsonl`; folding in the whole-log
 /// scan would protect every blob and make the op a no-op.
-fn referenced_hashes_outside_log(root: &Path) -> HashSet<String> {
+fn referenced_hashes_outside_log(root: &Path) -> Result<HashSet<String>, String> {
     let mut out = HashSet::new();
     for path in [crate::open_path(root), memory_path(root)] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            harvest_refs(&text, &mut out);
-        }
+        harvest_refs(&read_liveness_input(&path)?, &mut out);
     }
-    out
+    Ok(out)
 }
 
 /// Does `pattern` select the recorded (root-relative, `/`-separated) path
@@ -1528,7 +1620,7 @@ fn purge_orphans(root: &Path) -> Result<(), String> {
 
     let pass_start = SystemTime::now();
     let store = BlobStore::new(objects_dir(root));
-    let referenced = referenced_hashes(root);
+    let referenced = referenced_hashes(root)?;
 
     let all = store.list_hashes();
     let scanned = all.len();
@@ -1570,14 +1662,12 @@ fn purge_orphans(root: &Path) -> Result<(), String> {
 /// blobs). A RAW byte-scan (never `load_log`) so a hash on a torn/unknown line
 /// still counts — see the module SAFETY note. Returns refs in `sha256:` form,
 /// matching `BlobStore::list_hashes`.
-pub(crate) fn referenced_hashes(root: &Path) -> HashSet<String> {
+pub(crate) fn referenced_hashes(root: &Path) -> Result<HashSet<String>, String> {
     let mut out = HashSet::new();
     for path in [log_path(root), crate::open_path(root), memory_path(root)] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            harvest_refs(&text, &mut out);
-        }
+        harvest_refs(&read_liveness_input(&path)?, &mut out);
     }
-    out
+    Ok(out)
 }
 
 /// Bytes currently held by orphaned (unreferenced) blobs — what
@@ -1587,7 +1677,14 @@ pub(crate) fn referenced_hashes(root: &Path) -> HashSet<String> {
 /// command so a just-written (racing) blob isn't counted reclaimable.
 pub(crate) fn orphan_bytes(root: &Path, store: &BlobStore) -> u64 {
     let pass_start = SystemTime::now();
-    let referenced = referenced_hashes(root);
+    // A refused liveness input makes the orphan estimate unknowable, and this
+    // is a read verb with no error channel (`status` prints a number). Report
+    // ZERO reclaimable rather than the alternative — an empty ref-set would
+    // count every live blob as an orphan and advertise a purge that must not
+    // happen. `purge --orphans` itself surfaces the refusal.
+    let Ok(referenced) = referenced_hashes(root) else {
+        return 0;
+    };
     store
         .list_hashes()
         .into_iter()
@@ -1690,6 +1787,10 @@ fn human_bytes(n: u64) -> String {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -1791,6 +1892,107 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty(), "63-hex and uppercase must not match");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    // A fifo at any liveness input HUNG `purge --orphans` (a bare
+    // `read_to_string` on a fifo blocks until a writer appears), so this test
+    // terminating is the first property. The second is the ERROR: recovering
+    // by treating the refused file as empty would shrink the protect-set and
+    // archive blobs that `log.jsonl` still references, so purge must refuse
+    // to run at all.
+    #[test]
+    #[cfg(unix)]
+    fn purge_refuses_a_fifo_liveness_input_instead_of_hanging() {
+        for name in ["log.jsonl", "open.json", "memory.jsonl"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir_all(objects_dir(root)).unwrap();
+            let live = BlobStore::new(objects_dir(root))
+                .put(b"live content")
+                .unwrap();
+            mkfifo_at(&agentrec_dir(root).join(name));
+
+            for err in [
+                purge_orphans(root).unwrap_err(),
+                purge_path(root, "src/**").unwrap_err(),
+            ] {
+                assert!(
+                    err.contains(name) && err.contains("not a regular file"),
+                    "{name}: refusal must name the file: {err}"
+                );
+            }
+            assert!(
+                BlobStore::new(objects_dir(root)).contains(&live),
+                "{name}: a refused pass must archive nothing"
+            );
+            // `status`' estimate has no error channel, so it must under-report
+            // (0) rather than count every live blob as reclaimable.
+            assert_eq!(orphan_bytes(root, &BlobStore::new(objects_dir(root))), 0);
+        }
+    }
+
+    // The allow half: the liveness inputs behind SYMLINKS (an ordinary
+    // relocated store) must still be read, or the protect-set silently
+    // empties and `--orphans` deletes live blobs — the exact way a
+    // refuse-only test suite stayed green through an over-refusal before.
+    #[test]
+    #[cfg(unix)]
+    fn purge_orphans_reads_symlinked_liveness_inputs_and_spares_their_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let in_log = store.put(b"referenced by log.jsonl").unwrap();
+        let in_open = store.put(b"referenced by open.json").unwrap();
+        let in_mem = store.put(b"referenced by memory.jsonl").unwrap();
+        let orphan = store.put(b"referenced by nothing").unwrap();
+
+        // Every input lives outside `.agentrec/` with only a link in place.
+        let elsewhere = tmp.path().join("relocated");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for (name, body) in [
+            (
+                "log.jsonl",
+                format!("{{\"v\":1,\"id\":\"t_A\",\"files\":[{{\"after\":\"{in_log}\"}}]}}\n"),
+            ),
+            (
+                "open.json",
+                format!("{{\"files\":[{{\"before_hash\":\"{in_open}\"}}]}}"),
+            ),
+            ("memory.jsonl", format!("{{\"pin\":\"{in_mem}\"}}\n")),
+        ] {
+            let real = elsewhere.join(name);
+            std::fs::write(&real, body).unwrap();
+            std::os::unix::fs::symlink(&real, agentrec_dir(root).join(name)).unwrap();
+        }
+
+        purge_orphans(root).unwrap();
+
+        for (hash, label) in [
+            (&in_log, "log.jsonl"),
+            (&in_open, "open.json"),
+            (&in_mem, "memory.jsonl"),
+        ] {
+            assert!(
+                store.contains(hash),
+                "a blob referenced only by the symlinked {label} must be kept"
+            );
+        }
+        assert!(
+            !store.contains(&orphan),
+            "the genuinely unreferenced blob must still be reclaimed"
+        );
     }
 
     // The load-bearing safety test: `purge --orphans` archives ONLY blobs no

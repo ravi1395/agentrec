@@ -121,6 +121,14 @@ fn scratch_lock_path(root: &Path) -> PathBuf {
 
 fn open_scratch_lock(root: &Path) -> Result<std::fs::File, String> {
     let path = scratch_lock_path(root);
+    // Write-side fsguard mirror: a FIFO here blocks the open until a reader
+    // appears, wedging the hook before the flock is even attempted.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to lock",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -191,6 +199,14 @@ fn write_scratch_entries(root: &Path, entries: &[ScratchEntry]) -> Result<(), St
         text.push('\n');
     }
     let tmp = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
+    // Write-side fsguard mirror: `fs::write` opens create+truncate, which
+    // blocks forever on a FIFO pre-created at the tmp name.
+    if agentrec_core::fsguard::is_nonregular(&tmp) {
+        return Err(format!(
+            "{} is not a regular file — refusing to write",
+            tmp.display()
+        ));
+    }
     std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
     agentrec_core::perms::lock_file(&tmp);
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())

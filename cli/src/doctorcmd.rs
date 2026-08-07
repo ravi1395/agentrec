@@ -842,6 +842,10 @@ fn probe_mcp_initialize(exe: &Path, root: &Path) -> Result<(), String> {
 /// VERIFY-LEDGER.md for a real Linux run.
 #[cfg(target_os = "linux")]
 fn check_inotify(root: &Path) -> Check {
+    // Fixed procfs path: a kernel-synthesized file, not attacker-
+    // substitutable, and reads never block. `#[cfg(target_os = "linux")]`
+    // means darwin clippy never lints this line; annotated for the Linux leg.
+    #[allow(clippy::disallowed_methods)]
     let max_watches: u64 = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
         .ok()
         .and_then(|s| s.trim().parse().ok())

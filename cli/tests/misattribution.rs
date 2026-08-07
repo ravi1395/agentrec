@@ -20,6 +20,11 @@
 //! rather than shared — same file-ownership convention as the rest of
 //! `cli/tests/`.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;

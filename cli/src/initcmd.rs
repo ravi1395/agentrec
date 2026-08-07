@@ -479,7 +479,23 @@ fn ensure_gitignore(root: &Path) -> Result<bool, String> {
         return Ok(false);
     }
     let path = root.join(".gitignore");
-    let current = fs::read_to_string(&path).unwrap_or_default();
+    // Guarded like every other config read here: this function MERGES (it
+    // appends to whatever it read and writes the result back), so a read that
+    // silently produced "" would truncate the user's .gitignore. A fifo would
+    // additionally hang the read outright. Only the non-regular case is
+    // escalated; every other read failure keeps its existing empty-string
+    // meaning, which is what makes a first `init` in a repo with no
+    // `.gitignore` still work.
+    let current = match agentrec_core::fsguard::read_regular_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(format!(
+                "cannot read existing {} ({e}); not touching it",
+                path.display()
+            ))
+        }
+        Err(_) => String::new(),
+    };
     if current
         .lines()
         .any(|l| l.trim() == ".agentrec/" || l.trim() == ".agentrec")
@@ -500,7 +516,7 @@ fn ensure_gitignore(root: &Path) -> Result<bool, String> {
 /// on malformed JSON (IMPLEMENTATION AC A4/A5).
 fn install_claude_hooks(root: &Path) -> Result<bool, String> {
     let path = root.join(".claude").join("settings.local.json");
-    let current = match fs::read_to_string(&path) {
+    let current = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
             format!(
                 "existing {} is not valid JSON ({e}); not touching it",
@@ -677,7 +693,7 @@ pub(crate) enum CodexHooksTarget {
 pub(crate) fn codex_hooks_target(root: &Path) -> Result<CodexHooksTarget, String> {
     let hooks_json_present = codex_hooks_json_path(root).is_file();
     let config_toml_path = codex_config_toml_path(root);
-    let inline_present = match fs::read_to_string(&config_toml_path) {
+    let inline_present = match agentrec_core::fsguard::read_regular_to_string(&config_toml_path) {
         Ok(text) => {
             let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
                 format!(
@@ -749,7 +765,7 @@ fn codex_hook_json_entry(matcher: Option<&str>) -> serde_json::Value {
 /// `install_claude_hooks` above, generalized over the 3 Codex events.
 fn install_codex_hooks_json(root: &Path) -> Result<bool, String> {
     let path = codex_hooks_json_path(root);
-    let current = match fs::read_to_string(&path) {
+    let current = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(text) => serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
             format!(
                 "existing {} is not valid JSON ({e}); not touching it",
@@ -863,7 +879,7 @@ fn codex_hook_toml_entry(matcher: Option<&str>) -> toml::Value {
 /// section, bonus finding).
 fn install_codex_hooks_toml(root: &Path) -> Result<bool, String> {
     let path = codex_config_toml_path(root);
-    let text = match fs::read_to_string(&path) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -948,7 +964,7 @@ fn codex_refuse_line(root: &Path) -> String {
 /// (`--codex`), so a repo that never asked for it must report `n/a`, not a
 /// fabricated failure.
 pub(crate) fn codex_hooks_installed(root: &Path) -> bool {
-    if let Ok(text) = fs::read_to_string(codex_hooks_json_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&codex_hooks_json_path(root)) {
         if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) {
             if CODEX_HOOK_EVENTS
                 .iter()
@@ -958,7 +974,8 @@ pub(crate) fn codex_hooks_installed(root: &Path) -> bool {
             }
         }
     }
-    if let Ok(text) = fs::read_to_string(codex_config_toml_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&codex_config_toml_path(root))
+    {
         if let Ok(table) = text.parse::<toml::Table>() {
             if let Some(hooks_table) = table.get("hooks").and_then(|h| h.as_table()) {
                 if CODEX_HOOK_EVENTS
@@ -980,7 +997,7 @@ pub(crate) fn codex_hooks_installed(root: &Path) -> bool {
 /// what's missing/wrong — `doctorcmd.rs` renders that as the failing
 /// check's remedy text.
 pub(crate) fn codex_hooks_shape(root: &Path) -> Result<(), String> {
-    if let Ok(text) = fs::read_to_string(codex_hooks_json_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&codex_hooks_json_path(root)) {
         if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) {
             if CODEX_HOOK_EVENTS
                 .iter()
@@ -990,7 +1007,8 @@ pub(crate) fn codex_hooks_shape(root: &Path) -> Result<(), String> {
             }
         }
     }
-    if let Ok(text) = fs::read_to_string(codex_config_toml_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&codex_config_toml_path(root))
+    {
         if let Ok(table) = text.parse::<toml::Table>() {
             if let Some(hooks_table) = table.get("hooks").and_then(|h| h.as_table()) {
                 return codex_hooks_shape_toml(hooks_table);
@@ -1161,7 +1179,7 @@ pub(crate) fn mcp_json_path(root: &Path) -> std::path::PathBuf {
 /// precedent `codex_hooks_target`/`service_decision` set).
 pub(crate) fn mcp_json_state(root: &Path) -> Result<McpRegState, String> {
     let path = mcp_json_path(root);
-    let text = match fs::read_to_string(&path) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(McpRegState::Absent),
         Err(e) => {
@@ -1190,7 +1208,7 @@ pub(crate) fn mcp_json_state(root: &Path) -> Result<McpRegState, String> {
 /// `[mcp_servers.agentrec]` table.
 pub(crate) fn codex_mcp_state(root: &Path) -> Result<McpRegState, String> {
     let path = codex_config_toml_path(root);
-    let text = match fs::read_to_string(&path) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(McpRegState::Absent),
         Err(e) => {
@@ -1236,7 +1254,7 @@ pub(crate) fn install_mcp_json(root: &Path) -> Result<McpRegOutcome, String> {
         McpRegState::Ours => return Ok(McpRegOutcome::Registered { changed: false }),
         McpRegState::Absent => {}
     }
-    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+    let mut value: serde_json::Value = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| {
             format!(
                 "existing {} is not valid JSON ({e}); not touching it",
@@ -1289,7 +1307,7 @@ pub(crate) fn install_codex_mcp(root: &Path) -> Result<McpRegOutcome, String> {
         McpRegState::Ours => return Ok(McpRegOutcome::Registered { changed: false }),
         McpRegState::Absent => {}
     }
-    let text = match fs::read_to_string(&path) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -1361,6 +1379,10 @@ fn codex_target_label(target: CodexHooksTarget, root: &Path) -> String {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -1411,6 +1433,134 @@ mod tests {
 
         let after = fs::read(&settings_path).unwrap();
         assert_eq!(before, after, "unreadable settings file must be untouched");
+    }
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    // Same class as `init_aborts_untouched_on_unreadable_settings_file`, but
+    // the failure mode is worse than an abort: a bare `read_to_string` on a
+    // fifo BLOCKS until a writer appears, so `agentrec init` hung forever.
+    // These two paths abort `run` outright (both are merge targets — treating
+    // a refused read as "" would write back a file missing the user's own
+    // content). The test terminating at all is the property.
+    #[test]
+    #[cfg(unix)]
+    fn init_refuses_a_fifo_at_a_merge_target_instead_of_hanging() {
+        for rel in [".claude/settings.local.json", ".gitignore"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            fs::create_dir_all(root.join(".git")).unwrap();
+            mkfifo_at(&root.join(rel));
+
+            let err = run(root, false, false, true, false, false).unwrap_err();
+            assert!(
+                err.contains(rel.rsplit('/').next().unwrap()) && err.contains("not a regular file"),
+                "{rel}: refusal must name the file: {err}"
+            );
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                std::fs::symlink_metadata(root.join(rel))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo(),
+                "{rel}: the refused path must be left exactly as found"
+            );
+        }
+    }
+
+    // The remaining config readers `init --codex` drives. `run` folds their
+    // errors into a printed "skipped: {e}" action line rather than aborting,
+    // so the refusal is asserted at the function that performs the read —
+    // which is also where the hang used to be.
+    #[test]
+    #[cfg(unix)]
+    fn codex_and_mcp_readers_refuse_a_fifo_instead_of_hanging() {
+        let names_it = |e: &str, name: &str| {
+            assert!(
+                e.contains(name) && e.contains("not a regular file"),
+                "refusal must name {name}: {e}"
+            );
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&mcp_json_path(tmp.path()));
+        names_it(&mcp_json_state(tmp.path()).unwrap_err(), ".mcp.json");
+        let Err(e) = install_mcp_json(tmp.path()) else {
+            panic!("install_mcp_json must refuse a fifo .mcp.json");
+        };
+        names_it(&e, ".mcp.json");
+
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&codex_config_toml_path(tmp.path()));
+        names_it(&codex_hooks_target(tmp.path()).unwrap_err(), "config.toml");
+        names_it(&codex_mcp_state(tmp.path()).unwrap_err(), "config.toml");
+        let Err(e) = install_codex_mcp(tmp.path()) else {
+            panic!("install_codex_mcp must refuse a fifo config.toml");
+        };
+        names_it(&e, "config.toml");
+        names_it(
+            &install_codex_hooks_toml(tmp.path()).unwrap_err(),
+            "config.toml",
+        );
+        // Read-only detection: a refused read cannot hang and cannot clobber,
+        // so it falls through to "not installed" exactly as an unreadable
+        // file already did.
+        assert!(!codex_hooks_installed(tmp.path()));
+
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&codex_hooks_json_path(tmp.path()));
+        names_it(
+            &install_codex_hooks_json(tmp.path()).unwrap_err(),
+            "hooks.json",
+        );
+    }
+
+    // The allow half. A config file behind a symlink (dotfiles repo) is an
+    // ordinary setup, and `is_nonregular` resolves the link deliberately —
+    // an over-refusal here would make `init` abort on, or silently overwrite,
+    // a perfectly readable file. Asserts CONTENT, not just exit status: the
+    // user's own hook must survive the merge that reads through the link.
+    #[test]
+    #[cfg(unix)]
+    fn init_merges_through_a_symlinked_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        let real = tmp.path().join("dotfiles-settings.json");
+        fs::write(
+            &real,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": { "Stop": [ { "hooks": [
+                    { "type": "command", "command": "other-tool" }
+                ] } ] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, root.join(".claude/settings.local.json")).unwrap();
+
+        run(root, false, false, true, false, false).unwrap();
+
+        let after: serde_json::Value = serde_json::from_str(&fs::read_to_string(&real).unwrap())
+            .expect("the merge must land on the symlink target");
+        let stop = after["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "the user's own Stop hook must survive");
+        assert!(stop
+            .iter()
+            .any(|e| e["hooks"][0]["command"].as_str() == Some("other-tool")));
+        assert!(stop.iter().any(|e| e["hooks"][0]["command"]
+            .as_str()
+            .is_some_and(|c| c.contains(HOOK_MARKER))));
     }
 
     #[test]
