@@ -1,6 +1,7 @@
 # Phase 3 design — leverage the ledger (analytics, search, annotate, bisect, undo power, digest, policy signals)
 
-Date: 2026-08-07. Status: DRAFT — pending skeptic gate + founder approval.
+Date: 2026-08-07. Status: **SKEPTIC GATE PASS (round 3, Fable, 2026-08-07)** —
+pending founder approval before implementation planning.
 Gate history: round 1 GATE FAIL (B1 partial-undo already shipped in Phase F —
 section rewritten as delta; B2 restore gate violated frozen predicate-2 MUST
 NOTs — replaced with recorded-state-hash gate; B3 checkpoints didn't store
@@ -82,7 +83,11 @@ Per-repo analytics over the turn ledger:
     target survives only in display prose (`prompt_excerpt`), which is not
     computable and MUST NOT be parsed; clause (c) therefore only counts
     undo turns written by 3.x-era binaries, and the output's exclusion
-    note says so. A rename observed as delete+create counts via (b) — no
+    note says so. `reverts` is a single turn id (an undo targets exactly
+    one turn today; widening to an array is a future additive change).
+    Checkpoint-restore undo turns carry NO `reverts` (they target a
+    checkpoint, not a turn) and are deliberately not counted by (c).
+    A rename observed as delete+create counts via (b) — no
     rename tracking exists in the ledger and none is invented here.
   - Unevaluable events: window overlapped by a recording gap →
     `excluded_gap`; current hash ≠ last recorded `after` with no subsequent
