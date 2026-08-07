@@ -10156,21 +10156,33 @@ impl Drop for SingleDaemonGuard {
 ///
 /// **The fixture REPLACES a watched regular file with a fifo rather than
 /// creating a fifo outright. That choice is for determinism, not necessity.**
-/// The fresh-FIFO delivery matrix, measured live on this branch (round-8 gate,
-/// 2026-08-07, one macOS machine): a bare `mkfifo` with no writer delivers no
-/// event in a 30s wait; `mkfifo` + open read-write with no byte written also
-/// delivered nothing (single-run negatives — FSEvents false-negatives are the
-/// plausible flake direction); but `mkfifo` + open read-write + a byte WRITTEN
-/// delivered a turn 2/2, recorded as `op: "create", skipped_reason:
-/// "unreadable"`. An earlier version of this comment claimed the byte-written
-/// shape delivers nothing — that was false. Mechanism at the notify layer:
-/// FSEvents' `ItemIsFile`/`ItemIsDir`/`ItemIsSymlink` flags do not cover a
-/// FIFO, and notify emits `Create(Other/Any)` for flag-less creates, which
-/// `daemon.rs`'s `Create(_)` arm accepts — delivery hinges on FSEvents
-/// producing an event for the path at all, not on the missing flag.
-/// Delete-then-mkfifo reliably delivers an event for the path (the delete),
-/// and by the time `stage` resolves it the path is a fifo — a deterministic
-/// shape, and a realistic one (any path an agent replaces in-place).
+/// Fresh-FIFO delivery was measured by two gate rounds (2026-08-07, one macOS
+/// machine each) and their results DISAGREE on one row; neither is treated as
+/// authoritative here. Bare `mkfifo` with no writer: no delivery (both
+/// rounds). `mkfifo` + read-write open, no byte written: no delivery (one
+/// round, single run). `mkfifo` + read-write open + a byte written: round 8
+/// saw 2/2 turns delivered; round 9's reconstruction saw 0/3, and got 2/2
+/// only after adding an explicit `touch` on the fifo (a metadata syscall) —
+/// round 8's exact probe commands were not persisted, so which stimulus
+/// governs delivery is UNDETERMINED. `scripts/probe-fresh-fifo-delivery.sh`
+/// now persists the probe shapes so a future run can settle it. Two things
+/// hold either way: all no-delivery figures are few-run negatives (FSEvents
+/// false-negatives are the plausible flake direction), and every delivered
+/// fifo turn in both rounds rendered `op: "create", skipped_reason:
+/// "unreadable"` — the guard handles the fresh-FIFO shape end-to-end whenever
+/// it is reached.
+///
+/// Mechanism, verified against this repo's source rather than notify
+/// internals: file staging on macOS is kind-agnostic — every watched-class
+/// path lands in `pending` via the `Class::Watch` arm's closing
+/// `pending.insert(path)` (`daemon.rs::run`), and the only
+/// `EventKind::Create(_)` match in production code is Linux-only directory
+/// admission; the macOS arm deliberately excludes `Create` (pinned by
+/// `create_kind_does_not_admit_on_macos`). So delivery hinges entirely on
+/// whether FSEvents emits any event for the path. Delete-then-mkfifo
+/// reliably does (the delete), and by the time `stage` resolves the path it
+/// is a fifo — a deterministic shape, and a realistic one (any path an agent
+/// replaces in-place).
 ///
 /// The fifo is opened READ-WRITE and the handle held for the rest of the test.
 /// That is what makes the fixture reproduce the hazard without the test itself

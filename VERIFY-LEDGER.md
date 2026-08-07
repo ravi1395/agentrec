@@ -2932,6 +2932,17 @@ in-`src` allows attach to `mod tests {` items or the 8 documented exemption site
 skeptic itself recorded: the post-revert clean run was incremental (cli crate only, 0.99s); a
 from-clean clippy re-run would remove the cache caveat.
 
+> **Partition sentence above corrected by the round-9 gate and re-verified before this
+> rewrite:** the 24 grep hits for `allow(clippy::disallowed_methods)` in `agentrec-core/src` +
+> `cli/src` are NOT "test mods + 8 sites". Enumerated (2026-08-07, `65d725c` working tree):
+> 11 attach to `#[cfg(test)] mod` items, 8 to the documented exemption sites (`id.rs:58,71`,
+> `doctorcmd.rs:848`, `store.rs:99,330`, `purgecmd.rs:594,916,1246`), 3 to `fsguard`'s own
+> wrapper functions (`fsguard.rs:152,165,180` — the guards themselves, anticipated by the
+> module doc's registry), and 2 are doc-comment prose mentions in `fsguard.rs:19,22`, not
+> attributes at all. 11+8+3+2 = 24; 22 attributes, 2 prose. The substance of the round-8
+> verification (no attacker-reachable site silenced) is unchanged; the partition as written
+> was a miscount.
+
 **Miscitation, noted not hunted.** The SUPERSEDED sentence at the top of the mechanical-audit
 section says "the grep in `fsguard`'s module doc is how to re-check it". `fsguard`'s module doc
 contains no grep. The re-check instrument is the replay command in this entry, not anything in
