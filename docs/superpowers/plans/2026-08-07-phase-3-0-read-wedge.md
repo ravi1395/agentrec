@@ -1,5 +1,9 @@
 # Phase 3.0 — read-only wedge implementation plan (stats, search, annotate, bisect)
 
+> Plan gate: round 1 GATE FAIL (P1–P5: rework-window channel, SearchPage
+> wrapper, undo_unevaluable_c definition, working-tree-hash seam, frozen-clone
+> exit protocol), round 2 **GATE PASS** (Fable, 2026-08-07, @ 986bf94).
+
 > **For agentic workers:** execute task-by-task with fresh-context executors
 > (subagent-driven). Each task stands alone; do not read other tasks' internals
 > beyond the Interface blocks. Skeptic gate per task AC set; plan-exit gate at end.
@@ -10,8 +14,8 @@
 round 3; founder questions resolved: stats default `--since 30d`, no bisect
 sandbox).
 
-**Architecture:** every feature is a read-only fold over `log.jsonl` + CAS +
-— for stats only — current working-tree content hashes (the normative
+**Architecture:** every feature is a read-only fold over `log.jsonl` + CAS
+plus — for stats only — current working-tree content hashes (the normative
 `excluded_unknown_mtime` bucket and the human-share predicate both compare
 live file hashes against recorded `after` hashes; a log-only fold cannot
 compute them). All ledger access through `agentrec-core`'s `RepositoryView`
@@ -145,8 +149,8 @@ fixture — a ledger PLUS on-disk working-tree state in a tempdir (the
 ledger alone; the fixture writes real files whose hashes match or diverge
 from recorded `after` hashes by construction). Required cases, each its own
 test, expected numbers hand-derived in comments:
-- rich/bare/git/imported/undo turn mix → each exclusion bucket hits at least
-  once; denominator/numerator counted by hand.
+- rich/bare/git/imported/undo turn mix → across the test SET each exclusion
+  bucket hits at least once; denominator/numerator counted by hand.
 - right-censoring boundary: event exactly at N days is IN denominator; N-ε
   younger is `censored_recent` (pin the ≥ comparison).
 - deletion-by-uncovered-change counts as rework (clause b).
