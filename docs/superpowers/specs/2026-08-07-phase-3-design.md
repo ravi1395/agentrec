@@ -58,7 +58,10 @@ Per-repo analytics over the turn ledger:
 - **Rework rate** (the headline metric). Unit of analysis is the
   **(turn, file) write event**, not the file — a file written twice enters
   the denominator twice, each event judged over its own window. Definition:
-  - Denominator: every write event (create or write op) by a rich agent turn
+  - Denominator: every write event (`create` or `modify` op — the wire enum
+    is `create|modify|delete`, PROTOCOL §5; an earlier draft said "write",
+    an op that does not exist, caught by measurement at T0 re-gate D1) by a
+    rich agent turn
     whose `ended` is ≥ N days (default 7, `--rework-window`) before query
     time. Younger events are right-censored: excluded from both sides,
     counted in `censored_recent`. Excluded from the denominator entirely:
@@ -96,9 +99,13 @@ Per-repo analytics over the turn ledger:
     contains one; same defect class as the bisect gap-fatality fixed at
     round 2). Instead: gap-overlapped windows stay measurable, the output
     counts them (`gap_overlapped`), and the rework rate is labeled a
-    **lower bound** — an edit hidden inside a gap is invisible to the
-    ledger, so rework can be undercounted, never overcounted, and the
-    output says so.
+    an **approximate lower bound** — two disclosed channels, opposite
+    directions: an edit hidden inside a gap is invisible to the ledger
+    (undercount), and a gap can strip bracket coverage — a dropped `start`
+    signal (PROTOCOL `dropped_signals`) means post-restart agent activity
+    mints bare turns that clause (a) then counts as rework (overcount;
+    the §4 fold is bracket-scoped and cannot retroactively cover them).
+    Undercount dominates in practice; the output names both channels.
   - Unevaluable events: current hash ≠ last recorded `after` with no subsequent
     turn AND no recorded gap (missed-watch / noise-glob shadow) — the
     modification time is unknowable → `excluded_unknown_mtime`. Both printed.
