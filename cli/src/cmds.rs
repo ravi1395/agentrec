@@ -101,7 +101,7 @@ pub fn log(
     // below that consults `noise_matcher` behaves exactly as it did before
     // this feature existed — no separate "is the feature configured" flag
     // needed anywhere else in this function.
-    let noise_globs = crate::noise::read_noise_globs(root);
+    let noise_globs = crate::noise::read_noise_globs(root)?;
     let noise_matcher = crate::noise::NoiseMatcher::build(root, &noise_globs);
 
     let rendered = render_log(
@@ -267,7 +267,10 @@ pub fn status(root: &Path, ack_degraded: bool, json: bool) -> Result<(), String>
         println!("{}", status_json(root)?);
         return Ok(());
     }
-    print!("{}", status_report(root, effective_store_budget(root))?);
+    print!(
+        "{}",
+        status_report(root, effective_store_budget_checked(root)?)?
+    );
     Ok(())
 }
 
@@ -373,7 +376,7 @@ fn status_json(root: &Path) -> Result<serde_json::Value, String> {
         .unwrap_or(0);
     let view = agentrec_core::view::RepositoryView::open(root).map_err(|e| e.to_string())?;
     let health = view
-        .health(effective_store_budget(root))
+        .health(effective_store_budget_checked(root)?)
         .map_err(|e| e.to_string())?;
     let payload = StatusJson {
         health,
@@ -648,18 +651,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // count, so the filter is content-aware (keys on `n`), not a raw line
     // count. A capped injection still carries `n` (plus `capped`), so it IS
     // counted here, correctly — it really did inject something.
-    let injections = std::fs::read_to_string(crate::memory_stats_path(root))
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .map(|v| v.get("n").is_some())
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let injections =
+        agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .map(|v| v.get("n").is_some())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
     // F10: memory-store recall failures (a malformed/unreadable NON-EMPTY
     // memory.jsonl, per hook attempt) — same read-only
     // parse-and-count-defensively pattern as `injections` above, keyed on
@@ -667,18 +671,19 @@ fn status_report(root: &Path, budget: u64) -> Result<String, String> {
     // itself (any JSON parse failure, or a value that isn't a JSON object)
     // are ignored, never a panic — same `.unwrap_or(false)` posture as
     // `injections`. Never mutates state.json (only the daemon writes that).
-    let mem_failures = std::fs::read_to_string(crate::memory_stats_path(root))
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .map(|v| v.get("failure").and_then(|f| f.as_bool()) == Some(true))
-                        .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let mem_failures =
+        agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .map(|v| v.get("failure").and_then(|f| f.as_bool()) == Some(true))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
     out.push_str(&format!(
         "memory:     {mem_fresh} fresh, {mem_stale} stale, {} rejects, {injections} injections, {mem_failures} failures\n",
         state.memory_rejects
@@ -937,7 +942,7 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
         crate::open_path(root),
         agentrec_core::memory::memory_path(root),
     ] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) {
             crate::purgecmd::harvest_refs(&text, &mut out);
         }
     }
@@ -945,7 +950,7 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     // validly-parsed line's hashes are already reachable through
     // `owned_turns`, so re-adding them here would over-protect (see the
     // doc comment above).
-    if let Ok(text) = std::fs::read_to_string(log_path(root)) {
+    if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&log_path(root)) {
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -959,11 +964,22 @@ pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     out
 }
 
-/// `hook`: invoked by a Claude Code lifecycle hook with the JSON payload on
+/// `hook`: invoked by an agent lifecycle hook with the JSON payload on
 /// stdin. Maps the hook event to a start/stop signal and appends it to the
 /// inbox. Prompt text is scrubbed HERE — `signal.jsonl` is on disk, so no
 /// pre-scrub prompt may ever reach it (AC I4).
+///
+/// `codex` is routed to its own module (`hookcmds::hook_codex`) rather than
+/// handled inline below: Codex's payload shapes, its three-event
+/// (`UserPromptSubmit`/`PostToolUse`/`Stop`) structure, and its stdout/
+/// validation posture all differ enough from Claude's that sharing this
+/// function's body would mean branching almost every line — see
+/// `hookcmds.rs`'s module doc for exactly how and why they diverge. Every
+/// other `tool` value (today: `"claude"`) keeps the body below unchanged.
 pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
+    if tool == "codex" {
+        return crate::hookcmds::hook_codex(root);
+    }
     let mut buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut buf);
     let payload: serde_json::Value =
@@ -1021,6 +1037,14 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         transcript,
         prompt,
         files_written,
+        // C1: Claude Code's hook emitter has no equivalent stable upstream
+        // turn id today — see `SignalEvent::emitter_turn`'s doc.
+        emitter_turn: None,
+        // C2 fix 2: Claude Code's hook emitter has no `model` field either —
+        // Claude's model attribution is the separate, pre-existing
+        // transcript-parse mechanism (`daemon.rs::parse_transcript`), left
+        // untouched by this field. See `SignalEvent::model`'s doc.
+        model: None,
         kind: None,
         fact: None,
         pins: None,
@@ -1052,42 +1076,45 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
 #[cfg(debug_assertions)]
 const TEST_STORE_BUDGET_BYTES_VAR: &str = "AGENTREC_TEST_STORE_BUDGET_BYTES";
 
-/// `.agentrec/config.toml` key holding the store budget, in bytes (F28,
-/// redteam round 2). Before this the budget was reachable ONLY through
-/// [`TEST_STORE_BUDGET_BYTES_VAR`], which is `#[cfg(debug_assertions)]` and
-/// therefore compiled out of every shipped binary — a release user had a
-/// non-negotiable 2 GiB per root, and the README's own remedy for D6 ("put
-/// concurrent work in a separate worktree") multiplies roots.
-pub(crate) const STORE_BUDGET_CONFIG_KEY: &str = "store_budget_bytes";
-
 /// Resolution order, highest first:
 ///
 /// 1. [`TEST_STORE_BUDGET_BYTES_VAR`] — debug builds only, never present in a
 ///    release binary (this repo audits release `strings` for exactly that).
 ///    It stays highest so the existing integration seams keep driving a tiny
 ///    budget in fixtures that also carry an `init`-written `config.toml`.
-/// 2. `store_budget_bytes` in `.agentrec/config.toml`, via the shared
-///    [`config_values`] scanner — same convention as `ttl_days`,
-///    `memory_enabled`, `memory_inject_max`.
+/// 2. `store_budget_bytes` in `.agentrec/config.toml`, via
+///    [`crate::config::load_or_default`] — same convention as `memory_enabled`
+///    (both are consumers documented on [`crate::config::load_or_default`]
+///    itself: the daemon's per-tick reads, which must never hard-fail).
 /// 3. [`agentrec_core::MAX_STORE_BYTES`].
 ///
 /// Levels 2 and 3 are covered by `store_budget_is_settable_from_config_toml`;
 /// level 1 beating level 2 is a **control-flow** fact readable three lines
 /// below — the env arm `return`s before the config read is reached — and is
 /// deliberately NOT asserted by a test: `std::env::set_var` is process-global,
-/// and `status`/`status_json` in this same binary call this function, so such
-/// a test would race every one of them. Stated as mechanism rather than as a
-/// measured outcome on purpose. (`store_budget_override_is_a_no_op_in_release`
-/// does cover the release side, where level 1 does not exist at all.)
+/// and both this function and [`effective_store_budget_checked`] in this same
+/// binary read it, so such a test would race every one of them. Stated as
+/// mechanism rather than as a measured outcome on purpose.
+/// (`store_budget_override_is_a_no_op_in_release` does cover the release
+/// side, where level 1 does not exist at all.)
 ///
 /// A missing file, a missing key, an unparseable value, and an explicit `0`
-/// all fall through to the default. The zero case is a deliberate extra
-/// condition rather than the bare `parse` other readers use: with F26's
-/// managed-byte semantics a budget of 0 makes every evictable snapshot a
-/// candidate on the daemon's next tick, so a stray `store_budget_bytes = 0`
-/// would be a silent history-wipe. Same protective class as A5 — refuse the
-/// value, keep the data. A user who really wants an aggressive budget can set
-/// a small non-zero one.
+/// all fall through to the default — `crate::config::load`'s per-key
+/// tolerance for this key. The zero case is a deliberate extra condition
+/// rather than a bare parse: with F26's managed-byte semantics a budget of 0
+/// makes every evictable snapshot a candidate on the daemon's next tick, so a
+/// stray `store_budget_bytes = 0` would be a silent history-wipe. Same
+/// protective class as A5 — refuse the value, keep the data. A user who
+/// really wants an aggressive budget can set a small non-zero one.
+///
+/// **This is the TOLERANT reader.** It is `pub(crate)` for exactly two
+/// callers: `daemon::run_eviction_pass` (both its startup and mid-tick call
+/// sites — the daemon must never crash-loop under launchd `KeepAlive` on a
+/// config edited to garbage after a clean boot) and this module's own tests,
+/// which drive the pre-existing value-level fallback behavior unchanged.
+/// `status`/`status_json` (CLI verbs) call [`effective_store_budget_checked`]
+/// instead — see its doc comment for why a file-level parse error must be a
+/// real, nonzero-exit error for those two, but not for the daemon.
 pub(crate) fn effective_store_budget(root: &Path) -> u64 {
     #[cfg(debug_assertions)]
     if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
@@ -1095,16 +1122,35 @@ pub(crate) fn effective_store_budget(root: &Path) -> u64 {
             return n;
         }
     }
-    if let Some(text) = read_config_text(root) {
-        for value in config_values(&text, STORE_BUDGET_CONFIG_KEY) {
-            if let Ok(n) = value.parse::<u64>() {
-                if n > 0 {
-                    return n;
-                }
-            }
+    crate::config::load_or_default(root).store_budget_bytes
+}
+
+/// Hard-erroring counterpart to [`effective_store_budget`], used ONLY by
+/// `status`/`status_json` (gate finding, D16 remediation): both are CLI
+/// verbs, so a `config.toml` that fails to parse as TOML at all must surface
+/// as a real, nonzero-exit, line-numbered error — not silently degrade every
+/// key (including, connectedly, a bad `mcp_destructive` value: [`crate::
+/// config::load`] treats that as a file-level `Err` too, so it now surfaces
+/// here exactly like a syntax error would, instead of silently resetting
+/// `store_budget_bytes` back to the default alongside it).
+///
+/// Same [`TEST_STORE_BUDGET_BYTES_VAR`] precedence as [`effective_store_
+/// budget`] (same seam, same debug-only fail-safe class) — the existing
+/// `status --json` over-budget integration tests drive this override against
+/// the REAL binary and must keep winning outright, same as the tolerant
+/// reader. Value-level problems (wrong type, an explicit `0`) still degrade
+/// per-key via `Ok`, same as [`load`](crate::config::load)'s documented
+/// per-key tolerance — only a file-level syntax error is `Err` here.
+pub(crate) fn effective_store_budget_checked(root: &Path) -> Result<u64, String> {
+    #[cfg(debug_assertions)]
+    if let Ok(v) = std::env::var(TEST_STORE_BUDGET_BYTES_VAR) {
+        if let Ok(n) = v.parse::<u64>() {
+            return Ok(n);
         }
     }
-    agentrec_core::MAX_STORE_BYTES
+    crate::config::load(root)
+        .map(|c| c.store_budget_bytes)
+        .map_err(|e| e.to_string())
 }
 
 /// Test-only override (`cli/tests/integration.rs`,
@@ -1361,28 +1407,6 @@ pub(crate) fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read `.agentrec/config.toml`'s raw text, or `None` if it doesn't exist.
-/// Shared entry point for the hand-rolled `key = value` scanners below (not
-/// worth a `toml` dependency for a handful of scalar keys).
-pub(crate) fn read_config_text(root: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(crate::agentrec_dir(root).join("config.toml")).ok()
-}
-
-/// Every `key = value` line in `text` (comments stripped after `#`), in file
-/// order, with the raw trimmed value text. `key` is matched as a literal
-/// prefix before whitespace + `=`, so `memory_enabled_foo = true` never
-/// matches `key: "memory_enabled"`. Multiple matching lines are all
-/// yielded — callers that skip unparseable values fall through to a later
-/// line, exactly like the original per-site scanners.
-pub(crate) fn config_values<'a>(text: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    text.lines().filter_map(move |line| {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let rest = line.strip_prefix(key)?;
-        let value = rest.trim_start().strip_prefix('=')?;
-        Some(value.trim())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,6 +1498,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![FileEntry {
                 path: path.into(),
                 before: None,
@@ -1794,8 +1819,11 @@ mod tests {
             "a zero budget must be refused, not honored"
         );
 
-        // Prefix discipline inherited from `config_values`: a longer key that
-        // merely starts with ours must not match.
+        // B2 amendment: was "prefix discipline inherited from the old
+        // hand-rolled line scanner" (it matched by string prefix). Now
+        // backed by the real `toml` parser, this is simply a distinct,
+        // unknown key that must not be mistaken for `store_budget_bytes` —
+        // same assertion, different mechanism.
         std::fs::write(&config, "store_budget_bytes_extra = 42\n").unwrap();
         assert_eq!(effective_store_budget(root), agentrec_core::MAX_STORE_BYTES);
     }
@@ -1896,6 +1924,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         }
     }
@@ -2531,6 +2560,7 @@ mod tests {
                     v: 1,
                     event: event.to_string(),
                     ts: ts.to_string(),
+                    dropped_signals: 0,
                 }),
             )
             .unwrap();
@@ -2570,6 +2600,7 @@ mod tests {
                 v: 1,
                 event: "start".to_string(),
                 ts: "2026-01-01T00:00:00.000Z".to_string(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();
@@ -2604,6 +2635,7 @@ mod tests {
                     v: 1,
                     event: event.to_string(),
                     ts: ts.to_string(),
+                    dropped_signals: 0,
                 }),
             )
             .unwrap();
@@ -3096,6 +3128,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: snapshot
                 .map(|h| {
                     vec![FileEntry {

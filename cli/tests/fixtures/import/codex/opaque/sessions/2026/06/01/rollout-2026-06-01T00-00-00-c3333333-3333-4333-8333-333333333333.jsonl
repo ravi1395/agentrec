@@ -1,0 +1,4 @@
+{"timestamp":"2026-06-01T00:00:00.000Z","type":"session_meta","payload":{"id":"c3333333-3333-4333-8333-333333333333","cwd":"/fake/repo3","originator":"Codex CLI","cli_version":"0.146.0"}}
+{"timestamp":"2026-06-01T00:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"list the directory","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-06-01T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_3","arguments":"{\"cmd\":\"ls -la\"}"}}
+{"timestamp":"2026-06-01T00:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_3","output":"total 0\n"}}

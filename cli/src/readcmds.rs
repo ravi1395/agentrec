@@ -6,8 +6,8 @@
 use crate::cmds::wall_now_ms;
 use crate::{fmt, log_path, objects_dir, undo_guard_path, UndoGuard};
 use agentrec_core::diff;
-use agentrec_core::record::{FileEntry, LogRecord, TurnRecord};
-use agentrec_core::store::{hash_bytes, BlobStore, StoreError};
+use agentrec_core::record::{FileEntry, LogRecord, TurnRecord, UndoOrigin};
+use agentrec_core::store::{BlobStore, StoreError};
 use agentrec_core::view;
 use std::collections::HashSet;
 use std::io::Write;
@@ -227,7 +227,7 @@ pub fn show(root: &Path, turn_ref: &str, prompt: bool, all_files: bool) -> Resul
     if !prompt {
         println!("{}", render_turn(turn));
         if !all_files {
-            let noise_globs = crate::noise::read_noise_globs(root);
+            let noise_globs = crate::noise::read_noise_globs(root)?;
             if let Some(matcher) = crate::noise::NoiseMatcher::build(root, &noise_globs) {
                 let n = turn
                     .files
@@ -575,28 +575,7 @@ pub fn undo(
         // mutations), so append a partial, honestly-truncated undo turn
         // covering them before surfacing the error.
         if !inverse_entries.is_empty() {
-            let now = wall_now_ms();
-            let partial = TurnRecord {
-                v: 1,
-                id: agentrec_core::id::turn_id(),
-                grade: "rich".to_string(),
-                truncated: true,
-                started: agentrec_core::time::rfc3339(now),
-                ended: agentrec_core::time::rfc3339(now),
-                tool: Some("agentrec".to_string()),
-                model: None,
-                session: None,
-                root: root.to_string_lossy().to_string(),
-                prompt_ref: None,
-                prompt_excerpt: Some(format!(
-                    "undo of {short_target} (partial — aborted mid-revert)"
-                )),
-                merges: vec![],
-                imported: None,
-                files_complete: None,
-                files: inverse_entries,
-            };
-            let _ = crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(partial));
+            let _ = append_undo_turn(root, &short_target, inverse_entries, true, UndoOrigin::Cli);
         }
         // Any entries already reverted are real writes a concurrent daemon
         // must still not misattribute, so this waits out the same linger as
@@ -605,12 +584,51 @@ pub fn undo(
         return Err(e);
     }
 
+    let reverted_n = inverse_entries.len();
+    let new_id = append_undo_turn(root, &short_target, inverse_entries, false, UndoOrigin::Cli)?;
+    let new_short_id = fmt::short_id(&new_id);
+
+    finish_undo_guard(root);
+
+    println!("reverted {reverted_n} file(s); recorded as turn {new_short_id}");
+    Ok(())
+}
+
+/// Build and append the undo turn for a completed (or, with `truncated`, an
+/// aborted) revert, returning its id.
+///
+/// The ONE place this record's shape is decided. `agentrec approve` (task F3)
+/// appends through it too, so "an approved undo is recorded exactly as
+/// `undo --confirm` records one" is true by construction rather than by two
+/// struct literals someone has to keep in agreement. F5's `origin`
+/// discriminator (delta decision 11) lands here for the same reason: it is a
+/// parameter of THIS function, so a new transport cannot record an undo
+/// without stating which surface it is, and the partial/`truncated` append
+/// on an aborted revert cannot disagree with its success sibling — each
+/// caller passes one `origin` value to both of its call sites.
+///
+/// `origin` is the surface that EXECUTED the writes, never the one that
+/// requested them: `agentrec approve` passes [`UndoOrigin::Cli`] even though
+/// the request it is approving arrived over MCP (a human ran the verb), and
+/// the request's own provenance stays in `.agentrec/undo-requests.jsonl`.
+pub(crate) fn append_undo_turn(
+    root: &Path,
+    short_target: &str,
+    files: Vec<FileEntry>,
+    truncated: bool,
+    origin: UndoOrigin,
+) -> Result<String, String> {
     let now = wall_now_ms();
-    let undo_record = TurnRecord {
+    let excerpt = if truncated {
+        format!("undo of {short_target} (partial — aborted mid-revert)")
+    } else {
+        format!("undo of {short_target}")
+    };
+    let record = TurnRecord {
         v: 1,
         id: agentrec_core::id::turn_id(),
         grade: "rich".to_string(),
-        truncated: false,
+        truncated,
         started: agentrec_core::time::rfc3339(now),
         ended: agentrec_core::time::rfc3339(now),
         tool: Some("agentrec".to_string()),
@@ -618,20 +636,16 @@ pub fn undo(
         session: None,
         root: root.to_string_lossy().to_string(),
         prompt_ref: None,
-        prompt_excerpt: Some(format!("undo of {short_target}")),
+        prompt_excerpt: Some(excerpt),
         merges: vec![],
         imported: None,
         files_complete: None,
-        files: inverse_entries,
+        origin: Some(origin.as_str().to_string()),
+        files,
     };
-    let reverted_n = undo_record.files.len();
-    let new_short_id = fmt::short_id(&undo_record.id);
-    crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(undo_record))?;
-
-    finish_undo_guard(root);
-
-    println!("reverted {reverted_n} file(s); recorded as turn {new_short_id}");
-    Ok(())
+    let id = record.id.clone();
+    crate::loglock::append_log_locked(&log_path(root), &LogRecord::Turn(record))?;
+    Ok(id)
 }
 
 /// Panic-mode target resolution (Z+1/D42): the most recent turn, excluding
@@ -657,264 +671,21 @@ fn resolve_panic_target<'a>(
     Ok(*newest)
 }
 
-/// Per-file disposition for an undo.
-struct Plan {
-    entry: FileEntry,
-    kind: PlanKind,
-}
-
-enum PlanKind {
-    /// Will be reverted; `warn` names the modified-since cause when included
-    /// only because of `--allow-modified`.
-    Revert { warn: Option<String> },
-    /// Modified since the turn; skipped unless `--allow-modified`.
-    Excluded { cause: String },
-    /// Never revertible regardless of flags (no content, or none was ever
-    /// snapshotted).
-    Refused { reason: String },
-}
-
-/// Classify every file in `target` (filtered by `files_filter`, when
-/// non-empty) into revert / exclude / refuse. Order matches `target.files`.
-#[allow(clippy::too_many_arguments)]
-fn build_plan(
-    root: &Path,
-    store: &BlobStore,
-    target: &TurnRecord,
-    target_idx: usize,
-    turns: &[&TurnRecord],
-    records: &[LogRecord],
-    files_filter: &[String],
-    allow_modified: bool,
-) -> Vec<Plan> {
-    let filter_set: Option<HashSet<&str>> = if files_filter.is_empty() {
-        None
-    } else {
-        Some(files_filter.iter().map(|s| s.as_str()).collect())
-    };
-
-    let mut plans = Vec::with_capacity(target.files.len());
-    for entry in &target.files {
-        if let Some(set) = &filter_set {
-            if !set.contains(entry.path.as_str()) {
-                continue; // deselected by --files, left untouched (AC H2)
-            }
-        }
-
-        // F2 (red team round 2). This gate is FIRST, above every other
-        // refusal, because it is the only one whose failure mode writes to a
-        // file that was never in the plan: `std::fs::write` follows a
-        // symlink and truncates its target, and the post-write read-back
-        // follows it too, so the corruption verifies clean and reports
-        // success. It is also unconditional w.r.t. `--allow-modified` — it
-        // sits above the modified-since gate below, so that flag never
-        // reaches it.
-        //
-        // TWO INDEPENDENT triggers, each sufficient on its own:
-        //   1. the record says the path was a link when it was snapshotted;
-        //   2. the path IS a link on disk right now.
-        // (1) does not cover records written before `link_kind` existed —
-        // they carry no such field and never will, so (2) is the ONLY guard
-        // for the entire pre-existing log. (2) does not cover a link that
-        // has since been deleted (nothing to lstat), which is exactly the
-        // F2a delete-restore case — so (1) is the only guard there. Neither
-        // subsumes the other; both stay.
-        if let Some(kind) = symlink_refusal(root, entry) {
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind,
-            });
-            continue;
-        }
-        if entry.withheld {
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Refused {
-                    reason: "secret-pattern file, never snapshotted".to_string(),
-                },
-            });
-            continue;
-        }
-        // SR6: the skipped gate MUST stay above modified-since (below). A
-        // skipped entry is refused unconditionally here and `continue`s
-        // before `entry.after` is ever compared against the current on-disk
-        // hash — otherwise an unmodified skipped file (SR-C now gives it a
-        // real `after` hash) could fall through into the revert path and
-        // undo would try to restore a blob that was never stored.
-        if entry.skipped {
-            // SR-D: the wire field is the per-entry authoritative cause —
-            // `state.json`'s `io_failed` is a separate, aggregate/operational
-            // channel (drives the DEGRADED banner) and is deliberately never
-            // consulted here, so the two can't be made to disagree.
-            // Finding #5(a): unified on `print_entry`'s em-dash form (was
-            // parenthesized here) — same fact, one spelling; D-PD6 is the
-            // tracked debt item for exactly this renderer-drift class.
-            let reason = format!(
-                "content not snapshotted — {}",
-                fmt::skip_reason_text(entry.skipped_reason.as_deref())
-            );
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Refused { reason },
-            });
-            continue;
-        }
-        if entry.op == "modify" || entry.op == "delete" {
-            // E1: an integrity READ (store.get), not a bare existence check —
-            // build_plan runs entirely before any file mutation, so a corrupt
-            // (hash-mismatched) before-blob is caught and refused here, never
-            // discovered mid-revert after other files have already changed.
-            let refuse_reason = match entry.before.as_deref() {
-                None => Some("no prior snapshot to restore".to_string()),
-                Some(h) => match store.get(h) {
-                    Ok(_) => None,
-                    Err(StoreError::Missing(_)) => {
-                        Some("prior snapshot unavailable — refusing to restore".to_string())
-                    }
-                    Err(StoreError::Corrupt(_)) => Some(
-                        "prior snapshot corrupt (hash mismatch) — refusing to restore".to_string(),
-                    ),
-                },
-            };
-            if let Some(reason) = refuse_reason {
-                plans.push(Plan {
-                    entry: entry.clone(),
-                    kind: PlanKind::Refused { reason },
-                });
-                continue;
-            }
-        }
-
-        // modified-since (PROTOCOL §5): current on-disk hash vs. the turn's
-        // recorded `after` for this path. `None` on either side means absent.
-        let current = read_current_hash(root, &entry.path);
-        let is_modified = current.as_deref() != entry.after.as_deref();
-
-        let after_synthesized = entry.after_synthesized == Some(true);
-
-        if is_modified && !allow_modified {
-            let cause = modified_cause(
-                target_idx,
-                turns,
-                records,
-                target,
-                &entry.path,
-                after_synthesized,
-            );
-            plans.push(Plan {
-                entry: entry.clone(),
-                kind: PlanKind::Excluded { cause },
-            });
-            continue;
-        }
-
-        let warn = is_modified.then(|| {
-            modified_cause(
-                target_idx,
-                turns,
-                records,
-                target,
-                &entry.path,
-                after_synthesized,
-            )
-        });
-        plans.push(Plan {
-            entry: entry.clone(),
-            kind: PlanKind::Revert { warn },
-        });
-    }
-    plans
-}
-
-/// On-disk content hash for `rel`, relative to `root`; `None` for an absent
-/// file OR any read error — undo's safety gate treats both as "no content to
-/// compare", which only ever makes the modified-since check MORE cautious
-/// (a spurious `None` looks like a legitimate delete-target, not a bypass).
-fn read_current_hash(root: &Path, rel: &str) -> Option<String> {
-    std::fs::read(root.join(rel)).ok().map(|b| hash_bytes(&b))
-}
-
-/// True when `path` is itself a symbolic link. `symlink_metadata` is an
-/// lstat: it describes the link, where `metadata`/`Path::exists` would
-/// describe (and a write would hit) the pointed-to file. A metadata error —
-/// absent path, permission denied — is `false`: this predicate answers only
-/// "is there a link here", and the absent case is handled by the record-side
-/// trigger instead.
-fn is_symlink_on_disk(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// The F2 symlink refusal: `Some(PlanKind::Refused)` when `entry` must never
-/// be reverted because a link is involved, `None` otherwise.
-///
-/// The two triggers produce DELIBERATELY DIFFERENT text. They are different
-/// facts — "the record says this was a link" vs "there is a link here now" —
-/// and only distinct wording lets a reader (or a test) tell which one fired;
-/// identical text would let the legacy-record path pass a test for the wrong
-/// reason.
-///
-/// `entry.link_kind` is matched on `is_some()`, never against the known
-/// value: an unrecognized future kind is still not an ordinary file, so
-/// refusing to act on it is the correct degradation (PROTOCOL §5,
-/// refuse-to-act-not-refuse-to-parse). Never make this an equality test
-/// against [`link_kind::SYMLINK`].
-fn symlink_refusal(root: &Path, entry: &FileEntry) -> Option<PlanKind> {
-    if let Some(kind) = entry.link_kind.as_deref() {
-        // `link_kind` is wire data on an OPEN enum — a foreign producer can
-        // put any bytes here, and this string reaches the pre-confirm plan
-        // the user reads (F8's exact surface). Sanitized at the one
-        // interpolation site so `render_plan`'s every-reason-is-safe
-        // invariant holds by construction.
-        let kind = fmt::sanitize_terminal(kind);
-        return Some(PlanKind::Refused {
-            reason: format!(
-                "recorded as a {kind} — its snapshot is the link target, not file content"
-            ),
-        });
-    }
-    if is_symlink_on_disk(&root.join(&entry.path)) {
-        return Some(PlanKind::Refused {
-            reason: "path is a symlink on disk — reverting would write through the link"
-                .to_string(),
-        });
-    }
-    None
-}
-
-/// Best-effort explanation for why a path is modified-since the target turn:
-/// a later rich turn touching the same path outranks an uncovered recording
-/// gap, which outranks the default "some edit we can't otherwise explain".
-fn modified_cause(
-    target_idx: usize,
-    turns: &[&TurnRecord],
-    records: &[LogRecord],
-    target: &TurnRecord,
-    path: &str,
-    after_synthesized: bool,
-) -> String {
-    // D1 (P2 fix round, founder decision 2): a synthesized `after` is a
-    // DERIVED value, not an observation of what the file actually looked
-    // like post-edit — comparing the real on-disk hash against it and
-    // reporting a mismatch as "human or external edit" would fabricate
-    // attribution nobody earned. This must win over both signals below: a
-    // later rich turn or a recording gap are real facts about *observed*
-    // history, but neither makes an unobserved comparison point trustworthy.
-    if after_synthesized {
-        return "imported turn's after-state was derived (not observed) — cannot attribute this difference".to_string();
-    }
-    let later_touches = turns[target_idx + 1..]
-        .iter()
-        .any(|t| t.grade == "rich" && t.files.iter().any(|f| f.path == path));
-    if later_touches {
-        return "later agent turn".to_string();
-    }
-    if view::has_gap_after(records, &target.ended) {
-        return "recording gap".to_string();
-    }
-    "human or external edit".to_string()
-}
+// `Plan`/`PlanKind`/`build_plan` and its helpers (`read_current_hash`,
+// `is_symlink_on_disk`, `symlink_refusal`, `modified_cause`) plus
+// `window_caution` MOVED to `agentrec_core::undo_coordinator` (task F2);
+// `execute_revert`/`restore_from_before` followed in task F3, so `agentrec
+// approve` reverts through THIS function rather than a second copy.
+// The MCP `agentrec_undo` preview has to reach exactly the same refusal
+// interpretation the CLI's preview does — D42 panic mode, D49 caution, F2
+// symlink refusal, K2 imported-unreconstructible — and reimplementing any
+// of it behind the MCP seam is what the core seam exists to prevent. The
+// bodies moved VERBATIM (gate order is load-bearing: symlink, withheld,
+// skipped/SR6, before-blob integrity, modified-since). Re-imported under
+// their original names so this module's renderer and its whole test module
+// resolve unchanged — an untouched test passing against a moved
+// implementation is the behavior-preservation proof.
+use agentrec_core::undo_coordinator::{build_plan, execute_revert, window_caution, Plan, PlanKind};
 
 /// The exact bytes of the pre-`--confirm` undo plan, one `\n`-terminated line
 /// per emitted row. Split out of [`print_plan`] so the text a user reads
@@ -946,7 +717,7 @@ fn modified_cause(
 /// log-writer) threat model, and [`fmt::turn_list_line`] renders the same id
 /// unsanitized, so treating it here alone would split the treatment without
 /// closing anything.
-fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
+pub(crate) fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
     let mut out = String::new();
     let tool = fmt::sanitize_terminal(target.tool.as_deref().unwrap_or("—"));
     out.push_str(&format!("undo {} ({tool})\n", fmt::short_id(&target.id)));
@@ -972,197 +743,18 @@ fn render_plan(target: &TurnRecord, plans: &[Plan]) -> String {
             }
         }
     }
+    // The caution text itself lives in core (one string for the CLI preview
+    // and the MCP preview both); the two-space row indent is this renderer's
+    // and is applied here. Byte-for-byte identical output to before the move
+    // — `render_plan_*` goldens are the proof.
     if let Some(caution) = window_caution(target, plans) {
-        out.push_str(&caution);
-        out.push('\n');
+        out.push_str(&format!("  {caution}\n"));
     }
     out
 }
 
-fn print_plan(target: &TurnRecord, plans: &[Plan]) {
+pub(crate) fn print_plan(target: &TurnRecord, plans: &[Plan]) {
     print!("{}", render_plan(target, plans));
-}
-
-/// D6 honesty line. A rich turn's file list is an *activity window*, not an
-/// authorship record: while a bracket is open, every mutation in the root is
-/// folded into that one turn (D6, "one open turn per root"), so a human edit
-/// landing during the agent's bracket becomes one of the turn's files and the
-/// recorded `after` hash for it IS the human's own content. That makes the
-/// D30 modified-since rail structurally unable to fire for such a file — it
-/// is not modified-since, it is *mis-attributed*, and no post-hoc heuristic
-/// can separate the two. So undo states the limitation rather than guessing:
-/// a warning that is always true beats a detector that is sometimes a lie.
-/// "Always true" is load-bearing and was once violated: the sentence claimed
-/// "every file listed above is reverted", which is false on a MIXED plan where
-/// an `EXCLUDE`/`REFUSE` line is also listed. It now names only the files
-/// marked `revert`, the one set that is reverted under every flag combination
-/// (`--allow-modified` moves a file INTO that set, never out of it).
-///
-/// Deliberately NOT prefixed `WARNING:` — that token is already the per-file
-/// modified-since marker above, and conflating the two would make each one
-/// unreadable as evidence of the other. Turns with `tool: "agentrec"` are the
-/// one rich shape excluded: their file list is built from a revert plan (what
-/// this process itself wrote), not from a watch window. `tool: "git"` turns
-/// are deliberately INCLUDED — a checkout burst is a watch window like any
-/// other — which is why the wording says "the recorded tool's own writes"
-/// rather than "the agent's": the sentence has to stay true for every turn
-/// class the gate admits.
-///
-/// BARE turns get their own sentence (D49, founder decision 2026-08-01; this
-/// was an open residual until then). They are cautioned — the writes are as
-/// real and as irreversible-by-preview as a rich turn's — but not with the
-/// rich text, which names "the recorded tool" and D6: a bare turn has no
-/// recorded tool, so that sentence would fabricate the attribution the grade
-/// exists to withhold. "No recorded tool" is an invariant, not an observation:
-/// every bare close runs through `Source::Quiet`, whose `OpenTurn` is built
-/// `tool: None` (agentrec-core `engine.rs`), and crash recovery hard-codes
-/// `None` for a bare grade (`daemon.rs`) — a producer minting bare-with-tool
-/// would make this sentence false and must change it. The gate stays on
-/// `grade` alone (founder-specified), so that invariant is documented here
-/// rather than defensively re-checked at the call site.
-fn window_caution(target: &TurnRecord, plans: &[Plan]) -> Option<String> {
-    let rich = target.grade == "rich" && target.tool.as_deref() != Some("agentrec");
-    let bare = target.grade == "bare";
-    if !rich && !bare {
-        return None;
-    }
-    if !plans
-        .iter()
-        .any(|p| matches!(p.kind, PlanKind::Revert { .. }))
-    {
-        return None; // nothing will be written; no scope to caution about
-    }
-    // One branch or the other, never a concatenation: that is what makes
-    // "the variants do not bleed" structural rather than test-enforced in
-    // both directions (only the bare-shows-no-rich-text direction is
-    // asserted; the reverse is closed here).
-    if bare {
-        return Some(
-            "  CAUTION: this is a bare turn — an unattributed activity window with no recorded \
-             tool; agentrec cannot say who or what made these writes, and every file marked \
-             `revert` above is reverted regardless of who or what wrote it. Review the list \
-             before confirming."
-                .to_string(),
-        );
-    }
-    Some(
-        "  CAUTION: this turn's file list is an activity window, not an authorship record — \
-         agentrec cannot distinguish the recorded tool's own writes from concurrent human \
-         edits made in the same window (D6), and every file marked `revert` above is \
-         reverted regardless of who wrote it. Review the list before confirming."
-            .to_string(),
-    )
-}
-
-/// Apply one file's revert and return the inverse `FileEntry` for the new
-/// undo turn. Snapshots the CURRENT (pre-undo) bytes first — that becomes the
-/// inverse entry's `before`, so the undo is itself re-revertible (AC H6).
-/// Every write is verified by re-reading and re-hashing before returning Ok;
-/// a mismatch is a hard error, never a silent partial revert.
-fn execute_revert(root: &Path, store: &BlobStore, entry: &FileEntry) -> Result<FileEntry, String> {
-    let path = root.join(&entry.path);
-    let pre_bytes = match std::fs::read(&path) {
-        Ok(b) => Some(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{}: cannot read before revert: {e}", entry.path)),
-    };
-    let new_before = match &pre_bytes {
-        Some(b) => Some(store.put(b).ok_or_else(|| {
-            format!(
-                "{}: failed to snapshot current content before revert",
-                entry.path
-            )
-        })?),
-        None => None,
-    };
-
-    let (new_after, inverse_op) = match entry.op.as_str() {
-        "create" => {
-            // E1: idempotent — a file already absent (deleted by something
-            // else since the turn) means the goal state ("file gone") is
-            // already reached; NotFound is success, not an error.
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{}: failed to delete: {e}", entry.path)),
-            }
-            if path.exists() {
-                return Err(format!(
-                    "{}: still present after delete (revert of create)",
-                    entry.path
-                ));
-            }
-            (None, "delete")
-        }
-        "delete" => {
-            let restored = restore_from_before(&path, store, entry)?;
-            (Some(restored), "create")
-        }
-        _ => {
-            // "modify"
-            let restored = restore_from_before(&path, store, entry)?;
-            (Some(restored), "modify")
-        }
-    };
-
-    Ok(FileEntry {
-        path: entry.path.clone(),
-        before: new_before,
-        after: new_after,
-        op: inverse_op.to_string(),
-        skipped: false,
-        withheld: false,
-        baseline_unknown: false,
-        skipped_reason: None,
-        after_synthesized: None,
-        link_kind: None,
-        attribution: None,
-    })
-}
-
-/// Write `entry.before`'s blob to `path` (creating parent dirs), then verify
-/// by re-reading and re-hashing. Returns the (already-known) `before` hash on
-/// success — the content is byte-identical by construction, verified.
-fn restore_from_before(
-    path: &Path,
-    store: &BlobStore,
-    entry: &FileEntry,
-) -> Result<String, String> {
-    // F2, second gate. `build_plan::symlink_refusal` already keeps every
-    // link-involved entry out of the revert set; this repeats the check at
-    // the write primitive itself so no future caller of `restore_from_before`
-    // can reach `fs::write` on a link by skipping the planner. The `create`
-    // arm's `remove_file` is covered by the planner gate only — `remove_file`
-    // unlinks the link rather than following it, so it destroys a link but
-    // cannot truncate a file outside the plan.
-    if entry.link_kind.is_some() || is_symlink_on_disk(path) {
-        return Err(format!(
-            "{}: symlink — refusing to restore (writing here would replace the link or \
-             truncate its target)",
-            entry.path
-        ));
-    }
-    let before_hash = entry
-        .before
-        .as_deref()
-        .ok_or_else(|| format!("{}: no prior snapshot to restore", entry.path))?;
-    let bytes = store
-        .get(before_hash)
-        .map_err(|e| format!("{}: {e}", entry.path))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{}: failed to create parent dirs: {e}", entry.path))?;
-    }
-    std::fs::write(path, &bytes).map_err(|e| format!("{}: failed to write: {e}", entry.path))?;
-    let readback = std::fs::read(path)
-        .map_err(|e| format!("{}: failed to verify after write: {e}", entry.path))?;
-    if hash_bytes(&readback) != before_hash {
-        return Err(format!(
-            "{}: verification failed after restore (byte mismatch)",
-            entry.path
-        ));
-    }
-    Ok(before_hash.to_string())
 }
 
 /// E8: `Some(reason)` when an unexpired H7 coordination guard already exists
@@ -1170,8 +762,13 @@ fn restore_from_before(
 /// it (clobbering would let the first undo's in-flight writes be mistaken
 /// for a bare turn, and the two guards would delete each other on cleanup).
 /// An absent, malformed, or expired guard is not live: `None`.
-fn live_undo_guard_reason(root: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(undo_guard_path(root)).ok()?;
+pub(crate) fn live_undo_guard_reason(root: &Path) -> Option<String> {
+    // fsguard (round-7 blocker): this read is on all three undo legs — CLI
+    // undo, `agentrec approve`, and MCP execute (agent-triggerable) — and a
+    // fifo at this path hung every one of them. `daemon.rs:992` already
+    // guards the SAME file; this was the mirror site the per-file pass
+    // missed.
+    let text = agentrec_core::fsguard::read_regular_to_string(&undo_guard_path(root)).ok()?;
     let guard: UndoGuard = serde_json::from_str(&text).ok()?;
     if guard.until_ms > wall_now_ms() {
         Some(format!(
@@ -1184,13 +781,22 @@ fn live_undo_guard_reason(root: &Path) -> Option<String> {
 }
 
 /// Write the H7 coordination guard before any file mutation begins.
-fn write_undo_guard(root: &Path, paths: &[String]) -> Result<(), String> {
+pub(crate) fn write_undo_guard(root: &Path, paths: &[String]) -> Result<(), String> {
     let guard = UndoGuard {
         paths: paths.to_vec(),
         until_ms: wall_now_ms() + 30_000,
     };
     let text = serde_json::to_string(&guard).map_err(|e| e.to_string())?;
     let path = undo_guard_path(root);
+    // Write-side fsguard mirror: `fs::write` opens create+truncate, which
+    // blocks forever on a FIFO at this fixed in-repo path — and this runs
+    // BEFORE any file mutation, so a hang here wedges the undo silently.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to write",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1212,14 +818,21 @@ const GUARD_LINGER: std::time::Duration = std::time::Duration::from_millis(3_000
 /// Wait out [`GUARD_LINGER`], then best-effort remove the guard — the
 /// `until_ms` deadline written alongside it is the backstop if this doesn't
 /// run at all (e.g. the process is killed mid-revert).
-fn finish_undo_guard(root: &Path) {
+pub(crate) fn finish_undo_guard(root: &Path) {
     std::thread::sleep(GUARD_LINGER);
     let _ = std::fs::remove_file(undo_guard_path(root));
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    // Moved to core in F3 alongside `execute_revert`; used only by this
+    // module's tests, which are the behavior-preservation proof for the move.
+    use agentrec_core::undo_coordinator::restore_from_before;
 
     fn entry(path: &str, op: &str) -> FileEntry {
         FileEntry {
@@ -1254,6 +867,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         }
     }
@@ -1292,6 +906,36 @@ mod tests {
              \x20 revert  src/app.rs (modify)\n\
              \x20 EXCLUDE src/b.rs — modified since (later agent turn); --allow-modified to include\n\
              \x20 REFUSE  src/c.rs — no prior snapshot to restore\n"
+        );
+    }
+
+    // The caution ROW's exact bytes, indent included.
+    //
+    // Task F2 moved the caution text into `agentrec_core::undo_coordinator`
+    // (one string for the CLI preview and the MCP preview both) and left the
+    // two-space row indent here — a coordinated edit across a crate boundary
+    // that NOTHING in the suite pinned: deleting the indent from
+    // `render_plan` reds zero tests (measured). `misattribution.rs` asserts
+    // the caution by SUBSTRING, so it cannot see the indent at all. This
+    // pins it. `render_plan_clean_input_is_byte_exact` above cannot: its
+    // turn is `tool: "agentrec"`, the one rich shape `window_caution`
+    // deliberately excludes.
+    #[test]
+    fn render_plan_caution_row_is_byte_exact_including_its_indent() {
+        let t = turn("rich", Some("claude"));
+        let plans = vec![Plan {
+            entry: entry("src/app.rs", "modify"),
+            kind: PlanKind::Revert { warn: None },
+        }];
+        assert_eq!(
+            render_plan(&t, &plans),
+            "undo t_ABCD…EFGH (claude)\n\
+             \x20 revert  src/app.rs (modify)\n\
+             \x20 CAUTION: this turn's file list is an activity window, not an authorship \
+             record — agentrec cannot distinguish the recorded tool's own writes from \
+             concurrent human edits made in the same window (D6), and every file marked \
+             `revert` above is reverted regardless of who wrote it. Review the list before \
+             confirming.\n"
         );
     }
 
@@ -1545,5 +1189,288 @@ mod tests {
             "path is a symlink on disk — reverting would write through the link",
             "a create-revert must not unlink a symlink undo never recorded"
         );
+    }
+
+    // ---- Root containment (branch review, PR #20 blockers 1+2) -----------
+    //
+    // `entry.path` is wire data, and before this gate `root.join(&path)` was
+    // an arbitrary-write primitive reachable by an agent through
+    // `agentrec_undo` in `auto` mode with no human in the loop. Each shape
+    // below was proven exploitable end-to-end against the real binary before
+    // the fix; the gate lives in the shared `build_plan`, so these cover the
+    // MCP leg too.
+
+    const ESCAPE: &str =
+        "path escapes the repository root — refusing to write outside the recorded repo";
+
+    #[test]
+    fn build_plan_refuses_parent_dir_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        std::fs::write(tmp.path().join("outside/victim.txt"), b"VICTIM\n").unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("../outside/victim.txt", "modify")], true);
+        assert_eq!(refusal_reason(&plans), ESCAPE);
+    }
+
+    #[test]
+    fn build_plan_refuses_absolute_path() {
+        // `Path::join` with an absolute path DISCARDS the base, so a
+        // `..`-component-only guard would not catch this shape at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs = tmp.path().join("elsewhere.txt");
+        std::fs::write(&abs, b"VICTIM\n").unwrap();
+
+        let (_, plans) = plan_for(
+            root,
+            vec![entry(&abs.display().to_string(), "modify")],
+            true,
+        );
+        assert_eq!(refusal_reason(&plans), ESCAPE);
+    }
+
+    // The worse shape: lexically innocent, so neither a `..` check nor the
+    // human reading the rendered plan would catch it. `is_symlink_on_disk`
+    // lstats the FINAL component only, while `restore_from_before` runs
+    // `create_dir_all(parent)` and writes THROUGH the intermediate link.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_symlinked_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("c.txt"), b"VICTIM\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("linkdir/c.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            ESCAPE,
+            "an intermediate symlink escapes every lexical check and the final-component lstat"
+        );
+    }
+
+    // Positive control, and it must DISCRIMINATE: an ordinary in-root path
+    // has to reach the gates BELOW containment. Asserting the store-missing
+    // refusal (rather than merely "not ESCAPE") proves the entry was still
+    // being evaluated, so a containment gate that refused everything would
+    // red here.
+    #[test]
+    fn build_plan_allows_an_ordinary_in_root_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("src/main.rs", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "containment must pass this through to the store check, not refuse it"
+        );
+    }
+
+    // A revert whose target directory does not exist yet is legitimate
+    // (`restore_from_before` calls `create_dir_all`). Containment resolves
+    // the nearest EXISTING ancestor precisely so this is not refused.
+    #[test]
+    fn build_plan_allows_a_path_whose_directory_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let (_, plans) = plan_for(root, vec![entry("not/here/yet.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "absent intermediate dirs cannot be links, so they must not trip containment"
+        );
+    }
+
+    // Hardlink escape (branch review re-gate, PR #20 blocker 1). Path
+    // containment CANNOT close this: `canonicalize` resolves symlinks, and a
+    // hardlink leaves no path-level evidence that the inode has another name.
+    // The repo-internal path is lexically ordinary, canonicalizes inside
+    // root, and is not a symlink — yet `fs::write` truncates the shared inode
+    // and the outside name sees the new bytes. Proven through MCP auto mode
+    // before this gate existed.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_hardlink_to_a_file_outside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"VICTIM\n").unwrap();
+        std::fs::hard_link(&victim, root.join("hard.txt")).unwrap();
+
+        let (_, plans) = plan_for(&root, vec![entry("hard.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a hardlink — its inode has another name, which reverting would also rewrite"
+        );
+    }
+
+    // The predicate is `nlink > 1`, deliberately not "the other name is
+    // outside the root" — we cannot know where it is, and a second name
+    // inside the repo is equally a file this turn's record does not describe.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_hardlink_whose_other_name_is_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), b"shared\n").unwrap();
+        std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("b.txt", "modify")], true);
+        assert!(
+            refusal_reason(&plans).starts_with("path is a hardlink"),
+            "an in-root second name is still a file the record does not describe"
+        );
+    }
+
+    // A FIFO target HUNG the process before this gate: `fs::read` on a fifo
+    // blocks until a writer appears, which for the single-threaded stdio MCP
+    // loop kills the whole agent-facing surface for the session, and hangs
+    // `agentrec undo` for a human identically. `mkfifo` needs no privileges
+    // and creating one is a write inside cwd — same sandboxed-agent
+    // precondition as every escape shape above. This test would HANG, not
+    // fail, if the gate regressed to skipping non-regular files.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_fifo_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fifo = root.join("pipe");
+        let rc = unsafe {
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            libc::mkfifo(c.as_ptr(), 0o600)
+        };
+        assert_eq!(rc, 0, "fixture must actually create a fifo");
+
+        let (_, plans) = plan_for(root, vec![entry("pipe", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is not a regular file (directory, fifo, socket or device) — reverting cannot \
+             read or write it as file content"
+        );
+    }
+
+    // A directory recorded as a `modify` entry used to be rendered as a
+    // performable `revert`, then failed at execution with `Is a directory` —
+    // a plan promising an action it cannot take.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_refuses_a_directory_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("adir")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("adir", "modify")], true);
+        assert!(
+            refusal_reason(&plans).starts_with("path is not a regular file"),
+            "a plan must not promise a revert it cannot perform"
+        );
+    }
+
+    // The non-regular-file branch must NOT steal the symlink refusal: that is
+    // `symlink_refusal`'s, with its own distinct wording, and stealing it
+    // would make its tests pass for the wrong reason. (The symlink tests
+    // above are the assertion; this one names the intent.)
+    #[test]
+    #[cfg(unix)]
+    fn inode_gate_leaves_symlinks_to_the_symlink_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), b"real\n").unwrap();
+        std::os::unix::fs::symlink("real.txt", root.join("link.txt")).unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("link.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "path is a symlink on disk — reverting would write through the link",
+            "the inode gate must not shadow the symlink gate's distinct wording"
+        );
+    }
+
+    // Discriminating control for the hardlink gate specifically: an ordinary
+    // single-named file at nlink == 1 must pass it and reach the store gate.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_allows_an_ordinary_single_linked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("plain.txt"), b"plain\n").unwrap();
+
+        let (_, plans) = plan_for(root, vec![entry("plain.txt", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "nlink == 1 must not trip the hardlink gate"
+        );
+    }
+
+    // A root that is ITSELF reached through a symlink (macOS `/tmp` →
+    // `/private/tmp` is the everyday case) must not make every revert under
+    // it look like an escape — which is what comparing a canonical child
+    // against a non-canonical root would do.
+    #[test]
+    #[cfg(unix)]
+    fn build_plan_allows_in_root_paths_under_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        let linked_root = tmp.path().join("linked-repo");
+        std::os::unix::fs::symlink(&real, &linked_root).unwrap();
+
+        let (_, plans) = plan_for(&linked_root, vec![entry("src/main.rs", "modify")], true);
+        assert_eq!(
+            refusal_reason(&plans),
+            "prior snapshot unavailable — refusing to restore",
+            "a symlinked root is ordinary, not an escape"
+        );
+    }
+
+    /// `write_undo_guard` writes `.agentrec/undo-guard.json` with `fs::write`
+    /// (create+truncate), which blocks forever on a FIFO at that fixed
+    /// in-repo path. It runs BEFORE any file mutation begins, so a hang here
+    /// wedges the undo silently — the operator sees a command that never
+    /// returns, with nothing written and nothing logged.
+    /// HANGS rather than fails on regression: terminating is the property.
+    #[test]
+    #[cfg(unix)]
+    fn write_undo_guard_refuses_a_fifo_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = undo_guard_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+
+        let err = write_undo_guard(root, &["a.rs".to_string()]).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary guard path must still be written and must
+        // read back as a live guard. Without this, a refuse-everything
+        // mutation of the guard passes the assert above while disabling H7
+        // undo coordination entirely.
+        let ok_tmp = tempfile::tempdir().unwrap();
+        let ok = ok_tmp.path();
+        write_undo_guard(ok, &["a.rs".to_string()])
+            .expect("an ordinary guard path must still be written");
+        let text = std::fs::read_to_string(undo_guard_path(ok)).unwrap();
+        assert!(text.contains("a.rs"), "guard must carry its paths: {text}");
     }
 }

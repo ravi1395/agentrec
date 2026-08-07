@@ -124,6 +124,26 @@ pub fn run(root: &Path) -> Result<(), String> {
     // flock right away, silently destroying mutual exclusion.
     let _lock = acquire_lock(&root)?;
 
+    // D16 / gate finding: a daemon that starts against a config.toml it
+    // can't even parse is worse than one that refuses loudly — hard-fail
+    // HERE, once, at startup, before anything else runs. This is the ONLY
+    // place `daemon::run` calls `config::load` directly; every per-tick read
+    // below (`run_eviction_pass`'s budget read at both its startup and
+    // mid-tick call sites, `replay_pending_candidates`'s and the main loop's
+    // `memory_enabled` reads) still goes through the tolerant
+    // `config::load_or_default`/`memorycmds::read_memory_enabled` shims for
+    // its own per-tick freshness — by the time any of them runs for the
+    // FIRST time, this gate has already proven the file parses, and a config
+    // edited to garbage AFTER a clean boot must degrade, not crash: this
+    // repo has a documented history of exactly that failure mode under
+    // launchd `KeepAlive` (CLAUDE.md, "40 orphaned LaunchAgents").
+    if let Err(e) = crate::config::load(&root) {
+        return Err(format!(
+            ".agentrec/config.toml failed to parse ({e}) — refusing to start; \
+             fix the file (or delete it to use defaults) and retry"
+        ));
+    }
+
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
     recover_orphan(&root)?;
@@ -142,12 +162,22 @@ pub fn run(root: &Path) -> Result<(), String> {
     // Candidate-only startup replay: memory-candidate lines that landed in the
     // inbox while no daemon was running are ingested now, and the live tailer
     // starts exactly where this scan stopped so nothing is read twice.
-    let replay_to = replay_pending_candidates(&root, engine.open_turn_id());
-    let mut tailer = SignalTailer { offset: replay_to };
+    let replay = replay_pending_candidates(&root, engine.open_turn_id());
+    let mut tailer = SignalTailer {
+        offset: replay.consumed,
+    };
     let mut ignore_set = IgnoreSet::build(&root);
     let mut journal_cache: Option<String> = None;
 
-    append_epoch(&root, "start", clock.wall_ms(clock.now_ms()))?;
+    // D51: the gap scan's dropped turn-boundary count rides out on THIS
+    // record — the only durable trace that a bracket elapsed while the
+    // recorder was down. `stop` gets 0: a clean shutdown scans no gap.
+    append_epoch(
+        &root,
+        "start",
+        clock.wall_ms(clock.now_ms()),
+        replay.dropped_signals,
+    )?;
 
     // notify → channel of raw events; we debounce and filter here.
     let (tx, rx) = channel();
@@ -379,6 +409,21 @@ pub fn run(root: &Path) -> Result<(), String> {
                 ingest_candidate(&root, &mut state, &sig, engine.open_turn_id());
                 continue;
             }
+            // C1 (PROTOCOL §4 additive): a start/stop signal carrying
+            // `emitter_turn` participates in restart-safe dedup + the
+            // bracket-mismatch check. Gated on `sig.kind.is_none()` — the
+            // same "genuinely start/stop-shaped, no `type`" test
+            // `apply_signal` itself uses for its stop arm — so a signal with
+            // an unrecognized future `type` is never touched here; it still
+            // reaches `apply_signal`'s own `record_unknown_signal` counting
+            // unperturbed, never miscounted as an emitter_turn resend. A
+            // signal with no `emitter_turn` at all (every Claude Code hook
+            // payload today) is a no-op inside the helper: zero extra
+            // `state.json` reads/writes, byte-identical to before this
+            // field existed (AC-C1).
+            if sig.kind.is_none() && handle_emitter_turn_signal(&root, &engine, &sig) {
+                continue;
+            }
             let (prompt, model, transcript_raw) = signal_context(&sig);
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
@@ -419,7 +464,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     persist(&root, &recorder, &clock, closed)?;
     // Clean shutdown: the turn is persisted, so drop the crash journal.
     sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
-    append_epoch(&root, "stop", clock.wall_ms(clock.now_ms()))?;
+    append_epoch(&root, "stop", clock.wall_ms(clock.now_ms()), 0)?;
     release_lock(&root);
     println!("\nstopped recording {}", root.display());
     Ok(())
@@ -944,7 +989,8 @@ fn log_ignore_rebuild(root: &Path, matcher_count: usize, wall_ms: u64) {
 /// than blocking normal recording — a crash-orphaned guard must not wedge
 /// the daemon.
 fn undo_guard_paths(root: &Path, now_wall_ms: u64) -> HashSet<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(crate::undo_guard_path(root)) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&crate::undo_guard_path(root))
+    else {
         return HashSet::new();
     };
     let Ok(guard) = serde_json::from_str::<crate::UndoGuard>(&text) else {
@@ -1125,7 +1171,12 @@ impl Recorder {
                 }
                 (after, snapshotted, withheld, skip_cause)
             } else {
-                match std::fs::read(abs) {
+                // fsguard: THE daemon snapshot read. A fifo in the watched
+                // tree reaches this line; the exposure was recorded as
+                // plausible-on-inspection and unrefuted after three probe
+                // attempts, and this closes it by construction rather than by
+                // another probe.
+                match agentrec_core::fsguard::read_regular(abs) {
                     Ok(bytes) if bytes.len() <= MAX_SNAPSHOT_BYTES => {
                         match self.store.put_result(&bytes) {
                             PutResult::Stored {
@@ -1387,7 +1438,7 @@ impl SignalTailer {
     /// during the truncated window is lost.
     fn poll(&mut self, root: &Path) -> Vec<SignalEvent> {
         let path = signal_path(root);
-        let Ok(mut file) = std::fs::File::open(&path) else {
+        let Ok(mut file) = agentrec_core::fsguard::open_regular(&path) else {
             return vec![];
         };
         let Ok(len) = file.metadata().map(|m| m.len()) else {
@@ -1503,13 +1554,22 @@ fn resync_shrunk_signal_offset(root: &Path, persisted: u64, len: u64, when: &str
 /// silent no-op — so replaying candidates is turn-neutral and idempotent across
 /// restarts, while start/stop lines here still never reach the engine.
 ///
-/// Returns the offset consumed up to (the last complete line). The live tailer
-/// adopts this as its starting offset, so within a single boot the startup scan
-/// and the live tailer never read the same line twice. The advanced offset is
-/// also persisted, so an immediate restart doesn't re-scan the same window
-/// (dedup would no-op it, but advancing avoids the repeated work).
-fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
-    let Ok(mut file) = std::fs::File::open(signal_path(root)) else {
+/// Returns [`ReplayOutcome`]: the offset consumed up to (the last complete
+/// line), plus the D51 count of turn-boundary signals dropped in the gap. The
+/// live tailer adopts the offset as its starting point, so within a single boot
+/// the startup scan and the live tailer never read the same line twice. The
+/// advanced offset is also persisted, so an immediate restart doesn't re-scan
+/// the same window (dedup would no-op it, but advancing avoids the repeated
+/// work).
+///
+/// D51: the drop stays a drop — nothing here changed about which lines reach
+/// the engine — but it is no longer SILENT. The count rides out to the
+/// `start` epoch record `daemon::run` appends immediately after this call, so
+/// a reader of `log.jsonl` can see that a tool session's bracket elapsed while
+/// the recorder was down. Count only: the dropped line's prompt text is never
+/// scrubbed, stored, or excerpted, matching D7's no-phantom-data posture.
+fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> ReplayOutcome {
+    let Ok(mut file) = agentrec_core::fsguard::open_regular(&signal_path(root)) else {
         // No inbox. Offset 0 is a fresh store (no hook has ever fired) and is
         // silent. A NONZERO offset against an absent file is the same
         // inconsistency as a shrink with length 0 — the inbox was deleted or
@@ -1519,10 +1579,10 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
         if persisted > 0 {
             resync_shrunk_signal_offset(root, persisted, 0, "at startup (inbox absent)");
         }
-        return 0;
+        return ReplayOutcome::at(0);
     };
     let Ok(len) = file.metadata().map(|m| m.len()) else {
-        return 0;
+        return ReplayOutcome::at(0);
     };
     let mut state = read_state(root);
     let start = state.signal_offset;
@@ -1530,39 +1590,92 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     // external shrink discovered at boot: announce + reconcile + persist,
     // identically to the mid-run branch (red-team D1 — this case previously
     // returned here silently, leaving state.json stale forever).
+    //
+    // D51 count is 0 here and that is NOT an undercount claim: the lost bytes
+    // were never read, so nothing can say how many turn-boundary lines they
+    // held. That loss has its own louder channel already (the resync logs and
+    // counts an I/O failure, so `status`/`doctor` read DEGRADED).
     if len < start {
         resync_shrunk_signal_offset(root, start, len, "at startup");
-        return len;
+        return ReplayOutcome::at(len);
     }
     // `len == start` is the ordinary fully-consumed steady state on every
     // boot — nothing appended since the last session. It must stay SILENT;
     // folding it into the branch above would fire DEGRADED on every start.
     if len == start {
-        return len;
+        return ReplayOutcome::at(len);
     }
     if file.seek(SeekFrom::Start(start)).is_err() {
-        return len;
+        return ReplayOutcome::at(len);
     }
     let mut buf = Vec::new();
     if file.read_to_end(&mut buf).is_err() {
-        return len;
+        return ReplayOutcome::at(len);
     }
     // Only replay complete lines; a torn final line is left for the live tailer
     // to complete and process (it re-reads from `start` in that case).
     let Some(nl) = buf.iter().rposition(|b| *b == b'\n') else {
-        return start;
+        return ReplayOutcome::at(start);
     };
     // Kill-switch (design spec line 184, binding): `memory_enabled = false`
     // disables injection AND candidate ingestion, including this pre-daemon
     // replay window. One read for the whole replay batch — same rationale as
     // the live loop above.
     let memory_enabled = memorycmds::read_memory_enabled(root);
+    let mut dropped_signals: u32 = 0;
     for sig in parse_signals(&String::from_utf8_lossy(&buf[..=nl])) {
         // D7 preserved: ONLY candidate lines are acted on; start/stop (and any
         // other) signals in the pre-daemon gap are dropped, never fed to the
         // engine, so no phantom turn can be minted here.
-        if sig.is_memory_candidate() && memory_enabled {
-            ingest_candidate(root, &mut state, &sig, current_turn);
+        //
+        // INVARIANT (D51): the counted set below == the set `apply_signal`
+        // would route to its start/stop arms in the LIVE loop, with
+        // memory-candidates excluded FIRST, in the same order as the live
+        // loop. Any drift between this branch order and `daemon::run`'s poll
+        // loop makes the count lie. The candidate exclusion is UNCONDITIONAL —
+        // the `memory_enabled` kill-switch decides whether the line is
+        // ingested, never whether it is a turn boundary — because the live
+        // loop likewise `continue`s on a candidate whether memory is on or
+        // off. Gating this exclusion on `memory_enabled` would let a
+        // `{"event":"start","type":"memory-candidate"}` line inflate the count
+        // when memory is disabled, which the live loop never treats as a
+        // boundary. Pinned by
+        // `replay_gap_drop_count_excludes_non_boundary_kinds`.
+        if sig.is_memory_candidate() {
+            if memory_enabled {
+                ingest_candidate(root, &mut state, &sig, current_turn);
+            }
+            continue;
+        }
+        // D51: count the TURN-BOUNDARY drops, and only those. The predicate
+        // mirrors `apply_signal`'s own check ORDER: it tests `is_start()`
+        // BEFORE its `kind` guard, so the routed-as-boundary set is
+        // `{event == "start"} ∪ {kind.is_none()}`, not `kind.is_none()` alone.
+        // Two consequences worth stating, because both read as bugs otherwise:
+        //   - The asymmetry is real and inherited, not a mistake here.
+        //     `{"event":"start","type":"<unknown>"}` IS a boundary (live opens
+        //     a real turn for it), while `{"event":"stop","type":"<unknown>"}`
+        //     is NOT — it falls to `apply_signal`'s `record_unknown_signal`
+        //     arm. Pinned by `replay_gap_drop_count_follows_live_routing`.
+        //   - Still deliberately NOT "everything the branch above skipped":
+        //     that set also holds memory-candidates under a disabled
+        //     kill-switch, plus any future typed non-`start` `kind`, neither
+        //     of which is a dropped turn boundary.
+        // Known unmodelled divergence, disclosed rather than fixed: the live
+        // loop's `handle_emitter_turn_signal` pre-filter can also swallow an
+        // untyped start/stop before `apply_signal` sees it (a dedup resend, or
+        // a mismatched stop), so a count here can OVERSTATE what the live loop
+        // would have routed. This is live today, not theoretical: the Codex
+        // hook emits `emitter_turn` on both signals
+        // (`hookcmds.rs`, `emitter_turn: Some(turn_id)`; Claude Code payloads
+        // still carry none). Not modelled because the pre-filter's verdict is
+        // a function of `state.json`'s `last_emitter_turn_key` and the OPEN
+        // BRACKET — engine state the gap scan has, by D7's design, refused to
+        // reconstruct. Over-counting is the safe direction here: the field
+        // exists to break silence, and it is documented (PROTOCOL §5) as a
+        // count of drops, never as an activity record.
+        if sig.is_start() || sig.kind.is_none() {
+            dropped_signals = dropped_signals.saturating_add(1);
         }
     }
     let consumed = start + (nl as u64) + 1;
@@ -1570,7 +1683,31 @@ fn replay_pending_candidates(root: &Path, current_turn: Option<&str>) -> u64 {
     if let Err(e) = write_state(root, &state) {
         eprintln!("agentrec: warning: failed to persist replayed signal offset: {e}");
     }
-    consumed
+    ReplayOutcome {
+        consumed,
+        dropped_signals,
+    }
+}
+
+/// What the pre-startup gap scan found (`replay_pending_candidates`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayOutcome {
+    /// Offset the scan consumed up to; the live tailer's starting point.
+    consumed: u64,
+    /// D51: turn-boundary signal lines dropped in the gap (never replayed).
+    dropped_signals: u32,
+}
+
+impl ReplayOutcome {
+    /// An outcome that scanned no signal lines at all — every early bail-out.
+    /// A zero count here means "nothing countable was read", never "no
+    /// boundaries were lost"; see the `len < start` branch's comment.
+    fn at(consumed: u64) -> Self {
+        ReplayOutcome {
+            consumed,
+            dropped_signals: 0,
+        }
+    }
 }
 
 fn ingest_candidate(root: &Path, state: &mut State, sig: &SignalEvent, current_turn: Option<&str>) {
@@ -1693,6 +1830,163 @@ fn reject_candidate(root: &Path, state: &mut State) {
     }
 }
 
+/// C1 dedup key for a start/stop signal carrying `emitter_turn` (PROTOCOL §4
+/// additive): `(tool, event, session, emitter_turn)`, joined on the U+0001
+/// control character as a delimiter.
+///
+/// NOT collision-proof against an adversarial component, and not claimed to
+/// be: a JSON string can carry that control character via its own numeric
+/// escape sequence, and `serde_json` decodes it to the real character like
+/// any other escape (measured, not assumed) — so a crafted `tool`/`session`
+/// value could in principle inject the delimiter and collide two distinct
+/// tuples onto one key. Not a threat worth guarding here: the emitter is
+/// inside the local trust boundary this whole signal channel already trusts
+/// (PROTOCOL §9), and a collision's worst effect is dropping one spurious
+/// "resend" a signal early — never a wrong-bytes revert source. The
+/// delimiter is chosen only because no realistic tool name or session id
+/// contains it, not because it is un-injectable.
+///
+/// Returns `None` when `emitter_turn` itself is absent (every Claude Code
+/// hook payload today) — callers must treat that as "does not participate",
+/// never as a key that legitimately equals another `None`-keyed signal's.
+fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
+    let et = sig.emitter_turn.as_deref()?;
+    let event = sig.event.as_deref().unwrap_or("stop");
+    let session = sig.session.as_deref().unwrap_or("");
+    Some(format!("{}\u{1}{event}\u{1}{session}\u{1}{et}", sig.tool))
+}
+
+/// C1 fix 1 (content-aware dedup): what varies, per event kind, between two
+/// signals that share one `emitter_turn_dedup_key`. Identity alone cannot
+/// tell a genuine emitter RETRY (byte-identical resend, e.g. racing a
+/// daemon restart) apart from a real SECOND firing under the same key —
+/// Codex's `Stop` hook fires twice for one `turn_id` on a
+/// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
+/// "Continuation semantics"), and the second firing can carry genuinely
+/// NEW `files_written` from `apply_patch` calls made during the
+/// continuation. Two signals with the same key AND the same fingerprint
+/// are a genuine resend; same key, different fingerprint, is real new
+/// data.
+///
+/// **Starts get a constant fingerprint, deliberately.** The same spike
+/// confirmed (answer 2, "Continuation semantics") that `UserPromptSubmit`
+/// fires exactly ONCE per turn — never resent with different content for
+/// one `emitter_turn`, even across a `Stop` block-continuation. A start's
+/// content is therefore already fully determined by its identity tuple
+/// (all of which is already in the dedup key), so a constant fingerprint
+/// reproduces the pre-fix identity-only verdict for starts exactly,
+/// without a start-side carve-out.
+///
+/// **Stops hash `files_written`** — the only `SignalEvent` field that can
+/// vary between two `Stop` firings sharing a key (`session`/`tool`/
+/// `event`/`emitter_turn` are already in the key; `prompt` is always
+/// `None` on a Codex stop). The `"-"` / `"+"` prefix discriminates an
+/// undeclared list (`None`) from a declared-but-empty one
+/// (`Some(vec![])`) — `record.rs` pins that distinction as meaningful on
+/// the wire (`signal_files_written_roundtrips_and_absence_stays_absent`),
+/// and collapsing the two here would let a `(None, then Some([]))` pair
+/// (or the reverse) wrongly compare equal.
+fn emitter_turn_content_fingerprint(sig: &SignalEvent) -> String {
+    if sig.is_start() {
+        String::new()
+    } else {
+        match &sig.files_written {
+            Some(paths) => format!("+{}", paths.join("\u{1}")),
+            None => "-".to_string(),
+        }
+    }
+}
+
+/// C1: emitter_turn restart-safe dedup + bracket-mismatch check for a
+/// signal already known to be start/stop-shaped (`sig.kind.is_none()` at
+/// the caller). Returns `true` when the signal was fully handled HERE (a
+/// resend of the previous processed signal, or a stop mismatched against
+/// the open bracket) and must not reach `apply_signal` at all; `false`
+/// means normal processing continues unchanged. Split out from the poll
+/// loop so both branches are unit-testable without spinning up the
+/// blocking `run()` loop — see `cli/tests/emitter_turn.rs` for the
+/// real-daemon-restart integration coverage this alone can't provide.
+///
+/// C1 fix 1: dedup is now content-aware, not identity-only — see
+/// `emitter_turn_content_fingerprint`'s doc for the motivating bug and the
+/// per-event-kind fingerprint it computes.
+fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEvent) -> bool {
+    if let Some(key) = emitter_turn_dedup_key(sig) {
+        let mut state = read_state(root);
+        let content_fp = emitter_turn_content_fingerprint(sig);
+        if state.last_emitter_turn_key.as_deref() == Some(key.as_str()) {
+            let is_genuine_resend = match &state.last_emitter_turn_fingerprint {
+                Some(prev_fp) => *prev_fp == content_fp,
+                // Legacy/first-sighting state.json for this key (see
+                // `State::last_emitter_turn_fingerprint`'s doc): fall back
+                // to the pre-fix, identity-only verdict rather than risk
+                // double-applying a genuine crash-restart resend.
+                None => true,
+            };
+            if is_genuine_resend {
+                // A resend of the immediately-previous processed signal
+                // (emitter retry, or a resend racing a daemon restart):
+                // counted, not silently dropped (the `memory_rejects`/
+                // `unknown_signal_ignored` honesty pattern), and never
+                // applied — applying it again would open (or wrongly
+                // close) a second bracket for a turn that already
+                // happened.
+                state.duplicate_emitter_turn_signals += 1;
+                // Heal a missing/legacy fingerprint on this exact
+                // occurrence (see the field's doc) — the key is unchanged
+                // either way, only the fingerprint needs stamping.
+                state.last_emitter_turn_fingerprint = Some(content_fp);
+                if let Err(e) = write_state(root, &state) {
+                    eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+                }
+                return true;
+            }
+            // Key matches but content differs (fix 1: e.g. a Stop
+            // block-continuation's second firing carrying NEW
+            // files_written) — this is NOT a duplicate. Fall through to
+            // the mark-and-continue path below so the caller applies it,
+            // and so a genuine resend of THIS signal is still caught next
+            // time.
+        }
+        // Mark-before-apply, mirroring `SignalTailer::poll`'s own
+        // `signal_offset` posture (see that fn's doc comment): a crash
+        // between this write and `apply_signal` (called by our caller,
+        // after this returns `false`) can LOSE this one signal's effect if
+        // it's never resent, but can never cause it to be DOUBLE-applied
+        // on the next restart — the same never-duplicate-over-never-lose
+        // tradeoff `resync_shrunk_signal_offset` already makes for
+        // `signal_offset` itself.
+        state.last_emitter_turn_key = Some(key);
+        state.last_emitter_turn_fingerprint = Some(content_fp);
+        if let Err(e) = write_state(root, &state) {
+            eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
+        }
+    }
+    // A stop whose emitter_turn doesn't match the currently open bracket's
+    // own is not this bracket's close (C1): leave the bracket exactly as it
+    // is (never call `observe_stop` for it — that would fall into its
+    // tool-matching/timeout logic, which is not what a mismatch means),
+    // counted rather than silently dropped. A resent MISMATCHED stop that
+    // also collides with `last_emitter_turn_key` is caught by the dedup
+    // branch above first and never reaches here a second time — this only
+    // sees the FIRST mismatched stop for a given key.
+    if !sig.is_start() {
+        if let Some(et) = sig.emitter_turn.as_deref() {
+            if engine.stop_mismatches_open_bracket(&sig.tool, Some(et)) {
+                let mut state = read_state(root);
+                state.mismatched_stop_emitter_turns += 1;
+                if let Err(e) = write_state(root, &state) {
+                    eprintln!(
+                        "agentrec: warning: failed to persist emitter_turn mismatch state: {e}"
+                    );
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn apply_signal(
     root: &Path,
     engine: &mut TurnEngine,
@@ -1703,7 +1997,13 @@ fn apply_signal(
     // `prompt` is already resolved (hook-provided or transcript-extracted);
     // persist() scrubs before anything reaches disk (idempotent, AC I4).
     if sig.is_start() {
-        return engine.observe_start(now, &sig.tool, prompt, sig.session.clone());
+        return engine.observe_start(
+            now,
+            &sig.tool,
+            prompt,
+            sig.session.clone(),
+            sig.emitter_turn.clone(),
+        );
     }
     // F5 / PROTOCOL §10 additive-versioning: a signal carrying a `type` this
     // consumer doesn't recognize MUST be tolerated, never reinterpreted as a
@@ -1739,24 +2039,31 @@ fn record_unknown_signal(root: &Path) {
     }
 }
 
-/// Resolve a signal's effective prompt + model. Prompt prefers the hook-provided
-/// value, falling back to the transcript's last real user message (Q+). Model is
-/// read from the transcript's assistant messages. Extraction is best-effort and
-/// tolerant: a parse failure yields None rather than a wrong attribution.
-/// Also returns the raw transcript text so downstream consumers (declared-write
-/// fallback, D6 phase 2b) reuse this single read — the transcript is read at
-/// most once per signal.
+/// Resolve a signal's effective prompt + model. Both prefer the
+/// hook-provided value (`sig.prompt` / `sig.model` — C2 fix 2 added the
+/// latter), falling back to the transcript's last real user message /
+/// assistant model (Q+) respectively when the emitter didn't declare one.
+/// Extraction is best-effort and tolerant: a parse failure yields None
+/// rather than a wrong attribution. Claude Code signals never set
+/// `sig.model` today, so for them this is byte-identical to the
+/// transcript-only behavior that predates fix 2. Also returns the raw
+/// transcript text so downstream consumers (declared-write fallback, D6
+/// phase 2b) reuse this single read — the transcript is read at most once
+/// per signal.
 fn signal_context(sig: &SignalEvent) -> (Option<String>, Option<String>, Option<String>) {
     let mut prompt = sig.prompt.clone();
-    let mut model = None;
+    let mut model = sig.model.clone();
     let mut transcript = None;
     if let Some(path) = &sig.transcript {
-        if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(std::path::Path::new(path))
+        {
             let (tp, tm) = parse_transcript(&text);
             if prompt.is_none() {
                 prompt = tp;
             }
-            model = tm;
+            if model.is_none() {
+                model = tm;
+            }
             transcript = Some(text);
         }
     }
@@ -1961,7 +2268,7 @@ pub(crate) fn read_transcript_capped(path: &Path, cap: u64) -> Option<String> {
     if len > cap {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    agentrec_core::fsguard::read_regular_to_string(path).ok()
 }
 
 /// Extract the CURRENT turn's declared writes from a Claude Code transcript:
@@ -2114,6 +2421,7 @@ fn persist(
             merges: turn.merges.clone(),
             imported: None,
             files_complete: None,
+            origin: None,
             files,
         };
         append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -2178,6 +2486,14 @@ fn sync_journal(
             }
             let path = open_path(root);
             let tmp = path.with_extension("json.tmp");
+            // Write-side fsguard mirror: this tmp name is FIXED, so a FIFO
+            // planted at it would block the daemon's journal write forever —
+            // the strongest case in the class. Skipping the write leaves the
+            // previous journal in place, which is the same outcome as any
+            // other write failure here.
+            if agentrec_core::fsguard::is_nonregular(&tmp) {
+                return;
+            }
             if std::fs::write(&tmp, &text).is_ok() {
                 // D37: lock down before the rename makes it visible under
                 // its final name.
@@ -2203,7 +2519,7 @@ fn sync_journal(
 /// the journaled files already exist — they were snapshotted before the crash.
 fn recover_orphan(root: &Path) -> Result<(), String> {
     let path = open_path(root);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         return Ok(());
     };
     let Ok(journal) = serde_json::from_str::<OrphanJournal>(&text) else {
@@ -2299,6 +2615,7 @@ fn recover_orphan(root: &Path) -> Result<(), String> {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: journal.files.clone(),
     };
     append_log(&log_path(root), &LogRecord::Turn(record))?;
@@ -2350,13 +2667,25 @@ fn files_match(a: &[FileEntry], b: &[FileEntry]) -> bool {
     set_a == set_b
 }
 
-fn append_epoch(root: &Path, event: &str, wall_ms: u64) -> Result<(), String> {
+/// Append a `start`/`stop` epoch record (D27).
+///
+/// `dropped_signals` (D51) is the count of turn-boundary signal lines the
+/// pre-startup gap scan dropped without feeding them to the engine; it is
+/// meaningful on `start` only and every other caller passes 0, which serde
+/// omits from the wire.
+fn append_epoch(
+    root: &Path,
+    event: &str,
+    wall_ms: u64,
+    dropped_signals: u32,
+) -> Result<(), String> {
     append_log(
         &log_path(root),
         &LogRecord::Epoch(EpochRecord {
             v: 1,
             event: event.to_string(),
             ts: rfc3339(wall_ms),
+            dropped_signals,
         }),
     )
 }
@@ -2382,6 +2711,15 @@ fn lock_path(root: &Path) -> PathBuf {
 /// display — it is never consulted to decide whether the lock is held.
 fn acquire_lock(root: &Path) -> Result<std::fs::File, String> {
     let path = lock_path(root);
+    // Write-side fsguard mirror: opening a FIFO for write blocks until a
+    // reader appears, so a named pipe left at `.agentrec/daemon.lock` would
+    // wedge `agentrec record` before it ever reached the flock.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to lock",
+            path.display()
+        ));
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         // Never truncate: this file's only role is to be `flock`'d — clearing
@@ -2483,6 +2821,15 @@ fn stamp_watcher_armed(root: &Path) {
 /// annoying.
 pub(crate) fn daemon_is_running(root: &Path) -> bool {
     let path = lock_path(root);
+    // A non-regular lock path is a can't-determine case, and this function's
+    // documented posture is to report "not running" for every one of those —
+    // returning `false` rather than an error is deliberate here, matching the
+    // unopenable-file arm below. Without it, opening a FIFO for write blocks
+    // until a reader appears, so `status`/`doctor` would hang on a liveness
+    // check.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return false;
+    }
     // No `.create(true)`: a lock file that was never written means the
     // daemon has never run here — nothing to probe, and `doctor` must not
     // mutate disk as a side effect of a liveness check.
@@ -2517,6 +2864,10 @@ fn watch_error(e: &notify::Error) -> String {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -2532,10 +2883,327 @@ mod tests {
             transcript: transcript.map(String::from),
             prompt: None,
             files_written,
+            emitter_turn: None,
+            model: None,
             kind: None,
             fact: None,
             pins: None,
         }
+    }
+
+    // ---- C1: emitter_turn dedup key + restart-safe dedup / mismatch -------
+
+    fn et_sig(
+        tool: &str,
+        event: Option<&str>,
+        session: Option<&str>,
+        emitter_turn: Option<&str>,
+    ) -> SignalEvent {
+        SignalEvent {
+            v: 1,
+            ts: 1000,
+            tool: tool.to_string(),
+            event: event.map(String::from),
+            session: session.map(String::from),
+            transcript: None,
+            prompt: None,
+            files_written: None,
+            emitter_turn: emitter_turn.map(String::from),
+            model: None,
+            kind: None,
+            fact: None,
+            pins: None,
+        }
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_none_when_absent() {
+        assert_eq!(
+            emitter_turn_dedup_key(&et_sig("claude-code", Some("stop"), None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_distinguishes_every_component() {
+        let base = emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et1")))
+            .unwrap();
+        let diff_tool = emitter_turn_dedup_key(&et_sig(
+            "claude-code",
+            Some("start"),
+            Some("s1"),
+            Some("et1"),
+        ))
+        .unwrap();
+        let diff_event =
+            emitter_turn_dedup_key(&et_sig("codex", Some("stop"), Some("s1"), Some("et1")))
+                .unwrap();
+        let diff_session =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s2"), Some("et1")))
+                .unwrap();
+        let diff_et =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et2")))
+                .unwrap();
+        for other in [diff_tool, diff_event, diff_session, diff_et] {
+            assert_ne!(base, other);
+        }
+        // Identical tuples produce identical keys — required for the dedup
+        // comparison to ever match at all.
+        let repeat =
+            emitter_turn_dedup_key(&et_sig("codex", Some("start"), Some("s1"), Some("et1")))
+                .unwrap();
+        assert_eq!(base, repeat);
+    }
+
+    #[test]
+    fn emitter_turn_dedup_key_missing_event_defaults_to_stop_like_the_engine_does() {
+        // `sig.event: None` is the "stop" shape (`is_start()` false) —
+        // the dedup key's `event` component must agree with that default,
+        // or a start's key and an absent-event stop's key could collide.
+        let explicit =
+            emitter_turn_dedup_key(&et_sig("codex", Some("stop"), Some("s1"), Some("et1")))
+                .unwrap();
+        let implicit =
+            emitter_turn_dedup_key(&et_sig("codex", None, Some("s1"), Some("et1"))).unwrap();
+        assert_eq!(explicit, implicit);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_noop_and_zero_writes_when_emitter_turn_absent() {
+        // AC-C1 byte-identical claim, at the daemon layer: a signal with no
+        // emitter_turn (every Claude Code hook payload today) must not read
+        // OR write state.json at all — not even to leave it unchanged.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        assert!(!crate::state_path(root).exists());
+
+        let start = et_sig("claude-code", Some("start"), Some("s1"), None);
+        assert!(!handle_emitter_turn_signal(root, &engine, &start));
+        assert!(
+            !crate::state_path(root).exists(),
+            "an emitter_turn-less start must write nothing to state.json"
+        );
+
+        let stop = et_sig("claude-code", Some("stop"), Some("s1"), None);
+        assert!(!handle_emitter_turn_signal(root, &engine, &stop));
+        assert!(
+            !crate::state_path(root).exists(),
+            "an emitter_turn-less stop must write nothing to state.json either"
+        );
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_dedups_resent_start_after_simulated_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        let start = et_sig("codex", Some("start"), Some("s1"), Some("et-abc"));
+
+        // First delivery: not a resend, marks the key, lets the caller
+        // proceed to `apply_signal`.
+        assert!(!handle_emitter_turn_signal(root, &engine, &start));
+        let after_first = read_state(root);
+        assert_eq!(
+            after_first.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}start\u{1}s1\u{1}et-abc")
+        );
+        assert_eq!(after_first.duplicate_emitter_turn_signals, 0);
+
+        // Simulated restart: a fresh TurnEngine (exactly what `run()` starts
+        // with after a crash — any prior open bracket is closed by
+        // `recover_orphan` before the engine is ever constructed, never
+        // resurrected into it), same `root`/state.json. The emitter resends
+        // the identical start signal (its own retry, or a resend racing the
+        // restart).
+        let restarted_engine = TurnEngine::new();
+        assert!(
+            handle_emitter_turn_signal(root, &restarted_engine, &start),
+            "a resend of the exact previous signal must be swallowed, not reopen a bracket"
+        );
+        let after_resend = read_state(root);
+        assert_eq!(
+            after_resend.duplicate_emitter_turn_signals, 1,
+            "the resend must be counted, not silently dropped"
+        );
+        assert_eq!(
+            after_resend.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}start\u{1}s1\u{1}et-abc"),
+            "the dedup key itself is unchanged by a swallowed resend"
+        );
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_a_different_signal_in_between_is_not_a_resend() {
+        // Single-slot dedup, deliberately (state.rs doc comment): a
+        // genuinely different signal arriving in between clears the slot,
+        // so the SAME start signal sent a second time afterward is treated
+        // as new again, not as a resend of the original.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        let start_a = et_sig("codex", Some("start"), Some("s1"), Some("et-a"));
+        let start_b = et_sig("codex", Some("start"), Some("s2"), Some("et-b"));
+
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_a));
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_b));
+        // start_a again: NOT a resend, because start_b's key overwrote the
+        // slot in between.
+        assert!(!handle_emitter_turn_signal(root, &engine, &start_a));
+        assert_eq!(read_state(root).duplicate_emitter_turn_signals, 0);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_mismatched_stop_leaves_bracket_open_and_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+        assert!(engine.has_open_turn());
+
+        let mismatched_stop = et_sig("claude-code", Some("stop"), None, Some("et-2"));
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &mismatched_stop),
+            "a mismatched stop must be swallowed here, never reach apply_signal"
+        );
+        assert!(
+            engine.has_open_turn(),
+            "handle_emitter_turn_signal takes &TurnEngine and never calls observe_stop \
+             itself — the bracket is untouched by construction"
+        );
+        let state = read_state(root);
+        assert_eq!(state.mismatched_stop_emitter_turns, 1);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_matching_stop_is_not_swallowed() {
+        // Positive control: equal emitter_turn on both sides must let the
+        // stop proceed to `apply_signal` (which will close the bracket) —
+        // the mismatch check must not over-fire on a genuine match.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, Some("et-1".into()));
+
+        let matching_stop = et_sig("claude-code", Some("stop"), None, Some("et-1"));
+        assert!(!handle_emitter_turn_signal(root, &engine, &matching_stop));
+        assert_eq!(read_state(root).mismatched_stop_emitter_turns, 0);
+    }
+
+    // C1 fix 1 (content-aware dedup) — the load-bearing test for the fix.
+    // Reproduces the exact bug: Codex's Stop fires twice for one turn_id on
+    // a decision:"block" continuation (docs/verify/codex-spike.md), sharing
+    // the identical C1 dedup key, but the second firing carries genuinely
+    // NEW files_written from apply_patch calls made during the
+    // continuation. Pre-fix, identity-only dedup silently dropped the
+    // second Stop; this proves it through the REAL engine, not just the
+    // dedup key.
+    #[test]
+    fn handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "codex", None, Some("s1".into()), Some("et-block".into()));
+        assert!(engine.has_open_turn());
+
+        // (a) the first Stop must be applied: not swallowed by dedup, and
+        // it closes the open bracket through the real engine.
+        let mut first_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
+        first_stop.files_written = Some(vec!["/repo/a.rs".to_string()]);
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &first_stop),
+            "(a) the first Stop must not be swallowed"
+        );
+        let closed_first = apply_signal(root, &mut engine, &first_stop, None, 1_000);
+        assert_eq!(
+            closed_first.len(),
+            1,
+            "(a) the first Stop closes the open bracket"
+        );
+        assert!(!engine.has_open_turn());
+
+        // (b) a second Stop sharing the IDENTICAL dedup key but carrying
+        // NEW files_written must ALSO be applied — this is the bug.
+        let mut second_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
+        second_stop.files_written = Some(vec!["/repo/a.rs".to_string(), "/repo/b.rs".to_string()]);
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &second_stop),
+            "(b) a second Stop sharing the same key but carrying DIFFERENT \
+             files_written must not be treated as a duplicate — dropping it \
+             would silently lose the continuation's real file-attribution data"
+        );
+        let closed_second = apply_signal(root, &mut engine, &second_stop, None, 1_000);
+        assert_eq!(
+            closed_second.len(),
+            1,
+            "(b) once not dropped by dedup, the second Stop reaches the engine \
+             (today's architecture mints it as its own stop-only turn rather \
+             than folding into the first, since no bracket is left open to \
+             fold into — D6 phase 3 is what would eventually thread \
+             files_written into a persisted record; this assertion only \
+             proves the signal is no longer silently discarded before the \
+             engine ever sees it)"
+        );
+        assert_eq!(
+            read_state(root).duplicate_emitter_turn_signals,
+            0,
+            "neither firing is a genuine duplicate"
+        );
+
+        // (c) a genuine identical resend (same key, same content) of the
+        // last processed signal IS still dropped — the crash-restart
+        // guarantee C1 was built for must survive this fix.
+        let resend = second_stop.clone();
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &resend),
+            "(c) an exact resend (same key, same content) must still be \
+             recognized as a duplicate and dropped"
+        );
+        assert_eq!(read_state(root).duplicate_emitter_turn_signals, 1);
+    }
+
+    // Backward-compat companion to the fix-1 test above: a legacy
+    // state.json that has `last_emitter_turn_key` but predates
+    // `last_emitter_turn_fingerprint` (see that field's doc) must still
+    // dedup a resend by identity alone, exactly like pre-fix behavior — and
+    // must heal the missing fingerprint on this exact occurrence.
+    #[test]
+    fn handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+
+        let stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-legacy"));
+        write_state(
+            root,
+            &State {
+                last_emitter_turn_key: Some(
+                    emitter_turn_dedup_key(&stop).expect("stop carries emitter_turn"),
+                ),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_state(root).last_emitter_turn_fingerprint, None);
+
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &stop),
+            "identity match against a missing (legacy) fingerprint must \
+             still be treated as a duplicate"
+        );
+        let state = read_state(root);
+        assert_eq!(state.duplicate_emitter_turn_signals, 1);
+        assert!(
+            state.last_emitter_turn_fingerprint.is_some(),
+            "the gap must self-heal on this exact occurrence"
+        );
     }
 
     const FIXTURE_TRANSCRIPT: &str = concat!(
@@ -2838,6 +3506,45 @@ mod tests {
         // last real user text wins; the tool_result turn is skipped
         assert_eq!(prompt.as_deref(), Some("now add tests"));
         assert_eq!(model.as_deref(), Some("claude-fable-5"));
+    }
+
+    // C2 fix 2: `signal_context` must prefer the hook-provided `sig.model`
+    // over transcript-parsed attribution — the exact same precedence
+    // `sig.prompt` already had. Neuter: drop the `if model.is_none()`
+    // guard (always overwrite with the transcript's model) -> RED, this
+    // would silently clobber a Codex-declared model with a differently
+    // (or un-)attributed transcript reading.
+    #[test]
+    fn signal_context_prefers_hook_provided_model_over_transcript() {
+        let transcript_sample = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","model":"transcript-model","content":[{"type":"text","text":"ok"}]}}"#,
+            "\n",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        std::fs::write(&path, transcript_sample).unwrap();
+
+        let mut sig = et_sig("codex", Some("start"), Some("s1"), Some("et-1"));
+        sig.model = Some("hook-declared-model".to_string());
+        sig.transcript = Some(path.to_str().unwrap().to_string());
+        let (_, model, _) = signal_context(&sig);
+        assert_eq!(
+            model.as_deref(),
+            Some("hook-declared-model"),
+            "the hook-declared model must win over the transcript's own"
+        );
+
+        // Falls back to the transcript's model when the emitter didn't
+        // declare one — the pre-fix-2 behavior for every Claude signal.
+        sig.model = None;
+        let (_, model, _) = signal_context(&sig);
+        assert_eq!(
+            model.as_deref(),
+            Some("transcript-model"),
+            "with no hook-provided model, the transcript reading must survive"
+        );
     }
 
     #[test]
@@ -3916,7 +4623,7 @@ mod tests {
         let eof = contents.len() as u64;
 
         // No state.json -> persisted offset 0: the whole file is the gap.
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(
             consumed, eof,
             "scan consumes up to the last complete line (EOF)"
@@ -3955,6 +4662,251 @@ mod tests {
         );
     }
 
+    // ---- D51: the gap drop is counted, not silent ------------------------------
+
+    /// AC-D0. The sibling test above asserts only the offset and the ingested
+    /// memory count — it is blind to whether the dropped start/stop lines were
+    /// counted, which is exactly the silence D51 closes. This one reproduces
+    /// the same repro shape (signals appended with no daemon running, fresh
+    /// state.json at offset 0, then the startup scan) and asserts the count
+    /// the `start` epoch record will carry.
+    ///
+    /// Neuter: hardcode `dropped_signals: 0` in `replay_pending_candidates`'s
+    /// returned `ReplayOutcome` -> RED here, while
+    /// `replay_pending_candidates_is_candidate_only_and_offset_reconciled`
+    /// stays GREEN (it never reads the count).
+    #[test]
+    fn replay_gap_drops_are_counted_for_the_epoch_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+
+        let start_line = r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#;
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        // No `event` key: PROTOCOL §4's implicit stop, the shape the real
+        // Claude Code Stop hook writes.
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        // Review round 1: a candidate that ALSO carries `event: "start"`. The
+        // live loop routes candidates away BEFORE `apply_signal`, so this is
+        // ingested, never a boundary — the widened predicate must not count it
+        // despite `is_start()` being true.
+        let start_shaped_candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_001_000u64, "tool": "claude-code",
+            "event": "start",
+            "type": "memory-candidate", "fact": "a start-shaped gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let contents =
+            format!("{start_line}\n{candidate}\n{stop_line}\n{start_shaped_candidate}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.consumed,
+            contents.len() as u64,
+            "unchanged: the scan still consumes to EOF"
+        );
+        assert_eq!(
+            out.dropped_signals, 2,
+            "both turn-boundary lines in the gap are dropped AND counted; the \
+             two memory-candidates — including the start-shaped one — are not"
+        );
+        assert_eq!(
+            agentrec_core::memory::load_effective(root).unwrap().len(),
+            2,
+            "the start-shaped candidate is INGESTED as a candidate, not dropped"
+        );
+
+        // D7 is unchanged: the drop is still a drop. Nothing minted a turn.
+        assert!(
+            !log_path(root).exists(),
+            "the gap scan must never write a turn record"
+        );
+    }
+
+    /// AC-D0 review round 1. The count predicate must mirror the LIVE routed
+    /// set, and `apply_signal` tests `is_start()` BEFORE its `kind` guard — so
+    /// `{"event":"start","type":"<unknown>"}` opens a real turn live, and is
+    /// therefore a real dropped boundary in the gap. The original
+    /// `kind.is_none()`-only predicate dropped it AND failed to count it: the
+    /// exact silence D51 exists to close, reintroduced for one shape.
+    ///
+    /// Neuter: restore `if sig.kind.is_none()` as the whole predicate -> this
+    /// test REDs (1 vs 2), while every other D51 test stays GREEN (none of
+    /// their fixtures carries a typed `start`).
+    #[test]
+    fn replay_gap_drop_count_follows_live_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // A typed `start` — the divergent shape. Live: `apply_signal`'s
+        // `is_start()` check precedes the `kind` guard, so this opens a turn.
+        let typed_start =
+            r#"{"v":1,"ts":1,"tool":"claude","event":"start","type":"some-future-thing"}"#;
+        // Untyped stop: the ordinary boundary, counted before and after.
+        let stop_line = r#"{"v":1,"ts":2,"tool":"claude"}"#;
+        // A typed NON-start unknown: live routes it to `record_unknown_signal`,
+        // never to the stop arm, so it is not a boundary and stays uncounted.
+        // This is what keeps the widening from collapsing into "count
+        // everything".
+        let typed_other = r#"{"v":1,"ts":3,"tool":"claude","type":"some-future-thing"}"#;
+        let contents = format!("{typed_start}\n{stop_line}\n{typed_other}\n");
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.dropped_signals, 2,
+            "a typed `start` is a boundary live, so it is a counted drop here; \
+             a typed non-start is not"
+        );
+        assert!(
+            !log_path(root).exists(),
+            "D7 unchanged: still no turn minted from any of these"
+        );
+    }
+
+    /// The discriminating half of AC-D0's predicate: the count is the set
+    /// `apply_signal` routes to its start/stop arms, NOT "everything the
+    /// ingest branch skipped". With the `memory_enabled` kill-switch off, the
+    /// candidate is skipped too — and must NOT inflate the count, or the field
+    /// lies about how many brackets were lost.
+    ///
+    /// Since review round 1 this also pins the ORDERING: the candidate
+    /// exclusion runs before the boundary predicate, unconditionally. The
+    /// third fixture line is a memory-candidate that ALSO carries
+    /// `"event":"start"`. Live routes it away as a candidate regardless of the
+    /// kill-switch, so it is not a boundary — but the widened predicate's
+    /// `is_start()` arm would count it if the exclusion were gated on
+    /// `memory_enabled` (the naive widening), which is exactly why this
+    /// assertion lives in the kill-switch-OFF fixture: under memory ON both
+    /// the old and new predicates decline it, and it would discriminate
+    /// nothing.
+    ///
+    /// Neuter A: gate the candidate `continue` on `memory_enabled` (i.e.
+    /// `if sig.is_memory_candidate() && memory_enabled`) -> reds at 3.
+    /// Neuter B: hoist the boundary predicate ABOVE the candidate branch ->
+    /// reds at 3 here AND (measured, not assumed) in
+    /// `replay_gap_drops_are_counted_for_the_epoch_record`, which carries the
+    /// same start-shaped candidate under memory ON.
+    #[test]
+    fn replay_gap_drop_count_excludes_non_boundary_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+        std::fs::write(
+            crate::agentrec_dir(root).join("config.toml"),
+            b"memory_enabled = false\n",
+        )
+        .unwrap();
+
+        let candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_000_000u64, "tool": "claude-code",
+            "type": "memory-candidate", "fact": "a gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        // A candidate that ALSO looks start-shaped. `is_memory_candidate()`
+        // wins in the live loop's routing order, so this is not a boundary.
+        let start_shaped_candidate = serde_json::json!({
+            "v": 1, "ts": 1_700_000_001_000u64, "tool": "claude-code",
+            "event": "start",
+            "type": "memory-candidate", "fact": "another gap fact", "pins": ["notes.txt"],
+        })
+        .to_string();
+        let contents = format!(
+            "{}\n{candidate}\n{}\n{start_shaped_candidate}\n",
+            r#"{"v":1,"ts":1,"tool":"claude","event":"start"}"#,
+            r#"{"v":1,"ts":2,"tool":"claude"}"#
+        );
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(
+            out.dropped_signals, 2,
+            "a kill-switch-skipped candidate is not a dropped turn boundary, \
+             not even one carrying `event: start`"
+        );
+        assert!(
+            agentrec_core::memory::load_effective(root)
+                .unwrap()
+                .is_empty(),
+            "precondition: the kill-switch really did suppress ingestion"
+        );
+    }
+
+    /// Every pre-loop bail-out reads no signal lines, so it can count none.
+    /// A steady-state boot (`len == start`) must report 0 — otherwise every
+    /// daemon start would stamp a nonzero count onto its epoch record.
+    #[test]
+    fn replay_early_bailouts_report_a_zero_drop_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        // No inbox at all, offset 0: the fresh-store case.
+        assert_eq!(replay_pending_candidates(root, None).dropped_signals, 0);
+
+        // Fully-consumed steady state: the file holds a stop signal, but the
+        // persisted offset is already at EOF, so it is not in any gap.
+        let contents = "{\"v\":1,\"ts\":7,\"tool\":\"claude\"}\n";
+        std::fs::write(signal_path(root), contents.as_bytes()).unwrap();
+        let mut st = read_state(root);
+        st.signal_offset = contents.len() as u64;
+        write_state(root, &st).unwrap();
+        let out = replay_pending_candidates(root, None);
+        assert_eq!(out.consumed, contents.len() as u64);
+        assert_eq!(
+            out.dropped_signals, 0,
+            "an ordinary boot with nothing in the gap counts nothing"
+        );
+    }
+
+    /// Wire shape of the count at the serializer: a nonzero count is written,
+    /// a zero one is omitted entirely (the byte-identity half of AC-D0, at the
+    /// `append_epoch` layer rather than `record.rs`'s type layer).
+    ///
+    /// **What this does NOT pin, stated because the obvious reading is wrong:**
+    /// it supplies both counts itself, so it says nothing about `daemon::run`'s
+    /// `stop` call site passing 0. Measured, not assumed — changing that call
+    /// to `replay.dropped_signals` leaves all four of these tests green. No
+    /// test pins it: every daemon integration test SIGKILLs (deliberately, see
+    /// `integration.rs`'s note that `Child::kill()` is only sometimes
+    /// graceful), so the clean-shutdown `stop` epoch is never written under
+    /// test at all. `stop` passing 0 rests on the argument at the call site —
+    /// a clean shutdown scans no gap — not on coverage.
+    #[test]
+    fn stop_epoch_never_carries_a_dropped_signal_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+
+        append_epoch(root, "start", 1_700_000_000_000, 4).unwrap();
+        append_epoch(root, "stop", 1_700_000_001_000, 0).unwrap();
+
+        let lines: Vec<String> = std::fs::read_to_string(log_path(root))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains(r#""dropped_signals":4"#),
+            "start epoch carries the count: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains("dropped_signals"),
+            "a zero count is omitted from the wire entirely: {}",
+            lines[1]
+        );
+    }
+
     // ---- red-team D1: startup shrink detection --------------------------------
 
     /// The defect the skeptic refuted: a persisted `signal_offset` PAST the
@@ -3988,7 +4940,7 @@ mod tests {
         st.signal_offset = 9999;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(
             consumed, len,
             "the tailer must be seeded at the real EOF, never the stale offset"
@@ -4030,7 +4982,7 @@ mod tests {
         st.signal_offset = len;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, len);
 
         let after = read_state(root);
@@ -4061,7 +5013,7 @@ mod tests {
         st.signal_offset = 4242;
         write_state(root, &st).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, 0, "no inbox means the only honest offset is 0");
 
         let after = read_state(root);
@@ -4082,7 +5034,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
 
-        let consumed = replay_pending_candidates(root, None);
+        let consumed = replay_pending_candidates(root, None).consumed;
         assert_eq!(consumed, 0);
 
         let after = read_state(root);
@@ -4980,6 +5932,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
@@ -5066,6 +6019,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: files.clone(),
         };
         append_log(&log_path(root), &LogRecord::Turn(existing)).unwrap();
@@ -5150,5 +6104,133 @@ mod tests {
             "a genuinely new orphan must still be recovered"
         );
         assert!(!open_path(root).exists());
+    }
+
+    // ---- write-side fsguard: the three inline `is_nonregular` guards in
+    // ---- this file (`acquire_lock`, `daemon_is_running`, `sync_journal`).
+    // ---- All three landed evidenced only by the green suite.
+
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+    }
+
+    /// `acquire_lock` opens `.agentrec/daemon.lock` for WRITE before the
+    /// flock, so a FIFO there wedges `agentrec record` at startup — the
+    /// recorder never begins, and nothing reports why.
+    /// HANGS rather than fails on regression: terminating is the property.
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lock_refuses_a_fifo_lock_file_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&lock_path(tmp.path()));
+
+        let err = acquire_lock(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+
+        // ALLOW half: an ordinary lock path must still be acquirable, or a
+        // refuse-everything guard passes the assert above while making the
+        // daemon permanently unstartable.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        drop(acquire_lock(ok.path()).expect("an ordinary lock path must still be acquirable"));
+    }
+
+    /// `daemon_is_running` opens the same lock path for WRITE as a liveness
+    /// probe, so a FIFO there hangs `status` and `doctor` — read verbs that
+    /// need no daemon at all.
+    ///
+    /// Its return value is deliberately NOT the discriminator: `false` is
+    /// also what a missing lock file yields, so the assertion below could
+    /// not tell a working guard from a vanished one. What this test pins is
+    /// TERMINATION — it hangs rather than fails on regression. The two
+    /// controls that follow are what make the `false` meaningful: an
+    /// ordinary lock file with nobody holding it must also read `false`, and
+    /// one this test holds must read `true`.
+    #[test]
+    #[cfg(unix)]
+    fn daemon_is_running_terminates_with_a_fifo_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        mkfifo_at(&lock_path(tmp.path()));
+        assert!(
+            !daemon_is_running(tmp.path()),
+            "a non-regular lock path is a can't-determine case: report not-running"
+        );
+
+        // ALLOW half, both directions.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        let held = acquire_lock(ok.path()).expect("fixture must take the lock");
+        assert!(
+            daemon_is_running(ok.path()),
+            "a held ordinary lock must still read as running"
+        );
+        drop(held);
+        assert!(
+            !daemon_is_running(ok.path()),
+            "a released ordinary lock must read as not running"
+        );
+    }
+
+    /// `sync_journal`'s tmp name is FIXED (`open.json.tmp`), so a FIFO
+    /// planted at it would block the daemon's journal write forever — the
+    /// strongest case in the class, since it fires on the recorder's own
+    /// loop rather than on a user-invoked verb. The guard's response is to
+    /// skip the write (a `()` return), so the discriminating evidence is
+    /// that the call RETURNED, the fifo is still a fifo (nothing was written
+    /// through it), and `open.json` was never created.
+    #[test]
+    #[cfg(unix)]
+    fn sync_journal_skips_a_fifo_tmp_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::objects_dir(root)).unwrap();
+        let tmp_path = open_path(root).with_extension("json.tmp");
+        mkfifo_at(&tmp_path);
+
+        let mut engine = TurnEngine::new();
+        engine.observe_start(0, "claude-code", None, None, None);
+        let recorder = Recorder::scan(root, BlobStore::new(crate::objects_dir(root)));
+        let clock = Clock::start();
+        let mut cache = None;
+
+        sync_journal(root, &engine, &recorder, &clock, &mut cache);
+
+        assert!(
+            !open_path(root).exists(),
+            "a refused journal write must not rename anything into place"
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&tmp_path)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the fifo must be untouched — nothing may have been written through it"
+        );
+        assert!(cache.is_none(), "a skipped write must not prime the cache");
+
+        // ALLOW half: the identical call without the fifo must actually
+        // write the journal and prime the cache.
+        let ok_tmp = tempfile::tempdir().unwrap();
+        let ok = ok_tmp.path();
+        std::fs::create_dir_all(crate::objects_dir(ok)).unwrap();
+        let ok_recorder = Recorder::scan(ok, BlobStore::new(crate::objects_dir(ok)));
+        let mut ok_cache = None;
+        sync_journal(ok, &engine, &ok_recorder, &clock, &mut ok_cache);
+        assert!(
+            open_path(ok).exists(),
+            "an ordinary tmp path must still produce open.json"
+        );
+        assert!(ok_cache.is_some(), "a completed write must prime the cache");
     }
 }

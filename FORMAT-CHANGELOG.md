@@ -7,9 +7,365 @@ protocol version (PROTOCOL.md's versioning rule): existing readers must
 tolerate an unknown field, and a record that never sets a new field must
 serialize byte-identically to its pre-change form.
 
-Conformance fixtures for these fields are **not** created yet — the
-protocol freeze is Phase 2.1 (spec decision 5). Until then, these fields
-are additive but UNFROZEN: their shape can still change before 2.1 locks it.
+**The protocol is frozen at 1.0 (2026-08-06).** Every "UNFROZEN until the
+Phase 2.1 protocol freeze" note in the entries below is now discharged — see
+the freeze entry directly beneath this paragraph. Those notes are left in
+place verbatim: they were true when written, and this file is a history.
+Conformance fixtures now exist, at `docs/fixtures/conformance/`.
+
+## `origin` added to `TurnRecord` (2026-08-06)
+
+**Additive, wire-visible.** `TurnRecord` gains `origin: Option<String>`, one
+new §5 row. `v` does not bump; nothing is removed or retyped.
+
+Written by `cli/src/readcmds.rs::append_undo_turn` — the single site that
+decides an undo turn's shape — as `"cli"` or `"mcp"`, and `None` on every
+other turn, so **only undo turns change shape on the wire**. A recorder that
+never executes an undo writes byte-identically to a pre-this-field one, and
+`skip_serializing_if` keeps the key off every record that does not set it.
+Not one golden moved: the goldens' undo turn is hand-seeded and deliberately
+keeps `origin` absent, which makes them the pre-F5 rendering proof (see
+`cli/tests/golden.rs`).
+
+Permitted post-freeze under the rule the 1.0 freeze binds — additive fields
+within the major, consumers tolerate unknown ones. Delta decision 16
+(`docs/superpowers/specs/2026-08-05-phase-2-tail-codex-mcp-design.md`) names
+this discriminator, together with the `agentrec_status` §8 row above, as the
+two post-freeze additions anticipated at freeze time; delta decision 11
+requires it in 2.3's ship commit.
+
+**Absent means `"cli"`, and that is a real reading, not a fallback for
+missing data**: every undo turn written before this field existed was a
+`undo --confirm`. `TurnRecord::origin()` is the one place that default lives.
+Consumers MUST NOT treat absence as a third state.
+
+**It names the executing surface, not the requesting one.** `agentrec
+approve` writes `"cli"` even though the request it settles arrived over MCP,
+because a human at a keyboard performed the writes; the MCP provenance is the
+`.agentrec/undo-requests.jsonl` row, which is implementation-local state and
+deliberately not on the wire. The consequence is stated in the §5 row and
+must travel with any count derived from the field: `"cli"` conflates
+human-initiated and human-approved-but-agent-requested undos, and separating
+them requires joining to that ledger.
+
+Conformance corpus: `valid/turn_undo.jsonl` gains `"origin":"cli"` (it is
+serializer-emitted and would otherwise drift from the real wire — the
+corpus's stated failure mode), and `valid/turn_undo_mcp_origin.jsonl` is
+added for the other value, with a manifest entry. No fixture carries an
+absent `origin`; that reading is pinned by `cli/tests/conformance.rs` against
+a stripped line and by `cli/tests/undo_origin.rs`.
+
+## §8 `allow_modified` text corrected to match founder decision 6 (2026-08-06)
+
+**No wire change, and not an additive change either — a correction of stale
+normative prose.** No schema is touched, no `v` bumps, no field is added,
+removed, or retyped; no serializer, golden, `Cargo.toml`, or conformance
+fixture moves. Consumers are unaffected: nothing on the wire changes shape.
+The §8 tool table is untouched — the `agentrec_undo` row already exists.
+
+One sentence in §8's "Rails that hold in every mode" paragraph said
+`allow_modified: true` is "honored only in `auto` mode or with human approval
+in `confirm` mode". That inverts the `auto` half of founder decision 6
+(parent spec `2026-07-18-agentrec-phase-2-design.md` :676-681): **auto mode
+refuses `allow_modified: true` outright** — an agent must never be able to
+lower its own rail, and a token-bound auto grant is still the agent granting
+itself. The only override path is explicit human approval in `confirm` mode.
+The sentence now says that, in RFC 2119 terms.
+
+The freeze binds the two *schemas* (§4, §5) to additive-only change; it does
+not license normative prose that contradicts the decision register, and
+leaving it would have meant the first implementation of the flag either
+matched the document and violated decision 6, or matched decision 6 and
+violated the document. Ordered first deliberately (delta decision 15,
+`2026-08-05-phase-2-tail-codex-mcp-design.md`): the text is fixed **before**
+any code parses the flag, so no commit ever ships a parser disagreeing with
+§8. The rail itself lands in the next commit (plan task F1).
+
+## `agentrec_status` added to the §8 MCP table (2026-08-06)
+
+**No wire change** — neither the signal schema (§4) nor the record schema
+(§5) is touched, and no serializer, `Cargo.toml`, or golden moves. §8's tool
+table gains one row, `agentrec_status` (read tier), between `agentrec_recall`
+and `agentrec_undo`.
+
+Permitted post-freeze because it is purely additive under the rule the freeze
+binds: a new row is a new tool, no existing row changes tier, name, or
+meaning, and a consumer that does not know the tool simply does not call it.
+Delta decision 16 names this row and 2.3's origin discriminator as the two
+post-freeze additions anticipated at freeze time.
+
+**Placement is a deliberate deviation.** The parent Phase 2 design
+(`docs/superpowers/specs/2026-07-18-agentrec-phase-2-design.md`, the §8
+reservation at :384-387) reserved this row for "2.2's first commit"; it lands
+instead with the commit that implements the tool (plan task E3), per that same
+document's own rationale that normative wire text rides the code it describes.
+Recorded as gap 7 in the delta spec
+(`docs/superpowers/specs/2026-08-05-phase-2-tail-codex-mcp-design.md`).
+
+What the tool returns is `agentrec-core`'s `RepositoryHealth` plus this
+server's own operational facts (recorder liveness, effective agent-undo mode,
+negotiated MCP revision, and whether `config.toml` changed since startup). The
+§8 row deliberately does not enumerate that payload: §8 defines the tool
+surface a conforming server exposes, not one implementation's response shape.
+
+## Protocol 1.0 freeze (2026-08-06)
+
+No wire change. `PROTOCOL.md` moves from `v0.2` to **1.0, frozen**: within
+major `v: 1`, changes are additive only, permanently. `SCHEMA_MAJOR` is
+untouched and every line's `v` stays `1` — the 1.0 versions the document,
+not the wire — so no existing `log.jsonl` or `signal.jsonl` is affected and
+no golden moves.
+
+What the freeze binds, for every entry below and every future one:
+
+- A field MAY be added. No field may be removed, renamed, retyped, or have
+  its meaning narrowed; no already-defined value may change meaning.
+- The open string enums (`link_kind`, `skipped_reason`, `attribution`) MAY
+  gain values — consumers are already required to tolerate unrecognized
+  ones. `skipped_reason: "policy"` stays reserved with no producer.
+- Anything not expressible additively needs a NEW major, which is a new
+  schema, not an edit to this one (PROTOCOL §10).
+
+Every previously-UNFROZEN field is therefore now frozen as shipped:
+`FileEntry.link_kind`, `FileEntry.attribution`, `FileEntry.skipped_reason`,
+`SignalEvent.emitter_turn`, `SignalEvent.model`, `SignalEvent.files_written`,
+and `EpochRecord.dropped_signals` — all seven already described by
+PROTOCOL.md — plus the four the freeze itself added rows for, immediately
+below.
+
+### Four undescribed fields documented at freeze time — RESOLVED
+
+Four fields were already on the wire with **no row in PROTOCOL.md's §4 or §5
+tables**, so a freeze of the document would not have bound them. The founder
+ruled they are **inside** the freeze; the rows were written from the shipped
+code rather than from the record, and are documentation of existing behavior,
+**not a wire change**. No serializer, no `Cargo.toml`, and no golden moved.
+
+| Field | Where the row now lives | Landed in | Prior marker |
+|---|---|---|---|
+| `SignalEvent.prompt` | §4 signal table | the original Claude Code hook emitter (`cli/src/cmds.rs::hook`), extended to Codex by `cli/src/hookcmds.rs::hook_codex` | none — it predates the UNFROZEN convention entirely, and is the oldest and least-documented of the set |
+| `TurnRecord.imported` | §5 record table | the import round (Phase 2.0 P2); both importers set it — `importcmd.rs`'s `persist::persist_session_file` (Claude) and `codex::persist_session_file` (Codex) | "Additive + UNFROZEN per spec decision 5" |
+| `TurnRecord.files_complete` | §5 record table | same two sites, same round | same |
+| `FileEntry.after_synthesized` | §5 file-entry prose, beside `link_kind`/`attribution`/`skipped_reason` | the Phase 2.0 P2 fix round, founder decision 2; written by the Claude importer only (`persist::classify_and_resolve`) — the Codex importer never derives an `after`, so it never sets it | "Additive, UNFROZEN … founder decision 2" |
+
+Three things the rows say that the code says and the prior record did not:
+
+- **`prompt` is not gated on `event`.** `cmds.rs::hook` reads the payload's
+  `prompt` key whichever hook fired, and `daemon.rs::signal_context` consumes
+  it on `stop` as well as `start` — on a stop it becomes `observe_stop`'s
+  `prompt_fallback`, which is how a stop-only emitter gets a prompt at all.
+  The row says MAY-on-either-event, not "start only".
+- **`prompt` serializes as an explicit `null`.** It has no
+  `skip_serializing_if`, unlike every additive field added after it. The row
+  pins explicit `null` as identical to absence (same posture `dropped_signals`
+  takes for an explicit `0`).
+- **`files_complete` discriminates "imported, so partial" and nothing finer.**
+  It is `false` unconditionally on every imported turn, so it can never mean
+  "entries were dropped from *this* turn". The row forbids reading it that way.
+
+Their shapes were already pinned by the conformance corpus
+(`valid/signal_start_with_prompt.jsonl`, `valid/turn_imported_partial.jsonl`),
+so no fixture was added or changed — the corpus counts below are unchanged.
+`docs/fixtures/conformance/README.md`'s recorded-gap section is updated to
+point at the new rows.
+
+Conformance corpus: `docs/fixtures/conformance/` — 29 fixtures across
+`valid/` (17), `tolerated/` (3) and `invalid/` (9), pinned by
+`cli/tests/conformance.rs`. 19 of the 29 are emitted by the real serializers
+in `agentrec-core/src/record.rs` (16 of the 17 in `valid/`, plus the three
+wrong-major lines). The other 10 are hand-written because no serializer can
+produce them: malformed JSON, unknown fields, an unknown record `type`, and
+`valid/signal_stop_protocol_example.jsonl` — PROTOCOL §4's own example line,
+which omits the optional keys our emitters always write as explicit `null`.
+
+Decision refs: spec decision 5 (freeze behind Codex 2.1), delta decision 16,
+D51 (`dropped_signals`, landed immediately prior so it is inside the freeze).
+
+## Phase 2 tail D0 — `EpochRecord.dropped_signals` (2026-08-05)
+
+Added to `EpochRecord`, after `ts`:
+
+```rust
+#[serde(default, skip_serializing_if = "is_zero_u32")]
+pub dropped_signals: u32,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `0`, and `0`
+is what every pre-existing epoch line parses to, so every existing
+`log.jsonl` epoch line round-trips byte-identically
+(`record.rs::epoch_dropped_signals_roundtrips_and_zero_stays_absent`).
+UNFROZEN until the Phase 2.1 protocol freeze, like every field above — though
+this one lands specifically so it is *inside* that freeze rather than after it.
+
+A count of the turn-boundary signals (`start`/`stop`) the recorder found in
+the **pre-startup gap** — the window of `signal.jsonl` that accumulated while
+no daemon was running — and **dropped**. D7's posture is unchanged: those
+signals are still never fed to the engine, because replaying a stale
+start/stop would mint an empty turn misdated to daemon boot. What changes is
+that the drop is no longer silent (decision D51; PROTOCOL §5).
+
+Count only. Nothing about a dropped signal's content is captured: no
+`scrub_prompt`, no `BlobStore` write, no excerpt. A tool session whose whole
+bracket elapsed offline still leaves no turn and no prompt — only the fact
+that N boundaries were dropped.
+
+- **Writer: `cli/src/daemon.rs`.** `replay_pending_candidates` now returns
+  `ReplayOutcome { consumed, dropped_signals }` instead of a bare `u64`, and
+  counts, inside its scan loop, every parsed signal the LIVE poll loop would
+  have routed to `apply_signal`'s start/stop arms. The predicate is
+  `is_start() || kind.is_none()`, evaluated AFTER an unconditional
+  memory-candidate exclusion — the same order the live loop uses.
+  `apply_signal` tests `is_start()` before its `kind` guard, so a typed
+  `start` (`{"event":"start","type":"<unknown>"}`) opens a real turn live and
+  is therefore a real dropped boundary
+  (`daemon.rs::replay_gap_drop_count_follows_live_routing`); a typed
+  NON-`start` line is tolerated-unknown (§10) and is not counted. Deliberately
+  NOT "everything the ingest branch skipped": that set also holds
+  memory-candidates when the `memory_enabled` kill-switch is off, and any
+  future typed non-`start` `kind`
+  (`daemon.rs::replay_gap_drop_count_excludes_non_boundary_kinds`, which also
+  pins that a candidate carrying `event: "start"` is routed away as a
+  candidate and never counted, kill-switch either way). **Corrects
+  `deb2f85`'s commit message**, which stated the predicate as `kind.is_none()`
+  and recorded a mutation probe ("widen the predicate to count the whole
+  else-branch → only `replay_gap_drop_count_excludes_non_boundary_kinds`
+  REDs"). That verdict is **not reproducible** against this predicate — the
+  probe is not inverted, its catcher moved. Re-run here: the widening still
+  reds, but as `replay_gap_drop_count_follows_live_routing` (`left: 3, right:
+  2` — its typed non-`start` line gets counted), while the test the probe
+  named now passes, because the candidate exclusion runs ahead of the
+  predicate unconditionally and `true` cannot reach a candidate.
+  `daemon::run` threads `replay.dropped_signals` into the `append_epoch(&root,
+  "start", …)` call that immediately follows the scan; `append_epoch` gained a
+  fourth parameter and every other caller passes `0` — the `stop` call site's 0 rests on
+  the argument that a clean shutdown scans no gap, NOT on coverage (no test pins it; every
+  daemon integration test SIGKILLs, so a clean-shutdown `stop` epoch is never written under
+  test). Wiring of the START count is proven against
+  the real daemon binary, not just in-process
+  (`integration.rs::live_daemon_start_epoch_carries_the_offline_dropped_signal_count`).
+- **Zero is not "no loss".** Every early bail-out in the scan returns `0`
+  because it read no lines at all. The `len < start` (inbox shrunk) branch is
+  the one worth naming: bytes were genuinely lost there, but they were never
+  parsed, so nothing can say how many boundaries they held. That loss keeps
+  its own louder channel (`resync_shrunk_signal_offset` → stderr +
+  `record_io_failure` → DEGRADED in `status`/`doctor`).
+- **Readers: none yet.** `view::recording_gaps`/`GapKind` are untouched and no
+  renderer reads the field, so every human-form golden is byte-identical. A
+  `blame` clause surfacing a nonzero count is available and deliberately not
+  built in this round.
+
+## Phase 2 tail C1 — `SignalEvent.emitter_turn` (2026-08-05)
+
+Added to `SignalEvent`, after `files_written`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub emitter_turn: Option<String>,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `None`, and
+`None` is what every pre-existing signal line parses to, so every existing
+`signal.jsonl` line round-trips byte-identically
+(`record.rs::signal_emitter_turn_roundtrips_and_absence_stays_absent`).
+UNFROZEN until the Phase 2.1 protocol freeze, like every field above.
+
+An open string carrying a stable turn identity the **emitter** assigns,
+present on `start`/`stop` signals only (PROTOCOL §4). Motivating producer:
+Codex's own hook `turn_id` (see `docs/verify/codex-spike.md`) — Task C2
+(`agentrec hook codex`, not built in this round) is its intended writer.
+Claude Code's hook emitter has no equivalent stable id today and omits the
+field entirely; `None` means "emitter did not declare", never "no upstream
+turn".
+
+- **Reader: `agentrec-core::engine::TurnEngine`.** `observe_start` gained a
+  fifth parameter, `emitter_turn: Option<String>`, stored on the newly
+  opened bracket. A new query method,
+  `TurnEngine::stop_mismatches_open_bracket(tool, emitter_turn)`, reports
+  whether a stop's `emitter_turn` differs from the open bracket's own
+  (both present) — `observe_stop`'s own signature and matching logic are
+  untouched; a caller that gets `true` back is expected to skip calling
+  `observe_stop` for that signal entirely, leaving the bracket open.
+- **Writer/consumer: `cli/src/daemon.rs`.** `handle_emitter_turn_signal`
+  (called from the poll loop before `apply_signal`, gated on
+  `sig.kind.is_none()` so an unrecognized future `type` never enters it)
+  does two things for a signal that carries `emitter_turn`: (1) restart-safe
+  dedup — a resend of the immediately-previous processed
+  `(tool, event, session, emitter_turn)` tuple is dropped, counted in
+  `state.json`'s new `duplicate_emitter_turn_signals`, and never reaches the
+  engine; (2) a mismatched stop (per `stop_mismatches_open_bracket`) is
+  likewise dropped and counted in `mismatched_stop_emitter_turns`, leaving
+  the bracket open. Both counters, plus the dedup key itself
+  (`last_emitter_turn_key`), are additive `#[serde(default)]` fields on
+  `state.json`'s `State` — itself operational, off-wire, per PROTOCOL §5's
+  note — so a pre-C1 `state.json` still parses with zero counted failures
+  (`state::tests::pre_c1_state_json_without_emitter_turn_fields_parses_cleanly`).
+  A signal with no `emitter_turn` never enters either check: zero extra
+  `state.json` reads or writes.
+- Single-slot dedup, deliberately: `last_emitter_turn_key` holds only the
+  most-recently-processed key, so it catches an immediately-following
+  resend, not an arbitrary-history duplicate — a different signal arriving
+  in between clears the slot (state.rs doc comment on the field).
+
+## Phase 2 tail C1 fix 1 — content-aware `emitter_turn` dedup (2026-08-05)
+
+Not a wire change (`state.json` is operational, off-wire per PROTOCOL §5) —
+recorded here for continuity with the C1 entry above, which this directly
+amends. Bug: Codex's `Stop` hook fires twice for one `turn_id` on a
+`decision:"block"` continuation (`docs/verify/codex-spike.md`,
+"Continuation semantics"), so both firings share the identical
+`(tool, event, session, emitter_turn)` dedup key — identity-only dedup
+silently dropped the second firing even when it carried genuinely NEW
+`files_written` from `apply_patch` calls made during the continuation.
+
+`cli/src/daemon.rs::handle_emitter_turn_signal` now additionally compares a
+content fingerprint (`emitter_turn_content_fingerprint`: constant for
+`start` — spike-confirmed `UserPromptSubmit` never re-fires mid-turn — and
+`files_written`-keyed for `stop`) before treating a key match as a
+duplicate. `state.json`'s `State` gained one more additive
+`#[serde(default)]` field, `last_emitter_turn_fingerprint`, alongside
+`last_emitter_turn_key`; a pre-fix `state.json` (key present, fingerprint
+absent) falls back to the original identity-only verdict and self-heals on
+that exact read (`state::tests::state_json_with_key_but_no_fingerprint_parses_cleanly`,
+`daemon::tests::handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing`).
+Load-bearing test:
+`daemon::tests::handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped`.
+
+## Phase 2 tail C2 fix 2 — `SignalEvent.model` (2026-08-05)
+
+Added to `SignalEvent`, after `emitter_turn`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub model: Option<String>,
+```
+
+Additive, `v` stays `1`. The key never appears on the wire when `None`,
+and `None` is what every pre-existing signal line parses to, so every
+existing `signal.jsonl` line round-trips byte-identically
+(`record.rs::signal_model_roundtrips_and_absence_stays_absent`). UNFROZEN
+until the Phase 2.1 protocol freeze, like every field above.
+
+The model the emitting tool was running, when the emitter has it.
+Motivating producer: Codex's hook payload carries `model` on all three of
+its lifecycle events (`docs/verify/codex-spike.md`'s field inventory);
+`cli/src/hookcmds.rs::hook_codex` sets it on `UserPromptSubmit` only,
+mirroring `prompt`'s existing start-only posture rather than
+`emitter_turn`'s carried-on-both-signals one (`emitter_turn` is carried on
+both because the daemon's dedup/mismatch logic needs it at both ends;
+`model` is purely descriptive and needs no re-assertion at stop time).
+Claude Code's hook emitter has no such field and omits it entirely; `None`
+means "emitter did not declare", never "no model".
+
+- **Reader/consumer: `cli/src/daemon.rs::signal_context`.** Now seeds
+  `model` from `sig.model` first (mirroring the existing `prompt`
+  precedence exactly), falling back to the pre-existing transcript-parse
+  extraction (`parse_transcript`) only when the signal didn't declare one.
+  Claude signals never set `model`, so this path is unchanged for them
+  (`daemon::tests::signal_context_prefers_hook_provided_model_over_transcript`
+  pins both the override and the fallback). Residual: `Recorder.models` is
+  in-memory and session-keyed, so a daemon restart strictly between a
+  session's `start` and `stop` loses the model for that one turn — the
+  same residual class an existing restart already has for `prompt`.
 
 ## MVP periphery — `FileEntry.link_kind`, `FileEntry.attribution` (2026-08-01)
 

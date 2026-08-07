@@ -20,6 +20,11 @@
 //! rather than shared — same file-ownership convention as the rest of
 //! `cli/tests/`.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
@@ -355,6 +360,7 @@ fn agentrec_own_turn_carries_no_window_caution() {
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files: vec![FileEntry {
             path: "restored.txt".into(),
             op: "create".into(),
@@ -438,6 +444,7 @@ fn seed_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     };
     agentrec_core::record::append_log(&root.join(".agentrec/log.jsonl"), &LogRecord::Turn(turn))

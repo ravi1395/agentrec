@@ -161,6 +161,60 @@ pub struct State {
     /// see `agentrec_core::store::PutResult::Stored`'s doc).
     #[serde(default)]
     pub dedup_reread_bytes: u64,
+    /// Dedup key of the most recently PROCESSED start/stop signal that
+    /// carried a PROTOCOL §4 `emitter_turn` (Phase 2 tail C1):
+    /// `"{tool}\u{1}{event}\u{1}{session}\u{1}{emitter_turn}"`. `None` when
+    /// no such signal has been processed yet — including every daemon that
+    /// predates this field, and every repo whose emitter never sets
+    /// `emitter_turn` (Claude Code today), which never writes this field at
+    /// all. Restart-safe by construction (persisted in `state.json`, not
+    /// engine memory): the emitter can resend the exact signal it already
+    /// sent (its own retry, or a resend racing a daemon restart) and the
+    /// daemon recognizes the repeat by this key rather than reopening a
+    /// second bracket for it. Single-slot, deliberately: this catches an
+    /// immediately-following resend of the last processed signal, not an
+    /// arbitrary-history duplicate — a genuinely different signal arriving
+    /// in between clears the slot. Mirrors `SignalTailer::poll`'s own
+    /// mark-before-apply posture (this key is written as soon as a signal is
+    /// recognized as new, before `apply_signal` runs) — never-duplicate over
+    /// never-lose, the same tradeoff `resync_shrunk_signal_offset`'s doc
+    /// comment already makes for `signal_offset`.
+    #[serde(default)]
+    pub last_emitter_turn_key: Option<String>,
+    /// Count of start/stop signals dropped as a resend of
+    /// `last_emitter_turn_key` (Phase 2 tail C1) — the `memory_rejects`
+    /// honesty pattern: a dropped resend leaves no trace in `log.jsonl`, so
+    /// this counter is the only visible evidence it happened.
+    #[serde(default)]
+    pub duplicate_emitter_turn_signals: u64,
+    /// Count of stop signals whose `emitter_turn` mismatched the currently
+    /// open bracket's own (Phase 2 tail C1) — the bracket was left open
+    /// rather than closed; same honesty pattern as every counter above.
+    #[serde(default)]
+    pub mismatched_stop_emitter_turns: u64,
+    /// Content fingerprint of the signal `last_emitter_turn_key` was last
+    /// set for (Phase 2 tail, C1 fix 1 — content-aware dedup). Identity
+    /// alone (`last_emitter_turn_key`) cannot distinguish a genuine emitter
+    /// RETRY (byte-identical resend) from a genuine SECOND firing that
+    /// happens to share the same `(tool, event, session, emitter_turn)`
+    /// tuple: Codex's `Stop` hook fires twice for one `turn_id` on a
+    /// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
+    /// "Continuation semantics"), and the second firing can carry
+    /// genuinely NEW `files_written` from `apply_patch` calls made during
+    /// the continuation. `daemon.rs::emitter_turn_content_fingerprint`
+    /// computes what this holds for each event kind. `None` when no key
+    /// has been recorded yet, OR when the currently-stored key predates
+    /// this field (every pre-fix `state.json`, which has
+    /// `last_emitter_turn_key` but never wrote this one): a key match
+    /// against a `None` fingerprint is treated the same as the pre-fix
+    /// behavior — identity alone means duplicate — rather than risk
+    /// double-applying a genuine crash-restart resend in the one-time
+    /// window right after a binary upgrade. That comparison ALSO stamps
+    /// this field with the incoming signal's fingerprint before returning
+    /// (see `handle_emitter_turn_signal`), so the gap self-heals on this
+    /// exact occurrence, not just on some later non-duplicate signal.
+    #[serde(default)]
+    pub last_emitter_turn_fingerprint: Option<String>,
 }
 
 /// Sentinel `last_bad_field` value for a file that could not be parsed as a
@@ -193,7 +247,7 @@ const WHOLE_FILE_SENTINEL: &str = "<state.json: unreadable or not a JSON object>
 /// counts as exactly one failure (`state_parse_failures = 1`,
 /// `last_bad_field` = the whole-file sentinel) rather than being silent.
 pub fn read_state(root: &Path) -> State {
-    let text = match std::fs::read_to_string(state_path(root)) {
+    let text = match agentrec_core::fsguard::read_regular_to_string(&state_path(root)) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
         Err(_) => return whole_file_failure(), // exists but unreadable (e.g. permissions)
@@ -240,6 +294,10 @@ pub fn read_state(root: &Path) -> State {
         watcher_armed_nonce: field!("watcher_armed_nonce"),
         dedup_hits: field!("dedup_hits"),
         dedup_reread_bytes: field!("dedup_reread_bytes"),
+        last_emitter_turn_key: field!("last_emitter_turn_key"),
+        duplicate_emitter_turn_signals: field!("duplicate_emitter_turn_signals"),
+        mismatched_stop_emitter_turns: field!("mismatched_stop_emitter_turns"),
+        last_emitter_turn_fingerprint: field!("last_emitter_turn_fingerprint"),
     };
 
     // Accumulate onto whatever count was already persisted (itself read
@@ -272,6 +330,19 @@ pub fn write_state(root: &Path, state: &State) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = state_path(root);
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // Write-side fsguard mirror: `fs::write` opens create+truncate, which
+    // blocks forever on a FIFO pre-created at the tmp name. The pid makes the
+    // name predictable enough to plant one, and this runs on the daemon's
+    // hot path.
+    if agentrec_core::fsguard::is_nonregular(&tmp) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file — refusing to write",
+                tmp.display()
+            ),
+        ));
+    }
     std::fs::write(&tmp, &text)?;
     // Lock down before the rename makes it visible under its final name
     // (D37) — no window where state.json is reachable at 0644.
@@ -373,6 +444,10 @@ pub fn current_epoch_reloads(state: &State) -> u64 {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -633,5 +708,124 @@ mod tests {
             text_before, text_after,
             "a healthy state.json must round-trip byte-identically"
         );
+    }
+
+    // C1 (verification item 6): a state.json written before
+    // `last_emitter_turn_key`/`duplicate_emitter_turn_signals`/
+    // `mismatched_stop_emitter_turns` existed — carrying only pre-C1 keys —
+    // must still parse cleanly. The new fields must default (never a parse
+    // failure): a MISSING key is not corruption, only a present key of the
+    // wrong type is. Neuter: swap any of the three `#[serde(default)]`s for
+    // a bare (non-defaulted) field -> RED (struct-level deserialize fails
+    // outright the instant a present sibling key exists without it).
+    #[test]
+    fn pre_c1_state_json_without_emitter_turn_fields_parses_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        // Exactly the field set a pre-C1 daemon would have written — no
+        // emitter_turn keys anywhere.
+        std::fs::write(
+            state_path(root),
+            r#"{"pid":42,"signal_offset":777,"snapshot_failures":0,"io_failed":[],
+               "memory_rejects":0,"unknown_signal_ignored":0,"non_utf8_path_skips":0,
+               "prompt_put_failures":0,"ignore_rebuilds":0,"last_ignore_rebuild_ms":0,
+               "epoch_ignore_rebuilds":0,"epoch_nonce":"","epoch_reload_nonce":"",
+               "state_parse_failures":0,"last_bad_field":null,"watcher_armed_nonce":"",
+               "dedup_hits":0,"dedup_reread_bytes":0}"#,
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.state_parse_failures, 0,
+            "a missing (not wrong-typed) new field must never be counted as corruption"
+        );
+        assert_eq!(state.last_bad_field, None);
+        assert_eq!(state.pid, 42);
+        assert_eq!(
+            state.signal_offset, 777,
+            "sibling fields must survive intact"
+        );
+        assert_eq!(state.last_emitter_turn_key, None);
+        assert_eq!(state.duplicate_emitter_turn_signals, 0);
+        assert_eq!(state.mismatched_stop_emitter_turns, 0);
+    }
+
+    // C1 fix 1: the specific transitional shape this fix must tolerate — a
+    // state.json written by a binary that HAD `last_emitter_turn_key` but
+    // predates `last_emitter_turn_fingerprint`. Missing (not wrong-typed)
+    // must default to None, never a parse failure — same posture as the
+    // test above, scoped to the one new field this fix adds. Neuter: swap
+    // the field's `#[serde(default)]` for a bare one -> RED.
+    #[test]
+    fn state_json_with_key_but_no_fingerprint_parses_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        // The delimiter inside `last_emitter_turn_key` is U+0001, a JSON
+        // control character that MUST be `\u0001`-escaped to be valid
+        // JSON (exactly what `serde_json::to_string` always emits for it)
+        // -- a raw unescaped control byte here would make the whole file
+        // fail to parse as JSON at all, a different (irrelevant) failure
+        // mode than the one this test targets.
+        std::fs::write(
+            state_path(root),
+            "{\"pid\":9,\"signal_offset\":5,\
+             \"last_emitter_turn_key\":\"codex\\u0001stop\\u0001s1\\u0001et-1\",\
+             \"duplicate_emitter_turn_signals\":0,\"mismatched_stop_emitter_turns\":0}",
+        )
+        .unwrap();
+
+        let state = read_state(root);
+        assert_eq!(
+            state.state_parse_failures, 0,
+            "a missing (not wrong-typed) new field must never be counted as corruption"
+        );
+        assert_eq!(
+            state.last_emitter_turn_key.as_deref(),
+            Some("codex\u{1}stop\u{1}s1\u{1}et-1"),
+            "the pre-fix key must survive intact"
+        );
+        assert_eq!(state.last_emitter_turn_fingerprint, None);
+    }
+
+    /// `write_state`'s tmp name is `state.json.tmp.<pid>` — predictable
+    /// enough for a sandboxed agent to plant a FIFO at it, and `fs::write`
+    /// opens create+truncate, which blocks until a reader appears. This is
+    /// the daemon's hot path (every offset/nonce persist), so a hang here
+    /// stops recording entirely. HANGS rather than fails on regression.
+    #[test]
+    #[cfg(unix)]
+    fn write_state_refuses_a_fifo_tmp_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(crate::agentrec_dir(root)).unwrap();
+        let tmp_path = state_path(root).with_extension(format!("json.tmp.{}", std::process::id()));
+        let c = std::ffi::CString::new(tmp_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+
+        let err = write_state(root, &State::default()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+        assert!(
+            !state_path(root).exists(),
+            "a refused write must not rename anything into place"
+        );
+
+        // ALLOW half: without the fifo the same call must still persist, or a
+        // refuse-everything guard would pass the asserts above while silently
+        // disabling every state write.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        write_state(ok.path(), &State::default()).expect("an ordinary tmp path must still write");
+        assert!(state_path(ok.path()).exists());
     }
 }

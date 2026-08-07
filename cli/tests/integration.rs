@@ -4,6 +4,11 @@
 //! and crash-journal recovery (B2). Spawned-daemon assertions poll with a
 //! timeout because macOS fsevents coalesces events by a second or more.
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -1731,6 +1736,7 @@ fn base_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }
@@ -2681,6 +2687,7 @@ fn make_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }
@@ -2692,6 +2699,7 @@ fn seed_epoch(root: &Path, event: &str, ts: &str) {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         }),
     )
     .expect("seed epoch");
@@ -5213,6 +5221,57 @@ fn live_daemon_reports_watcher_armed() {
     );
 }
 
+/// AC-D0 wiring proof (D51). `daemon.rs`'s unit tests can show that
+/// `replay_pending_candidates` counts and that `append_epoch` serializes the
+/// count, and STILL pass with the two never connected — the `append_epoch`
+/// call lives in `daemon::run`, which no unit test reaches (it needs a real
+/// watcher, the flock, and a ctrl-c handler). This drives the real daemon
+/// binary end to end: signals seeded into the inbox with no daemon running,
+/// then a fresh start, then read `log.jsonl`.
+///
+/// Neuter: pass a literal `0` instead of `replay.dropped_signals` at the
+/// `append_epoch(&root, "start", …)` call in `daemon::run` -> RED here, while
+/// every `daemon.rs` unit test stays green.
+#[test]
+fn live_daemon_start_epoch_carries_the_offline_dropped_signal_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // A complete bracket that elapsed entirely while nothing was recording:
+    // D7 drops both lines rather than minting a turn misdated to boot.
+    std::fs::write(
+        root.join(".agentrec/signal.jsonl"),
+        concat!(
+            "{\"v\":1,\"ts\":1,\"tool\":\"claude\",\"event\":\"start\"}\n",
+            "{\"v\":1,\"ts\":2,\"tool\":\"claude\"}\n",
+        ),
+    )
+    .unwrap();
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+    let log = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).unwrap();
+    daemon.kill();
+
+    let starts: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "epoch" && v["event"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 1, "one start epoch for one daemon run: {log}");
+    assert_eq!(
+        starts[0]["dropped_signals"], 2,
+        "the start epoch must carry the gap's dropped turn-boundary count: {}",
+        starts[0]
+    );
+
+    // D7 unchanged: the drop is announced, never replayed into a turn.
+    assert!(
+        !log.lines().any(|l| l.contains("\"grade\"")),
+        "no phantom turn may be minted from the dropped bracket: {log}"
+    );
+}
+
 #[test]
 fn doctor_healthy_all_pass_exit_0() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5257,6 +5316,207 @@ fn doctor_healthy_all_pass_exit_0() {
     assert!(
         !stdout.to_lowercase().contains("fail"),
         "healthy repo must report no failures: {stdout}"
+    );
+}
+
+// ---- MCP host registration + demand sweep (E4) -------------------------------
+
+/// AC-E4 end-to-end through the real binary: `init --codex` registers the
+/// agentrec MCP server in BOTH repo-local registries, `uninstall` removes
+/// exactly ours, and a foreign server pre-seeded in each file is untouched.
+#[test]
+fn init_registers_mcp_server_and_uninstall_removes_only_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let mcp_json = root.join(".mcp.json");
+    let codex_toml = root.join(".codex").join("config.toml");
+    let foreign_json = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {"other": {"command": "other-tool", "args": ["serve"]}}
+    }))
+    .unwrap();
+    std::fs::write(&mcp_json, &foreign_json).unwrap();
+    std::fs::write(
+        &codex_toml,
+        "[mcp_servers.other]\ncommand = \"other-tool\"\nargs = [\"serve\"]\n",
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let after_init: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_json).unwrap()).unwrap();
+    assert_eq!(after_init["mcpServers"]["agentrec"]["command"], "agentrec");
+    assert_eq!(after_init["mcpServers"]["agentrec"]["args"][0], "mcp");
+    let toml_after_init: toml::Table = std::fs::read_to_string(&codex_toml)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        toml_after_init["mcp_servers"]["agentrec"]["command"].as_str(),
+        Some("agentrec"),
+        "codex registration missing: {toml_after_init:?}"
+    );
+
+    let out = agentrec(root, &["uninstall", "--no-service"]);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(&mcp_json).unwrap(),
+        foreign_json,
+        ".mcp.json must be back to its pre-init bytes, foreign server intact"
+    );
+    let toml_after_uninstall: toml::Table = std::fs::read_to_string(&codex_toml)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        toml_after_uninstall["mcp_servers"]
+            .get("agentrec")
+            .is_none(),
+        "our registration must be gone: {toml_after_uninstall:?}"
+    );
+    assert_eq!(
+        toml_after_uninstall["mcp_servers"]["other"]["command"].as_str(),
+        Some("other-tool"),
+        "the foreign codex server must survive"
+    );
+}
+
+/// AC-E4: `doctor` reports the registration AND actually round-trips
+/// `initialize` against a spawned `agentrec mcp`.
+///
+/// The discriminating assertion is `remedy == null` on the `mcp server` row:
+/// every failure mode of the probe (skip, spawn failure, timeout, junk frame)
+/// is an advisory carrying a note, and `status` is `pass` in all of them, so
+/// asserting only the status would pass under a probe that never ran.
+#[test]
+fn doctor_reports_mcp_registration_and_server_answers_initialize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-service"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+
+    let report = doctor_json_value(root);
+    let checks = report["checks"].as_array().expect("checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name:?} check: {report}"))
+    };
+
+    let registration = find("mcp registration");
+    assert_eq!(registration["status"], "pass", "{registration}");
+    assert!(
+        registration["remedy"].is_null(),
+        "a registered repo needs no note: {registration}"
+    );
+
+    let server = find("mcp server");
+    assert_eq!(server["status"], "pass", "{server}");
+    assert!(
+        server["remedy"].is_null(),
+        "the probe must have spawned `agentrec mcp` and read a valid initialize \
+         result — any other outcome carries a note: {server}"
+    );
+}
+
+/// A repo initialized without the Claude Code integration (`--no-hook`) has no
+/// `.mcp.json`. That is reported as an advisory NOTE, never a failure: it
+/// breaks no recording, and every pre-E4 repo is in this state.
+#[test]
+fn doctor_reports_absent_mcp_registration_without_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-service", "--no-hook"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+    assert!(
+        !root.join(".mcp.json").exists(),
+        "--no-hook must not write a registration"
+    );
+
+    let report = doctor_json_value(root);
+    let registration = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "mcp registration")
+        .unwrap_or_else(|| panic!("no mcp registration check: {report}"))
+        .clone();
+    assert_eq!(registration["status"], "pass", "{registration}");
+    let remedy = registration["remedy"].as_str().unwrap_or("");
+    assert!(
+        remedy.contains(".mcp.json"),
+        "the note must name the file: {registration}"
+    );
+}
+
+fn demand_sweep_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts")
+        .join("mcp-demand-sweep.sh")
+}
+
+/// AC-E4: the gap-10 instrument runs against a synthetic `~/.claude/projects`
+/// and prints the candidate invocations it found. `HOME` is overridden so the
+/// script exercises its DEFAULT path (no argument), which is the way it will
+/// actually be run.
+#[test]
+fn mcp_demand_sweep_prints_candidate_invocations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let projects = home.join(".claude").join("projects").join("some-repo");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("session.jsonl"),
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\
+         \"name\":\"mcp__agentrec__agentrec_blame\"}]}}\n\
+         {\"name\":\"mcp__agentrec__agentrec_blame\"}\n\
+         {\"name\":\"Read\"}\n",
+    )
+    .unwrap();
+
+    let out = Command::new("bash")
+        .arg(demand_sweep_script())
+        .env("HOME", home)
+        .output()
+        .expect("run the demand sweep");
+    assert!(out.status.success(), "sweep failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("candidate invocations: 2"),
+        "expected both candidates counted: {stdout}"
+    );
+    assert!(
+        stdout.contains("agentrec_blame"),
+        "expected the tool named: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"name\":\"Read\""),
+        "a non-agentrec tool must not be reported: {stdout}"
+    );
+}
+
+/// The instrument must survive a machine that has never run Claude Code:
+/// absent transcript directory -> a printed explanation and exit 0, never a
+/// failure (it is a monthly cron-shaped chore, not a gate).
+#[test]
+fn mcp_demand_sweep_handles_absent_transcript_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new("bash")
+        .arg(demand_sweep_script())
+        .env("HOME", tmp.path())
+        .output()
+        .expect("run the demand sweep");
+    assert!(out.status.success(), "sweep must exit 0: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("nothing to sweep"),
+        "expected the absent-dir explanation: {stdout}"
     );
 }
 
@@ -5692,6 +5952,394 @@ fn doctor_state_parse_advisory_never_flips_exit() {
             .contains("signal_offset"),
         "expected the remedy to name the bad field: {v}"
     );
+}
+
+// --- C3: Codex hook install/uninstall/doctor, end-to-end through the real
+// binary (unit-level coverage of the same logic lives in
+// initcmd.rs/doctorcmd.rs/uninstallcmd.rs's own `#[cfg(test)]` modules —
+// these exercise the CLI surface: flag wiring, printed remedy text, and
+// process exit codes).
+
+fn read_codex_hooks_json(root: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap()
+}
+
+// AC-C3 table: state "none" -> defaults to creating `.codex/hooks.json`
+// with all three events.
+#[test]
+fn codex_init_none_creates_hooks_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Codex hooks installed"), "{stdout}");
+    assert!(
+        stdout.contains("/hooks"),
+        "expected the trust reminder: {stdout}"
+    );
+
+    let settings = read_codex_hooks_json(root);
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        let arr = settings["hooks"][event].as_array().unwrap_or_else(|| {
+            panic!("missing {event} in {settings}");
+        });
+        assert!(arr[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("agentrec hook codex"));
+    }
+    assert_eq!(
+        settings["hooks"]["PostToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap(),
+        "apply_patch"
+    );
+}
+
+// AC-C3 table: state "hooks.json-only" (with a foreign entry) -> merges,
+// preserving the foreign entry.
+#[test]
+fn codex_init_hooks_json_only_preserves_foreign_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(
+        root.join(".codex/hooks.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    // SUBSTITUTED ASSERTION (Task E4, recorded in VERIFY-LEDGER.md § "Task E4").
+    // This line read `assert!(!root.join(".codex/config.toml").exists())`. E4
+    // makes `init --codex` write the MCP registration into that file (parent
+    // spec :582 pins it as the registration home), so the file now exists by
+    // design. The invariant the original assertion protected — agentrec never
+    // creates a SECOND hook representation — is asserted directly and more
+    // specifically instead: no `hooks` key at all, and `mcp_servers` as the
+    // file's only table.
+    let config: toml::Table = std::fs::read_to_string(root.join(".codex/config.toml"))
+        .expect("E4 writes the MCP registration here")
+        .parse()
+        .unwrap();
+    assert!(
+        config.get("hooks").is_none(),
+        "no second hook representation may be created: {config:?}"
+    );
+    assert_eq!(
+        config.keys().collect::<Vec<_>>(),
+        vec!["mcp_servers"],
+        "only the MCP registration belongs in a file agentrec created here: {config:?}"
+    );
+    assert_eq!(
+        config["mcp_servers"]["agentrec"]["command"].as_str(),
+        Some("agentrec")
+    );
+
+    let settings = read_codex_hooks_json(root);
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 2, "foreign entry must survive: {settings}");
+    assert!(stop
+        .iter()
+        .any(|e| e["hooks"][0]["command"] == "other-tool"));
+}
+
+// AC-C3 table: state "[hooks]-only" -> merges into inline config.toml, never
+// creating hooks.json.
+#[test]
+fn codex_init_config_toml_only_merges_inline_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "model = \"o3\"\n\n[hooks]\n",
+    )
+    .unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    assert!(
+        !root.join(".codex/hooks.json").exists(),
+        "must not also create hooks.json when inline [hooks] is the target"
+    );
+
+    let text = std::fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    assert!(text.contains("agentrec hook codex"), "{text}");
+    assert!(text.contains("model"), "unrelated key must survive: {text}");
+}
+
+// Dry-run must PRINT the same codex decision the real run would take, and
+// write nothing. Lives here rather than in `initcmd`'s unit tests because
+// asserting on printed output in-process needs process-global stdout fd
+// redirection, which hijacks every concurrently-running test's output
+// under cargo's threaded runner; driving the real binary has no such
+// hazard. Pairs with `initcmd::tests::dry_run_with_codex_touches_nothing`,
+// which covers the filesystem half.
+#[test]
+fn codex_init_dry_run_prints_install_line_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(
+        root,
+        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "init --codex --dry-run failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[dry-run] would install Codex hooks"),
+        "{stdout}"
+    );
+    assert!(
+        !root.join(".codex").exists(),
+        "dry-run must not create .codex/"
+    );
+}
+
+// Same, for the refuse decision: dry-run against the "both present" state
+// must print the refusal (not the install line) and leave both files byte-
+// identical. Pins that `run` and `print_dry_run` cannot silently diverge on
+// which decision they reach.
+#[test]
+fn codex_init_dry_run_prints_refuse_line_when_both_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let hooks_json_before = "{\"hooks\":{}}\n";
+    let config_toml_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/hooks.json"), hooks_json_before).unwrap();
+    std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
+
+    let out = agentrec(
+        root,
+        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
+    );
+    assert!(
+        out.status.success(),
+        "init --codex --dry-run failed: {out:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(stdout.contains("both"), "{stdout}");
+    assert!(
+        !stdout.contains("would install Codex hooks"),
+        "dry-run must not claim it would install when it would refuse: {stdout}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+        hooks_json_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_toml_before
+    );
+}
+
+// AC-C3 table: state "both" -> refuse, neither file touched, no .bak.
+#[test]
+fn codex_init_both_present_refuses_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let hooks_json_before = "{\"hooks\":{}}\n";
+    std::fs::write(root.join(".codex/hooks.json"), hooks_json_before).unwrap();
+    let config_toml_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(stdout.contains("both"), "{stdout}");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+        hooks_json_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_toml_before
+    );
+    assert!(!root.join(".codex/hooks.json.bak").exists());
+    assert!(!root.join(".codex/config.toml.bak").exists());
+}
+
+/// E4's gate on the dual-hook-representation refusal, pinned separately from
+/// the C3 test above: MCP registration is a DIFFERENT layer, so it takes an
+/// explicit decision to withhold it — and withholding it is what keeps
+/// `init`'s printed "refuses … leaves both untouched" line true.
+#[test]
+fn codex_init_both_present_writes_no_mcp_registration_either() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    std::fs::write(root.join(".codex/hooks.json"), "{\"hooks\":{}}\n").unwrap();
+    let config_before = "[hooks]\n";
+    std::fs::write(root.join(".codex/config.toml"), config_before).unwrap();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success(), "init --codex failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("skipped Codex MCP registration"),
+        "the withheld registration must be announced, not silent: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        config_before,
+        "no [mcp_servers] table may appear in a file we promised not to touch"
+    );
+    assert!(!root.join(".codex/config.toml.bak").exists());
+}
+
+// AC-C3 table: "idempotent-reinstall" — the whole file, and every
+// agentrec-owned ENTRY specifically, is byte-identical across two
+// `agentrec init --codex` runs (not just the command string: a changed
+// timeout or matcher breaks trust exactly the same way).
+#[test]
+fn codex_init_idempotent_reinstall_is_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out1 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out1.status.success());
+    let first_bytes = std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
+    let first = read_codex_hooks_json(root);
+
+    let out2 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        stdout2.contains("already present"),
+        "second run must be a no-op: {stdout2}"
+    );
+    let second_bytes = std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
+    let second = read_codex_hooks_json(root);
+
+    assert_eq!(first_bytes, second_bytes, "whole file byte-identical");
+    for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+        assert_eq!(
+            first["hooks"][event], second["hooks"][event],
+            "whole entry for {event} must be byte-stable across reinstalls"
+        );
+    }
+}
+
+// Codex integration is opt-in: a plain `agentrec init` (no --codex) must
+// never touch `.codex/` at all.
+#[test]
+fn codex_init_without_flag_touches_nothing_under_codex_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
+    assert!(!root.join(".codex").exists());
+}
+
+// `agentrec uninstall` reverses `init --codex` — mirrors the Claude Code
+// hook removal, which is already covered by existing uninstall tests.
+#[test]
+fn codex_uninstall_removes_installed_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    assert!(root.join(".codex/hooks.json").exists());
+
+    let out = agentrec(root, &["uninstall", "--no-service"]);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed agentrec hook entries from Codex hook config"),
+        "{stdout}"
+    );
+
+    let settings = read_codex_hooks_json(root);
+    assert!(
+        settings.get("hooks").is_none(),
+        "all agentrec-only events must be fully removed: {settings}"
+    );
+}
+
+// AC-C3 doctor case: `[features] hooks = false` reports degraded (Fail,
+// nonzero exit).
+#[test]
+fn doctor_codex_hooks_feature_off_reports_degraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "[features]\nhooks = false\n",
+    )
+    .unwrap();
+
+    let out = doctor(root);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("codex hook flags"), "{stdout}");
+    assert!(stdout.contains("[features] hooks = false"), "{stdout}");
+}
+
+// AC-C3 doctor case: `allow_managed_hooks_only = true` ALSO reports
+// degraded, same severity.
+#[test]
+fn doctor_codex_managed_hooks_only_reports_degraded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    assert!(out.status.success());
+    std::fs::write(
+        root.join(".codex/config.toml"),
+        "allow_managed_hooks_only = true\n",
+    )
+    .unwrap();
+
+    let out = doctor(root);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("codex hook flags"), "{stdout}");
+    assert!(
+        stdout.contains("allow_managed_hooks_only = true"),
+        "{stdout}"
+    );
+}
+
+// A repo that never opted into Codex must report `n/a`, never a fabricated
+// failure — codex hook checks must not appear as "fail" text in an
+// otherwise-healthy repo (mirrors `doctor_healthy_all_pass_exit_0`'s own
+// no-failure-substring assertion).
+#[test]
+fn doctor_codex_checks_are_na_without_codex_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let out = agentrec(root, &["init", "--no-hook", "--no-service"]);
+    assert!(out.status.success());
+
+    let v = doctor_json_value(root);
+    let checks = v["checks"].as_array().unwrap();
+    for name in ["codex hooks", "codex hook flags"] {
+        let check = checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} check in {v}"));
+        assert_eq!(check["status"], "n/a", "{name}: {v}");
+    }
 }
 
 // --- AC-Z+2, AC-Z+3, AC-Z+4 (D42/D43): relative-time default / --utc
@@ -9494,6 +10142,245 @@ impl Drop for SingleDaemonGuard {
     }
 }
 
+/// The daemon's OWN snapshot read — `agentrec_core::fsguard::read_regular` at
+/// `daemon.rs::Recorder::stage`'s regular-file arm — had no regression test at
+/// all: every other fifo test in this repo pins a CLI or MCP read path.
+///
+/// The blast radius is not one bad entry. Without the guard the daemon blocks
+/// forever inside the snapshot loop, so the turn record is never appended and
+/// EVERY file in that turn is lost, including files nothing was wrong with.
+/// The control file is what detects that: it is written in the same burst as
+/// the fifo so both land in the SAME turn, and a stalled recorder therefore
+/// loses the control entry too. An assertion on the fifo entry alone would
+/// stay silent about the far larger failure.
+///
+/// **The fixture REPLACES a watched regular file with a fifo rather than
+/// creating a fifo outright. That choice is for determinism, not necessity.**
+/// Fresh-FIFO delivery was settled by a persisted 4x4 probe matrix
+/// (2026-08-07, `scripts/probe-fresh-fifo-delivery.sh`, 4 runs per shape, one
+/// macOS machine; raw tallies in `docs/verify/fresh-fifo-delivery-probe.txt`):
+/// `bare` 0/4, `rw-open` 0/4, `byte` 0/4, `byte-touch` 4/4. The governing
+/// stimulus is the METADATA event (`touch`) — writing a byte into a fifo
+/// moves data through the kernel pipe buffer without touching on-disk file
+/// data, so FSEvents emits nothing for it. Two earlier gate rounds had
+/// disagreed on the byte row; round 8's "2/2 delivered without touch" does
+/// not reproduce under the persisted shapes and its own commands were never
+/// persisted — superseded by this matrix. Caveats that stand: the negatives
+/// are 12 consistent runs on ONE machine (FSEvents false-negatives remain
+/// the plausible flake direction), and every delivered fifo turn in the
+/// earlier rounds rendered `op: "create", skipped_reason: "unreadable"` —
+/// the guard handles the fresh-FIFO shape end-to-end whenever it is reached.
+///
+/// Mechanism, verified against this repo's source rather than notify
+/// internals: file staging on macOS is kind-agnostic — every watched-class
+/// path lands in `pending` via the `Class::Watch` arm's closing
+/// `pending.insert(path)` (`daemon.rs::apply_watch_result`), and the only
+/// `EventKind::Create(_)` match in production code is Linux-only directory
+/// admission; the macOS arm deliberately excludes `Create` (pinned by
+/// `create_kind_does_not_admit_on_macos`). So delivery hinges entirely on
+/// whether FSEvents emits any event for the path. Delete-then-mkfifo
+/// reliably does (the delete), and by the time `stage` resolves the path it
+/// is a fifo — a deterministic shape, and a realistic one (any path an agent
+/// replaces in-place).
+///
+/// The fifo is opened READ-WRITE and the handle held for the rest of the test.
+/// That is what makes the fixture reproduce the hazard without the test itself
+/// blocking: under a neutered guard the daemon's `fs::read` consumes the one
+/// byte and then blocks waiting for an EOF this live writer never delivers.
+///
+/// STALLS the daemon rather than failing it on regression; the bounded polls
+/// below are what turn that stall into a RED.
+#[test]
+#[cfg(unix)]
+fn daemon_snapshots_a_fifo_as_skipped_without_losing_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    let mut daemon = SingleDaemonGuard::spawn(root);
+
+    // Phase 1: an ordinary file, recorded normally. This both establishes the
+    // watched path the fifo will later occupy and proves the daemon records at
+    // all — the rest of the test is moot otherwise.
+    std::fs::write(root.join("f.txt"), b"a\n").unwrap();
+    let saw_regular = poll_until(Duration::from_secs(25), || {
+        turns(root)
+            .iter()
+            .any(|t| turn_file(t, "f.txt").is_some())
+            .then_some(())
+    });
+    assert!(
+        saw_regular.is_some(),
+        "positive control never recorded — the daemon is not recording, so this \
+         run proves nothing about the fifo guard"
+    );
+
+    // Phase 2: replace that path with a fifo, in the same burst as a fresh
+    // control file. No sleep between them: the 1.5s debounce folds both into
+    // one turn, and that co-location is the whole point of the control.
+    std::fs::remove_file(root.join("f.txt")).unwrap();
+    let fifo = root.join("f.txt");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+    // Named binding, NOT `let _ =`: dropping the handle here closes the write
+    // end, and a neutered guard would then hang at `open` rather than mid-read
+    // — a different hazard than the one this test claims to pin.
+    let mut fifo_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open fifo read-write");
+    fifo_handle.write_all(b"x").expect("write into fifo");
+    std::fs::write(root.join("control.rs"), b"fn control() {}\n").unwrap();
+
+    // Debounce (1.5s) + quiet window (10s) + slack. Keyed on ONE turn carrying
+    // BOTH paths: phase 1's turn carries `f.txt` alone and must not satisfy it.
+    let entries = poll_until(Duration::from_secs(30), || {
+        turns(root)
+            .iter()
+            .find_map(|t| Some((turn_file(t, "f.txt")?, turn_file(t, "control.rs")?)))
+    });
+
+    daemon.kill();
+    drop(fifo_handle);
+
+    let (fifo_entry, control_entry) = entries.expect(
+        "no single turn carried both the fifo and the control file within the poll \
+         window. What this timeout OBSERVES is only that: the two paths never \
+         appeared in one turn record. Two causes produce it and the timeout alone \
+         cannot tell them apart — (1) the fsguard regression this pins: the recorder \
+         stalled inside the guarded snapshot read, so the turn was never appended \
+         and every file in it was lost; (2) FSEvents delivered the fifo and the \
+         control file in batches more than the 1.5s debounce apart, splitting them \
+         across two turns that each exist and are each complete. Rerun to \
+         distinguish: (2) is intermittent and leaves both paths present in \
+         log.jsonl in separate turns, (1) reproduces every time and leaves neither",
+    );
+
+    // (1) The fifo is recorded HONESTLY: refused rather than read, and no hash
+    //     fabricated for bytes that were never obtained.
+    assert_eq!(
+        fifo_entry.get("skipped").and_then(|v| v.as_bool()),
+        Some(true),
+        "the fifo must be recorded as skipped: {fifo_entry:?}"
+    );
+    assert_eq!(
+        fifo_entry.get("skipped_reason").and_then(|v| v.as_str()),
+        Some("unreadable"),
+        "the fifo's skip cause must be `unreadable`: {fifo_entry:?}"
+    );
+    assert!(
+        fifo_entry.get("after").map(|v| v.is_null()).unwrap_or(true),
+        "no content hash may be fabricated for a file whose bytes were never \
+         read: {fifo_entry:?}"
+    );
+
+    // (2) The ordinary file mutated in the SAME turn is recorded normally.
+    //     A fifo must cost one entry, never the recorder.
+    // `skipped` is `skip_serializing_if` false on the wire, so absent == false.
+    assert_ne!(
+        control_entry.get("skipped").and_then(|v| v.as_bool()),
+        Some(true),
+        "an ordinary file sharing a turn with a fifo must still be snapshotted: \
+         {control_entry:?}"
+    );
+    assert!(
+        control_entry
+            .get("after")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "the control file must carry a real content hash: {control_entry:?}"
+    );
+}
+
+/// The WRITE-side mirror of the fifo test above, and the half the
+/// `disallowed-methods` lint cannot reach: `record.rs::open_append` is the one
+/// primitive behind every `log.jsonl`/`signal.jsonl`/`memory.jsonl` append, and
+/// it opened its target with a bare `OpenOptions::append`. Opening a FIFO for
+/// APPEND blocks until a READER appears — no timeout, no error — so a named
+/// pipe at `.agentrec/signal.jsonl` (a path the sandboxed agent can create;
+/// `mkfifo` needs no privileges) wedged `agentrec hook claude` forever.
+/// Reproduced live before the guard landed: exit 142 under `alarm`, vs exit 0
+/// with an ordinary file there.
+///
+/// A wedged hook is worse than a lost signal: Claude Code waits on the hook
+/// process, so the whole agent turn stalls on a file nothing needed to read.
+///
+/// HANGS rather than fails on regression — the bounded `try_wait` poll below
+/// is what turns that hang into a RED. No reader is ever opened on the fifo,
+/// which is what makes the block reproducible rather than timing-dependent.
+#[test]
+#[cfg(unix)]
+fn a_fifo_signal_inbox_does_not_wedge_the_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    // `init` does not create signal.jsonl, so this occupies the path outright.
+    let sig = root.join(".agentrec/signal.jsonl");
+    assert!(!sig.exists(), "fixture must be the only thing at this path");
+    let c = std::ffi::CString::new(sig.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "fixture must actually create a fifo"
+    );
+
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    // Dropped immediately: the hook reads its event to EOF, and a stdin left
+    // open would stall it for a reason unrelated to the fifo.
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(br#"{"hook_event_name":"Stop","session_id":"s_fifo"}"#)
+            .unwrap();
+    }
+
+    let exited = poll_until(Duration::from_secs(20), || child.try_wait().ok().flatten());
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "`agentrec hook claude` never exited with a fifo at \
+                 .agentrec/signal.jsonl — the append-side fsguard refusal in \
+                 record.rs::open_append is gone and the hook is blocked inside \
+                 `OpenOptions::append().open()` waiting for a reader that never \
+                 comes"
+            );
+        }
+    };
+
+    // The hook must TERMINATE; whether it reports the refusal as a failure
+    // exit or swallows it is not what this pins, so assert only that it did
+    // not die on a signal (which is how a killed-because-blocked process
+    // would look if the poll above were ever loosened).
+    assert!(
+        status.code().is_some(),
+        "hook must exit normally, not die on a signal: {status:?}"
+    );
+}
+
+/// The `files` entry for `path` in turn record `t`, if present.
+fn turn_file(t: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    t.get("files")?
+        .as_array()?
+        .iter()
+        .find(|f| f.get("path").and_then(|p| p.as_str()) == Some(path))
+        .cloned()
+}
+
 // AC-F10.6: the sibling test above only races an IN-PROCESS `append_memory`
 // writer against the hook — it never starts a real `agentrec record` daemon
 // and never validates `state.json`, so it doesn't actually prove the stated
@@ -10019,6 +10906,299 @@ fn daemon_periodic_tick_evicts_after_startup_pass() {
         stderr_text.contains("evicted") && stderr_text.contains("blob"),
         "expected one stderr eviction line from the daemon: {stderr_text}"
     );
+}
+
+// ---- Config hard-error split (gate finding, D16 remediation): `daemon::run`
+// hard-fails once, at startup, on a config.toml that fails to parse; a
+// config that goes bad AFTER a clean boot must degrade per-tick, never crash
+// the running process — see `daemon.rs`'s `config::load` gate (right after
+// `acquire_lock`) and `cmds::effective_store_budget`'s doc comment.
+
+/// The startup gate sits before the watch loop is ever entered, so a
+/// malformed config makes the process return `Err` and exit on its own —
+/// no spawn-then-kill needed, and `agentrec()`'s blocking `.output()` is
+/// safe here precisely because a healthy `record` invocation would never
+/// return (it loops forever), while this one must.
+#[test]
+fn daemon_startup_refuses_on_malformed_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    let out = agentrec(root, &["record"]);
+    assert!(
+        !out.status.success(),
+        "daemon must refuse to start on an unparseable config.toml: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("config.toml") && stderr.contains("line"),
+        "startup refusal must name the file and the line: {stderr}"
+    );
+}
+
+/// Same over-budget-after-live shape as `daemon_periodic_tick_evicts_after_
+/// startup_pass`, but with `config.toml` corrupted the instant the daemon is
+/// confirmed live.
+///
+/// CORRECTED (round-2 gate follow-up on commit `9fee3ee`, which added this
+/// test): the doc comment and that commit's message both used to claim "the
+/// eviction still firing is what proves the mid-tick budget read actually
+/// executed and degraded". That is FALSE as written. This test drives the
+/// budget entirely through `AGENTREC_TEST_STORE_BUDGET_BYTES`, and `cmds::
+/// effective_store_budget`'s debug env-override arm `return`s BEFORE
+/// `config::load_or_default` — the actual config-parsing path — is ever
+/// reached. So the corrupted `config.toml` written to disk below is never
+/// parsed by the budget path in this test at all.
+///
+/// What this test actually proves: the daemon's per-poll `read_memory_
+/// enabled` re-read (a DIFFERENT config consumer, invoked every ~250ms tick
+/// regardless of the eviction interval) survives parsing a corrupted file
+/// repeatedly without crashing the process; `try_wait` below confirms the
+/// process itself never exited. It does NOT exercise, and cannot
+/// discriminate a regression in, the mid-tick BUDGET read's own tolerance —
+/// a budget read changed from tolerant (`effective_store_budget`) to
+/// hard-error-propagating would still pass this test unchanged, because the
+/// env override bypasses config parsing before that code would ever run.
+/// See `daemon_survives_config_corruption_with_real_budget_from_file` below
+/// for a test that sources the budget from a real on-disk `config.toml`
+/// (no env override) and so genuinely covers that path.
+#[test]
+fn daemon_mid_tick_survives_config_corruption_after_startup() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[
+            ("AGENTREC_TEST_STORE_BUDGET_BYTES", "5"),
+            ("AGENTREC_TEST_EVICT_INTERVAL_MS", "2000"),
+        ],
+    );
+    // `spawn` already blocked on `wait_for_live_daemon` — a clean, valid-
+    // config startup has already happened by this point.
+
+    // Corrupt config.toml AFTER the confirmed-live startup. Mid-tick reads
+    // must tolerate this, not crash the process.
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    // A structurally-visible eviction candidate needs a real committed turn
+    // referencing it — `plan_eviction` walks `log.jsonl`'s turns, never the
+    // raw store, so an unreferenced blob is invisible to it regardless of
+    // budget (same shape as `daemon_periodic_tick_evicts_after_startup_
+    // pass`). `new` is a second, newer turn so A5's "protect the newest turn
+    // while older data exists to sacrifice instead" rule doesn't shield the
+    // victim.
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+    seed_turn(
+        root,
+        &base_turn(
+            "t_MIDTICKCFGCORRUPT0001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_MIDTICKCFGCORRUPT0002", vec![file_entry("new.bin", &new)]),
+    );
+
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        evicted.is_some(),
+        "the recurring eviction tick did not survive a mid-run config.toml \
+         corruption — mid-tick config reads must degrade, never crash. \
+         victim={victim} stderr={stderr_text:?}"
+    );
+    assert!(store.contains(&new), "newest blob must survive: {new}");
+
+    assert!(
+        matches!(
+            daemon.0.as_mut().expect("daemon child handle").try_wait(),
+            Ok(None)
+        ),
+        "daemon process must still be running after config corruption"
+    );
+
+    daemon.kill();
+}
+
+/// Genuinely exercises the mid-tick BUDGET read's tolerance of a corrupted
+/// `config.toml` — the gap `daemon_mid_tick_survives_config_corruption_
+/// after_startup` above cannot close, because that test's budget comes
+/// entirely from `AGENTREC_TEST_STORE_BUDGET_BYTES`, whose env-override arm
+/// in `cmds::effective_store_budget` returns before `config::load_or_
+/// default` (the real config-parsing path) is ever reached.
+///
+/// This test sets NO budget env override anywhere: `store_budget_bytes`
+/// comes only from a real `.agentrec/config.toml` written to disk.
+/// Sequence: (1) seed an over-budget store BEFORE spawning, so the STARTUP
+/// eviction pass (`daemon::run`'s `run_eviction_pass` call, which runs
+/// before the watcher arms — same ordering `daemon_eviction_keeps_
+/// protected_refs` relies on) is what's observed evicting the victim,
+/// proving the low budget genuinely came from the config FILE since no env
+/// var is set anywhere in this test; (2) corrupt `config.toml`; (3) seed a
+/// second, equally-evictable blob and poll `try_wait` across several
+/// eviction ticks, asserting the daemon process never exits.
+///
+/// Per `config::load_or_default`'s own doc comment, a corrupted file
+/// degrades EVERY key back to `Config::default()`, whose `store_budget_
+/// bytes` is `agentrec_core::MAX_STORE_BYTES` — the LARGEST value in play —
+/// so eviction is expected to gracefully CEASE after corruption, not
+/// continue against the last-known-good low budget. This test asserts both
+/// halves: no crash (the `try_wait` loop) and the post-corruption blob
+/// surviving (the observable signature of "ceased", ruling out a stale-
+/// low-budget continuation as a false pass). The crash-direction assertion
+/// is what would catch a regression that changed the mid-tick budget read
+/// from the tolerant `effective_store_budget` to the hard-erroring
+/// `effective_store_budget_checked` (or an equivalent `.unwrap()`) — the
+/// exact crash-loop-under-`launchd KeepAlive` bug this whole fix round
+/// exists to prevent.
+#[test]
+fn daemon_survives_config_corruption_with_real_budget_from_file() {
+    use agentrec_core::record::FileEntry;
+    use agentrec_core::store::BlobStore;
+
+    fn file_entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            before: None,
+            after: Some(hash.to_string()),
+            op: "create".into(),
+            skipped: false,
+            withheld: false,
+            baseline_unknown: false,
+            skipped_reason: None,
+            after_synthesized: None,
+            link_kind: None,
+            attribution: None,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    // Real, valid, low budget written to the actual config file — no
+    // AGENTREC_TEST_STORE_BUDGET_BYTES anywhere in this test.
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "store_budget_bytes = 5\n",
+    )
+    .unwrap();
+
+    let objects_dir = root.join(".agentrec/objects");
+    let store = BlobStore::new(&objects_dir);
+
+    let victim = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim, 3600);
+    let new = store.put(&[0xCCu8; 5]).unwrap();
+    seed_turn(
+        root,
+        &base_turn(
+            "t_REALBUDGETVICTIM00001",
+            vec![file_entry("victim.bin", &victim)],
+        ),
+    );
+    seed_turn(
+        root,
+        &base_turn("t_REALBUDGETNEW0000001", vec![file_entry("new.bin", &new)]),
+    );
+
+    let stderr_path = root.join("daemon-stderr.log");
+    let mut daemon = StderrCapturingDaemonGuard::spawn(
+        root,
+        &stderr_path,
+        &[("AGENTREC_TEST_EVICT_INTERVAL_MS", "500")],
+    );
+
+    let evicted = poll_until(Duration::from_secs(6), || {
+        (!store.contains(&victim)).then_some(())
+    });
+    assert!(
+        evicted.is_some(),
+        "victim blob was not evicted at startup — the real config.toml's \
+         store_budget_bytes = 5 did not reach the budget read"
+    );
+    assert!(
+        store.contains(&new),
+        "newest blob must survive the startup pass"
+    );
+
+    // Corrupt config.toml AFTER the confirmed-live, confirmed-evicting
+    // startup pass.
+    std::fs::write(root.join(".agentrec/config.toml"), "ttl_days = [unclosed").unwrap();
+
+    // A second, equally over-budget candidate, added post-corruption — only
+    // a post-corruption tick can act on it either way.
+    let victim2 = store.put(&[0x11u8; 500]).unwrap();
+    backdate_blob(&objects_dir, &victim2, 3600);
+    seed_turn(
+        root,
+        &base_turn(
+            "t_REALBUDGETVICTIM00002",
+            vec![file_entry("victim2.bin", &victim2)],
+        ),
+    );
+
+    // Poll across several ~500ms eviction ticks (well past the interval),
+    // asserting the process is alive at every check — not just once at the
+    // end — so a crash on any individual tick's corrupted-config read is
+    // caught regardless of which tick it happens on.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(
+            matches!(
+                daemon.0.as_mut().expect("daemon child handle").try_wait(),
+                Ok(None)
+            ),
+            "daemon process must not exit while ticking against a \
+             corrupted config.toml on the real (non-env-override) budget \
+             path"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Per `config::load_or_default`'s documented degrade-to-default
+    // behavior, the corrupted file reverts `store_budget_bytes` to
+    // `MAX_STORE_BYTES` — eviction gracefully CEASES rather than continuing
+    // against the stale low budget, so the post-corruption blob survives.
+    assert!(
+        store.contains(&victim2),
+        "post-corruption blob should survive: a corrupted config.toml \
+         degrades store_budget_bytes back to MAX_STORE_BYTES, not to a \
+         crash and not to the last-known-good low value"
+    );
+
+    daemon.kill();
 }
 
 // ---- P5: `--json` read contracts for `diff`, `blame`, `status` -----------
@@ -10772,6 +11952,734 @@ mod service_leak_guard {
             !stdout.contains(bin()),
             "the unit must not record the resolved target {}: {stdout}",
             bin()
+        );
+    }
+}
+
+/// C2: `agentrec hook codex`, fixture-driven against the REAL, COMMITTED
+/// payloads in `docs/fixtures/codex/` (captured live against Codex CLI
+/// 0.146.0 — see `docs/verify/codex-spike.md`). These tests pipe the
+/// committed fixture BYTES verbatim wherever a single self-consistent event
+/// is under test; the one exception (`full_turn_...`, documented at its
+/// definition) needs a `Stop` payload whose `session_id`/`turn_id` matches
+/// the committed `PostToolUse` pair, which no two committed fixtures share
+/// (each was captured from a separate live run) — that test starts from the
+/// real `stop.json` fixture's bytes and overrides only those two id fields,
+/// never inventing a payload shape the spike didn't observe.
+mod codex_hook {
+    use super::*;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs/fixtures/codex")
+            .join(name)
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(fixture_path(name))
+            .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+    }
+
+    /// Same shape as `send_hook_capture` but for `hook codex` — captures
+    /// stdout/stderr/status so the stdout-silence assertions have something
+    /// to check.
+    fn send_hook_codex(root: &Path, payload: &str) -> Output {
+        let mut child = Command::new(bin())
+            .args(["hook", "codex", "--root", root.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook codex");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn scratch_entries(root: &Path) -> Vec<serde_json::Value> {
+        let text =
+            std::fs::read_to_string(root.join(".agentrec/codex-scratch.jsonl")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// `cwd` in every committed fixture — `apply_patch` paths are relative
+    /// to it, and the emitter absolutizes against it before the path ever
+    /// reaches scratch or `signal.jsonl` (see `hookcmds::absolutize`).
+    const FIXTURE_CWD: &str = "/REDACTED/scratch-repo";
+
+    #[test]
+    fn user_prompt_submit_fixture_produces_scrubbed_start_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let payload = fixture("user_prompt_submit.json");
+        let out = send_hook_codex(root, &payload);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "UserPromptSubmit must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["tool"], "codex");
+        assert_eq!(sig["event"], "start");
+        assert_eq!(sig["session"], "019fd1b4-aa34-7721-8d1d-fb198c45ecd6");
+        assert_eq!(sig["emitter_turn"], "019fd1b4-aa71-7a41-a9b2-fa189d8689e8");
+        assert_eq!(
+            sig["prompt"], "Say hello. Do not run any commands or edit any files.",
+            "harmless prompt must survive scrub unchanged: {sig:?}"
+        );
+        assert!(
+            sig.get("files_written").is_none(),
+            "a start signal must never carry files_written: {sig:?}"
+        );
+        // Fix 2: the committed fixture's own `model` field must reach the
+        // wire on the start signal.
+        assert_eq!(
+            sig["model"], "gpt-5.6-terra",
+            "UserPromptSubmit's model must reach signal.jsonl: {sig:?}"
+        );
+    }
+
+    /// Proves the emitter reuses `agentrec_core::scrub::scrub` (constraint:
+    /// "do not write a second scrubber") rather than passing the prompt
+    /// through untouched — a fixture-derived payload with a fake AWS key
+    /// spliced into the real prompt text must come out redacted.
+    #[test]
+    fn user_prompt_submit_prompt_is_scrubbed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("user_prompt_submit.json")).unwrap();
+        let secret = "AKIAABCDEFGHIJKLMNOP"; // AWS-key shape scrub.rs matches.
+        payload["prompt"] = serde_json::Value::String(format!("here is a key: {secret}"));
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "UserPromptSubmit must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        let prompt = events[0]["prompt"].as_str().unwrap();
+        assert!(
+            !prompt.contains(secret),
+            "raw secret must not reach signal.jsonl: {prompt}"
+        );
+    }
+
+    #[test]
+    fn post_tool_use_fixture_appends_scratch_and_writes_no_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let payload = fixture("post_tool_use_apply_patch.json");
+        let out = send_hook_codex(root, &payload);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "PostToolUse must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        assert!(
+            signal_events(root).is_empty(),
+            "PostToolUse must never append to signal.jsonl"
+        );
+
+        let entries = scratch_entries(root);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0]["session_id"],
+            "019fd1b5-83e9-7300-bc21-b79f709bb12c"
+        );
+        assert_eq!(
+            entries[0]["turn_id"],
+            "019fd1b5-8445-7f91-b3bf-2d5092cd1e3c"
+        );
+        assert_eq!(
+            entries[0]["paths"],
+            serde_json::json!([
+                format!("{FIXTURE_CWD}/hello.txt"),
+                format!("{FIXTURE_CWD}/second.txt"),
+                format!("{FIXTURE_CWD}/to_delete.txt"),
+            ]),
+            "one Update + two Add ops, absolutized against the fixture's cwd: {entries:?}"
+        );
+    }
+
+    /// Full turn: two REAL committed `PostToolUse` fixtures (they share one
+    /// `session_id`/`turn_id` — captured as two separate `apply_patch`
+    /// calls in the same live turn, per the spike) accumulate into scratch,
+    /// then a `Stop` for that same turn drains it. No committed `Stop`
+    /// fixture shares this pair's ids (each fixture is an independent live
+    /// capture), so the `Stop` payload here is the real `stop.json`
+    /// fixture's bytes with ONLY `session_id`/`turn_id` overridden to match
+    /// — every other field, and the overall shape, is exactly what the
+    /// spike observed for a real `Stop` event.
+    #[test]
+    fn full_turn_stop_drains_scratch_into_files_written_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let session_id = "019fd1b5-83e9-7300-bc21-b79f709bb12c";
+        let turn_id = "019fd1b5-8445-7f91-b3bf-2d5092cd1e3c";
+
+        for name in [
+            "post_tool_use_apply_patch.json",
+            "post_tool_use_apply_patch_delete.json",
+        ] {
+            let out = send_hook_codex(root, &fixture(name));
+            assert!(out.status.success(), "{name}: {out:?}");
+            assert!(
+                out.stdout.is_empty(),
+                "{name}: PostToolUse must write nothing to stdout: {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        assert_eq!(scratch_entries(root).len(), 2, "both firings recorded");
+        assert!(signal_events(root).is_empty());
+
+        let mut stop_payload: serde_json::Value =
+            serde_json::from_str(&fixture("stop.json")).unwrap();
+        stop_payload["session_id"] = serde_json::Value::String(session_id.to_string());
+        stop_payload["turn_id"] = serde_json::Value::String(turn_id.to_string());
+
+        let out = send_hook_codex(root, &stop_payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "Stop must write nothing to stdout: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["tool"], "codex");
+        assert_eq!(sig["event"], "stop");
+        assert_eq!(sig["session"], session_id);
+        assert_eq!(sig["emitter_turn"], turn_id);
+        assert_eq!(
+            sig["files_written"],
+            serde_json::json!([
+                format!("{FIXTURE_CWD}/hello.txt"),
+                format!("{FIXTURE_CWD}/second.txt"),
+                format!("{FIXTURE_CWD}/to_delete.txt"),
+            ]),
+            "union across both PostToolUse firings (absolutized), deduped on to_delete.txt: {sig:?}"
+        );
+        // Fix 2: model is deliberately NOT re-sent on stop — see the
+        // module doc's "model" paragraph (start-only, mirroring `prompt`).
+        assert!(
+            sig.get("model").is_none(),
+            "a stop signal must never carry model: {sig:?}"
+        );
+
+        assert!(
+            scratch_entries(root).is_empty(),
+            "drain must remove the consumed entries: {:?}",
+            scratch_entries(root)
+        );
+
+        // Same Stop payload again: drain-once semantics — nothing left to
+        // redeliver, so files_written is ABSENT (not an empty array) on
+        // this second stop signal.
+        let out2 = send_hook_codex(root, &stop_payload.to_string());
+        assert!(out2.status.success(), "{out2:?}");
+        assert!(out2.stdout.is_empty());
+        let events2 = signal_events(root);
+        assert_eq!(events2.len(), 2, "{events2:?}");
+        assert!(
+            events2[1].get("files_written").is_none(),
+            "a second identical Stop must not redeliver the drained files: {:?}",
+            events2[1]
+        );
+    }
+
+    #[test]
+    fn stop_fixture_with_no_scratch_has_files_written_absent_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        // stop.json's own session/turn never had any PostToolUse firing —
+        // piped completely unmodified.
+        let out = send_hook_codex(root, &fixture("stop.json"));
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let sig = &events[0];
+        assert_eq!(sig["event"], "stop");
+        assert!(
+            sig.get("files_written").is_none(),
+            "no scratch for this turn -> files_written must be ABSENT, not []: {sig:?}"
+        );
+        // The literal serialized line must not contain the key at all.
+        let raw = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap();
+        assert!(
+            !raw.contains("files_written"),
+            "absent means the key itself is missing from the wire line: {raw}"
+        );
+    }
+
+    #[test]
+    fn stop_with_corrupt_scratch_file_has_files_written_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        std::fs::write(
+            root.join(".agentrec/codex-scratch.jsonl"),
+            "not valid json at all\n{\"also\": \"not an entry\"}\n",
+        )
+        .unwrap();
+
+        let out = send_hook_codex(root, &fixture("stop.json"));
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "Stop must write nothing to stdout even with corrupt scratch: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].get("files_written").is_none(),
+            "corrupt scratch must degrade to absent, never fabricate []: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn malformed_stdin_is_a_loud_nonzero_exit_with_no_partial_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = send_hook_codex(root, "{ this is not valid json {{{");
+        assert!(
+            !out.status.success(),
+            "malformed stdin must be a nonzero exit: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "even on failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "no partial signal line may be written on a parse failure"
+        );
+        assert!(
+            !root.join(".agentrec/codex-scratch.jsonl").exists(),
+            "no partial scratch line may be written on a parse failure"
+        );
+    }
+
+    /// CI canary (AC-C2): a required field deliberately removed from a real
+    /// fixture must fail LOUDLY, never silently degrade (e.g. Claude's arm
+    /// defaults a missing `hook_event_name` to `"Stop"` — Codex's arm must
+    /// not do the equivalent). Built by mutating the real fixture's parsed
+    /// JSON, since by definition no committed fixture is missing a field.
+    #[test]
+    fn missing_required_field_is_a_loud_failure_not_silent_degradation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("user_prompt_submit.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("session_id")
+            .expect("fixture must have session_id to remove");
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(
+            !out.status.success(),
+            "a required field missing must be a nonzero exit, not a silent default: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("session_id"),
+            "the error should name the missing field: {stderr}"
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "nothing should have been written for a rejected payload"
+        );
+    }
+
+    /// Same canary shape, for `hook_event_name` specifically: Claude's arm
+    /// treats an absent `hook_event_name` as an implicit `"Stop"` — Codex's
+    /// arm must not silently reclassify a payload this way.
+    #[test]
+    fn missing_hook_event_name_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value = serde_json::from_str(&fixture("stop.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("hook_event_name")
+            .unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !root.join(".agentrec/signal.jsonl").exists(),
+            "must not silently treat a missing hook_event_name as Stop"
+        );
+    }
+
+    #[test]
+    fn post_tool_use_missing_tool_input_command_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tool_input")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("command")
+            .unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(scratch_entries(root).is_empty());
+    }
+
+    /// Finding from review: extracted `apply_patch` paths are relative
+    /// (spike: `hello.txt`, no leading `/`) but `files_written` and the
+    /// daemon's `normalize_declared` both require absolute paths — without
+    /// `cwd` to join against, a declaration would be silently unusable
+    /// downstream rather than merely absent. `cwd` is therefore required
+    /// (loud failure), not best-effort.
+    #[test]
+    fn post_tool_use_missing_cwd_is_a_loud_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload.as_object_mut().unwrap().remove("cwd").unwrap();
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "even on a validation failure, stdout must stay empty: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(scratch_entries(root).is_empty());
+    }
+
+    /// Finding from review: a `PostToolUse` firing whose patch contains only
+    /// unparsed op kinds (here: `Move to:`, deliberately not read by
+    /// `apply_patch_paths` — see its doc comment) must extract zero paths
+    /// and, critically, must NOT store an empty scratch entry — that would
+    /// let a later `Stop` drain it into `files_written: []`, an affirmative
+    /// "wrote nothing" that would be false for a file the parser simply
+    /// couldn't see. Hand-crafted: no committed fixture exercises `Move
+    /// to:` (the spike never observed it live), so this starts from the
+    /// real `post_tool_use_apply_patch.json` fixture's bytes with only
+    /// `tool_input.command` replaced.
+    #[test]
+    fn post_tool_use_move_only_patch_extracts_nothing_and_stays_undeclared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        let session_id = payload["session_id"].as_str().unwrap().to_string();
+        let turn_id = payload["turn_id"].as_str().unwrap().to_string();
+        payload["tool_input"]["command"] = serde_json::Value::String(
+            "*** Begin Patch\n*** Move to: new_name.txt\n*** End Patch".to_string(),
+        );
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+        assert!(
+            scratch_entries(root).is_empty(),
+            "a zero-path extraction must not be stored at all"
+        );
+
+        // Confirm end-to-end: a Stop for this exact turn finds nothing to
+        // drain and reports files_written ABSENT, not [].
+        let mut stop_payload: serde_json::Value =
+            serde_json::from_str(&fixture("stop.json")).unwrap();
+        stop_payload["session_id"] = serde_json::Value::String(session_id);
+        stop_payload["turn_id"] = serde_json::Value::String(turn_id);
+        let stop_out = send_hook_codex(root, &stop_payload.to_string());
+        assert!(stop_out.status.success(), "{stop_out:?}");
+        let events = signal_events(root);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].get("files_written").is_none(),
+            "a Move-only patch must never surface as a false empty declaration: {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn post_tool_use_non_apply_patch_tool_is_a_silent_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&fixture("post_tool_use_apply_patch.json")).unwrap();
+        payload["tool_name"] = serde_json::Value::String("shell".to_string());
+
+        let out = send_hook_codex(root, &payload.to_string());
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty());
+        assert!(
+            scratch_entries(root).is_empty(),
+            "a non-apply_patch PostToolUse must not be accumulated"
+        );
+        assert!(signal_events(root).is_empty());
+    }
+}
+
+/// O5 fix (phase-2-tail): the hook's root, absent an explicit `--root`, is
+/// now discovered by walking up from cwd to the nearest ancestor carrying
+/// `.agentrec/` — see `main.rs::resolve_hook_root`. O5's live measurement
+/// (`docs/verify/o5-two-tool-session.md`) found that BOTH the installed
+/// Codex hook (`agentrec hook codex`, no `--root`) and the installed Claude
+/// hook (`agentrec hook claude`, no `--root`) inherit cwd = wherever the
+/// agent process itself was launched from — a launch from a subdirectory
+/// silently minted a second, invisible `.agentrec/` there and lost the
+/// signal for good, with no error. These tests drive the REAL binary with
+/// `current_dir` set to a subdirectory and deliberately omit `--root`,
+/// mirroring exactly how the installed hook command (a bare `agentrec hook
+/// <tool>`, per `initcmd.rs`'s `HOOK_COMMAND`/`CODEX_HOOK_COMMAND`) is
+/// actually invoked in production.
+mod hook_root_discovery {
+    use super::*;
+
+    fn codex_fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("docs/fixtures/codex")
+                .join(name),
+        )
+        .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+    }
+
+    /// Spawn `agentrec hook <tool>` with NO `--root`, cwd set to `dir`,
+    /// stdin fed `payload`. Returns the captured output.
+    fn send_hook_from_dir(dir: &Path, tool: &str, payload: &str) -> Output {
+        let mut child = Command::new(bin())
+            .args(["hook", tool])
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook (no --root)");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// The load-bearing regression: `hook codex` invoked from three levels
+    /// below the real root, no `--root`, must append to the ROOT's
+    /// `signal.jsonl` and must NOT create `sub/.agentrec/` — that absence IS
+    /// the defect O5 found being closed.
+    #[test]
+    fn hook_codex_from_subdirectory_finds_root_and_creates_no_nested_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let sub = root.join("workdir/deeper/still");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let out = send_hook_from_dir(&sub, "codex", &codex_fixture("user_prompt_submit.json"));
+        assert!(out.status.success(), "hook codex must exit 0: {out:?}");
+
+        assert!(
+            !sub.join(".agentrec").exists(),
+            "hook codex from a subdirectory must NOT create sub/.agentrec/ — \
+             this is the exact silent-data-loss shape O5 measured"
+        );
+        assert!(
+            !root.join("workdir/.agentrec").exists(),
+            "no intermediate ancestor may get a stray .agentrec/ either"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must land in the ROOT's signal.jsonl: {events:?}"
+        );
+    }
+
+    /// Same shape, `hook claude` (`cmds::hook`'s Claude arm) — the second
+    /// emitter O5's fix note says shares the identical bare-command
+    /// vulnerability, just masked today by Claude Code's own cwd behavior.
+    #[test]
+    fn hook_claude_from_subdirectory_finds_root_and_creates_no_nested_agentrec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+        let sub = root.join("workdir/deeper/still");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_o5","prompt":"hello"}"#;
+        let out = send_hook_from_dir(&sub, "claude", payload);
+        assert!(out.status.success(), "hook claude must exit 0: {out:?}");
+
+        assert!(
+            !sub.join(".agentrec").exists(),
+            "hook claude from a subdirectory must NOT create sub/.agentrec/"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must land in the ROOT's signal.jsonl: {events:?}"
+        );
+    }
+
+    /// No-regression companion: invoking from the root itself (cwd == root,
+    /// no `--root`) must keep working exactly as before this fix.
+    #[test]
+    fn hook_codex_from_the_root_itself_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init(root);
+
+        let out = send_hook_from_dir(root, "codex", &codex_fixture("user_prompt_submit.json"));
+        assert!(out.status.success(), "{out:?}");
+        let events = signal_events(root);
+        assert!(events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")));
+    }
+
+    /// Explicit `--root` still wins over discovery, even when cwd sits
+    /// inside a DIFFERENT initialized repo — proves precedence, not just
+    /// absence-of-flag behavior.
+    #[test]
+    fn explicit_root_flag_wins_over_a_discoverable_cwd_root() {
+        let real_tmp = tempfile::tempdir().unwrap();
+        let real_root = real_tmp.path();
+        init(real_root);
+
+        let decoy_tmp = tempfile::tempdir().unwrap();
+        let decoy_root = decoy_tmp.path();
+        init(decoy_root); // cwd's own ancestor also has .agentrec/
+
+        let mut child = Command::new(bin())
+            .args(["hook", "codex", "--root", real_root.to_str().unwrap()])
+            .current_dir(decoy_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook with explicit --root");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(codex_fixture("user_prompt_submit.json").as_bytes())
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+
+        assert!(
+            !signal_events(decoy_root)
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "explicit --root must win: the decoy cwd root must get nothing"
+        );
+        let events = signal_events(real_root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "the explicitly named root must receive the signal: {events:?}"
+        );
+    }
+
+    /// Discovery-failure leg (no `.agentrec/` anywhere up the tree, no
+    /// `--root`): the deliberate fail-open choice (see
+    /// `main.rs::resolve_hook_root`'s doc comment) falls back to cwd rather
+    /// than erroring — INV-M4 requires the hook path to always exit 0 and
+    /// append the start signal, even against an uninitialized repo.
+    #[test]
+    fn discovery_failure_falls_back_to_cwd_and_still_appends_inv_m4() {
+        let tmp = tempfile::tempdir().unwrap(); // never `init`ed at all
+        let root = tmp.path();
+
+        let payload =
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_o5_fail","prompt":"x"}"#;
+        let out = send_hook_from_dir(root, "claude", payload);
+        assert!(
+            out.status.success(),
+            "discovery failure must still exit 0 (INV-M4 fail-open): {out:?}"
+        );
+        let events = signal_events(root);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("start")),
+            "start signal must still be appended at the cwd fallback: {events:?}"
         );
     }
 }

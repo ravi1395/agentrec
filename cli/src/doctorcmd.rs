@@ -128,6 +128,10 @@ pub(crate) fn diagnose(root: &Path) -> Report {
                 "store permissions",
                 "inotify headroom",
                 "orphaned services",
+                "codex hooks",
+                "codex hook flags",
+                "mcp registration",
+                "mcp server",
             ]
             .iter()
             .map(|name| Check::na(name)),
@@ -145,6 +149,10 @@ pub(crate) fn diagnose(root: &Path) -> Report {
         check_permissions(root),
         check_inotify(root),
         check_orphan_services(),
+        check_codex_hooks(root),
+        check_codex_hook_flags(root),
+        check_mcp_registration(root),
+        check_mcp_server(root),
     ];
     let ok = checks.iter().all(|c| c.status != CheckStatus::Fail);
     Report { checks, ok }
@@ -186,7 +194,7 @@ fn check_daemon(root: &Path) -> Check {
 fn check_hooks(root: &Path) -> Check {
     const REMEDY: &str = "hooks missing/mangled — run `agentrec init`";
     let path = root.join(".claude").join("settings.local.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
         return Check::fail("hook presence", REMEDY);
     };
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -498,6 +506,334 @@ fn check_orphan_services() -> Check {
     Check::advisory(NAME, notes.join(" "))
 }
 
+// ---- Codex hooks (C3) --------------------------------------------------------
+
+/// Shape + "recent signals" validation for agentrec's own Codex hook
+/// entries. `n/a` when Codex integration was never opted into (`agentrec
+/// init --codex`) — this is an opt-in feature, so a repo that never asked
+/// for it must not report a fabricated failure. Once installed:
+/// - malformed/missing entries -> `Fail` (mirrors Claude's `check_hooks`);
+/// - shape OK but zero `tool:"codex"` lines ever recorded in `signal.jsonl`
+///   -> ADVISORY pass. This is deliberately non-blocking, unlike Claude's
+///   signal-freshness check: that check is gated on independent evidence of
+///   RECENT transcript activity (so it only fires when a signal is actually
+///   overdue); this repo has no equivalent external oracle for Codex
+///   without scanning `~/.codex/sessions` (out of this round's scope — see
+///   docs/verify/codex-spike.md's "what was NOT probed"), so a freshly
+///   `init --codex`'d repo that hasn't run a Codex turn yet must not be
+///   told it's broken. The note still carries real information: it is
+///   `doctor`'s only behavioral signal for the spike's confirmed
+///   silent-skip-on-untrusted-hook failure mode, since trust state itself
+///   is not inspectable (no documented location — spike, "Trust flow").
+fn check_codex_hooks(root: &Path) -> Check {
+    const NAME: &str = "codex hooks";
+    if !crate::initcmd::codex_hooks_installed(root) {
+        return Check::na(NAME);
+    }
+    if let Err(reason) = crate::initcmd::codex_hooks_shape(root) {
+        return Check::fail(
+            NAME,
+            format!("Codex hook entries missing/mangled ({reason}) — run `agentrec init --codex`"),
+        );
+    }
+    if codex_signal_ever_seen(root) {
+        Check::pass(NAME)
+    } else {
+        Check::advisory(
+            NAME,
+            "Codex hooks are installed but no tool:\"codex\" line has ever appeared in \
+             signal.jsonl — if you've used Codex in this repo, the hooks are likely still \
+             untrusted: inside Codex run `/hooks` and trust them (`codex exec` gives no \
+             warning at all when hooks are silently skipped — confirmed live, \
+             docs/verify/codex-spike.md). Support verified live against codex-cli 0.146.0.",
+        )
+    }
+}
+
+fn codex_signal_ever_seen(root: &Path) -> bool {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&signal_path(root)) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("tool").and_then(|t| t.as_str()).map(String::from))
+            .is_some_and(|tool| tool == "codex")
+    })
+}
+
+/// Reads repo-local `.codex/config.toml` only — `$CODEX_HOME`'s user-global
+/// layer (and any managed/MDM `requirements.toml` layer) is a stated gap,
+/// not built (spike, "what was NOT probed": "Managed/enterprise hooks
+/// (`requirements.toml`, `allow_managed_hooks_only`) ... no live evidence").
+///
+/// Two conditions, both confirmed by this task round to silently disable
+/// hooks without any other visible symptom, so both get LOUD `Fail`
+/// severity — same as an absent-trust condition would if it were directly
+/// inspectable (it is not; see `check_codex_hooks`):
+///
+/// - `[features] hooks = false` — **measured live this round**, same
+///   pinned `codex-cli 0.146.0`: `codex features list` reports
+///   `hooks  stable  true` (default-on). Checked as `[features].hooks`,
+///   the canonical location (`codex --help`: `--enable <FEATURE>` is
+///   "Equivalent to `-c features.<name>=true`", a dotted `features.<name>`
+///   path). `[features] codex_hooks = false` is ALSO checked, defensively,
+///   but this is NOT confirmed to work the same way: `codex_hooks` does not
+///   appear anywhere in `codex features list`'s registry output on
+///   0.146.0 (only `hooks` and the unrelated, `removed`, `plugin_hooks`
+///   do) — it is checked in case it is a legacy alias, not because that
+///   was verified.
+/// - `allow_managed_hooks_only = true` — the spike explicitly did NOT probe
+///   this live; checked at the top level of `.codex/config.toml` per this
+///   task's instruction. Binary-string inspection of the pinned
+///   `codex-cli` 0.146.0 executable (`strings ... | grep
+///   allow_managed_hooks_only`) shows this key as a field of
+///   `ConfigRequirementsToml`, associated with the enterprise/MDM
+///   `requirements.toml` layer — NOT confirmed to live in, or be honored
+///   from, a repo-local `.codex/config.toml` at all. The remedy text below
+///   states what the config declares, not what Codex does with it.
+fn check_codex_hook_flags(root: &Path) -> Check {
+    const NAME: &str = "codex hook flags";
+    if !crate::initcmd::codex_hooks_installed(root) {
+        return Check::na(NAME);
+    }
+    let path = crate::initcmd::codex_config_toml_path(root);
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) else {
+        return Check::pass(NAME); // no config.toml at all -> nothing declares a disable
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Check::fail(NAME, format!("{} is not valid TOML", path.display()));
+    };
+
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some(features) = table.get("features").and_then(|v| v.as_table()) {
+        if features.get("hooks").and_then(|v| v.as_bool()) == Some(false) {
+            reasons.push(
+                "[features] hooks = false disables ALL Codex hooks (confirmed live, \
+                 codex-cli 0.146.0: `codex features list` reports `hooks  stable  true` by \
+                 default)"
+                    .to_string(),
+            );
+        }
+        if features.get("codex_hooks").and_then(|v| v.as_bool()) == Some(false) {
+            reasons.push(
+                "[features] codex_hooks = false — checked defensively as a possible legacy \
+                 alias for `hooks`; NOT confirmed live (this key does not appear in `codex \
+                 features list`'s registry on codex-cli 0.146.0)"
+                    .to_string(),
+            );
+        }
+    }
+    if table
+        .get("allow_managed_hooks_only")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        reasons.push(
+            "allow_managed_hooks_only = true is declared in this config — Codex's own \
+             suppression behavior for this key was NOT verified live (spike scope gap); this \
+             key is also associated with the enterprise/managed requirements.toml layer, not \
+             confirmed to be read from repo-local .codex/config.toml"
+                .to_string(),
+        );
+    }
+
+    if reasons.is_empty() {
+        Check::pass(NAME)
+    } else {
+        Check::fail(NAME, reasons.join("; "))
+    }
+}
+
+// ---- MCP registration + server probe (E4) -----------------------------------
+
+/// Are the repo-local MCP registrations in the state `init` would leave them?
+///
+/// **Advisory, never `fail`, and that is a decision rather than timidity.**
+/// `doctor`'s all-pass exit 0 is a deploy gate; an MCP registration is a
+/// consumer-side convenience (the server answers whether or not any host has
+/// it registered), and every repo initialized before E4 has no registration at
+/// all. Turning those into hard failures would red the gate for a condition
+/// that breaks no recording. A foreign server occupying our key is likewise
+/// reported and left alone — `init` refuses to overwrite it (see
+/// `initcmd::mcp_entry_is_ours`), so surfacing it is all `doctor` can honestly
+/// do.
+///
+/// The Codex leg is `n/a`-shaped: Codex integration is opt-in (`init
+/// --codex`), so a repo that never asked for it is not reported on.
+fn check_mcp_registration(root: &Path) -> Check {
+    const NAME: &str = "mcp registration";
+    use crate::initcmd::McpRegState;
+    let mut notes: Vec<String> = Vec::new();
+
+    let claude_path = crate::initcmd::mcp_json_path(root);
+    match crate::initcmd::mcp_json_state(root) {
+        Ok(McpRegState::Ours) => {}
+        Ok(McpRegState::Absent) => notes.push(format!(
+            "the agentrec MCP server is not registered in {} — run `agentrec init` to add it",
+            claude_path.display()
+        )),
+        Ok(McpRegState::Foreign) => notes.push(format!(
+            "{} declares a server named \"agentrec\" that is not `agentrec mcp` — left \
+             untouched by init and uninstall",
+            claude_path.display()
+        )),
+        Err(e) => notes.push(e),
+    }
+
+    let codex_path = crate::initcmd::codex_config_toml_path(root);
+    let codex_state = crate::initcmd::codex_mcp_state(root);
+    let codex_opted_in =
+        crate::initcmd::codex_hooks_installed(root) || matches!(codex_state, Ok(McpRegState::Ours));
+    if codex_opted_in {
+        match codex_state {
+            Ok(McpRegState::Ours) => {}
+            Ok(McpRegState::Absent) => notes.push(format!(
+                "Codex hooks are installed but {} declares no [mcp_servers.agentrec] — run \
+                 `agentrec init --codex`",
+                codex_path.display()
+            )),
+            Ok(McpRegState::Foreign) => notes.push(format!(
+                "{} declares an [mcp_servers.agentrec] that is not `agentrec mcp` — left \
+                 untouched by init and uninstall",
+                codex_path.display()
+            )),
+            Err(e) => notes.push(e),
+        }
+    }
+
+    if notes.is_empty() {
+        Check::pass(NAME)
+    } else {
+        Check::advisory(NAME, notes.join("; "))
+    }
+}
+
+/// How long the `initialize` probe waits for the server's first frame before
+/// giving up and killing the child. Deliberately short: `doctor` is asserted
+/// to finish well under 2 s by `doctor_completes_quickly`, and every other
+/// check is sub-millisecond, so this is the only one that could blow that
+/// budget. A local stdio handshake that has not answered in a second is
+/// broken, not slow.
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Does `agentrec mcp` actually come up and answer `initialize` against this
+/// root? Spawns the server, writes one frame, reads one line, kills the child.
+///
+/// **Advisory, like the registration check** — a probe failure means the MCP
+/// consumer surface is broken, not that recording is. It never contributes to
+/// the exit code.
+///
+/// **The probe spawns `current_exe()`, not a PATH lookup of `agentrec`**: a
+/// PATH hit could be an entirely different (older, or absent) build than the
+/// one being asked to diagnose itself. The consequence is that under the test
+/// harness `current_exe()` is the *test binary*, which would be spawned with
+/// `--root … mcp` and answer nothing useful; rather than add an env-var test
+/// seam (which would then have to be proven absent from release `strings`),
+/// the probe declares itself skipped when it is not running from a binary
+/// named `agentrec`. Integration tests drive the real binary, so the live path
+/// is exercised there — see `doctor_mcp_server_answers_initialize`.
+fn check_mcp_server(root: &Path) -> Check {
+    const NAME: &str = "mcp server";
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return Check::advisory(NAME, format!("cannot resolve agentrec's own binary ({e})"))
+        }
+    };
+    if exe.file_stem() != Some(std::ffi::OsStr::new("agentrec")) {
+        return Check::advisory(
+            NAME,
+            "probe skipped — doctor is not running from the `agentrec` binary (in-process test \
+             harness); run `agentrec doctor` to exercise it",
+        );
+    }
+    match probe_mcp_initialize(&exe, root) {
+        Ok(()) => Check::pass(NAME),
+        Err(reason) => Check::advisory(
+            NAME,
+            format!(
+                "`agentrec mcp` did not answer `initialize` ({reason}) — MCP hosts will see \
+                     a dead server; try running `agentrec mcp` by hand to see the startup error"
+            ),
+        ),
+    }
+}
+
+/// One `initialize` round-trip against a freshly spawned `agentrec mcp`.
+/// Returns `Ok(())` iff a JSON-RPC success frame carrying a
+/// `result.protocolVersion` came back within [`MCP_PROBE_TIMEOUT`].
+fn probe_mcp_initialize(exe: &Path, root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(exe)
+        .arg("--root")
+        .arg(root)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": crate::mcpcmd::PINNED_REVISION,
+                   "capabilities": {},
+                   "clientInfo": {"name": "agentrec-doctor", "version": env!("CARGO_PKG_VERSION")}},
+    });
+    let write_result = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "no stdin pipe".to_string())
+        .and_then(|stdin| {
+            writeln!(stdin, "{frame}")
+                .and_then(|()| stdin.flush())
+                .map_err(|e| format!("write failed: {e}"))
+        });
+
+    // Read the first line on a helper thread so a server that never answers
+    // cannot wedge `doctor`: the child is killed either way below.
+    let outcome = write_result.and_then(|()| {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "no stdout pipe".to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+                .map(|_| line);
+            let _ = tx.send(read);
+        });
+        match rx.recv_timeout(MCP_PROBE_TIMEOUT) {
+            Err(_) => Err(format!("no response within {MCP_PROBE_TIMEOUT:?}")),
+            Ok(Err(e)) => Err(format!("read failed: {e}")),
+            Ok(Ok(line)) => {
+                let value: serde_json::Value = serde_json::from_str(line.trim())
+                    .map_err(|e| format!("response was not JSON ({e})"))?;
+                if value
+                    .get("result")
+                    .and_then(|r| r.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                {
+                    Ok(())
+                } else {
+                    Err(format!("unexpected first frame: {}", line.trim()))
+                }
+            }
+        }
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
 // ---- inotify headroom (Linux only) ------------------------------------------
 
 /// LADDERED: this Linux-only path cannot be exercised on macOS dev machines.
@@ -506,6 +842,10 @@ fn check_orphan_services() -> Check {
 /// VERIFY-LEDGER.md for a real Linux run.
 #[cfg(target_os = "linux")]
 fn check_inotify(root: &Path) -> Check {
+    // Fixed procfs path: a kernel-synthesized file, not attacker-
+    // substitutable, and reads never block. `#[cfg(target_os = "linux")]`
+    // means darwin clippy never lints this line; annotated for the Linux leg.
+    #[allow(clippy::disallowed_methods)]
     let max_watches: u64 = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -821,8 +1161,10 @@ mod tests {
     // Env vars are process-global; every test below drives the debug-only
     // AGENTREC_TEST_SERVICE_DIR seam, so they must serialize against each
     // other or the mutations race across cargo's parallel test threads.
+    #[cfg(debug_assertions)]
     static SERVICE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(debug_assertions)]
     fn with_service_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = SERVICE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("AGENTREC_TEST_SERVICE_DIR").ok();
@@ -839,6 +1181,11 @@ mod tests {
     // `pass` so a stale unit from an unrelated scratch repo cannot break this
     // repo's all-pass exit-0 gate, while the note still carries the count and
     // the runnable removal command.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn orphaned_unit_is_advisory_not_fail() {
         let tmp = tempfile::tempdir().unwrap();
@@ -872,6 +1219,11 @@ mod tests {
 
     // The whole-report leg: `diagnose` on an otherwise-healthy-shaped repo
     // must carry the check, and an orphan must not flip `report.ok`.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn orphaned_unit_does_not_flip_report_ok_reason() {
         let tmp = tempfile::tempdir().unwrap();
@@ -897,6 +1249,11 @@ mod tests {
 
     // No orphan -> a plain pass with NO note, so a healthy machine's `doctor`
     // output gains no noise.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn no_orphans_is_a_silent_pass() {
         let tmp = tempfile::tempdir().unwrap();
@@ -930,6 +1287,11 @@ mod tests {
     // reports nothing. Advisory like its sibling, and it must name the exec
     // and the re-init remedy — NOT the removal command, since the repo is
     // still there and the user almost certainly wants recording back.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn vanished_exec_on_a_live_root_is_reported_advisory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -970,6 +1332,11 @@ mod tests {
     // The two staleness axes are ORTHOGONAL, and an unreadable unit must gain
     // no exec finding at all: `Unparseable` means we know nothing, and a
     // fabricated finding is the failure mode this check's design forbids.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn vanished_root_and_unparseable_units_carry_no_exec_finding() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1014,6 +1381,11 @@ mod tests {
     // check names; a new check missing from it makes the report shape differ
     // between the two paths. Asserted as set equality, not by name, so any
     // future check that forgets the list also reds here.
+    // Debug-only: drives the AGENTREC_TEST_SERVICE_DIR seam, which is
+    // #[cfg(debug_assertions)] in service.rs::service_dir — in a release build
+    // the seam is ignored and the test would scan the developer's real
+    // service directory (and can pass or fail on ambient machine state).
+    #[cfg(debug_assertions)]
     #[test]
     fn uninitialized_report_has_the_same_check_set_as_an_initialized_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1061,5 +1433,183 @@ mod tests {
             "symlinked dir tree must be followed like notify does: \
              before={before} after={after}"
         );
+    }
+
+    // ---- C3: Codex hooks doctor checks ------------------------------------
+
+    #[test]
+    fn codex_checks_are_na_when_never_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+
+        assert_eq!(check_codex_hooks(root).status, CheckStatus::Na);
+        assert_eq!(check_codex_hook_flags(root).status, CheckStatus::Na);
+    }
+
+    #[test]
+    fn codex_checks_pass_on_a_freshly_installed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+
+        // Shape is fine but no codex signal has ever been recorded ->
+        // advisory pass, not a hard fail — a fresh install hasn't run a
+        // Codex turn yet, which is not evidence of a real problem.
+        let hooks_check = check_codex_hooks(root);
+        assert_eq!(hooks_check.status, CheckStatus::Pass);
+        assert!(hooks_check.remedy.is_some(), "advisory note expected");
+
+        assert_eq!(check_codex_hook_flags(root).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn codex_hooks_shape_check_fails_on_mangled_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        // Only Stop installed — UserPromptSubmit/PostToolUse missing.
+        std::fs::write(
+            crate::initcmd::codex_hooks_json_path(root),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "Stop": [ { "hooks": [ { "type": "command", "command": "agentrec hook codex", "timeout": 10 } ] } ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let check = check_codex_hooks(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("agentrec init --codex"));
+    }
+
+    // AC-C3: `[features] hooks = false` must produce a LOUD (Fail) degraded
+    // result.
+    #[test]
+    fn codex_hook_flags_fails_when_hooks_feature_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("[features] hooks = false"), "{remedy}");
+        assert!(remedy.contains("hooks  stable  true"), "{remedy}");
+    }
+
+    // AC-C3: `allow_managed_hooks_only = true` must ALSO produce a LOUD
+    // (Fail) degraded result, same severity as the feature-flag case.
+    #[test]
+    fn codex_hook_flags_fails_when_managed_hooks_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "allow_managed_hooks_only = true\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check
+            .remedy
+            .unwrap()
+            .contains("allow_managed_hooks_only = true"));
+    }
+
+    #[test]
+    fn codex_hook_flags_reports_both_reasons_when_both_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "allow_managed_hooks_only = true\n\n[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        let remedy = check.remedy.unwrap();
+        assert!(remedy.contains("[features] hooks = false"), "{remedy}");
+        assert!(
+            remedy.contains("allow_managed_hooks_only = true"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn codex_hook_flags_defensive_codex_hooks_alias_also_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\ncodex_hooks = false\n",
+        )
+        .unwrap();
+
+        let check = check_codex_hook_flags(root);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.remedy.unwrap().contains("codex_hooks = false"));
+    }
+
+    #[test]
+    fn codex_signal_ever_seen_detects_a_codex_tool_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        assert!(!codex_signal_ever_seen(root));
+
+        std::fs::write(
+            signal_path(root),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"v":1,"ts":0,"tool":"claude","event":"start"}),
+                serde_json::json!({"v":1,"ts":0,"tool":"codex","event":"start"}),
+            ),
+        )
+        .unwrap();
+        assert!(codex_signal_ever_seen(root));
+    }
+
+    // The whole-report leg: `diagnose` on a repo with codex hooks installed
+    // and a disabling flag set must flip `report.ok` to false via THIS
+    // check specifically.
+    #[test]
+    fn diagnose_reports_codex_hook_flags_failure_in_full_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(agentrec_dir(root)).unwrap();
+        crate::initcmd::install_codex_hooks(root).unwrap();
+        std::fs::write(
+            crate::initcmd::codex_config_toml_path(root),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let report = diagnose(root);
+        assert!(!report.ok);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "codex hook flags")
+            .expect("diagnose must include the codex hook flags check");
+        assert_eq!(check.status, CheckStatus::Fail);
     }
 }

@@ -31,6 +31,14 @@ fn lock_path(root: &Path) -> PathBuf {
 
 fn open_lock_file(root: &Path) -> Result<File, String> {
     let path = lock_path(root);
+    // Write-side fsguard mirror: a FIFO here blocks the open until a reader
+    // appears, wedging every memory writer before the flock is even attempted.
+    if agentrec_core::fsguard::is_nonregular(&path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to lock",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -91,4 +99,49 @@ pub fn append_memory_locked(
     let _lock = acquire_blocking(root)?;
     agentrec_core::memory::append_memory(root, rec)
     // `_lock` drops here (end of scope), releasing the flock.
+}
+
+#[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    /// `open_lock_file` opens `.agentrec/memory.lock` for WRITE before the
+    /// flock is attempted, so a FIFO planted there blocks every memory writer
+    /// (`remember`/`verify`/`forget`, the daemon's `ingest_candidate`) and
+    /// `purge --memories-retracted` alike.
+    /// HANGS rather than fails on regression: terminating is the property.
+    #[test]
+    #[cfg(unix)]
+    fn open_lock_file_refuses_a_fifo_lock_instead_of_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = lock_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "fixture must actually create a fifo"
+        );
+
+        let err = open_lock_file(tmp.path()).unwrap_err();
+        assert!(
+            err.contains("not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+        // Reached through the public entry point too, not just the primitive.
+        assert!(try_acquire(tmp.path())
+            .unwrap_err()
+            .contains("not a regular file"));
+
+        // ALLOW half: an ordinary lock path must still be acquirable, or a
+        // refuse-everything guard would pass the asserts above while silently
+        // blocking every memory writer.
+        let ok = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(crate::agentrec_dir(ok.path())).unwrap();
+        drop(try_acquire(ok.path()).expect("an ordinary lock path must still be acquirable"));
+    }
 }

@@ -1,0 +1,160 @@
+Linux clippy census — feat/phase-2-tail
+=======================================
+
+WHY THIS EXISTS
+---------------
+clippy.toml's `disallowed-methods` lint (blocking fs reads) cannot see code inside
+`#[cfg(target_os = "linux")]` bodies when clippy runs on darwin — those items are
+never compiled. The Linux-only paths were swept by hand and
+`cli/src/doctorcmd.rs:848` got a `#[allow(clippy::disallowed_methods)]` with a
+procfs rationale. This run exercises the lint on a real Linux toolchain.
+
+PROVENANCE
+----------
+Date:              2026-08-07
+Worktree:          /Users/ravichandrasekhar/Projects/agentrec-phase2-tail
+Branch:            feat/phase-2-tail
+HEAD:              728b225  ("docs: record the PR #20 fsguard remediation round
+                              — GATE PASS at 832ad63 (rounds 8-11)")
+DIRTY:             ` M cli/src/service.rs` (+138/-2). The source was bind-mounted
+                   read-only, so THIS MEASURES THE WORKING TREE, NOT HEAD.
+
+Runtime:           Colima VM (`colima start`, profile `default`, aarch64, 4 vCPU),
+                   Docker via DOCKER_HOST=unix:///Users/…/.colima/default/docker.sock
+Image:             rust:latest
+                   digest sha256:3382bd20aa942806c533e9a73cd000474fb3ef173f71e684cc9b942675781769
+Guest kernel:      Linux 6.8.0-100-generic aarch64
+rustc:             rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo:             cargo 1.97.1 (c980f4866 2026-06-30)
+clippy:            clippy 0.1.97 (8bab26f4f6 2026-07-14)
+                   (rust:latest ships no clippy component; `rustup component add
+                   clippy` was run first. Toolchain matches CI's
+                   dtolnay/rust-toolchain@stable and the host's cargo 1.97.1.)
+
+Container invocation (host side, from the worktree root):
+
+  docker run --rm -v "$PWD":/src:ro -w /src rust:latest sh -c '...'
+
+Source mounted READ-ONLY and CARGO_TARGET_DIR redirected inside the container, so
+the host `target/` was never written (other agents run cargo against it
+concurrently).
+
+
+PASS 1 — THE VERDICT RUN
+------------------------
+Exact command (inside the container, CARGO_TARGET_DIR=/tmp/t1):
+
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+Result: EXIT 0. ZERO warnings, zero errors — no clippy diagnostic of any lint was
+emitted anywhere in the workspace. (`--locked` was used, so the committed
+Cargo.lock resolved cleanly on Linux too.)
+
+Last 30 lines:
+
+   Compiling heck v0.5.0
+    Checking winnow v0.7.15
+    Checking clap_lex v1.1.0
+    Checking linux-raw-sys v0.12.1
+    Checking strsim v0.11.1
+    Checking toml_write v0.1.2
+    Checking bitflags v1.3.2
+    Checking inotify v0.9.6
+    Checking clap_builder v4.6.0
+   Compiling clap_derive v4.6.1
+    Checking globset v0.4.18
+    Checking crossbeam-deque v0.8.6
+    Checking mio v0.8.11
+    Checking crossbeam-channel v0.5.15
+    Checking filetime v0.2.29
+    Checking once_cell v1.21.4
+    Checking fastrand v2.4.1
+    Checking notify v6.1.1
+    Checking tempfile v3.27.0
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking agentrec-core v0.2.0 (/src/agentrec-core)
+    Checking ctrlc v3.5.2
+    Checking toml_edit v0.22.27
+    Checking ignore v0.4.27
+    Checking clap v4.6.1
+    Checking toml v0.8.23
+    Checking agentrec v0.2.0 (/src/cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.15s
+  PASS1_EXIT=0
+
+On the "6.15s looks too fast" question, and on target coverage: Pass 1 and Pass 2
+below were the SAME invocation shape in the same container — identical
+`--workspace --all-targets --all-features --locked`, cold target dir, differing
+only in the trailing lint flag after `--`. Pass 2's own output names
+`agentrec-core (lib)`, `agentrec (test "import_codex")`, `(test
+"hardening_daemon")` and `(test "approve")`, so Pass 1 analysed that same target
+set. The reported wall time is recorded verbatim and is not load-bearing for the
+verdict.
+
+
+PASS 2 — THE CONTROL (does the lint actually SEE the Linux-only bodies?)
+-----------------------------------------------------------------------
+A clean Pass 1 is ambiguous on its own: "zero hits" is equally consistent with
+"no violations" and "the lint never compiled those cfg-gated blocks". The
+`#[allow]` attributes could not be neutered (read-only on Rust source), so
+`--force-warn` was used instead — it overrides `allow` at the source level.
+
+Exact command (CARGO_TARGET_DIR=/tmp/t2):
+
+  cargo clippy --workspace --all-targets --all-features --locked -- \
+      --force-warn clippy::disallowed_methods
+
+Result: 276 total suppressed sites re-surfaced workspace-wide, INCLUDING the
+Linux-only one:
+
+        2    --> cli/src/doctorcmd.rs:849:28
+
+That is the `std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")`
+call inside `#[cfg(target_os = "linux")] fn check_inotify`, i.e. exactly the site
+carrying the procfs `#[allow]` at doctorcmd.rs:848. Count 2 = the bin target and
+its test target, both of which compile the module.
+
+CONCLUSION OF THE CONTROL: the disallowed_methods lint demonstrably compiled and
+analysed the `#[cfg(target_os = "linux")]` bodies on this run, and the
+doctorcmd procfs `#[allow]` is what suppresses the one known hit. Because cfg
+evaluation is uniform per compilation unit, `check_inotify` having been analysed
+means every `#[cfg(target_os = "linux")]` item in these crates was analysed too.
+Pass 1's clean verdict is therefore meaningful rather than vacuous.
+
+Converse, worth stating: `cli/src/service.rs:695` carries an
+`#[allow(clippy::disallowed_methods)]` but appears NOWHERE in the control's
+src-path hits — that site is macOS-gated and does not compile on Linux, so this
+run says nothing about it. What this run DOES cover is the uncommitted +138 lines
+in `cli/src/service.rs`: they were in scope of the clean Pass 1, so the dirty
+working tree is measured, not a hole.
+
+Other src-path sites the control surfaced (all pre-existing, all already carrying
+their own `#[allow]`, none of them new and none of them Linux-gated):
+agentrec-core/src/{fsguard.rs, id.rs, store.rs, record.rs, view.rs,
+undo_coordinator.rs}; cli/src/{uninstallcmd.rs, initcmd.rs, purgecmd.rs, state.rs,
+readcmds.rs, daemon.rs}. The remainder of the 276 are in cli/tests/*.
+
+
+VERDICT
+-------
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` PASSES on
+Linux for this branch. Exit code 0. Zero hits. No new lint findings; the known
+Linux-only procfs read is correctly suppressed by its documented `#[allow]`.
+
+
+CAVEATS
+-------
+1. Measures the WORKING TREE at HEAD 728b225 plus the uncommitted
+   `cli/src/service.rs` change, not the committed tree.
+2. aarch64 Linux under a Colima VM, not GitHub's x86_64 ubuntu-24.04 runner.
+   Same rustc/clippy version as CI's `stable`, but not the same host triple.
+3. `--locked` was added beyond the task's stated command (CI does not pass it);
+   it makes a stale lockfile fail loudly on a read-only mount rather than
+   obscurely. It cannot mask a clippy hit.
+4. On CI: the `lint` job in .github/workflows/ci.yml DOES run this exact command
+   on ubuntu-24.04. But `on:` is `push: branches: [main]` + `pull_request` +
+   `workflow_dispatch`, and that file's own comment records that
+   `workflow_dispatch` is inert until the workflow is on the default branch — so
+   pushing `feat/phase-2-tail` alone triggers nothing. It takes a PR (or landing
+   on `main`) to exercise the Linux lint leg in CI.

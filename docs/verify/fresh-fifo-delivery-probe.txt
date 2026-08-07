@@ -1,0 +1,30 @@
+# Fresh-FIFO FSEvents delivery probe — 2026-08-07
+# Command: scripts/probe-fresh-fifo-delivery.sh <shape> (wait=35s), 4 runs per shape,
+# driven by a matrix wrapper; binary target/debug/agentrec built at working tree of 728b225+fixes.
+# Machine: single macOS (darwin 25.5.0) host. Verdict = grep for the fifo path in the fixture log.jsonl.
+#
+# Settles the round-8/round-9 disagreement recorded above
+# daemon_snapshots_a_fifo_as_skipped_without_losing_the_turn (cli/tests/integration.rs):
+# delivery is governed by the metadata event (touch), not by bytes written into the fifo.
+
+bare run1: NOT-DELIVERED (shape=bare wait=35s)
+bare run2: NOT-DELIVERED (shape=bare wait=35s)
+bare run3: NOT-DELIVERED (shape=bare wait=35s)
+bare run4: NOT-DELIVERED (shape=bare wait=35s)
+rw-open run1: NOT-DELIVERED (shape=rw-open wait=35s)
+rw-open run2: NOT-DELIVERED (shape=rw-open wait=35s)
+rw-open run3: NOT-DELIVERED (shape=rw-open wait=35s)
+rw-open run4: NOT-DELIVERED (shape=rw-open wait=35s)
+byte run1: NOT-DELIVERED (shape=byte wait=35s)
+byte run2: NOT-DELIVERED (shape=byte wait=35s)
+byte run3: NOT-DELIVERED (shape=byte wait=35s)
+byte run4: NOT-DELIVERED (shape=byte wait=35s)
+byte-touch run1: DELIVERED (shape=byte-touch wait=35s)
+byte-touch run2: DELIVERED (shape=byte-touch wait=35s)
+byte-touch run3: DELIVERED (shape=byte-touch wait=35s)
+byte-touch run4: DELIVERED (shape=byte-touch wait=35s)
+=== TALLY ===
+bare: DELIVERED=0 NOT-DELIVERED=4
+rw-open: DELIVERED=0 NOT-DELIVERED=4
+byte: DELIVERED=0 NOT-DELIVERED=4
+byte-touch: DELIVERED=4 NOT-DELIVERED=0

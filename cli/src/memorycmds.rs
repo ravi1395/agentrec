@@ -123,6 +123,8 @@ pub fn candidate(root: &Path, fact: &str, from: &str, tool: &str) -> Result<(), 
         transcript: None,
         prompt: None,
         files_written: None,
+        emitter_turn: None,
+        model: None,
         kind: Some("memory-candidate".to_string()),
         fact: Some(scrubbed_fact),
         pins: Some(pins),
@@ -430,7 +432,8 @@ fn print_pin_diff(store: &BlobStore, pin: &Pin, root: &Path) {
     // between the two reads) degrades to silently skipping the diff rather
     // than erroring — the hash-drift line above already told the caller
     // enough to act on.
-    let Ok(current) = std::fs::read(root.join(&pin.path)) else {
+    // fsguard: a recorded pin path in the working tree.
+    let Ok(current) = agentrec_core::fsguard::read_regular(&root.join(&pin.path)) else {
         return;
     };
 
@@ -471,36 +474,38 @@ fn count_diff_lines(unified_text: &str) -> (usize, usize) {
     (added, removed)
 }
 
-/// Read `memory_enabled` from `.agentrec/config.toml` via the shared
-/// [`crate::cmds::config_values`] scanner. Missing file, missing key, or an
-/// unparseable value all fall back to the documented default of `true`.
+/// Read `memory_enabled` from `.agentrec/config.toml` via
+/// [`crate::config::load_or_default`]. Missing file, missing key, an
+/// unparseable value, or a file-level TOML parse error all fall back to the
+/// documented default of `true`.
+///
+/// **Deliberately stays tolerant** (gate finding, D16 remediation reviewed
+/// this call site and kept it as-is): every production caller today is
+/// either the daemon (`daemon.rs`'s live-loop and startup-replay reads, both
+/// per-tick freshness reads that must never hard-fail) or `cmds::hook`,
+/// whose own doc comment documents an explicit fail-open contract — Claude
+/// Code invokes `hook` on every prompt, and hard-failing here would exit
+/// nonzero AFTER `hook` has already appended the start/stop signal it gates
+/// (`cmds.rs`, `append_log_line` runs before this read), i.e. noise with no
+/// protective value. No CLI verb (`status`, `purge`, `log`, `show`) reads
+/// `memory_enabled` today; if one starts to, route it through
+/// [`crate::config::load`] directly, the same way `effective_store_budget_
+/// checked` and `read_ttl_days` do, rather than widening this function.
 pub fn read_memory_enabled(root: &Path) -> bool {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return true;
-    };
-    for value in crate::cmds::config_values(&text, "memory_enabled") {
-        match value {
-            "true" => return true,
-            "false" => return false,
-            _ => continue,
-        }
-    }
-    true
+    crate::config::load_or_default(root).memory_enabled
 }
 
-/// Read `memory_inject_max` from `.agentrec/config.toml` — same shared
-/// scanner as [`read_memory_enabled`]. Missing file, missing key, or an
-/// unparseable value all fall back to [`HOOK_MAX_FACTS_DEFAULT`].
+/// Read `memory_inject_max` from `.agentrec/config.toml` via
+/// [`crate::config::load_or_default`] — same loader as
+/// [`read_memory_enabled`]. Missing file, missing key, an unparseable value,
+/// or a file-level TOML parse error all fall back to
+/// [`HOOK_MAX_FACTS_DEFAULT`].
+///
+/// **Deliberately stays tolerant, same rationale as [`read_memory_enabled`]**
+/// — its only production caller is `cmds::inject_memory`, itself only ever
+/// called from `cmds::hook`'s fail-open path.
 pub fn read_memory_inject_max(root: &Path) -> usize {
-    let Some(text) = crate::cmds::read_config_text(root) else {
-        return HOOK_MAX_FACTS_DEFAULT;
-    };
-    for value in crate::cmds::config_values(&text, "memory_inject_max") {
-        if let Ok(n) = value.parse::<usize>() {
-            return n;
-        }
-    }
-    HOOK_MAX_FACTS_DEFAULT
+    crate::config::load_or_default(root).memory_inject_max
 }
 
 /// Default `memory_inject_max` (design spec) when `config.toml` has no such
@@ -841,7 +846,8 @@ pub fn memories_stats(root: &Path) -> Result<(), String> {
         return Err("not initialized — run `agentrec init`".to_string());
     }
 
-    let text = std::fs::read_to_string(crate::memory_stats_path(root)).unwrap_or_default();
+    let text = agentrec_core::fsguard::read_regular_to_string(&crate::memory_stats_path(root))
+        .unwrap_or_default();
     if text.trim().is_empty() {
         println!("no hook invocations recorded");
         return Ok(());
@@ -1035,7 +1041,8 @@ fn format_drift_line(d: &PinDrift, now_ms: u64) -> String {
 /// has no entry.
 fn latest_retract_reasons(root: &Path) -> HashMap<String, String> {
     let mut out: HashMap<String, (u64, String)> = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(memory::memory_path(root)) else {
+    let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&memory::memory_path(root))
+    else {
         return HashMap::new();
     };
     for line in text.lines() {

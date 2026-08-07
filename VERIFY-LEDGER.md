@@ -1070,3 +1070,1912 @@ that end-to-end test; check `launchctl print gui/$(id -u)/com.agentrec.bfa6bde6e
 The posture change means the **next `agentrec init` in `~/Projects/agentrec` rewrites and
 reloads the live dogfood unit** (`service::install` rewrites on content difference). Harmless in
 principle; flagged because that daemon is production evidence infrastructure.
+
+## Phase A — Codex hook spike (2026-08-05, `feat/phase-2-tail` worktree)
+
+Live-probe gate on `docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md` Phase A, before any
+Codex-emitter production code (Phase C) is written. Pinned Codex CLI: **`codex-cli 0.146.0`**
+(`/opt/homebrew/bin/codex`, Homebrew cask, confirmed via both `codex --version` and `codex
+doctor`). All work in a disposable scratch git repo under `scratchpad/`, isolated `CODEX_HOME`
+(only `auth.json` copied), never the agentrec repo or the user's real `~/.codex`. Full writeup,
+raw terminal transcripts, and field-inventory table: `docs/verify/codex-spike.md`. Redacted
+fixtures for all three required events (+2 bonus continuation-pair fixtures):
+`docs/fixtures/codex/*.json`, all `jq .`-valid.
+
+**Execution-branch baseline (global constraint: re-measure at start, never trust a stale count):**
+`cargo test --workspace -- --test-threads=3` on `feat/phase-2-tail` @ `64f2bcf` (forked from
+`origin/main` @ `dd4238f`) → **751 passed / 0 failed / 3 ignored**. Matches `main`'s last
+recorded figure (`fix/import-existing-ids-staleness` merge) — no drift since fork. This is the
+number every later phase in this branch diffs against.
+
+**Exit criteria 1–5 (plan Phase A), status:**
+1. Pinned version recorded here + `INTEGRATIONS.md` (Codex CLI section) — **DONE**.
+2. Redacted fixtures for all three events + field-inventory table — **DONE**
+   (`docs/fixtures/codex/`, table in `docs/verify/codex-spike.md`).
+3. Trust-flow writeup incl. hash-re-review on a changed command field AND a changed non-command
+   field — **DONE**, both tested independently and live via the real `/hooks` TUI (driven through
+   `tmux`, which — unlike a bare `expect` pty — answers the Ratatui terminal-capability queries
+   the TUI blocks on at startup).
+4. Continuation-semantics answers — **DONE**, see finding below.
+5. This row — **DONE**.
+
+**Headline finding — NOT a blocker.** The plan's scariest-unknown question (Phase A probe 5) was
+whether `turn_id` is stable across a `Stop`-hook `decision:"block"` continuation, since decision
+17's file-accumulator is keyed on `turn_id`. **Measured twice, independently: `turn_id` is
+STABLE** across the block-continuation (identical value on both `Stop` firings), `stop_hook_active`
+flips `false`→`true` exactly as documented, and `UserPromptSubmit` does **not** re-fire for the
+synthetic continuation prompt. This is the opposite of the plan's feared outcome — the
+pre-authorized founder-escalation contingency ("if `turn_id` proves UNSTABLE ... go back to the
+founder before Phase C") is **not triggered**. Phase C's drain-by-`turn_id` keying is sound as
+designed.
+
+**Other confirmed-live findings feeding Phase B/C directly:**
+- `PostToolUse` (`apply_patch`) `tool_input.command` is the raw patch-DSL text, not a structured
+  file list — confirmed the path-extraction rule must regex `^\*\*\* (Add|Update|Delete) File:
+  (.+)$` over that string. One firing = one `apply_patch` call, which can bundle several file
+  operations in one patch (observed 3 ops in one firing) — the accumulator must union across
+  potentially several `PostToolUse` firings per turn, not assume one-to-one.
+- Trust is **per-hook**, keyed on the parsed hook definition (not per-file, not per-session), and
+  **ANY** field change — command or non-command (`timeout` tested) — revokes trust for exactly
+  that hook while leaving untouched sibling hooks trusted; reverting to a previously-approved
+  definition silently restores trust with no re-review. C3's byte-stability requirement is
+  therefore load-bearing exactly as the plan assumed.
+- `hooks.json` + inline `[hooks]` in the same config layer **does** merge (not override) and
+  **does** print the documented startup warning verbatim, both in `codex exec`'s plain transcript
+  and inside the `/hooks` browser's "Issues" line.
+- **Silent-skip gap, not in the docs:** `codex exec` (non-interactive) with an untrusted
+  repo-local `hooks.json` and no `--dangerously-bypass-hook-trust` produces **zero** warning
+  anywhere in stdout/stderr — the documented "prints a warning" behavior is TUI-only. CI/automation
+  relying on stderr to notice an untrusted-hook config will see nothing; `--dangerously-bypass-
+  hook-trust` (confirmed live, exact flag name matches docs) is the correct automation answer, not
+  a fallback warning.
+- `Stop` fires on normal turn end; does **not** fire on a `SIGINT` mid-tool-call interrupt of
+  `codex exec` (`turn interrupted`, exit 1, no `Stop`); does **not** fire on `/clear` (the
+  abandoned session gets no `Stop`, a fresh `session_id`/`turn_id` starts on the next prompt).
+  `SubagentStop` not exercised (out of this round's effort budget).
+- `Stop` genuinely rejects non-empty non-JSON stdout (`Stop Failed` in the transcript, session
+  still completes normally) while **empty** stdout is treated as success — the emitter's "write
+  nothing on success" design (C2) is confirmed correct for `Stop`, not merely assumed.
+  `SubagentStop` was never exercised; whether it behaves the same is documented (not measured).
+
+**Not probed, stated explicitly rather than inferred:** `PreToolUse`, `PermissionRequest`,
+`SessionStart`/`SessionEnd` payload shapes (only `/clear`'s side effects were observed, not the
+`SessionStart` event itself — no `SessionStart` hook was wired this round), `PreCompact`/
+`PostCompact`, managed/enterprise/plugin-bundled hooks, Windows command variants, and interactive-
+TUI Ctrl-C specifically (only process-level `SIGINT` against `codex exec` was tested for the
+interrupt probe). None of these were required by the plan's exit criteria; listed so a later
+reader doesn't assume silence means "confirmed absent."
+
+Closes here — all 5 Phase A exit criteria met, no founder escalation triggered, Phase C's
+decision-17 keying assumption is upheld by live measurement rather than inference.
+
+## Task C4 — `agentrec import codex` (2026-08-05, `feat/phase-2-tail` worktree)
+
+K-series: streams Codex's `<source>/sessions/YYYY/MM/DD/rollout-*.jsonl` corpus (default
+`~/.codex`), same `--dry-run`/persist split as `import claude`. Files:
+`cli/src/importcmd.rs` (`mod codex`, new), `cli/src/main.rs` (`ImportSource::Codex` arm — shared
+file, only these lines are C4's), `cli/tests/import_codex.rs` (new, 14 tests, all green),
+`cli/tests/fixtures/import/codex/*` (new, synthetic fixtures grounded in the corpus-shape
+measurements below), `docs/fixtures/codex/rollout-add-sample-redacted.jsonl` (new — one genuine
+redacted rollout excerpt, real Position.java `add`, used by
+`real_redacted_rollout_dry_run_report_keys_match_claude` so at least one test is not
+fixture-only evidence, per this repo's standing lesson).
+
+**Real-corpus grounding (616 rollout files, this machine, measured 2026-08-05, commands behind
+every number — this is what decided the design, not an inference from Codex's docs):**
+- `session_meta.id`/`session_meta.cwd` present on line 1 of every file, `turn_context.cwd`
+  cross-checked identical on 860/860 sampled lines (0 diffs) — `cwd` is genuinely session-level,
+  no Claude-style "first line that carries one" ladder needed.
+- File changes are NOT parsed from the `apply_patch` tool call's raw patch-DSL text (that text
+  carries only diff hunks for updates, never a full file). Instead this importer keys off
+  `event_msg` type `patch_apply_end` — a structured, Codex-verified per-file signal
+  (`success: bool`, `changes: {<abs path>: {type, content?, unified_diff?, move_path?}}`).
+  Measured: 726 `apply_patch` calls, 1421 `patch_apply_end` events, `success` true on 1421/1421
+  observed (checked defensively anyway — never trust `changes` when `success != true`). 18 of 726
+  real `apply_patch` calls (2.5%) verification-FAILED before any `patch_apply_end` fired at all
+  (a completely different failure shape: `"apply_patch verification failed: ..."`, no exit code
+  at all) — invisible to every counter in this importer (a coverage rider, see below), and pinned
+  by the `failed_patch_apply_is_never_trusted` test using that exact real failure shape.
+- `changes[path].type == "add"` AND `"delete"` both carry `content` — the FULL new file (add) or
+  FULL pre-deletion file (delete), real/observed, never derived. Both map to T1 ("before or after
+  bytes known with certainty from the transcript itself"). `changes[path].type == "update"` carries
+  only `unified_diff` (hunks, real line numbers, never a full file either side) — **this importer
+  does not attempt to reconstruct `update` before/after bytes** (advisor-directed descope: no AC
+  requires it, and Codex's rollout format has no snapshot/backup mechanism analogous to Claude's
+  `trackedFileBackups` that would let it be done without fabrication risk). `update` entries are
+  persisted with `before: None`, `after: None`, `baseline_unknown: true` (the same field the live
+  daemon uses for "existed before we could see it" — `agentrec-core/src/daemon.rs`/`view.rs`) —
+  never dropped, since a "we know it changed but not to what" entry is still real information, and
+  never silently equivalent to a null-content file.
+- `t1_5` (and every `t15_*` sub-counter) is structurally unreachable, not merely measured
+  zero — no code path increments it (no per-edit snapshot mechanism exists in this format).
+  `skipped_sidechain` and `skipped_missing_field.tool_use_result` are likewise always 0 by
+  construction (no analogous concept in Codex's rollout shape). Kept in the wire report purely
+  for AC-C4's report-key-parity requirement — the shared `ImportReport`/`TierCounts` struct is
+  reused verbatim (same struct = same JSON, not "keys happen to match").
+
+**Real-corpus `--dry-run` run** (`cargo run --release -p agentrec -- import codex --dry-run --root
+~/Projects/agentrec`, release binary, this machine, 2026-08-05):
+```
+sessions_total: 616
+sessions_importable: 616 (100.0%)
+sessions_in_root: 36
+tier_counts: t1=382 t1_5=0 t2_candidate=1139 t3=431
+opaque_calls: 15000
+mean_opaque_share_pct: 68.32
+skipped_secret_path: 0 / skipped_sidechain: 0 / skipped_malformed_line: 0
+skipped_non_utf8_line: 0 / skipped_io_error: 0
+skipped_missing_field: cwd=0 tool_use_result=0
+peak_rss_mb: 31.59
+```
+**Coverage rider (Codex's analogue of P1's "99.6% is an ingestion rate, never a recovery rate" —
+never quote the numbers above without it):** this importer only recovers `apply_patch`-driven
+changes with a successful `patch_apply_end`. File mutations via `exec`/`exec_command`-family shell
+calls (redirects, `sed -i`, heredocs — a real and common Codex pattern, not a hypothetical) are
+completely invisible to it; `opaque_calls: 15000` on this corpus is dominated by exactly this
+population, not idle/no-op tool calls. No threshold gate is attached to any of these figures per
+plan decision 8 — report only, exactly as instructed.
+
+**Test baseline:** 806 → **842 passed / 0 failed / 3 ignored** on `cargo test --workspace --
+--test-threads=3` (parallel `feat/phase-2-tail` C3 work landed concurrently in the same run; the
+14 new tests here are `cli/tests/import_codex.rs`, all green, run in isolation and as part of the
+full suite). `cargo clippy --workspace --all-targets [--release] -- -D warnings` clean; `cargo
+fmt --check` clean on `cli/src/importcmd.rs` and `cli/tests/import_codex.rs` specifically (ran
+targeted `rustfmt`, not workspace-wide `cargo fmt`, to avoid touching C3's in-flight files —
+residual fmt drift in `doctorcmd.rs`/`initcmd.rs`/`uninstallcmd.rs`/`integration.rs` is C3's, not
+this task's). `cargo build --release --locked -p agentrec` succeeds; `AGENTREC_IMPORT_DEBUG_ENTRIES`
+(the existing debug seam, reused rather than minting a Codex-specific one) absent from release
+`strings`.
+
+**Real defect found and fixed by testing against a real tempdir root (not by inspection):** the
+first `resolve_codex_file_entry` implementation compared a raw transcript `abs_path` directly
+against a canonicalized `--root` — on macOS, `tempfile::tempdir()` roots live behind
+`/var/folders` -> `/private/var/folders` symlinks, so every persist test failed with
+`skipped_out_of_root: 1`, `appended: 0`. Fixed by routing the path through `session_cwd`,
+canonicalizing THAT, then rejoining — the exact same fix `import claude`'s own
+`classify_and_resolve` doc comment already documents for the identical bug class. Caught by
+`same_session_reimport_appends_zero` and `intra_run_duplicate_session_id_...` both failing with
+`appended: 0` on a first run (should never happen when a session file legitimately touches its own
+cwd) rather than by reasoning about the code.
+
+**Turn-id derivation:** `hash(session_id:turn_index)`, identical formula to `import claude`
+(duplicated as a tiny 4-line function, not shared across sibling modules — same posture as the
+duplicated `default_source_for_home`, deliberate per "diff ∝ request" over threading `pub(super)`
+visibility through tested Claude code). `session_id` = `session_meta.id` (first line, 616/616
+files carry exactly one). `turn_index` = a local counter incremented on each `event_msg
+user_message` boundary (mirrors Claude's `is_genuine_user_prompt` turn-boundary judgment call).
+**No new id-derivation rule was invented and none was needed** — nothing about Codex's rollout
+shape required deviating from the pinned formula.
+
+**No new wire/protocol field was added.** `FileEntry`'s existing `baseline_unknown` field is used
+for `update` entries exactly as its doc comment already describes it, not repurposed.
+
+**Not done, disclosed rather than silently skipped:**
+- `update` before/after byte reconstruction (see grounding notes above) — the highest-effort,
+  least-mandated piece per the advisor consult that shaped this task's scope; not built.
+- No fallback path when a `patch_apply_end` event never fires for an `apply_patch` call (verified
+  or interrupted) — such an attempt is invisible to every counter, not merely uncounted-but-flagged.
+- `Move to:`/`move_path` (rename) semantics: `move_path` was `null` on all 1952 real `changes`
+  entries sampled — never exercised live, so this importer makes no attempt to represent a rename
+  as anything other than independent per-path entries (which is what the `changes` map already
+  gives it).
+- Real corpus persist run: NOT executed against the live dogfood repos this machine's real Codex
+  sessions are rooted in (`~/Projects/agentrec`, `~/Projects/sutra`, etc.) — that would write real
+  turns into those repos' production `.agentrec/log.jsonl`, which this task has no mandate to do.
+  Persist correctness against real corpus *shapes* is covered by 7 integration tests built from
+  real-measured field structures (including the symlink defect above, only findable by actually
+  running persist against a real filesystem); the `--dry-run` real-corpus run (this task's explicit
+  verification step) covers the full 616-file real corpus.
+
+## O5 — live two-tool session evidence (Phase C exit, 2026-08-05, `feat/phase-2-tail` worktree)
+
+Manual, not-unit-testable honesty row per the plan's Phase C exit criterion. Full method, raw
+(redacted) captures, and every command's actual output: `docs/verify/o5-two-tool-session.md`.
+Binary: debug build (`target/debug/agentrec`, `agentrec 0.2.0`), NOT release — disclosed; this
+round checks protocol/attribution correctness, not performance. Disposable scratch git repo
+under this session's scratchpad, never the agentrec repo; isolated `CODEX_HOME` (`auth.json`
+only), mirroring Phase A's isolation method. Pinned `codex-cli 0.146.0` (same pin as Phase A;
+0.146.1 was available and deliberately not taken).
+
+**Execution-branch baseline, re-measured at the start of this round:** `cargo test --workspace --
+--test-threads=3` on `feat/phase-2-tail` @ `af3175a` → **855 passed / 0 failed / 3 ignored**.
+Re-measured again after the doc edits below (no Rust files touched) — same **855 / 0 / 3**.
+
+**Temp-root service guard (D46), verified live, not assumed:** `agentrec init --codex` on the
+`/private/tmp/...` scratch root printed `skipped service install: root is under a temporary
+directory`; `launchctl list` and `~/Library/LaunchAgents` were enumerated before this round
+started and after every step — **exactly one unit throughout**, `com.agentrec.bfa6bde6eaa4` (the
+pre-existing live dogfood daemon for `~/Projects/agentrec`, unrelated to this round). No plist
+was ever written for the scratch repo; `--service` was never passed.
+
+**Headline finding — BLOCKING product defect, confirmed live, reported here per the task's
+instruction rather than fixed:** the installed Codex hook entry is the bare command `agentrec
+hook codex`, no `--root` (`cli/src/initcmd.rs::CODEX_HOOK_COMMAND`; root then defaults to
+`std::env::current_dir()` at `cli/src/main.rs:386-389`). **Codex's hook-process cwd tracks the
+directory Codex was launched from, not the git repo root.** Measured directly with a `pwd -P` +
+payload-`cwd` probe wrapper substituted for the real hook command (`codex exec
+--dangerously-bypass-hook-trust`, sanctioned for this scripted leg per the plan), launched from
+two positions on the same trusted scratch repo:
+- From the repo root: `process_pwd` == `payload_cwd` == the repo root, on all three hook firings.
+  Corroborated by a second, independent channel — the interactive TUI's own startup banner
+  (`directory: /REDACTED/scratch-repo`) for a root-launch session (Part 2 of the writeup).
+- From a tracked subdirectory (`repo/sub/`): `process_pwd` == `payload_cwd` == **the
+  subdirectory**, on all three firings.
+
+**Consequence, observed directly:** the subdirectory run left a **second, independent**
+`sub/.agentrec/signal.jsonl` (`record.rs`'s append path creates parent dirs with no error) that a
+daemon running `agentrec record --root <repo-root>` never tails — every Codex signal from a
+session launched inside that subdirectory is silently and permanently invisible to the repo's
+real recorder. No error, no warning, anywhere in the chain. **This needs a founder-level design
+decision (most plausibly: `init --codex` bakes an explicit `--root <resolved-repo-root>` into the
+installed hook command) — not decided or built here**, per the task's explicit instruction not to
+attempt a redesign mid-verification.
+
+**Real `/hooks` trust flow — live, via `tmux` (bare `expect` hangs on Ratatui's terminal-capability
+queries, per the Phase A spike's method):** first launch in the scratch repo showed the same
+"Hooks need review" gate the spike documented; "Review hooks" → `/hooks` browser showed all three
+events `Installed=1 Active=0 Review=1`; `t` ("trust all") flipped every row to `Active=1`, Review
+column cleared. No bypass flag on this leg.
+
+**Cross-attribution — clean, jq-scoped (not substring grep, which the redacted scratchpad path's
+own `claude-501` component would false-positive on — caught and avoided):**
+- **Codex leg: LIVE**, real interactive session, now-trusted hooks, no bypass flag. Prompted to
+  create `codex_leg.txt`; all three hooks fired for real; `signal.jsonl`'s `stop` line carries
+  `files_written: [".../codex_leg.txt"]` and a stable `emitter_turn`.
+- **Claude leg: NOT live.** Driven by invoking `agentrec hook claude` directly with realistic
+  `UserPromptSubmit`/`Stop` JSON on stdin — exactly as Claude Code's own hooks would invoke it —
+  plus a real `claude_leg.txt` write in between so the daemon's fs watcher observes a genuine
+  mutation. Stated explicitly here because overstating this is exactly what this repo's history
+  punishes: **this is a direct-invocation leg, not a live Claude Code process.**
+- Resulting `log.jsonl`: one rich `codex` turn (prompt attached, `codex_leg.txt` mentioned nowhere
+  but its own signal), one rich `claude` turn (prompt attached, `claude_leg.txt` mentioned nowhere
+  but its own signal), plus two bare turns each holding exactly one file. `jq -c 'select(.tool==
+  "codex") | .files' log.jsonl` → `[]`; `jq -c 'select(.tool=="claude") | .files' log.jsonl` →
+  `[]`; `jq -c 'select(.grade=="bare") | .files[].path' log.jsonl` → `"codex_leg.txt"` then
+  `"claude_leg.txt"`. **Zero cross-attribution**: `codex_leg.txt` never appears under
+  `tool=="claude"`; `claude_leg.txt` never appears under `tool=="codex"`. `agentrec show <id>`
+  confirms both rich turns render the correct `tool` and prompt excerpt. **Exact wire value:**
+  the emitter writes `"tool":"claude"`, never `"claude-code"` — INTEGRATIONS.md's
+  "`claude-code`-and-`codex` lines" phrasing is prose shorthand for the product, not a literal
+  field; this row does not claim `"claude-code"` was observed on the wire.
+- Legs run strictly sequentially (each `Stop` fully processed before the next `UserPromptSubmit`),
+  distinct filenames per leg — deliberate, because an open start/stop bracket suppresses
+  quiet-window closure and retroactively folds interim bare turns into the rich turn (PROTOCOL
+  bracketing), so an interleaved run could manufacture cross-attribution from the test's own
+  design rather than measure the real thing. **Only the sequential case was exercised; interleaved
+  multi-tool sessions are the pre-existing, already-disclosed D6 misattribution risk (README
+  threat model), not a new finding here.**
+
+**Disclosed, not new — and two different mechanisms, not one:** both rich turns rendered
+`files:[]`; each leg's actual file write landed in an immediately-following bare (unattributed)
+turn instead. For `codex`, `files_written` WAS populated on the stop signal (confirmed above)
+and this matches CLAUDE.md's own disclosure that the D6 `resolve_declared` tier ladder "landed
+dark" — wired onto the wire, nothing yet consumes it at persist time. For `claude`,
+`files_written` was **never populated at all**: `cmds.rs::hook`'s Stop-event `files_written`
+block only runs when the payload carries a `transcript_path`, and this round's direct-invocation
+Stop payload omitted one (a real Claude Code payload supplies it) — a different cause (this
+test's own incomplete synthetic payload) producing the identical rendered symptom, not a second
+instance of the same dark-wiring gap. Neither compromises the cross-attribution result above — a
+file in an unattributed bare turn is a different failure than a file under the wrong tool's rich
+turn, and the latter never happened, on either leg, for either reason.
+
+**OPEN, not claimed as passed:** the Claude leg is direct-invocation, not live, per the task's
+own acknowledged environment constraint (no nested interactive Claude Code session is possible
+here) — the Codex leg IS live throughout, hooks trusted through the genuine un-bypassed `/hooks`
+flow. Interleaved/concurrent two-tool sessions were not exercised. The subdirectory-launch cwd
+measurement used `codex exec`, not the TUI (no non-interactive way to re-launch per position
+without a fresh trust cycle each time) — recorded as a scope note in the writeup, since both
+surfaces read cwd via the same `std::env::current_dir()` call in the same binary.
+
+**Cleanup:** `tmux kill-session`; this round's own daemon process killed by PID. Pre-existing,
+unrelated `agentrec record` processes found running against `/var/folders/.../T/.tmp*` roots
+(started hours before this round, leftover from other work) were deliberately left untouched —
+out of scope. `launchctl`/`~/Library/LaunchAgents` re-checked after cleanup: unchanged from the
+Part-0 baseline.
+
+Plan's O5 exit criterion: **DONE, with the two disclosures above carried forward as OPEN, not
+silently closed** — the live/direct-invocation split on the Claude leg, and the confirmed
+subdirectory-cwd defect now escalated rather than papered over.
+
+### APPENDED 2026-08-05 — the subdirectory-cwd defect above is CLOSED
+
+The finding above stands as written; this records its fix, it does not amend it. Founder
+ruled (2026-08-05) on the escalation: resolve the hook's root by **walking up from cwd to the
+nearest ancestor carrying `.agentrec/`**, git-style, for **both** emitters — explicitly chosen
+over baking an absolute `--root` into the installed hook command, because a baked path is a
+snapshot and this repo already carries the scar of that failure mode (the 39 orphaned
+LaunchAgents, all from a stale baked `--root`). Walking up also survives repo moves/renames.
+`hook claude` was fixed alongside `hook codex` although its defect was latent, not observed:
+it shares the identical bare-command shape and only escapes the bug because Claude Code
+happens to set cwd to the project root — an undocumented behavior worth not depending on.
+
+Fix commit: see `main.rs::resolve_hook_root` / `discover_agentrec_root`. Scoped to the `hook`
+verb alone; every other subcommand's root resolution is byte-identical to before. An explicit
+`--root` still wins outright — discovery is the default for an ABSENT root, never an override
+of a supplied one. Discovery failure falls back to cwd rather than erroring, deliberately:
+INV-M4 pins the hook path as fail-open (always append, always exit 0), and cwd is exactly what
+happened unconditionally before this change.
+
+**Re-measured, same method that found it** (debug binary, scratch repo, hook invoked two
+levels below the root with a committed fixture on stdin, no `--root`):
+
+```
+--- cwd for hook invocation: /private/var/folders/.../T/tmp.XXXX/sub/deeper
+--- exit=0
+--- sub/.agentrec exists? (defect shape; must be NO)
+NO
+deeper: NO
+--- root signal.jsonl:
+       1
+{"v":1,"ts":...,"tool":"codex","event":"start","session":"019fd1b4-...
+```
+
+**Mutation-probed in both directions**, not merely observed green: neutering
+`resolve_hook_root` back to `cwd.to_path_buf()` (the pre-fix behavior), rebuilding, and
+re-running reds EXACTLY the two subdirectory regression tests — one per emitter
+(`hook_root_discovery::hook_codex_from_subdirectory_finds_root_and_creates_no_nested_agentrec`,
+`…hook_claude_…`) — while the root-itself, explicit-`--root`, and fail-open legs stay green.
+Restoring returns all 5 to green. The absence of `sub/.agentrec/` is asserted explicitly in
+both tests; that absence IS the defect being closed.
+
+Suite 855 → 866/0/3. clippy `-D warnings` clean debug+release, fmt clean, release build
+`--locked`, 0 test seams in release `strings` — all confirmed by real exit codes, after an
+initial `| tail` pipeline masked a genuine `clippy::question_mark` failure (this repo's own
+recorded "`fmt --check | tail` exit-code trap", hit again; the lint was real and is fixed).
+
+**Still OPEN, unchanged by this fix:** the Claude leg's live/direct-invocation split above.
+Nothing here converts that simulated leg into a live one.
+
+### APPENDED 2026-08-05 (later same day) — the Claude leg IS now live; gap CLOSED
+
+Full method, raw captures, every command's actual output:
+`docs/verify/o5-two-tool-session.md`'s second section (below the original "Cleanup performed").
+Worktree unchanged at `3c4f598`; no Rust touched. Debug binary, same choice as every prior round.
+
+**Both legs live in one session, one `log.jsonl`, sequential not simultaneous:** `claude -p
+"Create a file named claude_leg.txt..." --allowedTools "Write"` ran a real Claude Code process
+against the scratch repo (`.claude/settings.local.json` installed by `init`, debug binary
+resolved via `PATH`); `-p`'s own help text confirms the trust dialog is skipped non-interactively
+and settings still load. Codex leg **also re-driven live** (not required by the task, done
+anyway) through the real `/hooks` TUI trust flow in the same repo, same method as the first O5
+round. **Cross-attribution: zero, jq-scoped, both directions** — `codex_leg.txt` never appears
+under `tool=="claude"`, `claude_leg.txt` never appears under `tool=="codex"`.
+
+**§4 wire path observed for the first time with a real `transcript_path`:** the live claude
+Stop signal carried both a genuine `transcript` field (verified: 85,068-byte, 25-line real
+transcript file) and a populated `files_written: ["claude_leg.txt"]` — the prior round's
+direct-invocation payload had omitted `transcript_path` entirely, so this exact wire shape had
+never been observed before in a two-tool context.
+
+**Correction to the prior round's diagnosis, proven from source + controlled repro, not
+asserted:** neither "D6 dark-wiring" (codex) nor "missing `transcript_path`" (claude) is what
+caused the prior round's `files:[]` on both rich turns. `agentrec-core/src/engine.rs::
+observe_changes` appends changes onto the open turn directly, independent of D6; `cli/src/
+daemon.rs` discards D6's resolution unconditionally (`let _declared = ...; // resolved but not
+yet consumed`) — confirmed live here, since this round's `files_written`-carrying, transcript-
+carrying claude Stop STILL required the (older, non-D6) watcher path to populate `turn.files`.
+A controlled repro (fresh scratch repos, the prior round's own direct-invocation method)
+reproduces the exact symptom on demand: a write immediately followed by Stop closes a
+**zero-duration bracket** (`started == ended` to the millisecond) with `files:[]`, the write
+landing in a separate bare turn instead; inserting a 2.5s gap between write and Stop closes a
+~977ms bracket that correctly captures the file. **The mechanism is fs-watcher/bracket timing,
+not D6 and not `transcript_path`** — both facts the prior round cited were true in isolation,
+neither was the actual cause. **Not claimed:** that the prior round's own live Codex leg lost
+this specific race — no write-to-Stop timing was recorded for that run, so it is undiagnosable
+now; only that the identical symptom is reproducible from timing alone. This is a **new,
+previously-undocumented, reproducible defect surface** (a fast-enough bracket can silently
+misattribute its own write to an orphaned bare turn), distinct from D6's phase-3 plan — recorded
+for founder disposition, not fixed here (out of this round's scope).
+
+**Second measurement, independent of the above — done twice, because the first attempt didn't
+measure the right process:** `3c4f598`'s commit message asserted `hook claude`'s pre-fix defect
+was latent because "Claude Code happens to set cwd to the project root" — an unverified
+assumption. A first live `claude -p` session from `<repo>/sub/` had the session's own **Bash
+tool** run `pwd` into a file — that measures the Bash tool subprocess's cwd, not necessarily the
+separate hook subprocess's cwd, so it was non-discriminating (a self-caught gap, not found by a
+second party). Redone with the Codex leg's own method: a wrapper substituted for the installed
+hook command itself, capturing `pwd -P` from inside the hook subprocess (plus the payload's own
+`"cwd"` JSON field as a second channel), daemon running throughout. **Both channels agree, both
+firings: the hook subprocess's own cwd was the subdirectory when launched from the
+subdirectory.** The assumption in `3c4f598` is false as stated; `resolve_hook_root` correctly
+discovered the root from a subdirectory for the **claude** emitter too — the fix earns its keep
+for claude for a now-properly-measured reason. Full corrected method + raw capture:
+`docs/verify/o5-two-tool-session.md` § "Correction to the subdirectory-cwd measurement above".
+
+**One honest, undiagnosed anomaly, not swept:** after a daemon restart, `state.json`'s
+`signal_offset` advanced to consume the subdirectory session's `start`/`stop` signals in full,
+but **no turn record for that session appears anywhere in `log.jsonl`** — zero occurrences of
+its session id or its file. Source tracing found no obvious filter that would drop a matched
+bracket's Stop turn, and no error was logged. **Cause not established**; candidate explanations
+are listed in the writeup and explicitly not asserted as the mechanism, to avoid repeating this
+document's own signature defect.
+
+**Suite:** `cargo test --workspace -- --test-threads=3` @ `3c4f598` (unchanged, no Rust touched),
+summed directly from all 14 `test result:` lines (not through `| tail`): **866 passed / 0 failed
+/ 3 ignored** — matches `3c4f598`'s own baseline exactly.
+
+**launchd: exactly one unit throughout** (`com.agentrec.bfa6bde6eaa4`, pre-existing dogfood
+daemon), before and after — no plist written for any scratch repo this round touched (main
+two-tool repo, `timing-fast`, `timing-slow`). All daemons this round started were killed by PID
+and confirmed stopped; the four pre-existing unrelated `/var/folders/.../T/.tmp*` recorders from
+other work were left untouched, per the first round's own precedent. Scratch repos removed after
+evidence was captured verbatim into the writeup.
+
+**Plan's O5 exit criterion: DONE, live, both legs, one `log.jsonl`, zero cross-attribution — the
+gap this repo disclosed (Claude leg not live) is closed.** Carried forward as genuinely OPEN:
+interleaved/concurrent two-tool sessions (pre-existing D6 risk); the newly-found bracket-timing
+race (new); the zero-turn-after-offline-bracket anomaly (new, undiagnosed). None fixed —
+verification only, per this round's scope.
+
+### FOUNDER WAIVER 2026-08-05 — claimd claims not declared for Phase C
+
+Recorded as a debt, not silently closed. The Phase 2 tail plan's executor protocol requires
+declaring a claimd claim per AC *before* implementing, plus one covering each normative-doc
+edit (C1 edited `PROTOCOL.md` §4). **This was not done for any of Phase C** — C1, C2, C3, C4,
+the §4 edit, or the O5 hook-root fix. Two successive skeptic gates found the gap; it is
+unchanged between them. Measured, not asserted: the worktree has no `.claims/` at all, and the
+main repo's `.claims/claims.jsonl` carries zero claim statements mentioning
+codex/`emitter_turn`/hook-root/O5 and zero events dated 2026-08-05 — the date of every Phase C
+commit.
+
+**Founder ruling (2026-08-05): waived, proceed.** Phase C ships without claims, carried as a
+coverage debt in the same shape as this repo's existing touched-uncovered rows
+(`cli/src/cmds.rs` from the P3 residuals round; `cli/src/purgecmd.rs` from the honesty round).
+Retroactive declaration was offered and **declined** on the founder's own standing rule that
+it is refused by design — a claim declared after its evidence exists is a weaker artifact than
+one declared before, and an agent minting claims for work it just finished is exactly the
+self-attestation the protocol exists to prevent.
+
+Scope of the debt, stated so it cannot be read as narrower than it is: every Phase C
+acceptance criterion rests on the automated suite plus two independent adversarial gate rounds
+(both of which re-ran the load-bearing mutation probes themselves rather than trusting the
+implementers), and on **no** claimd replay. Nothing here is claim-attested. A future round
+that wants claim coverage over this surface must declare fresh claims against live code, not
+backfill these.
+
+### CORRECTION 2026-08-05 — `3c4f598`'s commit message asserted an unmeasured live fact, now falsified
+
+Recorded because this repo's signature defect is exactly this shape, and this instance was
+written by the orchestrating agent into a commit message that cannot be amended.
+
+`3c4f598` (the hook-root walk-up fix) justified covering `hook claude` with:
+
+> "`hook claude`'s defect was **latent rather than observed**: identical bare-command shape,
+> escaping the bug **only because Claude Code happens to set cwd to the project root**, which
+> is an undocumented behavior not worth depending on silently."
+
+The bolded clause was never measured. It was inference presented as fact, in the same commit
+that fixed a defect found by refusing to accept exactly that kind of inference.
+
+**It is false.** The O5 Claude-leg round measured it directly, using the Codex leg's own
+wrapper-substitution method (substitute a wrapper for the installed hook command; capture the
+hook subprocess's real `pwd -P`, plus the payload's own `"cwd"` JSON field as an independent
+second channel). Launched from a subdirectory, both channels agree on both firings:
+
+```
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"UserPromptSubmit",...}
+hook_process_pwd=/REDACTED/repo/sub
+payload={"...","cwd":"/REDACTED/repo/sub","hook_event_name":"Stop",...}
+```
+
+Claude Code does **not** pin hook cwd to the project root; it inherits the launch directory,
+same as Codex. So the `hook claude` defect was **real and live, not latent** — a user running
+`claude` from a subdirectory of an agentrec repo was losing signals silently, exactly as Codex
+users were. The fix in `3c4f598` is correct and is load-bearing for both emitters; only its
+stated *reason* for covering claude was wrong, and it was wrong in the direction that
+understated the bug.
+
+Worth keeping for the pattern: the first attempt at this measurement was itself
+non-discriminating (it measured Claude Code's *Bash-tool* cwd, not the hook subprocess's), and
+was caught in review rather than by the agent that ran it — corrected in `1b34f5b`. Two
+successive measurements of the same fact, the first wrong, before the record was right.
+
+### CORRECTION 2026-08-05 (b) — conflicting provenance for the non-discriminating-probe catch
+
+A gate round found three mutually incompatible statements, across three gated commits, about
+who caught the first (non-discriminating) Claude hook-cwd probe:
+
+- `1b34f5b` commit message: "Caught before being relied on further **(not by a second party)**"
+- this ledger, above (`### ... (a)` section's neighbourhood, the O5 Claude-leg row): "**a
+  self-caught gap, not found by a second party**"
+- `ecd09bc`'s appendix: "was **caught in review rather than by the agent that ran it**"
+- `docs/verify/o5-two-tool-session.md`: "it was caught **(not by this round)**"
+
+"Self-caught, not by a second party" and "caught in review rather than by the agent that ran
+it" are direct negations. At least one gated commit carries a false sentence. This matters
+because this repo's honesty machinery explicitly tracks whether self-correction fires WITHOUT
+a reviewer — that datum is the whole point of distinguishing the two (cf. `f8d8f75`, labelled
+"advisor-caught" precisely to avoid claiming an unearned self-catch).
+
+**No account is endorsed here, because the artifacts cannot settle it.** What CAN be
+established, and is the only new fact this correction adds: the implementing agent gave the
+orchestrator a completion report stating the probe was "caught during review, not by me" —
+which contradicts that same agent's own commit message (`1b34f5b`) claiming a self-catch not
+found by a second party. The agent's two accounts of its own work disagree. `ecd09bc`'s
+sentence is traceable: the orchestrator transcribed the agent's completion report without
+reconciling it against the commit message the same agent had already written — a transcription
+of an unverified claim, which is its own instance of the pattern this file keeps recording.
+
+Disposition: the substantive conclusion is untouched by any of this — the redone probe's
+measurement stands (two agreeing channels, both firings), and `3c4f598`'s falsified claim
+stays falsified. Only the catch-provenance is unresolved, and it is left unresolved on the
+record rather than settled by picking the flattering account.
+
+### RE-RECORDED 2026-08-05 — the "offline bracket anomaly" is D7-by-design, not an anomaly
+
+The O5 Claude-leg round recorded, as an undiagnosed anomaly for founder disposition, that a
+bracket whose entire lifetime elapsed while the daemon was offline left `signal_offset` fully
+consumed but produced zero turn record. A gate round then reproduced it **deterministically**
+(signals appended with no daemon → fresh daemon start → `signal_offset` = exact file length,
+zero turns, epoch start/stop only) and found the mechanism, which is not a mystery at all:
+`cli/src/daemon.rs::replay_pending_candidates` drops start/stop in the pre-daemon window **by
+design**, with a comment saying so ("D7 preserved: ... never fed to the engine, so no phantom
+turn can be minted here"). This repo's own CLAUDE.md already records the same fact ("startup
+replay never feeds start/stop to the engine at any offset").
+
+The original round's trace of `apply_signal`/`observe_*`/`persist` was literally accurate but
+missed the startup site, so it reported a mystery where the answer was a documented decision.
+
+**Re-framed, because the framing changes what the founder actually owns:** this is not a
+diagnosis round to commission. It is a product-posture call on D7 — any tool session whose
+FULL bracket elapses while the daemon is down is silently dropped as-if-consumed, prompt
+included. That is the known D7 tradeoff (never mint a phantom turn) doing exactly what it was
+built to do, at a cost that is now measured rather than theoretical.
+
+#### Rider to CORRECTION (b) — its own evidence is unpersisted, and must not rot into fact
+
+Added after a gate round caught CORRECTION (b) committing the pattern it diagnoses. That
+paragraph labels `ecd09bc` "a transcription of an unverified claim" and then, one sentence
+later, offers as "what CAN be established" a verbatim quote from the implementing agent's
+completion report — an artifact that **exists nowhere in this repo**. `grep -rn "caught during
+review" docs/ VERIFY-LEDGER.md .claims/` returns exactly one hit: the sentence asserting it.
+
+Therefore, explicitly:
+
+- The completion report lives only in the orchestrating agent's session context. Its quote
+  cannot be checked by any reader of this repository — not a future round, not a skeptic, not
+  the founder.
+- **The only repo-verifiable fact here is the textual contradiction** between `1b34f5b`'s
+  commit message ("not by a second party") and `ecd09bc`'s ledger sentence ("caught in review
+  rather than by the agent that ran it"). Both strings are in git; anyone can diff them.
+- "The agent's two accounts of its own work disagree" is NOT repo-verifiable, because the
+  bridge — that the same agent authored the report, and that the report contained those words
+  — is unpersisted. Restating it without this rider would let it rot into fact.
+- `ecd09bc`'s sentence being a transcription is the orchestrator's own account of its own
+  action, offered as such, and carries exactly the weight of an unattested self-report.
+
+This is the same rider convention CLAUDE.md already applies to AC8(a) ("round 1's per-AC
+verdict table was never persisted ... restating it without this rider would let it rot into
+fact"). The catch-provenance question rests permanently unresolved; no artifact can settle it,
+and this rider is the fix rather than further investigation.
+
+#### SUPERSEDED 2026-08-05 — the artifact exists; it was never "nowhere," only outside git
+
+Founder directed further investigation rather than accepting the rider above. The rider's own
+scope was too narrow: `grep -rn "caught during review" docs/ VERIFY-LEDGER.md` (the rider's
+`.claims/` in that command does not exist on this branch — a reader running it verbatim gets
+exit 2, per the handoff's residual-nits note; corrected here rather than repeated) only searches
+this git tree. It does not search Claude Code's session transcript store, which is not part of
+the repo but is part of the durable record of who did what.
+
+**Found:** `~/.claude/projects/-Users-ravichandrasekhar-Projects-agentrec/01c71c15-e742-49c9-9391-f539cefd0287/subagents/agent-a87a3ec2e766145e4.jsonl`, final message (line 327,
+`assistant`, `isSidechain:true`, `2026-08-05T21:24:18.586Z`), a subagent of orchestrating
+session `01c71c15-e742-49c9-9391-f539cefd0287.jsonl`, labeled (its `.meta.json`)
+`{"agentType":"general-purpose","description":"O5 live Claude Code leg","model":"sonnet"}`.
+Verbatim: *"a first attempt measured Claude Code's Bash-tool cwd (non-discriminating — **caught
+during review, not by me**)."*
+
+Commit `1b34f5b` lands at `22:23:36+0100` = 21:23:36 UTC, fifty seconds after this report at
+21:24:18 UTC — the timing is consistent with the orchestrator committing right after reading it
+(NOT proof of causation on its own; timing alone is compatible with coincidence, and is offered
+here only as corroboration alongside the direct textual match).
+
+**This settles it, against `1b34f5b`:** the subagent that did the work reported "caught during
+review, not by me" (disclaiming self-catch). `1b34f5b`'s commit message says "not by a second
+party" (claiming self-catch) — the inverse. `ecd09bc`'s ledger sentence matches the subagent's
+own report; `1b34f5b`'s commit message does not. The orchestrator's commit message inverted or
+misremembered the subagent's actual words — itself another instance of this repo's
+confidently-worded-but-unverified pattern, this time in the artifact that started the whole
+correction chain.
+
+**Caveats that must travel with this, because they're the reason the search almost didn't
+happen:** (1) the settling artifact lives in a session transcript directory, not this repo — it
+is not git-tracked, not backed up by this project, and can rotate out or be deleted by tooling
+this repo doesn't control; a future reader following this citation may find it gone, which would
+NOT reopen the question, since the finding is recorded here verbatim. (2) This is single-machine,
+single-user evidence (`~/.claude/projects/...`), same class of caveat this repo already applies
+to perf/timing claims. (3) The search was scoped to transcripts under this repo's own Claude Code
+project directory; it did not exhaustively search every possible location a completion report
+could live.
+
+The prior rider's operational lesson stands regardless of this outcome: a repo-scoped grep cannot
+prove a claim is unrecoverable, only that it isn't in the repo. "No artifact can settle it" was
+itself an unverified claim dressed as a methodological conclusion.
+
+## Task E4 — MCP host registration, demand sweep, P.7 review (2026-08-06, `feat/phase-2-tail`)
+
+### DECLARED / manual — MCP demand sweep (delta spec gap 10; D7/D10)
+
+| Row | State | Closes when |
+|---|---|---|
+| MCP demand sweep — first run | **DECLARED, manual, not yet due** | `scripts/mcp-demand-sweep.sh` is run once, **one month after 2.2 ships**, and its output is pasted into this row. 2.2 is **unshipped as of 2026-08-06**, so no absolute date can be written here yet; the release that cuts 2.2 fills it in (`claude-setup/skills/agentrec-release`). An empty date in this row therefore means "2.2 has not shipped", never "the sweep was forgotten". |
+
+Why the date matters rather than the cadence: Claude Code prunes `~/.claude/projects` on a
+~30-day rolling window (measured in the Phase 2.0 P1 round — `-mtime +30` → 0 files). A sweep
+skipped by a month does not run late, it runs against a corpus that no longer contains the
+evidence. Slippage is lossy, not merely delayed.
+
+What the instrument does and does not do: it greps transcripts for `"name":"…agentrec_<tool>"`
+(the `mcp__<server>__<tool>` shape measured on this machine's real transcripts, plus the bare
+form) and prints per-tool and per-transcript candidate counts. **It judges nothing** — per the
+D7 clauses the audit is manual, and a name in a transcript is a candidate, not a verified
+invocation (it can appear in prose or in an echoed tool *definition*). Read-only, no network,
+absent directory → explanation + exit 0. Pinned by `mcp_demand_sweep_prints_candidate_invocations`
+and `mcp_demand_sweep_handles_absent_transcript_dir` (`cli/tests/integration.rs`, `HOME`
+overridden so the script's DEFAULT path is what runs).
+
+### Codex MCP registration — format verified live, location pinned, loading NOT confirmed
+
+Format measured, not recalled: `codex mcp add agentrec -- agentrec mcp` under a throwaway
+`CODEX_HOME` on the pinned `codex-cli 0.146.0` wrote exactly
+
+```toml
+[mcp_servers.agentrec]
+command = "agentrec"
+args = ["mcp"]
+```
+
+Location is **parent spec :582** ("Project `.codex/config.toml` owns the stdio MCP
+registration"), which is founder-owned and not an executor's to overturn.
+
+**Open gap, stated rather than resolved:** that Codex honors `mcp_servers` from a *repo-local*
+`.codex/config.toml` is **not confirmed**. `codex mcp list` under an isolated `CODEX_HOME` did
+not list a project-local `[mcp_servers.projlocal]` entry — but that probe is **weakly
+discriminating**: the management subcommand may only ever consult `CODEX_HOME`, regardless of
+what the agent runtime loads. What *is* confirmed live is that Codex loads repo-local
+`.codex/config.toml` for the `[hooks]` layer (spike: the dual-representation merge warning names
+the scratch repo's own path). The discriminating probe — `codex exec` in a temp repo carrying a
+project-local `mcp_servers` entry whose command leaves a filesystem trace — was **not run**
+(needs auth + a live model call). This code therefore states what the config declares, not what
+Codex does with it, the same honest form `doctorcmd.rs::check_codex_hook_flags` already uses.
+
+### P.7 review (IMPLEMENTATION.md §P.7) — reviewed 2026-08-06, stance unchanged
+
+Reviewed against the surface `agentrec mcp` actually ships today (five read tools, `mcpcmd.rs`).
+
+**Holds.** (a) All five tool descriptions are declarative statements of what is returned —
+no directives aimed at the model, no urgency, no authority claims. (b) Tool results are the
+`view.rs` typed serializers' JSON carried in `content:[{type:"text"}]`; no imperative text is
+synthesized anywhere in the result path. (c) Every tool carries `readOnlyHint: true` /
+`destructiveHint: false` (plus `idempotentHint: true`, `openWorldHint: false`), asserted per
+tool over the exact five-name list by `cli/tests/mcp.rs` (`names == READ_TOOLS`, then the
+per-tool annotation loop) — the Phase E exit item, already satisfied by E1's test, verified
+here rather than re-implemented.
+
+**Two findings, REPORTED not fixed** (both would be changes to shipped wire text or to
+founder-owned normative text, neither of which this task is authorized to rewrite):
+
+1. `agentrec_recall`'s description ends "raise `k` to see more hits", and its `cursor` property
+   says "see the tool description". These are imperatives, addressed to the caller about the
+   tool's own API rather than instructions to act in the world — benign on any reading, but
+   they are literally the shape §P.7's first clause bans ("no instructions"). Either the clause
+   wants narrowing to *instructions to act outside the tool call*, or those two sentences want
+   rephrasing declaratively. Founder's call.
+2. **The stance does not cover the real exposure.** Both clauses are about text *agentrec*
+   writes. The untrusted text on this surface is what agentrec *replays*: recorded prompt
+   excerpts and file diffs flow back into an agent's context through `agentrec_log`/
+   `agentrec_diff`/`agentrec_recall`, and current MCP security guidance treats tool-result
+   content as untrusted data that a host must not follow. Nothing here is a defect in the
+   code — the data is faithfully what was recorded — but §P.7 as written would be satisfied by
+   a server that echoed an attacker-authored prompt verbatim. A clause naming replayed content
+   as untrusted-by-construction is the gap.
+
+**Also stale, found during this review and likewise not rewritten:** §P.2 says read tools
+"return structured JSON mirroring `--json` output". Two later founder-series decisions narrow
+that — P4b decision 12 (`agentrec_log` mirrors `list()`'s `Page<TurnSummary>`, **not**
+`log --json`, which emits protocol JSONL) and delta decision 14 (`agentrec_recall` has no
+`--json` contract to mirror and carries its own flags). The code follows the decisions; §P.2's
+sentence is the thing out of date.
+
+### E4 residuals and scope statements (recorded, not fixed)
+
+- **Correction to `f4a96c3`'s commit message (Phase E gate finding 1, measured by the gate):**
+  the message claims the key-only-predicate neuter "reds exactly the **three** foreign-key
+  tests and nothing else." The gate re-ran the neuter (`mcp_entry_is_ours` → `true`):
+  **four** tests red — the three named plus
+  `uninstallcmd::tests::uninstall_does_not_remove_a_foreign_server_named_agentrec`
+  (346 passed / 4 failed). The guard is stronger than claimed; the count in the immutable
+  commit message is wrong. Signature-defect class (confident count in a gated record); this
+  entry is the correction.
+- **Uninstall of a pre-init `{"mcpServers":{}}` is not value-identical (gate finding 2):**
+  `remove_mcp_json` drops the now-empty `mcpServers` key, so an empty-table file does not
+  round-trip to its pre-init parsed value. No foreign registration is harmed — AC-E4's
+  letter holds — recorded here because it was previously recorded nowhere.
+- **No parallel D46 leak class.** Both registration targets are repo-local
+  (`initcmd::mcp_json_path` = `root/.mcp.json`, `codex_config_toml_path` =
+  `root/.codex/config.toml`); nothing user-scoped or global is written, and `uninstall`
+  removes both. `init` under a temp root writes them *inside* the temp root, so they vanish
+  with it — unlike the launchd unit `service_decision` guards, which outlives its root. The
+  temp guard is moot here by construction, not by exemption.
+- **`init` does not touch `.gitignore` for `.mcp.json`.** `ensure_gitignore` only ever
+  appends `.agentrec/`. `.mcp.json` is the *shared* registration (unlike
+  `.claude/settings.local.json`) and is left for the user to commit or not. Note this
+  repo's own `.gitignore:10` already lists `.mcp.json` — pre-existing, untouched by E4.
+- **Codex `Refuse`-state asymmetry, deliberate:** registration proceeds on `HooksJson` and
+  `ConfigToml`, and is withheld on `Refuse`, because `codex_refuse_line` promises the user
+  both hook files are left alone. Our own registration cannot push a repo into `Refuse` on a
+  later run — `[mcp_servers]` is not a hook representation, pinned by
+  `initcmd::tests::mcp_registration_alone_does_not_change_the_codex_hook_target`.
+- **Comment-dropping, inherited:** on the non-`Refuse` paths, registering re-serializes the
+  WHOLE `.codex/config.toml` through the `toml` crate, so a user's comments and key ordering
+  are lost on a file they did not ask to have reformatted. Same documented limitation as
+  `install_codex_hooks_toml` (fixing it needs `toml_edit`, a new dependency). Disclosed by
+  the printed action line; not silent. **`.mcp.json` reformats the same way** (post-review
+  correction — this bullet previously read as Codex-only): `install_mcp_json`/`remove_mcp_json`
+  re-serialize whole through `serde_json`, whose `Map` is a `BTreeMap` here, so keys re-sort
+  alphabetically and `to_string_pretty` normalizes layout. Foreign entries survive as parsed
+  values, never as bytes. Its printed action line carries no equivalent disclosure — recorded,
+  and deliberately NOT added (a new user-facing line is a behavior change nobody asked for).
+- **Declared `cursor` type is narrower than the implementation, and narrower than the only
+  cursor a client can hold — found by the P.7 F1 schema sweep, recorded NOT fixed.**
+  `agentrec_log`/`agentrec_diff`/`agentrec_recall` all declare
+  `"cursor": {"type": "string"}`, but `Page::next` serializes `view::Cursor` as a JSON
+  OBJECT (parity with `--json` forbids stringifying it), and `mcpcmd::cursor_arg`
+  deliberately accepts both shapes. A host that validates `tools/call` arguments against
+  the advertised schema would therefore reject the obvious move — lifting `next` verbatim
+  out of the page it just read. Widening the declared type is a wire-contract decision the
+  review did not mandate and is founder-owned; the descriptions ("Opaque cursor from a
+  previous page") are accurate as written. This is the one further schema/implementation
+  mismatch the F1 sweep turned up; the four non-diff tools' parameter *descriptions* are
+  accurate (`log.limit` and `recall.k` both clamp, `log.include_hidden` names both halves
+  of `include_all`, `blame.line` matches, `status` takes no parameters).
+- **`uninstall` aborts on an unparseable registration file before service removal and
+  `.agentrec/` archival.** An invalid `.mcp.json` (or `.codex/config.toml`) returns `Err` and
+  ends the run early. Pre-existing pattern — `remove_claude_hooks` aborts identically — and
+  extended by E4 to the two registration files; `init`'s counterpart degrades gracefully
+  ("MCP registration skipped: {e}" as an action line). Tested in neither direction. Changing
+  the ordering, or making uninstall degrade like init, is founder-owned.
+- The sweep script is committed `100755` but every caller invokes it as
+  `bash scripts/mcp-demand-sweep.sh` (test and docs both), matching the `check-versions.sh`
+  precedent — nothing depends on git's recording mode.
+- Release-seam check re-run against a **freshly built** `target/release/agentrec` (the
+  earlier reading was against a stale binary and is not the one recorded here):
+  `strings … | grep -c AGENTREC_TEST` → **0**. E4 adds no env seam.
+
+## Task F5 — undo `origin` discriminator (2026-08-06, `feat/phase-2-tail`)
+
+### DECLARED / manual — post-ship undo counts by origin (delta decision 11)
+
+| Row | State | Closes when |
+|---|---|---|
+| Executed-undo counts by origin — first reading | **DECLARED, manual, not yet due** | Delta decision 11 waived decision 6's ≥20-human-confirmed-`undo --confirm` gate and demoted it to this row (the same demotion decision 10 applied to decision 7). Count at waiver: **0** — `log.jsonl` held zero `tool: "agentrec"` turns. Closes when, **one month after 2.3 ships**, the counts are read off real `log.jsonl` files and pasted here as three numbers: undo turns with `origin: "mcp"`, with `origin: "cli"`, and with **no `origin` key at all**. 2.3 is **unshipped as of 2026-08-06**, so no absolute date can be written yet; the release that cuts 2.3 fills it in (`claude-setup/skills/agentrec-release`). An empty date means "2.3 has not shipped", never "the reading was forgotten". |
+
+**Three numbers, not two, and the third is why.** §5 says an absent `origin` reads as `"cli"`,
+so the arithmetic answer is to fold absent into cli and report two. Do not: an absent key is a
+**pre-F5** undo turn, and folding it in silently contaminates the post-ship denominator this
+row exists to establish with undos executed before the discriminator existed. Report it
+separately and subtract it, or the row measures a population it did not scope.
+
+**`"cli"` is two populations, and this row cannot separate them.** `origin` names the surface
+that EXECUTED the writes, not the one that requested them, so `"cli"` covers both a human's own
+`agentrec undo --confirm` and an `agentrec approve` of an undo an **agent requested over MCP**.
+Decision 6's gate was about human confirmation, and both of those are human-confirmed — which is
+why `approve` records `"cli"` and why the count is still the right instrument for the gate. But
+a reader wanting *human-initiated* undos specifically must join to `.agentrec/undo-requests.jsonl`
+(an approved undo has a `request` event followed by an `execute` event — only the `execute`
+event carries `undo_turn`; no `approve` event is ever written, `EVENT_APPROVE` is reserved and
+`undo_coordinator.rs` documents the durable approval as `EVENT_EXECUTE` itself; a bare
+`undo --confirm` has no ledger row at all). **A count reported as "N human-initiated undos"
+without that join is wrong**, and this paragraph must travel with any figure derived from the
+field.
+
+**No instrument is committed for this row**, deliberately, and that is a difference from E4's
+sweep: the counts are a `grep`/`jq` over `log.jsonl` files whose locations are not knowable in
+advance (every user's repos), so a script here would measure only the dogfood repo and read as
+if it had measured the population. The reading is manual and its scope must be stated with it.
+
+### Suite
+
+`cargo test --workspace -- --test-threads=3` → **985 passed / 0 failed / 4 ignored**
+(base at `93e43c2`: 981/0/4). The **+4 is exactly the four new
+`cli/tests/undo_origin.rs` tests** and nothing else: F5's other test edits are
+assertions added inside existing tests (`cli/tests/conformance.rs`) or two existing
+assertions inverted (below), neither of which moves a count. The conformance half
+of that was verified rather than reasoned: `cargo test --test conformance -- --list`
+returns the same **4** test names as before, because the new `MANIFEST` row is data
+iterated by one existing `#[test]`, not a new one. clippy `-D warnings`
+debug **and** release: exit 0. `cargo fmt --check`: exit 0.
+
+**Two pre-existing assertions were INVERTED, not deleted, and that is disclosed
+rather than quiet.** F3 and F4 each planted a guard that `origin` must be ABSENT
+("F5 owns `origin`; F3/F4 must not add it early") —
+`the_approved_undo_turn_has_the_shape_cli_undo_produces` (`cli/tests/approve.rs`)
+and `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable`
+(`cli/tests/undo_execute.rs`). Both now assert F5's specified value, `"cli"` and
+`"mcp"` respectively. The guards did their job: both went RED on this change
+before being touched, which is how F5's threading was proven to reach both
+transports and not merely the new test file.
+
+### There is no fifth undo-turn writer — checked, not assumed
+
+Four `append_undo_turn` call sites were threaded, but "four" came from grepping
+`append_undo_turn` itself, which cannot find a writer that bypasses it. The
+discriminating check is the other direction: `git grep -n 'Some("agentrec"' --
+cli/src agentrec-core/src` returns **exactly one constructor**,
+`cli/src/readcmds.rs::append_undo_turn`. Every other hit is a *reader* predicate
+(`readcmds.rs::…is_synthetic`, `undo_coordinator.rs`'s rich-coverage test) or an
+unrelated `initcmd` string. So no path appends an `agentrec`-tooled turn without
+stating an origin, and the eleven mechanical `origin: None` insertions into other
+`TurnRecord` literals are all on non-undo turns, where `None` is the correct and
+required value.
+
+### Mutation probes (run at `2706704`, on a clean tree, after `cargo build`)
+
+Both are **per-site** and both discriminate: an all-sites-fail probe cannot
+distinguish three independently-wired call sites from one shared default.
+
+| Probe | Result |
+|---|---|
+| `mcpcmd.rs` execute → `UndoOrigin::Cli` | `ac_f5_mcp_execute_records_origin_mcp` RED (`left: "cli"`, `right: "mcp"`); the other **three** `undo_origin` tests stay GREEN. `ac_f4_execute_reverts_records_a_turn_and_the_undo_is_re_undoable` also REDs — the F4 guard covers the same site |
+| `approvecmd.rs::approve` → `UndoOrigin::Mcp` | `ac_f5_approve_of_an_mcp_request_records_origin_cli` RED (`left: "mcp"`, `right: "cli"`); the CLI-undo and MCP-execute tests stay GREEN, proving `approve` is wired separately and does not inherit either |
+
+Pre-implementation RED, for the record: with the field present but nothing
+writing it, the three behavior tests failed on `left: Null` against their
+expected values while the legacy-reading test already passed — i.e. they
+failed as assertions, not as compile errors.
+
+### Verified here (automated)
+
+| AC | Evidence |
+|---|---|
+| AC-F5.1 CLI undo → `"cli"` | `ac_f5_cli_undo_confirm_records_origin_cli` (`cli/tests/undo_origin.rs`) — drives the real binary, asserts the raw `log.jsonl` bytes |
+| AC-F5.2 MCP undo → `"mcp"` | `ac_f5_mcp_execute_records_origin_mcp` — real `agentrec mcp` subprocess, auto-mode token |
+| AC-F5.3 approve → `"cli"` | `ac_f5_approve_of_an_mcp_request_records_origin_cli` — also asserts the request ledger names the undo turn, so the MCP provenance `origin` drops is demonstrably recoverable |
+| AC-F5.4 pre-F5 line parses, reads as cli, round-trips | `ac_f5_a_pre_f5_undo_turn_without_origin_reads_as_cli`; plus `named_fixtures_carry_the_semantics_they_are_named_for` (`cli/tests/conformance.rs`) against a stripped §5 fixture line |
+| Renders/blames identically | `cargo test --test golden` → **33 passed / 0 failed**, and all **30** golden files are byte-identical (`git status --short cli/tests/fixtures/golden/` empty afterwards). Both figures measured here, and they are different things: **30 `.golden` files, 33 golden tests** — CLAUDE.md's bare "33 goldens" is the test count, and quoting it as a file count is the arithmetic this row refuses. Their seeded undo turn keeps `origin` absent **on purpose** — it IS the pre-F5 record, so every log/show/blame golden built from it is the unchanged-rendering proof (`cli/tests/golden.rs`) |
+
+## Phase F residuals recorded at gate time (2026-08-06, gate round 1 blocker 2 + findings)
+
+- **`.agentrec/undo-requests.jsonl` growth is unbounded, and no sanctioned rewrite class
+  covers it** (Phase F review finding 13, recorded here because the gate found it recorded
+  nowhere). Every auto `preview` and confirm `request` appends rows; terminal events resolve
+  a reservation but no line is ever removed, and the file is deliberately outside the three
+  sanctioned `purge` rewrite classes ("never a wire surface" — `LEDGER_V`'s comment — does
+  not make it non-disk). An agent can grow it without bound by spamming preview/request.
+  Growth rate in real use: unmeasured. Adding a reclaim path requires a decision-register
+  entry, same bar as D48's. Founder-owned.
+- **The coordinator's auto `allow_modified` rail is downgrade-with-warning, not refusal**
+  (gate round 1, non-blocking finding 1). §8's "refused outright" behavior exists only at
+  the transport rail (`mcpcmd`'s router); `UndoCoordinator::preview` in Auto coerces the
+  flag false, warns, and returns a successful preview with modified files excluded
+  `ModifiedSince`. The safety property was probe-proven intact at both layers
+  independently, but any sentence claiming "refused at both rails" is wrong as written — a
+  future non-reference transport built directly on the coordinator would ignore-with-warn,
+  not refuse. Recorded so the §8 wording and the coordinator's behavior are not conflated.
+- **Kill-9 flake provenance, pinned by the gate:** `approve.rs::
+  a_killed_approve_never_leaves_a_phantom_approval` fails intermittently (gate measured 1/26
+  runs at stock `335f076`, 2/~14 at `e32d247`, same assertion `approve.rs:440` both times)
+  when the kill lands between `append_undo_turn` and the EXECUTE row — a window the crash
+  matrix itself documents. Pre-existing; NOT introduced by `e32d247` (test body byte-identical
+  across the range, e32d247's diff touches only the failure branch). The test doc's
+  "window-independent" claim is true of the ledger's two-state invariant and FALSE of the
+  strong-form log↔ledger agreement the failing assertion adds. A crash in that window is
+  SAFE (re-approve → `preview_stale`); the defect is the test's claim, not the crash
+  behavior. Disposition (weaken the assertion + fix the doc vs re-order the writes)
+  founder-owned.
+- **Confirm-path variant of the consumed-but-unresolved residual, stated explicitly** (gate
+  round 1, non-blocking finding 3): a kill-9'd approve leaves worktree reverted + turn
+  logged + request pending + reservation live until `REQUEST_TTL_MS` (10 min), not the 60 s
+  token TTL — the earlier residual named only the auto path.
+
+## Phase F exit — self-healing acceptance story, run live (2026-08-06, `feat/phase-2-tail`)
+
+Manual, not-unit-testable honesty row per the plan's Phase F exit criterion. It exists to close
+the gate's recorded blocker — *"the destructive loop end-to-end has zero live evidence"*. Full
+method, every command, every raw payload and hash: `docs/verify/f-exit-self-healing.md`. Run at
+worktree HEAD `78fbc36` (clean tree).
+
+**Binary: RELEASE, deliberately** — `target/release/agentrec`, `agentrec 0.2.0`, sha256
+`c1c00649dc3b1147120e0c2f1ffbe083eed00eaa4f912ce3a5c9ac10f3ade65e`. This row is a
+product-behavior story about the artifact users install, so unlike O5 (debug, disclosed) it runs
+the release build.
+
+**Agent identity is SIMULATED, stated first because it bounds everything below.** The two agent
+turns were driven through the real hook emitter (`agentrec hook claude` with `UserPromptSubmit` /
+`Stop` payloads on stdin, the way `cli/tests/misattribution.rs::send_hook` drives it) wrapping
+real file edits — the sanctioned hook-driven option. Bracketing, signal inbox, daemon
+consumption, turn minting, CAS snapshots, and every read/destructive verb are production paths;
+only the identity of the writing process is simulated. No `claude -p` session was involved.
+
+**Both legs green, on a disposable python repo (`calc.py` + two independently-failing named
+tests), never the agentrec repo.** Leg 1 (`mcp_destructive = "confirm"`): agent breaks `test_sub`
+→ daemon stopped → `log`/`blame`/`diff` all find the agent's own turn with no daemon running →
+MCP over real newline-delimited JSON-RPC frames (revision `2025-11-25`) lists **6 tools** (5 read
++ `agentrec_undo`, listed because mode ≠ `off`) → `preview` (no token, worktree digest unchanged
+after it) → `request` (10-min expiry observed on the wire as `expires - requested = 600000`) →
+human `agentrec approve <id>` → `test_sub` green → undo turn appended with **`"origin":"cli"`**.
+Leg 2 (`auto`): agent breaks `test_add` → both rails fired with their documented messages
+(`wrong_mode` for `request`-in-auto; `allow_modified_refused` for `allow_modified: true`) →
+`preview` issues a 60 s token → **`execute` run from a SECOND `agentrec mcp` process**, the
+preview process having already exited, with 40.99 s of TTL left → `test_add` green → undo turn
+with **`"origin":"mcp"`**. `grep -o '"origin":"[^"]*"' log.jsonl` over the one repo returns
+exactly `cli` then `mcp`. Replaying the spent token → `token_consumed`, worktree digest unchanged.
+Request ledger ended `0600` with all five events (`request`/`execute`, then
+`reserve`/`consume`/`execute`); F4's spend-before-writes order is visible in the last pair —
+`consume` at `…363051` precedes `execute` at `…363067`, **16 ms apart**. That figure is the
+consume→execute gap ONLY: `reserve`→`consume` is 19,015 ms, the wall-clock interval between the
+preview process and the separate execute process, and says nothing about write ordering. The raw
+token occurs 0 times in the ledger's bytes, only its sha256.
+
+**`origin: "cli"` for an agent-requested, human-approved undo is the SPECIFIED behavior, not a
+miss** — `record.rs`'s doc comment: *"It names the surface that wrote, never the one that asked."*
+Both observations carry the key explicitly, so neither rests on the absent-means-`cli` default.
+
+**The first attempt did not work, and it reshaped the run — recorded, not papered over.** A
+pre-check smoke of the undo round-trip produced `"before": null, "baseline_unknown": true` and
+nothing to revert. Not a defect: `record.rs:154` documents the field as exactly "before
+unrecoverable (first seen post-change)" — a daemon started moments before the edit has never
+observed the file, and git having it committed is irrelevant (the CAS is the daemon's, not git's).
+**Consequence, which is a genuine limit on this row's strength:** each leg required a **warm-up
+human write** (visible as a `bare` turn in every log) so the daemon held a baseline, and it was
+needed **twice** because a fresh daemon process starts baseline-less again. That a
+continuously-running real daemon supplies this for free is an *argument*, not something this round
+measured — **the story was never run against a daemon that had been up for days.**
+
+**Hash tie, observed rather than asserted:** at every transition in both legs, the turn record's
+`before`/`after` CAS refs are byte-identical to `shasum -a 256` of the file at that moment, and
+each post-undo digest equals its leg's baseline digest exactly.
+
+**Hygiene, measured at both ends.** `agentrec record|mcp` processes **5 → 5**, the same five PIDs
+with identical `lstart` (binary-path predicate). LaunchAgents **1 → 1 → 1** across before / after
+`init` / teardown; `init` on the `/private/tmp` root printed the D46 temp-root skip and
+`--service` was never passed. `pkill -f agentrec` was never run.
+
+**Two corrections to the round's own framing, both measured:**
+1. The task briefed **two** pre-existing leaked debug daemons (42419/42421). There are **four** —
+   41925 and 41952 too, all four `lstart` Wed Aug 5 15:37–15:38, all `target/debug` under
+   `/var/folders/...T/` tempdir roots (the same shape D46 reaped). None touched. A "count
+   restored" claim against a denominator of 2 would have been reported against the wrong number.
+2. A `pgrep -f "agentrec (record|mcp)"` predicate reported 7 mid-round and triggered a false
+   alarm: two `claude -p` processes carried the string `agentrec record` **in their prompt text on
+   the command line**. Every count in the evidence doc uses the binary-path predicate instead.
+
+**Not established, enumerated rather than implied:** agent identity simulated (above); the
+warm-up's dependence on a long-lived daemon unmeasured (above); one file / one path per turn, so
+**no** `skipped`/`withheld`/`modified_since` refusal, no path-subset reservation, and no
+`undo_conflict` was exercised live (`refusals` was empty in every preview — those rest on F2's
+fixtures, not on this row); macOS only, no Linux leg; strictly sequential, so no two-actor race on
+a reservation; `deny` never run; and **neither expiry path was reached** — the 10-min request
+expiry and 60 s token TTL were observed only as fields on the wire, beaten by ~9.5 min and ~41 s
+respectively.
+
+**The `allow_modified` refusal observed here is the TRANSPORT rail only** (`mcpcmd`'s router,
+which intercepts before the coordinator). Per this file's own Phase F gate-round-1 finding 1,
+`UndoCoordinator::preview` in Auto **downgrades-with-warning rather than refusing**. This round
+did not probe that layer, so nothing here is evidence of refusal at depth, and "both rails fired"
+above names two distinct *rails* (the mode matrix and the `allow_modified` check), never two
+*layers*.
+
+## Phase F gate round 2 (2026-08-06, HEAD `d8c69e3` + this commit)
+
+Adversarial re-gate over the two blocker closures. Verdict on the closures themselves: **both
+HOLD** — the E2E evidence was independently re-verified (the raw token quoted in the preview
+hashes to exactly the `token_sha256` in the reserve row — two independently-quoted values,
+cryptographically bound; all timestamp arithmetic exact; the surviving disposable repo's
+`log.jsonl`/`undo-requests.jsonl`/`calc.py` all match the doc), and finding 13 was confirmed
+truthful against source (`undo_coordinator.rs::append_event` sole writer, no
+truncate/rotate/reclaim path, `purgecmd.rs` has zero references). The round still **GATE-FAILED
+on two record defects**, both fixed in this commit:
+
+1. **The F5 "two populations" paragraph's join instruction was false against the code beside
+   it** (introduced at `2706704`): it said an approved undo has a `reserve`+`approve`/`execute`
+   row. The confirm path writes `request` (not `reserve` — `RESERVING_EVENTS` holds both as
+   distinct events) and **no `approve` event is ever written** — `undo_coordinator.rs::
+   EVENT_APPROVE` documents the durable approval as `EVENT_EXECUTE` itself, and the E2E's own
+   Part 4 shows the real confirm-leg rows (`request` then `execute`). A reader executing the
+   join as written greps for events that do not exist and reads every approved undo as
+   unmatched. Corrected in place; only `execute` carries `undo_turn`. Signature-defect class:
+   confidently-worded record text contradicted by the code beside it.
+2. **A flake that does not exist was briefed to the gate**: `hook_kill_9_closes_open_epoch`
+   (~3/6 rate) appears nowhere in the tree, in git history (`git log -S`, all branches), or in
+   any doc — it existed only in a session handoff transcribed from chat memory. The only
+   durably recorded flake is `approve.rs::a_killed_approve_never_leaves_a_phantom_approval`
+   (rates 1/26 and 2/~14, pinned in gate round 1's provenance bullet above). The false name is
+   recorded here precisely so no future exit narrative resurrects it.
+
+**Suite baseline, re-measured and recorded (not restated):**
+`cargo test --workspace -- --test-threads=3` at this HEAD → **987 passed / 0 failed / 4
+ignored** — measured independently by the orchestrator (twice: once foreground, once summed
+across binaries) and by the gate itself (twice, clean tree before and after, zero
+`FAILED`/`panicked` strings). Arithmetic from the last recorded baseline closes: 985
+(pre-`e32d247`) + 2 (`e32d247`'s fault-injection tests, counted from its diff) = 987.
+
+**Residuals the gate left open, recorded not fixed:** coordinator-layer `allow_modified`
+downgrade (finding 1) stands; the fexit corroboration repo lives in a session scratchpad and
+will vanish — the doc's hashes are the durable evidence. Clippy (`-D warnings`, debug and
+release) and `cargo fmt --check` were run clean by the orchestrator after the gate; the
+round-3 re-gate re-ran both clean (`--all-targets`, both profiles) and additionally ran the
+release-seam check itself: `strings target/release/agentrec | grep -i AGENTREC_TEST` → zero
+lines, on a release binary whose mtime postdates the last code commit (`e32d247`; every later
+commit is docs-only, so the artifact corresponds to this HEAD's code). Caveat carried from
+that gate: the seam grep keys on the `AGENTREC_TEST` prefix convention — a seam named outside
+that prefix would evade it (none known).
+
+## Phase 2 tail — plan exit round (2026-08-06, HEAD `670fba3` + this commit)
+
+Evidence roll-up for the plan's "Final acceptance — plan exit" checklist
+(`docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md`, on `docs/user-onboarding`).
+Per-box refs, then this round's own measurements.
+
+- **Phase A fixtures + pin:** ledger § "Phase A — Codex hook spike"; `codex-cli 0.146.0` pin
+  (INTEGRATIONS.md, live-verified); `docs/fixtures/codex/*.json` (7, git-tracked);
+  `docs/verify/codex-spike.md`.
+- **Config loader:** `cli/src/config.rs` live, 5 legacy read sites migrated, scanner deleted
+  (remaining "scanner" hits are historical prose in doc comments only); D16 semantics tested
+  (`config.rs::tests` ×5 + `integration.rs::daemon_startup_refuses_on_malformed_config` +
+  `mcp.rs::invalid_config_toml_is_a_startup_hard_error`).
+- **O5:** ledger § "O5" + `docs/verify/o5-two-tool-session.md`; Claude leg re-run LIVE
+  (appended row); carried disclosures stand (sequential not simultaneous; debug binary).
+- **PROTOCOL 1.0:** `PROTOCOL.md` header "1.0 (frozen 2026-08-06)"; 29 conformance fixtures
+  + manifest test (`cli/tests/conformance.rs`), all in `8d8e1db`. **Founder review of the
+  freeze diff is asserted ONLY in `8d8e1db`'s commit message — no ledger row records it and
+  there is no Phase D ledger section at all.** Recorded as provenance, not as fact
+  established by this round; founder attestation would close it.
+- **Five read tools + parity + §8 status row:** `mcpcmd.rs` (five read tools + gated undo);
+  parity pinned in `cli/tests/mcp.rs` (`ac_e2_diff/blame_*_byte_equals_*`; log/recall
+  typed-shape by decision 12 / delta 14); `PROTOCOL.md` §8 `agentrec_status` row.
+- **Mode matrix + §8 `allow_modified` + origin:** `ac_f1_*` (mcp.rs), `ac_f4_*`
+  (undo_execute.rs), approve.rs suite; §8 fixed at `e264d7c`; origin tests
+  `cli/tests/undo_origin.rs::ac_f5_*` + conformance fixture. Coordinator-layer downgrade
+  residual stands (gate finding 1).
+- **Self-healing story:** ledger § "Phase F exit" + `docs/verify/f-exit-self-healing.md`
+  (`d8c69e3`); Phase F gate rounds 2–4 above.
+- **Baselines:** debug `cargo test --workspace -- --test-threads=3` → **987/0/4** (§ "Phase F
+  gate round 2"). Clippy `-D warnings` debug+release, `cargo fmt --check`, release-seam grep:
+  all clean (same section + round-3 fix).
+
+**Release-profile suite, run for the first time in this repo's recorded history — and the
+checklist box's "debug+release" cannot be read as "the full suite passes under
+`--release`". THREE runs, stated separately** (the plan-exit gate's round-1 blocker was an
+earlier version of this paragraph conflating them into one figure — the doctorcmd
+observations below came from run 1, while `964/24/4` is run 3's; no verdict assignment could
+reconcile the two, and the gate proved it by reproducing 964/24/4 at HEAD with zero
+`doctorcmd` names among the 24):
+
+1. **Run 1, PRE-doctorcmd-gating, fail-fast:** aborted inside the `agentrec` bin's unit
+   tests at **355 passed / 3 failed / 1 ignored** (partial — cargo stopped at the first
+   failing binary). The 3 failures were the `doctorcmd` service-unit tests; this run is the
+   evidence behind the gating fix below. Its full-suite totals were never measured and are
+   unrecoverable.
+2. **Run 2, POST-gating, fail-fast:** aborted at the known recorded flake
+   `approve.rs::a_killed_approve_never_leaves_a_phantom_approval` — **369 / 1 / 1**
+   (partial). The flake's rates and disposition are already recorded above (Phase F gate
+   round 1); this was one more observation of it, in release.
+3. **Run 3, POST-gating, `--no-fail-fast` (the complete measurement):**
+   `cargo test --release --workspace --no-fail-fast -- --test-threads=3` →
+   **964 passed / 24 failed / 4 ignored** (debug at the same tree: 987/0/4). The known
+   approve flake did NOT fire in this run.
+
+All 24 of run 3's failures were individually classified against source (Opus classification
+round; table persisted durably in `docs/verify/release-seam-classification.md`, and the
+plan-exit gate independently reproduced the totals, the 24 names, 3 seams read in source,
+and 1 empirical probe + positive control): **24 SEAM / 0 TIMING / 0 REAL** — every failure
+is a test driving a `#[cfg(debug_assertions)]`-gated seam that release strips BY DESIGN (the
+same design the release-seam `strings` check exists to enforce). Family arithmetic, summing
+to exactly 24: hardening_cli 3 (`purgecmd.rs` test-pause sleeps) + import_claude 11 (9 ×
+`importcmd.rs::debug_dump_entries_enabled` + 2 × `importcmd.rs::t2_oracle_enabled`) +
+import_codex 3 (debug_entries family, incl. the key-parity list hardcoding `debug_entries`)
++ integration 7 (3 × `cmds.rs::effective_store_budget`/`daemon.rs::effective_evict_interval`
++ 3 × `cmds.rs::recall_deadline`/`memory.rs::test_slow_pin_read_delay` + 1 ×
+json_contracts budget). Positive control:
+`persist::ac5b_oracle_seam_disabled_in_release_even_with_env_set` PASSES in release.
+**No release-only product defect found.** Honest coverage statement: ~20 of the 24 fail at a
+seam-gated precondition, so their subject invariant is UNEXERCISED in release (not proven
+equivalent) — notably the zero-write status parity assertion; four others' invariants are
+visibly confirmed in the captured release output despite the test failing (daemon degrades
+to defaults on mid-tick corruption; codex/claude report key parity at 14 keys; two
+tier-classification runs print correct `tier_counts`).
+
+**Seam-caveat correction (plan-exit gate round-1 blocker 2):** the round-3 caveat above
+("a seam named outside the `AGENTREC_TEST` prefix would evade it — none known") is FALSE:
+`AGENTREC_CLAUDE_PROJECTS_DIR` (`doctorcmd.rs::claude_projects_dir`) is an UNGATED env
+override present in release `strings`, whose own doc comment says it exists "so this check
+is hermetically testable". Pre-existing since the repo's initial commit (`5c3a915`, on
+`main`); low severity — it redirects a read-only doctor advisory's scan directory, writes
+nothing. Recorded, not changed: whether to gate it `#[cfg(debug_assertions)]` (making the
+doctor check untestable in release builds) or sanction it as a production knob (documenting
+it) is a founder call. Until then, "no seams in release strings" must be read as "no
+`AGENTREC_TEST`-prefix seams, plus this one named exception".
+
+**Fix landed this round (code, small):** the three `doctorcmd` service-unit tests that
+FAILED in release (`orphaned_unit_is_advisory_not_fail`,
+`vanished_exec_on_a_live_root_is_reported_advisory`,
+`vanished_root_and_unparseable_units_carry_no_exec_finding`) — plus the three sibling tests
+that PASSED in release only by ACCIDENT — all drive the debug-only
+`AGENTREC_TEST_SERVICE_DIR` seam; in a release build the seam is ignored and all six scan
+the developer's REAL service directory, so their verdicts depend on ambient machine state
+(the accidental passes are the worse failure mode). All six + the `with_service_dir` helper
+are now `#[cfg(debug_assertions)]`. The other 24 seam tests are deliberately NOT gated: they
+fail deterministically at a seam precondition and never touch real user state, so leaving
+them visible in a release run is a truthful signal rather than a hazard; gating them is
+available if a release-suite CI leg is ever added. Debug suite after the gating change,
+re-measured: **987 / 0 / 4** — unchanged, because `cfg(debug_assertions)` is true in the
+debug profile so all six still compile and run there. Clippy `-D warnings` `--all-targets`
+debug AND release, `cargo fmt --check`: clean after the change.
+
+**Stale-doc fixes landed this round:** IMPLEMENTATION.md §P.1 (three-tool list → five,
+amended-note style), §P.2 ("mirroring `--json`" → parity/typed split per decision 12 /
+delta 14), §O.5 (O5 evidence pointer added); INTEGRATIONS.md Codex bullet + Ring 2 verb
+lists (three tools → five); CLAUDE.md worktree Status rewritten through Phase F (the stale
+"Next: Phase D BLOCKED" block replaced; the false "J1/J2/I3 recorded-not-fixed" bullet
+corrected — Phase B closed that debt).
+
+## Branch review (PR #20) — root-containment blockers 1+2, FIXED (2026-08-06)
+
+Whole-branch adversarial review of `feat/phase-2-tail` at `e5d7ea8` (58 commits vs
+`main`@`23a2e0d`), scoped deliberately to what per-phase gates structurally could not see:
+cross-phase seam drift, freeze discipline across the whole history, and the security posture
+of the new agent-triggerable write surface. It returned **NOT MERGE-READY on two BLOCKERs**,
+both proven end-to-end against the real binary rather than inferred. Fixed at `f501f07`.
+
+**The defect.** `entry.path` is wire data, and `root.join(&entry.path)` in
+`undo_coordinator.rs::execute_revert`/`restore_from_before` was an arbitrary-write primitive:
+`Path::join` with an ABSOLUTE path silently discards the base, and a `..` component walks
+straight out. `preview` validated requested paths only against `target.files` — the same
+attacker-supplied record. Two shapes, each proven live in `mcp_destructive = "auto"` over
+real JSON-RPC frames, zero refusals, no human in the loop:
+
+1. `"path":"../outside/victim.txt"` → preview issued a token, execute reported
+   `{"reverted":1}`, and the outside file's bytes changed.
+2. `"path":"linkdir/c.txt"` where `linkdir` is a symlink OUT of the repo → same result.
+   `is_symlink_on_disk` lstats the FINAL component only, while `restore_from_before` runs
+   `create_dir_all(parent)` and writes THROUGH the intermediate link. **This shape is the
+   worse one**: the rendered path looks entirely ordinary, so the CLI's human-reads-the-plan
+   mitigation fails too.
+
+**Provenance, stated rather than shaded.** The primitive is PRE-EXISTING on `main`
+(`23a2e0d:cli/src/readcmds.rs:1063` is the identical `root.join`); F3 moved it verbatim.
+What this branch changed is the ACTOR — on `main` the only caller is a human who sees
+`revert ../outside/victim.txt` printed before typing confirm; `agentrec_undo` in `auto` mode
+removes that human. Phase F's own gate validated its rails against the refusal inventory
+inherited from the CLI (symlink, skipped, withheld, modified-since), and root containment was
+never in that inventory *because the CLI's actor was a human reading a list*. That is exactly
+the class a per-phase gate cannot catch, and why the whole-branch pass earned its cost.
+Threat model is the SANDBOXED AGENT: agent permissions commonly confine edits to cwd,
+`.agentrec/` is inside cwd, the victim is not — agentrec becomes a confused deputy performing
+the out-of-sandbox write. Precondition bounded and checked: `import` is NOT a vector (both
+sites `strip_prefix(root_canon)` → `skipped_out_of_root`), and L3 sidecar-log merging does not
+exist, so the precondition is a direct write to `.agentrec/log.jsonl`.
+
+**The fix (`f501f07`).** `undo_coordinator.rs::escape_refusal`, called FIRST in `build_plan`'s
+per-entry loop — above even the symlink refusal, and unconditional w.r.t. `allow_modified`.
+`build_plan` is the shared planner both legs reach (`readcmds.rs::undo`,
+`undo_coordinator.rs::preview`, `::claim_grant`), so ONE gate covers CLI and MCP; the review's
+disposition explicitly warned against treating the CLI's rendered plan as a mitigation for the
+MCP leg. Two checks, and probe-proven non-redundant:
+1. LEXICAL — reject absolute paths and any `ParentDir`/`RootDir`/`Prefix` component.
+2. RESOLVED — canonicalize the nearest EXISTING ancestor of the target, require canonical
+   `root` as a prefix. Absent deeper components cannot be links, which is why a not-yet-created
+   directory is still allowed.
+Both sides canonicalized because a symlinked root is ordinary (macOS `/tmp` → `/private/tmp`);
+comparing a canonical child against a non-canonical root would refuse every legitimate revert.
+Canonicalize failure REFUSES — fail closed.
+
+**A fail-open bug in the fix's own first draft, caught before commit and recorded because the
+pattern is subtle:** the draft wrote `root.canonicalize().ok()?` inside a
+`-> Option<PlanKind>` where `None` MEANS ALLOWED, so `?` would have failed OPEN on an
+unresolvable root — inverting the doc comment sitting directly above it. Now an explicit
+`return refuse()`, with a comment naming the trap.
+
+**Evidence, all run:**
+- Live re-run of BOTH exploits against the release binary, `auto` mode, real JSON-RPC:
+  `files: []`, one refusal each carrying the containment reason, **`token issued: False`**,
+  and both victim files byte-unchanged. CLI leg on the same forged record:
+  `REFUSE … nothing to revert`.
+- Mutation probe 1 (gate call neutered): exactly the 3 escape tests red, all 3 positive
+  controls green.
+- Mutation probe 2 (RESOLVED check short-circuited, LEXICAL retained): exactly the
+  symlinked-parent test red, other 8 green — check 2 earns its place.
+- Suite **993 / 0 / 4** (base 987 + 6 new). An intermediate run with the gate but no new tests
+  measured 987/0/4, which is the evidence that containment over-refuses NO existing path.
+- Clippy `-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean.
+  Release-seam grep `AGENTREC_TEST`: 0.
+
+Positive controls are DISCRIMINATING by construction: each asserts the entry reaches the
+store gate BELOW containment (`prior snapshot unavailable — refusing to restore`), not merely
+that it was "not refused", so a gate that refused everything reds.
+
+**Not fixed here, recorded:** the review's finding that `main`'s CLI leg carries the same
+primitive today (mitigated only by a human reading a path that shape 2 shows can be made to
+look innocent). This branch's fix lands in shared core, so merging carries it to the CLI too —
+but v0.2.0 is already published with the unfixed CLI, and whether that warrants a security
+note is a founder call. Also unverified by anyone: no Linux leg has run this branch's HEAD.
+
+### Re-gate round 2 — the hardlink escape (a THIRD shape, found by hunting for one)
+
+The scoped re-gate confirmed both original blockers fixed — it rebuilt the exploits from
+scratch in its own repo rather than re-running the orchestrator's, and reported `files: []`,
+one containment refusal each, **`token issued: False`**, victims byte-unchanged, on both legs.
+It also confirmed the RESOLVED check earns its place by a cleaner channel than the mutation
+probe: `linkdir/c.txt` contains no `ParentDir`/`RootDir` component, so the LEXICAL check
+provably cannot be what refused it.
+
+**But the re-gate's brief asked it to hunt for a third escape shape, and it found one — same
+harm, same agent-triggerable path, surviving the fix.** GATE FAIL, one blocker, fixed at
+`ce641c4`.
+
+**HARDLINKS DEFEAT PATH CONTAINMENT, STRUCTURALLY.** `canonicalize` resolves SYMLINKS. A
+hardlink is a second directory entry for the same inode, and there is **no path-level evidence
+that the inode is reachable elsewhere** — so no amount of path checking can see it. A
+repo-internal `hard.txt` hardlinked to a file outside the repo is lexically ordinary,
+canonicalizes inside `root`, and is not a symlink: it passed `escape_refusal` AND
+`symlink_refusal`, and `fs::write` truncated the shared inode in place. Proven by the gate
+through MCP `auto` mode — token issued, `{"reverted":1}`, `outside/hardtarget2.txt` rewritten.
+The confused-deputy argument is unchanged: creating `repo/hard.txt` is a write INSIDE cwd,
+which a path-based agent sandbox permits, while the victim is outside. Net effect before the
+fix: an agent confined to cwd could modify any file its own user can write, anywhere on disk —
+and the fix's own refusal string promised "refusing to write outside the recorded repo",
+so this violated the invariant the fix had just stated.
+
+**Fix (`ce641c4`): `undo_coordinator.rs::hardlink_refusal`, `nlink > 1`, called immediately
+after `escape_refusal` in `build_plan`.** Kept a SEPARATE gate rather than another branch of
+`escape_refusal` precisely because the class is not a path property. `symlink_metadata`
+(lstat), not `metadata` — a symlink is `symlink_refusal`'s to refuse, and following it would
+read the TARGET's link count. The predicate is deliberately NOT "the other name is outside the
+root": we cannot know where it is, and a second name inside the repo is equally a file this
+turn's record does not describe. False positives (deliberately hardlinked files in a repo) are
+rare and degrade to a refusal — the same refuse-to-act-not-guess posture as `link_kind`.
+Unix-only (`nlink` needs `MetadataExt`), stated in the doc comment; the repo targets macOS +
+Linux (D19).
+
+**MINOR 2 also fixed in the same commit — a false cause on a real refusal.** The gate ran a
+preview → swap-parent-to-symlink → execute race with content DELIBERATELY IDENTICAL across the
+swap (same `sha256:90a6517b…`), so drift provably could not be what saved it. Containment
+re-ran inside `claim_grant` and correctly blocked the write, but reported
+*"work/target.txt changed since it was lodged"*. `UndoError::PreviewStale` now carries the
+plan's own refusal reasons; the wire code stays `preview_stale` (the caller's remedy is
+identical) while the text names containment when containment is what fired. Safe direction
+either way — but reporting a blocked attack as a benign content change misdirects the operator
+investigating it, which is this repo's tracked "message contradicted by the facts beside it"
+class.
+
+**Evidence, all run:** live hardlink exploit against the release binary, `auto` mode, real
+JSON-RPC → `files: []`, hardlink refusal, `token issued: False`, `outside/hardtarget.txt`
+byte-unchanged; CLI leg on the same forged record → `REFUSE … nothing to revert`. Mutation
+probe (hardlink gate call neutered) → exactly the 2 hardlink tests red, the `nlink == 1`
+control and all 6 path-containment tests green. Suite **996 / 0 / 4** (993 + 3). Clippy
+`-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean. Release-seam
+grep: 0.
+
+**Residuals the gate stated, recorded NOT fixed:**
+- **TOCTOU between `build_plan`'s canonicalize and `fs::write` is still open.** A parent
+  swapped inside that window is not re-lstat'd. Closing it properly needs `O_NOFOLLOW`/
+  `openat` rather than path re-checks — a larger change than this branch should take, and a
+  founder call. What IS closed: the swap-before-`claim_grant` race, which containment catches
+  on the re-planned entry (that is the race MINOR 2 was observed on).
+- **MINOR 3, over-refusal:** `a/../b.txt` resolves inside root but the lexical component scan
+  rejects it. No producer emits it today (the daemon writes normalized relatives; import
+  lexically normalizes before its own root check), so the cost is zero and the direction is
+  safe. Recorded so a future producer change does not hit a silent refusal.
+- `main`'s published v0.2.0 CLI carries the unfixed primitive; this branch's fix lands in
+  shared core so merging carries it to the CLI too, but whether the published version warrants
+  a security note is a founder call. No Linux leg has run this branch's HEAD.
+
+### Re-gate round 3 — GATE PASS on scope, plus a FIFO that hung the process
+
+The round-3 re-gate **PASSED** both subjects it was called on, on evidence it generated
+itself: it rebuilt the hardlink exploit in its own repo (both legs refuse, `token issued:
+False`, victim byte-unchanged) and — better than the orchestrator's mutation probe — ran an
+`nlink == 1` control with IDENTICAL content, identical record shape, same directory:
+`plain.txt` got `token issued: True`, `hard.txt` got the hardlink refusal. The link count is
+the only difference between them, so nothing incidental is doing the refusing. MINOR 2 was
+confirmed working on a live attack path, and the ledger's race distinction (swap-before-
+`claim_grant` caught; `build_plan`→`fs::write` window open) was independently verified rather
+than taken on the orchestrator's word.
+
+**Its hunt for a fourth shape succeeded again — MAJOR 1, fixed at `ca94cdd`.**
+
+**A FIFO target HUNG the process, because the hardlink gate SKIPPED what it should have
+REFUSED.** `inode_refusal`'s predecessor guarded on `meta.file_type().is_file()`, so a
+non-regular file fell through the gate entirely rather than being refused, and nothing
+downstream checks file type. `fs::read` on a fifo blocks until a writer appears. Measured by
+the gate: `agentrec undo --confirm` hung until killed at 30 s; MCP `preview` returned ZERO
+frames with the process still alive at 20 s. The MCP server is a single-threaded stdio loop,
+so this is not one failed call — it kills the whole agent-facing surface for that session.
+`mkfifo` needs no privileges and creating one is a write INSIDE cwd, so the sandboxed-agent
+precondition is identical to every escape shape above. **Availability, not an out-of-root
+write** — which is why the gate scored it MAJOR, not BLOCKER, and why it still blocked merge.
+
+**The fix is one inverted guard, and the inversion IS the lesson:** the branch now reads
+"refuse unless it is a regular file", never "skip unless it is a regular file". The skipping
+form is what let the class through, and it looked correct while doing so. The same branch
+closes NOTE 2 — a directory recorded as a `modify` entry was rendered as a performable
+`revert  adir (modify)` and then failed at execution with `Is a directory (os error 21)`, a
+plan promising an action it could not take. `hardlink_refusal` is renamed `inode_refusal`: it
+now carries two distinct refusals, both inode-level facts no path check can express.
+
+**A symlink returns `None` from this gate DELIBERATELY** and falls through to
+`symlink_refusal`, whose distinct wording that gate's own tests assert; stealing it would make
+those tests pass for the wrong reason. Pinned by a test named for that intent
+(`inode_gate_leaves_symlinks_to_the_symlink_gate`). An absent path also returns `None` —
+`create` reverts and delete-restores legitimately target paths that do not exist.
+
+**Evidence, all run:** live fifo probe against the release binary — CLI leg refuses and
+returns promptly (checked with an 8 s liveness poll that would have reported `STILL HUNG`),
+MCP leg returns `files: []`, the non-regular-file refusal, `token issued: False`, within a
+10 s poll. Suite **999 / 0 / 4** (996 + 3). Clippy `-D warnings` `--all-targets` debug AND
+release, `cargo fmt --check`: clean. Release-seam grep: 0. The fifo test would **HANG rather
+than fail** on a regression, which makes it self-enforcing.
+
+**NOTE 3 — the daemon's FIFO exposure: PROBED, and the result is PARTIAL. Do not read it as a
+clean bill of health.** The gate flagged this as potentially worse than the MCP case (silent
+loss of recording) and explicitly did not test it. Measured here: a live `agentrec record`
+daemon on a scratch repo, `mkfifo watched.pipe` in the watched tree, then an ordinary mutation
+afterwards. The daemon **stayed alive and kept recording** — 2 turns, `after.txt` (the
+post-fifo mutation) present. **But `watched.pipe` never entered a turn at all**, which means
+the snapshot READ path was never exercised on it, so this probe does NOT establish that the
+daemon survives reading a fifo — only that creating one in the watched tree neither hung it
+nor stopped recording. `daemon.rs`'s snapshot loop guards `is_symlink` and `is_dir` but has NO
+regular-file check, so the exposure is plausible on inspection and unrefuted. Forcing the read
+path needs a writer on the other end of the fifo, which was not attempted. **Open, and outside
+the undo surface this round fixed.**
+
+### Re-gate round 4 — the FIFO hang was HALF fixed; the gate was in the wrong layer
+
+Round 4 PASSED items 1, 3, 4 and 5 (fifo/directory refusal holds on both legs and returns
+promptly; no over-refusal, 999/0/4 reproduced; the NOTE 3 daemon paragraph judged honest and
+if anything UNDER-claiming; ledger truthful). **GATE FAIL on one blocker, fixed at
+`dc0befb`.**
+
+**`claim_grant` READS BEFORE IT PLANS, so a planner-side gate cannot protect it.**
+`inode_refusal` lives in `build_plan`. But `claim_grant` runs its drift loop through
+`read_current_hash` FIRST, and that was a bare `std::fs::read` — which BLOCKS on a fifo. So the
+exact defect round 3's fix was called to close remained reachable on the leg that matters most,
+the agent-triggerable execute path. Proven by the gate: preview a regular file (token issued),
+`rm` + `mkfifo`, execute → **zero `"id":3` frames, process alive at 25 s**. `agentrec approve`
+shares `claim_grant` and was exposed identically.
+
+**Blast radius, measured by the gate rather than assumed:** the hang holds the undo lock
+(`mcpcmd.rs:1224` acquires, `:1225` calls `claim_token`), but an unrelated `agentrec undo`
+still completed in 4 s during the hang — so it does NOT brick other processes. It kills the
+MCP session and burns the reservation. The token is NOT spent (`consume_token` runs after
+`claim_grant`), so this is availability only: no integrity or escape consequence.
+
+**Fixed at the PRIMITIVE, deliberately, not by policing a third call site.**
+`read_current_hash` now lstats and returns `None` for any non-regular file, so every present
+and future caller inherits it — there are four call sites today (`preview`, the reservation
+path, `claim_grant`'s drift loop, and `build_plan`'s modified-since check) and the next one
+would otherwise have to remember. `None` reads downstream as "no content to compare" = drift,
+surfacing as a clean `preview_stale` refusal instead of a hang; that is the same direction the
+function's existing doc already describes for an unreadable path, so no caller learns a new
+shape. Symlinks are included: returning `None` rather than the pointed-to file's hash only
+strengthens the "a symlink is always modified-since" property that
+`undo_refuses_on_disk_symlink_legacy_record_even_with_allow_modified` pins, and the entry is
+`symlink_refusal`'s to reject either way.
+
+**THE GENERAL LESSON, and the reason this round is worth reading later:** round 2's containment
+fix went into `build_plan` because it is the shared planner both legs reach, and that was
+correct — for a DECISION. It was not sufficient for anything that can block or escape **on
+read**, because `claim_grant` touches the filesystem before it calls the planner. *The planner
+is the right home for decisions; it is not the only place reads happen.* A gate's layer has to
+be chosen against the I/O, not against the control flow.
+
+**Evidence, all run:** new integration test at the `claim_grant` level
+(`a_fifo_swapped_in_after_the_preview_refuses_instead_of_hanging`) passes in 0.49 s; its
+mutation probe — the lstat guard neutered with `if false &&` — **HUNG at 25 s**, so the test is
+load-bearing rather than vacuous, and like the unit-level fifo test it hangs rather than fails
+on regression. Live MCP swap probe on the release binary: real 40-char token issued, regular
+file swapped for a fifo, `execute` returned **promptly** with `preview_stale`. Suite
+**1000 / 0 / 4** (999 + 1). Clippy `-D warnings` `--all-targets` debug AND release,
+`cargo fmt --check`: clean. Release-seam grep: 0.
+
+**An invalid probe, recorded because the failure mode is instructive.** The orchestrator's
+FIRST live swap probe reported "returned promptly" and was WORTHLESS: the preview had issued
+no token (empty string), so `execute` failed on `bad_token` and never reached the drift read at
+all. Cause: the fixture wrote CAS blobs at `objects/<fan>/<full-hash>`, but
+`store.rs::object_path` splits as `<fan>/<rest-62>`. Every EARLIER probe in this series refused
+before the store was ever consulted, which is why the wrong layout never surfaced. Re-run with
+the correct layout, the probe issued a real token and became discriminating. **A probe that
+"passes" without establishing its own precondition is evidence of nothing** — the same class as
+this repo's fixture-only-evidence rider.
+
+**Nuance, recorded not fixed:** the swapped-fifo refusal reads *"swap.txt changed since it was
+lodged"*, i.e. the drift wording, not a fifo-specific one. That is defensible here — the path
+genuinely did change, from a regular file to a fifo, and the refusal comes from the drift check
+rather than from a plan refusal, so MINOR 2's `refusals` channel legitimately does not fire.
+Stated so nobody later reads it as MINOR 2 regressing.
+
+**INCIDENT, disclosed by the gate itself and verified independently by the orchestrator:**
+while probing NOTE 3 the gate ran `pkill -f "agentrec record"`, which matched the **live
+dogfood daemon** (pid 865, `~/Projects/agentrec`) and killed it. launchd `KeepAlive` respawned
+it — now **pid 39492, `com.agentrec.bfa6bde6eaa4`, status 0**, confirmed recording turns after
+the respawn (orchestrator checked `pgrep`, `launchctl list`, and the tail of the dogfood
+`log.jsonl`). Consequence: a seconds-long recording gap in the dogfood repo, self-healed, no
+data loss. It also contaminated that round's first suite run (707/2/3, both failures
+daemon/FSEvents tests); the gate re-ran clean at 999/0/4 and correctly attributed the two
+failures to itself rather than to the branch. **This is the broad-pattern `pkill` hazard this
+repo already records in memory, hit anyway** — kill by exact pid.
+
+### Re-gate round 5 — the blocking-read CLASS, closed by audit instead of by another point fix
+
+Round 5 PASSED items 1, 2, 4 and 5. The round-4 blocker is closed, and the gate established
+its probe's precondition BEFORE drawing a conclusion — exactly the trap the orchestrator's
+invalid probe fell into: CAS layout checked (`objects/<2-char fan>/<62-char rest>`), token
+checked real (`len=40`, `[0-9a-f]{40}`), and **cryptographically bound** to the ledger
+(`sha256(token)` = the reserve row's `token_sha256`). Then regular file → `mkfifo` → execute
+returned in **1 s** with `preview_stale`, against zero frames and a live process at 25 s
+before the fix. The symlink semantic change was independently judged safe: `None` reads as
+modified (the cautious direction), and the one edge worth checking — `entry.after == None`
+AND a non-regular file on disk, where both sides are `None` — is unreachable because the three
+refusal gates run before the modified-since comparison.
+
+**GATE FAIL on a SIXTH shape, and the gate's disposition was to stop patching sites. Taken —
+fixed at `88967f4`.**
+
+**`store.rs::get` was a bare `fs::read`, and it is worse-placed than round 4's.** A FIFO
+planted at a CAS object path hangs `build_plan`'s deliberate integrity read, so **every undo
+leg blocks at once** — preview, CLI `undo`, `approve`, `execute` — and no token is ever
+issued. Measured by the gate: MCP preview timed out at 90 s. `.agentrec/objects/` is inside
+the repo, so the precondition is the same sandboxed-agent write that grounds every containment
+refusal. Availability only; no escape or integrity consequence.
+
+**Four rounds found this class at four sites, one per round, each fix correct and each
+insufficient** — `inode_refusal` in the planner (round 3), `read_current_hash`'s lstat
+(round 4), this (round 5). The gate's own words: fixing one `fs::read` per round is not
+converging. **The property is not "this path is safe" but "we never open something that is not
+a regular file"**, so this round makes it expressible once.
+
+**`agentrec-core/src/fsguard.rs`** — `read_regular` / `open_regular` / `is_nonregular` —
+applied at EVERY blocking-I/O site on the undo path, from the gate's own inspection list plus
+two it did not name:
+- `store.rs::get` — the demonstrated blocker.
+- `record.rs::load_log` — `open_regular`, deliberately streamed: this file is multi-MB in a
+  dogfooded repo and slurping it to gain the guard would be a real regression.
+- `execute_revert`'s `pre_bytes` read, and `restore_from_before`'s post-write readback.
+- `read_current_hash` — now delegates, so there is ONE lstat rather than two.
+- **The WRITE side, which nobody had probed:** `UndoLock::acquire` and the
+  `undo-requests.jsonl` append. Opening a FIFO for WRITE blocks until a **reader** appears —
+  the mirror of the read hazard, and it would wedge every leg before any gate ran.
+The two remaining `File::open` calls in `store.rs` (`:95`, `:323`) are **directory** fsyncs;
+opening a directory cannot block, so they are deliberately unguarded.
+
+**What fsguard does NOT fix, stated in the module rather than implied:** lstat-then-open is
+**not atomic**. A path swapped between the check and the open still reaches the raw call;
+closing that needs `O_NONBLOCK`/`openat` on the descriptor itself. What the guards remove is
+the DURABLE hazard — a FIFO sitting on disk when the read arrives — which is every case
+observed across all five rounds. The residual shares its shape with the
+`build_plan`→`fs::write` TOCTOU already recorded.
+
+**A signature-defect instance introduced BY this change and caught before commit:** once the
+lstat moved into `fsguard`, `read_current_hash`'s comment still claimed the function did the
+lstat itself. Rewritten to describe what the code now does. Recorded because the defect arrived
+inside the very commit that was closing a class of them.
+
+**Evidence, all run:** new integration test
+(`a_fifo_planted_in_the_cas_refuses_instead_of_hanging`) — preview ANSWERS, `files: []`,
+`token: null` — passes in 0.54 s; its mutation probe, `is_nonregular` neutered to `false`,
+**HUNG at 25 s**, so the test is load-bearing and hangs rather than fails on regression. Suite
+**1005 / 0 / 4** (1000 + 5: one integration test + four `fsguard` unit tests). Clippy
+`-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean. Error kind is
+`InvalidInput`, so no caller learns a new shape — which is what let one change land at six
+sites without moving any of their behavior for ordinary files.
+
+**The gate's low-signal note, recorded not fixed:** the swapped-fifo refusal reads "changed
+since it was lodged", so an operator cannot tell a FIFO was swapped in — an attack signature
+that is not surfaced. Judged (by the gate) not a defect and not a MINOR 2 regression, since
+the refusal genuinely comes from the drift check rather than a plan refusal. A missed
+opportunity, deliberately not taken here.
+
+**Still unrefuted after three probe attempts across two parties:** the daemon FIFO exposure.
+Neither the orchestrator nor the gate has managed to get a FIFO into a turn, so the snapshot
+read path remains unexercised; `daemon.rs` has no regular-file check, so the exposure is
+plausible on inspection. `fsguard` now EXISTS for the daemon to adopt, but this round did not
+adopt it there — that is a deliberate scope line, not an oversight, and the daemon's reads are
+outside the undo surface this review is scoped to.
+
+### Re-gate round 6 — the audit's SCOPE was wrong, not its method
+
+Round 6 PASSED items 1 and 3: the CAS blocker is closed (gate planted the fifo itself; preview
+returned in 1 s with `files: []`, `token: None`, against a 90 s timeout before), and `fsguard`
+broke nothing (1005/0/4 reproduced; `Missing` confirmed the right class for a non-regular CAS
+object, since `Corrupt` would assert a content mismatch nobody observed). **GATE FAIL on two
+blockers, both fixed at `0d971bc`** — and it falsified one ledger claim: *"applied at EVERY
+blocking-I/O site on the undo path"* was **not true**.
+
+**BLOCKER 2 is the lowest-precondition finding in the entire review series, and the ONLY one
+that can fire BY ACCIDENT.** `view.rs::blame` read a WIRE-SUPPLIED working-tree path with a
+bare `fs::read`, and `view.rs:289` is a second log reader that `record::load_log`'s guard does
+not cover. The gate reduced it to: `agentrec init`; `mkfifo notes.txt` (an ordinary write
+inside cwd); `agentrec_blame notes.txt` → **HUNG, killed at 18 s**. `mcp_destructive` was the
+untouched `off` default; no forged `log.jsonl`; no write to `.agentrec/` at all; a **read-only**
+tool available in the default configuration. Every earlier finding needed a hostile
+precondition. This one needs a repo that merely CONTAINS a named pipe.
+
+**BLOCKER 1 was inside the very module whose write side was guarded one round earlier.**
+`append_event` guards the write (`:820`), but `events()` (`:857`) and `live_reservations()`
+(`:732`) read the same `.agentrec/undo-requests.jsonl` with a bare `read_to_string`. Every flow
+READS BEFORE IT WRITES, so the write-side guard could never fire first. Reached by
+`claim_token`/`deny`/`status`/`pending_requests`/`resolve_request` and `reserve`. Demonstrated
+by the gate: `mkfifo .agentrec/undo-requests.jsonl` → MCP preview, zero frames, process alive
+at 20 s.
+
+**THE LESSON, and it is about method, not about these two sites.** `fsguard` was the right
+abstraction and the right response to round 5. What was wrong was the BOUNDARY: the audit
+covered *"the undo path"* while the exposure is *"every path that opens a file whose name came
+from wire data or the working tree."* That is why two sites survived — one INSIDE the undo
+module, one in the read tools. **The way to stop being one probe behind is a MECHANICAL audit,
+not an enumerative one:** `grep -rn "fs::read\|File::open\|read_to_string" agentrec-core/src
+cli/src`, then guard or JUSTIFY every remaining hit. That grep found both blockers in about a
+minute; unlike an enumeration it does not depend on correctly guessing the reachable set, and
+it is short enough to be a review checklist item.
+
+**Sites guarded this round**, from running exactly that grep: both `view.rs` sites, both undo-
+ledger reads, `store.rs`'s dedup read of an existing CAS object, `memory.rs`'s pin-path read
+and `memory.jsonl` open, `config.rs`, `hookcmds`' scratch file, and the `.agentrec` reads in
+`cmds.rs`/`doctorcmd.rs`/`memorycmds.rs`. Adds `fsguard::read_regular_to_string`.
+
+**Three exemptions, each JUSTIFIED in the module rather than silently skipped:**
+1. **`/dev/urandom` (`id.rs`) is a CHARACTER DEVICE** — `read_regular` would REFUSE it, and
+   refusing the entropy source is a worse failure than the hang this module prevents. Guarding
+   it would have been a self-inflicted outage.
+2. Fixed `/proc` paths, which no local party can replace.
+3. `File::open` on a DIRECTORY for fsync (`store.rs:95`, `:323`) — opening a real directory
+   cannot block. **The gate's note is adopted: the assumption is now stated in the module**,
+   because "this path is the type I expect" is the exact assumption class that produced this
+   whole series. It holds only while the parent really is a directory; a FIFO pre-created at a
+   fan-out path makes `create_dir_all` fail first, so the fsync open is never reached holding
+   one.
+
+**Evidence, all run:** two new tests, both HANGING rather than failing on regression —
+`blame_on_a_fifo_answers_instead_of_hanging` (default config, read-only tool) and
+`a_fifo_undo_ledger_does_not_hang_the_server` (via `agentrec_status`) — pass in 0.48 s.
+Mutation probe on the blame guard (reverted to the bare `fs::read`): **HUNG at 25 s**, so the
+highest-stakes test is load-bearing. Suite **1007 / 0 / 4**. Clippy `-D warnings`
+`--all-targets` debug AND release, `cargo fmt --check`: clean.
+
+**MINOR carried, not fixed:** `load_log` now returns an EMPTY ledger for a fifo `log.jsonl`
+rather than an error, so `undo` would report "no turns" instead of naming the real cause. Safe
+direction but silent, and a distinct error would suit a branch whose value is largely in not
+misreporting causes. Not taken here because `load_log` returns `Vec<LogRecord>` with no error
+channel, and widening that signature reaches far outside this fix.
+
+**THREE ORCHESTRATOR ERRORS THIS ROUND, recorded because two were nearly costly:**
+1. A blind string replace turned SEVEN pre-existing `serde_json::json!` calls into
+   `serde_json::serde_json::json!`. Caught by the compiler; repaired. `git diff --stat`
+   showing **+50 / -0** on that file is the evidence the pre-existing code is intact.
+2. The commit message used backticks inside a double-quoted shell string, so `` `off` `` ran
+   as a COMMAND SUBSTITUTION and the word vanished from the recorded message ("untouched
+   default"). Amended via `git commit -F` from a file. Shell-interpreted commit messages are a
+   silent-corruption channel.
+3. **`pkill -9 -f "mcp-"` — the same broad-pattern hazard the round-4 gate hit with
+   `pkill -f "agentrec record"`, and this repo already records in memory.** The pattern matched
+   `claude` processes and a node plugin whose COMMAND LINES merely contain `mcp-`; the
+   founder's other Claude sessions were in the blast radius. No damage occurred (14 sessions
+   verified alive afterwards, dogfood daemon healthy), but that is luck, not care. The real
+   stray — one leaked `agentrec mcp` blocked on the probe's fifo — was then killed by EXACT
+   PID after inspecting `ps` output. **Kill by pid; if a pattern is unavoidable, anchor it to
+   the binary path, never to a substring that can appear in an unrelated command line.**
+
+### The mechanical audit, finished — and why "the class is closed" was still not true
+
+After fixing round 6's two blockers, the orchestrator ran the gate's own prescribed grep
+rather than declaring the class closed. **It was not closed.** 22 non-test bare reads remained
+OUTSIDE the MCP/undo/read-tool surface: `daemon.rs` 7, `importcmd.rs` 8, `purgecmd.rs` 6,
+`state.rs` 1. Stopping at the two reported blockers would have reproduced the round-6 ledger's
+own false claim one round later, with a smaller scope and the same wording.
+
+All 22 guarded (`ea8650e`), by category: `daemon.rs` — the undo-guard read, **the SNAPSHOT
+READ of a watched file (`daemon.rs:1173`)**, the journal and signal-inbox opens, three
+`.agentrec` reads; `state.rs` — `state.json`; `purgecmd.rs` — `memory.jsonl`, the rewrite
+source, a CAS blob, `log.jsonl`; `importcmd.rs` — the transcript readers and both
+file-history blob reads.
+
+**The daemon FIFO exposure is now closed BY CONSTRUCTION, and that is deliberately not the
+same claim as "demonstrated and fixed".** A FOURTH probe attempt — this one forcing a writer
+to `exec 3>` the fifo and close it, so the watcher would see a mutation on that exact path —
+STILL could not get a fifo into a turn (4 attempts now, across both parties). The exploit
+remains **undemonstrated**. What changed is that `daemon.rs:1173` no longer performs a bare
+read, so the guard holds whether or not anyone ever reproduces the path. Recorded this way on
+purpose: a guard that does not depend on a reproduction is stronger evidence than a
+reproduction, and conflating the two would be the overclaim this repo keeps catching.
+
+Suite **1007 / 0 / 4** across the change (unchanged — 22 guarded sites, zero regressions,
+which is itself the evidence that no legitimate read was broken). Clippy `-D warnings`
+`--all-targets` debug AND release, `cargo fmt --check`: clean.
+
+> **SUPERSEDED — the sentence below is FALSE and is retained only as the record of what was
+> claimed.** It was offered as falsifiable, it was falsified (round 7, MAJOR 3), and it has
+> since been re-measured independently. Do not read it as current state; see
+> **"Correction — the completeness claim, re-measured"** at the end of this file for the
+> measured figure and its replay command. The audit is INCOMPLETE and remediation is in
+> progress.
+
+**Remaining raw reads are now, by inspection, the three documented exemption classes
+(`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code.** That is a
+falsifiable statement and the grep in `fsguard`'s module doc is how to re-check it after any
+future change.
+
+### Re-gate round 7 — GATE FAIL; the guard itself had over-rejected, silently
+
+Round 7 confirmed both round-6 blockers closed (probes rebuilt from scratch: blame-on-fifo in
+the DEFAULT config answered in 1 s; fifo `undo-requests.jsonl` answered in 1 s with a clean
+`repo_error`) and confirmed `fsguard` broke nothing at the suite level. It also judged the
+daemon's **"closed by construction, NOT demonstrated-and-fixed"** framing honest and said it
+would not change it — the claim states exactly what is held, and declines the available
+overclaim. **It still returned GATE FAIL, on three findings. Two are fixed at `371d63b`; the
+third is recorded below and NOT fixed.**
+
+**MAJOR 2 — a REGRESSION introduced by this review's OWN round-6 work, and it silently lost
+user history.** `fsguard::is_nonregular` used `symlink_metadata` (an lstat), so it refused
+EVERY symlink — including a symlink to a perfectly ordinary regular file. A symlink cannot
+block on open; only the resolved target can, so this was pure over-rejection. Because
+`load_log` converts a refusal into an empty ledger, an `.agentrec/log.jsonl` relocated behind
+a symlink (moving the store to another volume is an ordinary setup) made `log`/`diff`/`blame`/
+`undo` all report **"no turns recorded"** with the real data one hop away. Fixed to
+`std::fs::metadata` (a `stat`, which follows the link): a symlink TO a fifo still resolves to
+a fifo and is still refused, and a broken symlink still reads as `NotFound` rather than a
+refusal.
+
+**The asymmetry that hid it is the durable lesson.** The suite passed **1007/0/4 the entire
+time the regression existed**, because every test written for this guard asserted a case that
+must be **REFUSED** and NOT ONE asserted a case that must still be **ALLOWED**. Over-rejection
+fails silently and looks like safety; over-permission is loud. Three tests added to close the
+asymmetry: `a_symlink_to_an_ordinary_file_reads_normally` (the missing allow-case),
+`a_symlink_to_a_fifo_is_still_refused` (so the fix cannot become a new bypass), and
+`a_broken_symlink_reads_as_not_found_not_refused`. **Rule going forward: a refusal predicate
+ships with its allow-case test in the same commit.**
+
+This predicate is deliberately NOT what the undo WRITE path uses. Where following a symlink is
+itself the hazard — reverting through a link writes the pointed-to file —
+`undo_coordinator.rs::symlink_refusal` handles that separately with its own distinct refusal
+text and must keep doing so; merging the two would make that gate's tests pass for the wrong
+reason.
+
+**BLOCKER 1 — a SEVENTH site of the original class, and diagnostic of how round 6 was
+applied.** `readcmds.rs::live_undo_guard_reason` read the undo-guard file with a bare
+`read_to_string`, reachable from all three undo legs — CLI `undo`, `agentrec approve`, and
+**MCP `execute` (agent-triggerable)** — and the gate hung all of them at 18 s with a fifo at
+that path. What makes it diagnostic rather than merely one more site: **`daemon.rs:992` reads
+the very same file through `fsguard::read_regular_to_string`.** Same path, guarded in one
+module and bare in another — direct evidence the round-6 pass was applied **per-FILE rather
+than per-PATH**. Now guarded. **Residual, disclosed: no regression test was written for this
+one** — the gate demonstrated it live, but that was never ported into a test before the round
+ended. Owed.
+
+**MAJOR 3 — this file's own completeness claim is FALSE, and is NOT yet corrected.** The
+"mechanical audit, finished" section above states that remaining raw reads are only the three
+documented exemption classes plus test code. Round 7 measured, by `#[cfg(test)]` boundary:
+**35 non-test bare reads remain, 8 are the documented exemptions, 27 are NOT** — `initcmd.rs`
+13, `uninstallcmd.rs` 5, `importcmd.rs` 4, `purgecmd.rs` 2, `service.rs` 2, `readcmds.rs` 1
+(that last one is BLOCKER 1, now fixed, so 26 remain). Severity is genuinely lower — these sit
+in human-invoked verbs (`init`/`uninstall`/`import`/`purge`/`service`), not the agent-facing
+surface — but **the sentence was offered as falsifiable and it is false**, and a future reader
+will trust it instead of re-running the grep. **Correcting that sentence is owed regardless of
+whether the 26 sites are guarded.**
+
+**An attempt to guard all 26 mechanically FAILED and was reverted, which is itself worth
+recording.** A regex bulk-edit rewrote `std::fs::read_to_string(...)` into
+`std::agentrec_core::fsguard::read_regular_to_string(...)` — the pattern did not account for
+some call sites carrying a `std::` prefix and others not. `cargo build` caught it immediately
+(`E0433: cannot find agentrec_core in std`) and all five files were reverted with
+`git checkout --`. **Do that work by hand, one file at a time, building after each.**
+
+**Round 7's structural recommendation, NOT yet implemented and the most valuable item
+outstanding:** seven rounds of "find sites, guard sites" have not converged because the method
+is ENUMERATIVE — it depends on correctly guessing the reachable set every round. Add
+`disallowed-methods` to `clippy.toml` for `std::fs::read`, `std::fs::read_to_string` and
+`std::fs::File::open`, with `#[allow(clippy::disallowed_methods)]` plus a one-line
+justification at each exemption and inside `fsguard` itself. Clippy already runs `-D warnings`
+on both profiles in CI, so a reintroduced bare call becomes a **build failure** rather than a
+question for the next review round. Sequence matters: do it AFTER the 26 sites are guarded, or
+the lint fails the build on all of them at once.
+
+**Evidence for what IS fixed (`371d63b`):** suite **1010 / 0 / 4** (1007 + 3 new `fsguard`
+tests). Clippy `-D warnings` `--all-targets` debug AND release, `cargo fmt --check`: clean.
+Doc drift corrected in the same commit — the module and `read_regular` still described the
+predicate as an lstat after the code moved to `stat`, which is this repo's signature defect
+class appearing inside the commit that fixes another one.
+
+### Correction — the completeness claim, re-measured
+
+**The claim corrected here** is the sentence in "The mechanical audit, finished" reading
+*"Remaining raw reads are now, by inspection, the three documented exemption classes
+(`/dev/urandom`, fixed `/proc` paths, directory fsyncs) plus test-module code."* That sentence
+is FALSE. It is now marked SUPERSEDED in place rather than deleted, and this entry carries the
+measured replacement. **Nothing here is a completion claim: the audit is incomplete and
+remediation is in progress this round.**
+
+**Measured, not inspected.** At `2ed1ce9`, working tree, `2026-08-07T00:39:25Z`:
+
+- **34 non-test bare file reads** across `cli/src` + `agentrec-core/src`, excluding
+  `fsguard.rs` itself.
+- **8 of them match one of the three documented exemption rationales**; **26 do not.**
+
+Non-exempt, by file: `initcmd.rs` **13**, `uninstallcmd.rs` **5**, `purgecmd.rs` **2**
+(`referenced_hashes_outside_log`, `referenced_hashes` — the other 3 `purgecmd.rs` hits are
+directory fsyncs and are exempt), `importcmd.rs` **4**, `service.rs` **2**.
+
+Exempt, by file: `id.rs` **2** (`/dev/urandom`, class 1), `doctorcmd.rs` **1**
+(`/proc/sys/fs/inotify/max_user_watches`, class 2), `store.rs` **2** and `purgecmd.rs` **3**
+(directory `File::open` for fsync, class 3).
+
+**One honesty split inside that arithmetic:** the 8 match the three documented *rationales*,
+but `fsguard`'s module doc names only `store.rs` for class 3. `purgecmd.rs`'s three directory
+fsyncs are a class-3 site the doc does not name — same justification, unnamed. Writing "8 are
+the documented exemptions" flat would smuggle those three in. Naming the doc gap is the
+correction; fixing the doc is owed and not done here.
+
+**Replay command** (this repo's convention: the figure travels with the command that produced
+it). Run from the repository root:
+
+```sh
+for f in $(find cli/src agentrec-core/src -name '*.rs' ! -name fsguard.rs); do
+  b=$(grep -n '#\[cfg(test)\]' "$f" | head -1 | cut -d: -f1); b=${b:-999999}
+  awk -v b="$b" -v f="$f" 'NR<b && $0 !~ /^[[:space:]]*\/\// \
+    && /(std::)?fs::(read|read_to_string|File::open)[[:space:]]*\(|(^|[^:[:alnum:]_])File::open[[:space:]]*\(/ \
+    {print f":"NR}' "$f"
+done | tee /tmp/sites.txt | cut -d: -f1 | sort | uniq -c; wc -l < /tmp/sites.txt
+```
+
+**Four properties of that command, each checked rather than assumed, because a completeness
+claim measured by a narrower instrument is the same defect one layer down:**
+
+1. **`find`, not `cli/src/*.rs`.** A top-level glob would silently skip subdirectory modules.
+   Verified equal at this HEAD (`find … | wc -l` = 36 = `ls …/*.rs | wc -l`, i.e. there are no
+   subdirectory modules today) — but `find` is what is recorded, so the command stays correct
+   the day one is added.
+2. **Unprefixed `fs::read_to_string` is matched.** A first pass keyed only on `std::fs::…`
+   returned 17 sites and made `initcmd.rs`/`uninstallcmd.rs` look already-guarded. They are
+   not. `initcmd.rs` writes `fs::read_to_string` without the `std::` prefix; the narrow pattern
+   missed all 18 of those two files' hits.
+3. **The `#[cfg(test)]` boundary heuristic is "first occurrence, everything after is test
+   code", and it is sound at this HEAD only because every file was checked:** ~~each of the 36
+   files contains **exactly one** `#[cfg(test)]`~~ — **SUPERSEDED, the struck clause is FALSE
+   and is retained as the record of what was claimed; see "Property 3's per-file check did not
+   happen as written" below** — each is immediately followed by
+   `mod tests {` (or `mod coordinator_tests {` in `undo_coordinator.rs`), and no top-level
+   `fn`/`impl`/`struct`/`enum`/`const`/`static` appears after it in any file. An early inline
+   `#[cfg(test)]` on a helper would silently drop every real read below it; that shape does not
+   exist here today and the heuristic must be re-checked, not reused, if it appears.
+4. **Comment lines are excluded** (`^\s*//`). Without that, three doc-comment mentions of
+   `File::open`/`fs::read` inflate the count, as do `Read::read_to_string` calls on **stdin**
+   in `cmds.rs`/`hookcmds.rs`, which are not filesystem opens and cannot block on a FIFO.
+
+**Two caveats that must travel with the figure.** (a) The measurement is of the **working
+tree**, which carried concurrent uncommitted edits from other agents in this same worktree at
+the time — a re-run yielding a different count reads as drift, not as dishonesty. (b) The line
+numbers above are **as-of `2ed1ce9`** and will rot; the file-and-function names are the durable
+handles, which is why `purgecmd.rs`'s two are named by function rather than by line.
+
+**Consistency with round 7's own count:** round 7 measured 35 total / 27 non-exempt, then fixed
+one (`readcmds.rs::live_undo_guard_reason`, BLOCKER 1), predicting 34 / 26. This independent
+re-measure lands exactly there. That agreement is worth stating because it establishes the two
+counts used the same boundary definition — it does **not** establish that either instrument
+sees every reachable bare read, and no such claim is made.
+
+> **SUPERSEDED — the paragraph below was true at its measurement time and is FALSE as a
+> statement of present state.** It is retained as the record of what was written. Remediation
+> landed later in this same round; see **"Present state, re-measured"** immediately below.
+
+**State, stated plainly: 26 non-exempt bare reads remain unguarded.** The severity argument
+from round 7 is unchanged and still holds — these sit in human-invoked verbs (`init`,
+`uninstall`, `import`, `purge`, `service`), not the agent-facing MCP surface — but severity is
+not closure. Round 7's structural recommendation (`disallowed-methods` in `clippy.toml`, after
+the 26 are guarded) remains the item that would end the enumerative loop, and it is still not
+implemented.
+
+### Present state, re-measured
+
+**The 34/26 census above was true at its stated measurement time** —
+`2026-08-07T00:39:25Z`, commit `2ed1ce9` working tree. **Remediation landed within the same
+round**, after that measurement was taken, which is why the paragraph reads false today.
+
+**Re-measured at `2026-08-07T02:00:02Z`, commit `2ed1ce9` working tree** (same commit, later
+working tree; the tree carried concurrent uncommitted edits from another agent throughout, so
+a further re-run yielding different numbers reads as drift, not as dishonesty). The entry's own
+replay command was re-run verbatim from the repository root. Output:
+
+```
+   2 agentrec-core/src/id.rs
+   2 agentrec-core/src/store.rs
+   1 cli/src/doctorcmd.rs
+   3 cli/src/purgecmd.rs
+       8
+```
+
+**8 total bare reads, 0 non-exempt.** All 8 are the three documented exemption classes, by
+file: `id.rs` 2 (`/dev/urandom`, class 1), `doctorcmd.rs` 1 (`/proc/…/max_user_watches`,
+class 2), `store.rs` 2 and `purgecmd.rs` 3 (directory `File::open` for fsync, class 3). The
+five files that held the 26 — `initcmd.rs`, `uninstallcmd.rs`, `importcmd.rs`, `purgecmd.rs`,
+`service.rs` — now return zero non-exempt hits. Corroborated on a second channel at the same
+timestamp: `grep -c 'fsguard::'` over those five files returns `uninstallcmd.rs` 3,
+`initcmd.rs` 13, `purgecmd.rs` 5, `importcmd.rs` 7, `service.rs` 2 — guarded call sites where
+bare reads used to be. Two channels, agreeing.
+
+> **SUPERSEDED by the round-8 gate correction below — the sentence was false at the HEAD it
+> shipped in.**
+
+**The honesty split from the 34/26 census survives unchanged and still applies to this
+figure:** `fsguard`'s module doc names only `store.rs` for class 3, so `purgecmd.rs`'s three
+directory fsyncs remain a class-3 site the doc does not name. Fixing that doc is still owed and
+still not done here.
+
+**Round-8 correction (2026-08-07, gate on `44cc06a`):** the paragraph above went stale inside
+the very commit that carried it. `44cc06a` itself rewrote `fsguard`'s module doc to name all
+five class-3 sites by `file:symbol` — including `purgecmd.rs`'s three directory fsyncs — and
+the round-8 skeptic read that doc at `agentrec-core/src/fsguard.rs` (registry block near the
+top of the module doc) while this ledger sentence, added by the same commit, still said the fix
+was "still owed and still not done here". The doc fix and this sentence were authored by two
+concurrent agents in one shared tree; the sentence was written before the doc landed and nobody
+re-read it against the final tree — the same mid-round-measurement staleness this entry's own
+caveat (a) warned about for counts, now demonstrated for a completion claim. The fsguard
+exemption registry is DONE as of `44cc06a`; nothing about it is owed.
+
+**`disallowed-methods` in `clippy.toml` IS implemented.** Verified by reading the file at
+`2026-08-07T02:00:02Z`: all three methods are listed (`std::fs::read`,
+`std::fs::read_to_string`, `std::fs::File::open`), each with a reason string pointing at the
+corresponding `agentrec_core::fsguard` wrapper. **The live mutation proof belongs to the commit
+that landed the lint and is NOT re-run here** — this correction's only evidence for the lint is
+having read the config file, and writing "mutation-verified" in this entry's own voice on that
+evidence would be a fresh instance of the defect class this entry exists to correct. Whoever
+closes the round owes that probe, run after a `cargo build` (this repo's recorded stale-build
+hazard).
+
+**That owed probe was run by the round-8 gate (2026-08-07, on `44cc06a`):** a bare
+`std::fs::read_to_string` planted in `readcmds.rs::diff` made
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 101 with an error
+naming `disallowed_methods` and the fsguard reason string; the plant was reverted and the
+clean run exits 0. The skeptic also verified no file-wide
+`#![allow(clippy::disallowed_methods)]` exists outside `cli/tests/` (16 files) and that all 24
+in-`src` allows attach to `mod tests {` items or the 8 documented exemption sites. Caveat the
+skeptic itself recorded: the post-revert clean run was incremental (cli crate only, 0.99s); a
+from-clean clippy re-run would remove the cache caveat.
+
+> **Partition sentence above corrected by the round-9 gate and re-verified before this
+> rewrite:** the 24 grep hits for `allow(clippy::disallowed_methods)` in `agentrec-core/src` +
+> `cli/src` are NOT "test mods + 8 sites". Enumerated (2026-08-07, `65d725c` working tree):
+> 11 attach to `#[cfg(test)] mod` items, 8 to the documented exemption sites (`id.rs:58,71`,
+> `doctorcmd.rs:848`, `store.rs:99,330`, `purgecmd.rs:594,916,1246`), 3 to `fsguard`'s own
+> wrapper functions (`fsguard.rs:152,165,180` — the guards themselves, anticipated by the
+> module doc's registry), and 2 are doc-comment prose mentions in `fsguard.rs:19,22`, not
+> attributes at all. 11+8+3+2 = 24; 22 attributes, 2 prose. The substance of the round-8
+> verification (no attacker-reachable site silenced) is unchanged; the partition as written
+> was a miscount.
+
+**Miscitation, noted not hunted.** The SUPERSEDED sentence at the top of the mechanical-audit
+section says "the grep in `fsguard`'s module doc is how to re-check it". `fsguard`'s module doc
+contains no grep. The re-check instrument is the replay command in this entry, not anything in
+that doc. Scope of this note is that one sentence; no wider citation audit was performed.
+
+### Property 3's per-file check did not happen as written
+
+Property 3 above claims, as checked-not-assumed, that "each of the 36 files contains **exactly
+one** `#[cfg(test)]`". **That is false, and was false both in the working tree and at
+`2ed1ce9`.** Verified at `2026-08-07T02:00:02Z` with:
+
+```sh
+for f in $(find cli/src agentrec-core/src -name '*.rs' ! -name fsguard.rs); do
+  printf '%s %s\n' "$(grep -c '#\[cfg(test)\]' "$f")" "$f"
+done | awk '$1!=1{print "  n="$1" "$2} {c[$1]++} END{for(k in c) print "n="k": "c[k]" files"}'
+```
+
+Output: **29 files with exactly one, 6 with zero** — `cli/src/approvecmd.rs`,
+`cli/src/loglock.rs`, `cli/src/memlock.rs`, `agentrec-core/src/perms.rs`,
+`agentrec-core/src/lib.rs`, `agentrec-core/src/text.rs`.
+
+Two things measured alongside it, because the arithmetic in property 3 is off by one against
+the command it describes. The replay's census set **excludes** `fsguard.rs` (its own
+`! -name fsguard.rs`), so the set is **35 files, not 36**; `ls cli/src/*.rs
+agentrec-core/src/*.rs | wc -l` returns 36 **including** `fsguard.rs`, and
+`grep -c '#\[cfg(test)\]' agentrec-core/src/fsguard.rs` returns 1. So a 36-file reading counts
+`fsguard.rs` in, which the replay does not.
+
+**The census conclusion survives, in the conservative direction.** A file with zero
+`#[cfg(test)]` falls through to `b=999999`, so the whole file is scanned — including any test
+module. That **over**-includes rather than dropping real reads, so it cannot hide a non-exempt
+site. It is a live shape, not hypothetical: `agentrec-core/src/perms.rs` does carry a test
+module, gated `#[cfg(all(test, unix))]`, which the literal `#\[cfg(test)\]` pattern does not
+match. Its test module is therefore scanned in full, and contributes zero hits — so the 8/0
+figure is not understated by it. What is false is only the stated verification: the per-file
+check was asserted, not performed as described.

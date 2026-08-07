@@ -60,6 +60,14 @@ pub struct SignalEvent {
     #[serde(default)]
     pub transcript: Option<String>,
     /// Post-scrub prompt text, when the emitting hook has it (UserPromptSubmit).
+    /// PROTOCOL §4 (row added at the 1.0 freeze, documenting shipped
+    /// behavior). NOT gated on `event`: `cmds.rs::hook` reads the payload's
+    /// `prompt` key whichever Claude Code hook fired, and `daemon.rs::
+    /// signal_context` consumes it on `start` and `stop` alike — on a stop it
+    /// becomes `observe_stop`'s `prompt_fallback` for a stop-only emitter.
+    /// Unlike the additive fields below it has no `skip_serializing_if`, so
+    /// it goes on the wire as an explicit `null` when absent; §4 pins
+    /// explicit `null` as identical to absence.
     #[serde(default)]
     pub prompt: Option<String>,
     /// PROTOCOL §4 additive (D6 attribution): absolute paths the emitting tool
@@ -68,6 +76,35 @@ pub struct SignalEvent {
     /// consumers must not infer authorship for paths absent from the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_written: Option<Vec<String>>,
+    /// PROTOCOL §4 additive (Phase 2 tail C1): a stable turn identity the
+    /// EMITTER assigns, present on `start`/`stop` only. Motivating producer:
+    /// Codex's own hook `turn_id` (docs/verify/codex-spike.md) — the daemon
+    /// uses it to detect an emitter-resent start/stop (retry, or a daemon
+    /// restart racing the emitter's own retry) by
+    /// `(tool, event, session, emitter_turn)` instead of timing heuristics.
+    /// Claude Code's hook emitter has no equivalent stable id today and
+    /// omits this field entirely; `None` means "emitter did not declare",
+    /// never "no upstream turn" — a recorder MUST fall back to today's
+    /// existing start/stop matching whenever either side of a comparison
+    /// lacks it (see `cli/src/daemon.rs`'s dedup + mismatch handling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitter_turn: Option<String>,
+    /// PROTOCOL §4 additive (Phase 2 tail C2 fix 2): the model the emitting
+    /// tool was running, when the emitter has it. Motivating producer:
+    /// Codex's hook payload carries `model` on all three of its lifecycle
+    /// events (`docs/verify/codex-spike.md`'s field inventory); `cli/src/
+    /// hookcmds.rs::hook_codex` sets it on `UserPromptSubmit` only —
+    /// mirroring `prompt`'s start-only posture, not `emitter_turn`'s
+    /// carried-on-both one (see that module's doc for why). Claude Code's
+    /// hook emitter has no such field and omits this entirely; its model
+    /// attribution is a SEPARATE, pre-existing mechanism
+    /// (`cli/src/daemon.rs::parse_transcript`, daemon-side transcript
+    /// parsing) that this field does not replace. `None` means "emitter
+    /// did not declare", never "no model" — a recorder falling back to
+    /// transcript-derived attribution whenever this is absent is the
+    /// existing, unchanged behavior (`cli/src/daemon.rs::signal_context`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Signal variant discriminator (PROTOCOL §4, additive). Absent/`None` on
     /// every existing turn-boundary signal (`start`/`stop`, keyed by `event`
     /// instead). Currently the only non-`None` value is `"memory-candidate"`
@@ -126,8 +163,10 @@ pub struct FileEntry {
     /// and aggregate, driving the DEGRADED banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,
-    /// Additive, UNFROZEN (Phase 2.0 P2 fix round, founder decision 2):
-    /// `Some(true)` when `after` was DERIVED (e.g. applying an imported
+    /// PROTOCOL §5 additive, FROZEN at protocol 1.0 (2026-08-06) — the
+    /// freeze added its §5 row (see the `after_synthesized` paragraph
+    /// there); it landed in the Phase 2.0 P2 fix round under founder
+    /// decision 2. `Some(true)` when `after` was DERIVED (e.g. applying an imported
     /// turn's `oldString`→`newString` substitution to a resolved-or-
     /// unresolved `before`) rather than observed directly from the source
     /// (a live daemon snapshot, or a transcript's own recorded `content`
@@ -233,8 +272,10 @@ pub struct TurnRecord {
     /// PROTOCOL §4). Consumers must treat merged turns as superseded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merges: Vec<String>,
-    /// Import provenance (Phase 2.0 P2). Additive + UNFROZEN per spec
-    /// decision 5. `None` on every live-recorded record, so existing lines
+    /// Import provenance (Phase 2.0 P2). PROTOCOL §5 additive, FROZEN at
+    /// protocol 1.0 (2026-08-06) — the freeze added the §5 rows for this
+    /// field and for `files_complete` below, documenting both as already
+    /// shipped. `None` on every live-recorded record, so existing lines
     /// stay byte-identical — neither this nor `files_complete` is emitted
     /// unless set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,7 +286,69 @@ pub struct TurnRecord {
     /// completeness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_complete: Option<bool>,
+    /// Which surface EXECUTED an undo's writes (PROTOCOL §5 additive, delta
+    /// decision 11): [`UndoOrigin::CLI`] or [`UndoOrigin::MCP`]. Set only on
+    /// undo turns — the ones this implementation writes with
+    /// `tool: "agentrec"` — and `None` on every other turn, so nothing else
+    /// on the wire moves.
+    ///
+    /// Read through [`TurnRecord::origin`], never bare: an absent value means
+    /// `cli`, which is what every undo turn written before this field existed
+    /// is. Absent is therefore NOT "unknown" and NOT a third state.
+    ///
+    /// It names the surface that *wrote*, never the one that *asked*: an
+    /// `agentrec approve` of an undo an agent requested over MCP is `cli`,
+    /// because a human at a keyboard performed it. The requesting provenance
+    /// lives in `.agentrec/undo-requests.jsonl`, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub files: Vec<FileEntry>,
+}
+
+/// The two values [`TurnRecord::origin`] may carry (PROTOCOL §5).
+///
+/// An enum rather than two `&str` constants at the call sites, because the
+/// whole point of the field is that four `append_undo_turn` call sites across
+/// two transports agree; a typo in a string literal is exactly the drift the
+/// discriminator exists to measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndoOrigin {
+    /// `agentrec undo --confirm` or `agentrec approve` — a human executed it.
+    Cli,
+    /// The MCP `agentrec_undo` `execute` action — an agent spent a token.
+    Mcp,
+}
+
+impl UndoOrigin {
+    /// The wire value. `TurnRecord::CLI`/`MCP` name the same two strings for
+    /// readers, which do not have this enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndoOrigin::Cli => TurnRecord::CLI,
+            UndoOrigin::Mcp => TurnRecord::MCP,
+        }
+    }
+}
+
+impl TurnRecord {
+    /// Wire value for [`UndoOrigin::Cli`].
+    pub const CLI: &'static str = "cli";
+    /// Wire value for [`UndoOrigin::Mcp`].
+    pub const MCP: &'static str = "mcp";
+
+    /// The effective `origin`, applying PROTOCOL §5's absent-means-`cli`
+    /// default. The ONE place that default lives: reading `self.origin`
+    /// directly and matching on `Some("cli")` would silently exclude every
+    /// pre-F5 undo turn, which is the misreading the row this field feeds
+    /// (delta decision 11's post-ship undo counts) would be destroyed by.
+    ///
+    /// Returns an unrecognized value verbatim rather than folding it into
+    /// `cli` — §10 says consumers tolerate unknown values, and quietly
+    /// relabelling a future surface as a human one would be worse than
+    /// surfacing a string the caller does not know.
+    pub fn origin(&self) -> &str {
+        self.origin.as_deref().unwrap_or(Self::CLI)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,6 +358,23 @@ pub struct EpochRecord {
     pub v: u32,
     pub event: String, // "start" | "stop"
     pub ts: String,    // RFC 3339
+    /// D51 (PROTOCOL §5, additive): how many turn-boundary signal lines the
+    /// recorder found in the pre-startup gap and DROPPED without feeding them
+    /// to the engine (D7 — replaying a stale start/stop would mint an empty
+    /// turn misdated to daemon boot). A count, never the dropped content:
+    /// nothing about the dropped signals is captured or persisted beyond how
+    /// many there were.
+    ///
+    /// Meaningful on `event: "start"` only — a `stop` epoch is a clean
+    /// shutdown, which has no gap to scan — and omitted from the wire
+    /// whenever it is `0`, so every pre-D51 epoch line round-trips
+    /// byte-identically (`epoch_dropped_signals_roundtrips_and_zero_stays_absent`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dropped_signals: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Append one record; creates parents; never rewrites (append-only invariant).
@@ -288,7 +408,25 @@ pub fn append_log_line(path: &Path, line: &str) -> Result<(), String> {
 /// Shared open+write for both append paths. Creates parents; writes `line` as
 /// a single `\n`-terminated buffer (one write syscall helps append atomicity
 /// across processes). Returns the open file so callers may fsync it.
+///
+/// Refuses a non-regular target before opening it. This is the WRITE-side
+/// mirror of the [`crate::fsguard`] read guards, and the same hazard: opening
+/// a FIFO for append blocks until a READER appears, indefinitely. Reproduced
+/// live on this branch — `mkfifo .agentrec/signal.jsonl` then piping a `Stop`
+/// event into `agentrec hook claude` hung the hook process forever, and a
+/// hook that never returns is a wedged agent turn, not a lost record. The
+/// sibling write-opens in `undo_coordinator.rs` (`append_event`,
+/// `UndoLock::acquire`) already refuse the same way; this is the one primitive
+/// every `log.jsonl`/`signal.jsonl`/`memory.jsonl` append funnels through, so
+/// guarding it here covers [`append_log`], [`append_log_line`] and
+/// [`append_line_synced`] at once.
 fn open_append(path: &Path, line: &str) -> Result<fs::File, String> {
+    if crate::fsguard::is_nonregular(path) {
+        return Err(format!(
+            "{} is not a regular file — refusing to append",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         perms::lock_dir(parent);
@@ -398,7 +536,11 @@ pub fn parse_log_line(line: &str) -> ParsedLine {
 /// Load all parseable records; torn/corrupt lines are skipped, never fatal
 /// (a bad line must not wipe history — lesson inherited from Sutra).
 pub fn load_log(path: &Path) -> Vec<LogRecord> {
-    let Ok(file) = fs::File::open(path) else {
+    // fsguard: `log.jsonl` lives in `.agentrec/`, which an agent sandboxed
+    // to the repo can write, and opening a FIFO here would block every
+    // reader of the log. Streamed rather than slurped — this file is
+    // multi-MB in a dogfooded repo — so the guard is on the open.
+    let Ok(file) = crate::fsguard::open_regular(path) else {
         return vec![];
     };
     let reader = std::io::BufReader::new(file);
@@ -434,6 +576,10 @@ pub fn parse_signals(text: &str) -> Vec<SignalEvent> {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -483,6 +629,76 @@ mod tests {
     }
 
     #[test]
+    fn signal_emitter_turn_roundtrips_and_absence_stays_absent() {
+        // Pre-field line (every Claude Code hook payload today): parses with
+        // None, and re-serializing does NOT mint the key — this is the wire
+        // half of AC-C1's byte-identical claim (the daemon-side half is in
+        // `cli/tests/emitter_turn.rs`).
+        let old = "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\"}";
+        let sig: SignalEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(sig.emitter_turn, None);
+        let re = serde_json::to_string(&sig).unwrap();
+        assert!(!re.contains("emitter_turn"));
+
+        // Field-carrying line round-trips intact.
+        let new = concat!(
+            "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"event\":\"start\",",
+            "\"emitter_turn\":\"turn_abc123\"}"
+        );
+        let sig: SignalEvent = serde_json::from_str(new).unwrap();
+        assert_eq!(sig.emitter_turn.as_deref(), Some("turn_abc123"));
+        let re = serde_json::to_string(&sig).unwrap();
+        let back: SignalEvent = serde_json::from_str(&re).unwrap();
+        assert_eq!(back.emitter_turn, sig.emitter_turn);
+    }
+
+    /// D51 wire half: the type-level byte-identity proof for every epoch line
+    /// written before this field existed.
+    #[test]
+    fn epoch_dropped_signals_roundtrips_and_zero_stays_absent() {
+        // Pre-D51 line: parses with 0, and re-serializing is byte-identical —
+        // the key is never minted.
+        let old = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\"}";
+        let ep: EpochRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(ep.dropped_signals, 0);
+        assert_eq!(serde_json::to_string(&ep).unwrap(), old);
+
+        // An explicit zero on the wire is tolerated and normalizes away.
+        let zero = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\",\"dropped_signals\":0}";
+        let ep: EpochRecord = serde_json::from_str(zero).unwrap();
+        assert_eq!(serde_json::to_string(&ep).unwrap(), old);
+
+        // Nonzero round-trips intact.
+        let new = "{\"v\":1,\"event\":\"start\",\"ts\":\"2026-07-05T00:00:00.000Z\",\"dropped_signals\":3}";
+        let ep: EpochRecord = serde_json::from_str(new).unwrap();
+        assert_eq!(ep.dropped_signals, 3);
+        assert_eq!(serde_json::to_string(&ep).unwrap(), new);
+    }
+
+    #[test]
+    fn signal_model_roundtrips_and_absence_stays_absent() {
+        // Pre-field line (every existing signal, and every Claude Code hook
+        // payload today): parses with None, and re-serializing does NOT mint
+        // the key.
+        let old = "{\"v\":1,\"ts\":5000,\"tool\":\"claude-code\",\"event\":\"stop\"}";
+        let sig: SignalEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(sig.model, None);
+        let re = serde_json::to_string(&sig).unwrap();
+        assert!(!re.contains("\"model\""));
+
+        // Field-carrying line round-trips intact.
+        let new = concat!(
+            "{\"v\":1,\"ts\":5000,\"tool\":\"codex\",\"event\":\"start\",",
+            "\"model\":\"gpt-5.6-terra\"}"
+        );
+        let sig: SignalEvent = serde_json::from_str(new).unwrap();
+        assert_eq!(sig.model.as_deref(), Some("gpt-5.6-terra"));
+        let re = serde_json::to_string(&sig).unwrap();
+        let back: SignalEvent = serde_json::from_str(&re).unwrap();
+        assert_eq!(back.model, sig.model);
+    }
+
+    #[test]
     fn signal_stream_with_files_written_keeps_existing_routing() {
         // Conformance: a files_written-carrying stop interleaved with legacy
         // lines and a memory-candidate parses as before — the field changes
@@ -526,6 +742,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![FileEntry {
                 path: "src/a.rs".into(),
                 before: None,
@@ -556,6 +773,7 @@ mod tests {
                 v: 1,
                 event: "start".into(),
                 ts: "2026-07-05T00:00:02.000Z".into(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();
@@ -704,6 +922,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files: vec![],
         };
         append_log(&log_path, &LogRecord::Turn(turn)).unwrap();
@@ -739,6 +958,7 @@ mod tests {
                 v: 1,
                 event: "start".into(),
                 ts: "2026-07-05T00:00:00.000Z".into(),
+                dropped_signals: 0,
             }),
         )
         .unwrap();
@@ -843,6 +1063,7 @@ mod tests {
             merges: vec!["t_MERGED".into()],
             imported: Some(true),
             files_complete: Some(false),
+            origin: None,
             files: vec![],
         };
         let json = serde_json::to_string(&turn).unwrap();

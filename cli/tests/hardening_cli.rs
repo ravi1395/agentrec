@@ -4,6 +4,11 @@
 //! fixtures, mirroring the helper patterns in `cli/tests/integration.rs`
 //! (kept separate per file-ownership rules for this hardening round).
 
+#![allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures, which this harness created;
+//    there is no attacker-supplied FIFO to block on, so the fsguard wrappers
+//    buy nothing here. Production reads stay lint-enforced (clippy.toml).
+
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -51,6 +56,7 @@ fn base_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }
@@ -79,6 +85,7 @@ fn make_turn(
         merges: vec![],
         imported: None,
         files_complete: None,
+        origin: None,
         files,
     }
 }
@@ -98,6 +105,7 @@ fn seed_epoch(root: &Path, event: &str, ts: &str) {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         }),
     )
     .expect("seed epoch");

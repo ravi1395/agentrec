@@ -76,7 +76,8 @@ impl BlobStore {
             // rewriting. Verify before trusting. Perf-evidence round: this
             // read's length is the `reread_bytes` cost a clean dedup hit
             // pays — captured here rather than dropped on the floor.
-            let existing_bytes = fs::read(&path).ok();
+            // fsguard: same CAS-object hazard as `get`.
+            let existing_bytes = crate::fsguard::read_regular(&path).ok();
             let intact = existing_bytes
                 .as_ref()
                 .is_some_and(|existing| hash_bytes(existing) == hash);
@@ -92,7 +93,12 @@ impl BlobStore {
                 // D34 hole) — fsync it too, since a prior crash could have
                 // lost the directory entry even though this inode survived.
                 if let Some(parent) = path.parent() {
-                    if let Ok(dir) = fs::File::open(parent) {
+                    // Directory handle opened solely for `sync_all`; a
+                    // directory is never a regular file, so the fsguard
+                    // predicate would refuse it, and opening one cannot block.
+                    #[allow(clippy::disallowed_methods)]
+                    let opened = fs::File::open(parent);
+                    if let Ok(dir) = opened {
                         let _ = dir.sync_all();
                     }
                 }
@@ -155,7 +161,13 @@ impl BlobStore {
         let Some(path) = self.object_path(hash) else {
             return Err(StoreError::Missing(hash.to_string()));
         };
-        let bytes = fs::read(&path).map_err(|_| StoreError::Missing(hash.to_string()))?;
+        // fsguard, not `fs::read`: a FIFO planted at a CAS object path hung
+        // every undo leg at once — `build_plan` calls this as an integrity
+        // read, so preview, CLI `undo`, `approve` and `execute` all blocked
+        // (branch review re-gate round 5). A non-regular object is reported
+        // `Missing`, which is what it is: not a retrievable blob.
+        let bytes = crate::fsguard::read_regular(&path)
+            .map_err(|_| StoreError::Missing(hash.to_string()))?;
         if hash_bytes(&bytes) != hash {
             return Err(StoreError::Corrupt(hash.to_string()));
         }
@@ -314,7 +326,10 @@ fn create_tmp_file(path: &std::path::Path) -> std::io::Result<fs::File> {
 /// final name by the time this runs, so a dir-fsync failure past this point
 /// is a durability warning, never a "no snapshot" report.
 fn finish_stored(hash: String, parent: &std::path::Path) -> PutResult {
-    if let Ok(dir) = fs::File::open(parent) {
+    // Directory handle opened solely for `sync_all` (see `put` above).
+    #[allow(clippy::disallowed_methods)]
+    let opened = fs::File::open(parent);
+    if let Ok(dir) = opened {
         if let Err(e) = dir.sync_all() {
             eprintln!("agentrec: snapshot {hash} stored but parent-dir fsync failed: {e}");
         }
@@ -368,6 +383,10 @@ impl std::fmt::Display for StoreError {
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

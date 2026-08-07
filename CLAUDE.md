@@ -14,6 +14,130 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
+  pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
+  four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal
+  shrinking the protect set would let purge delete live blobs); init (12 sites) / uninstall
+  (5) named-error on FIFO config paths, never treat-as-empty (init merges, so empty-on-refusal
+  clobbers); importcmd ×4, service ×2, `record::open_append` (reviewer-found HIGH — `hook
+  claude` hung on a FIFO `signal.jsonl`, the agent-facing surface) plus ten write-open guards
+  (locks, tmp-writers, undo-guard, purge rewrites). `clippy.toml disallowed-methods`
+  (fs::read/read_to_string/File::open) makes reintroduction a build failure — proven live by
+  plant-probe (exit 101), partition of all 24 in-src allows enumerated in the ledger. Tests
+  +9 incl. the daemon FIFO regression test (asserts skipped entry AND control-file survival —
+  the neutered guard loses the whole recorder) — its fixture replaces a watched regular file
+  with a FIFO for determinism. Suite 1019/0/4; clippy `--all-features -D warnings` + fmt clean.
+  - **Rounds 8–10 each failed on PROSE only, never code — three of the false sentences were
+    the orchestrator transcribing a skeptic's claims unverified** (the recorded gate-loop
+    lesson, hit again): a `Create(_)` mechanism citing a cfg'd-out Linux arm, a "2/2
+    byte-written" figure round 9 could not reproduce (0/3; 2/2 only with an explicit touch —
+    stimulus UNDETERMINED, both measurements now stated without adjudication, probe shapes
+    persisted in `scripts/probe-fresh-fifo-delivery.sh`), and a "(both rounds)" attribution
+    for a shape round 9 never ran.
+  - **Known-open, disclosed not fixed:** OpenOptions/fs::write/fs::copy lint gap (write-open
+    class; store.rs:91 named); service.rs unit-file write outside the repo threat model;
+    darwin-only lint census (Linux cfg bodies unlinted locally); nine of ten write-open guards
+    evidenced only by the green suite; fresh-FIFO delivery stimulus undetermined (script
+    settles it when someone runs the matrix); round-8/9/10 probe outputs not persisted to
+    `docs/verify/` (founder option if gradeable figures wanted).
+- **Phase 2 tail execution started (2026-08-05, branch `feat/phase-2-tail`, forked from
+  `main`@`dd4238f`, worktree `~/Projects/agentrec-phase2-tail`) — orchestrated: Sonnet
+  implementers per task, Fable skeptic gate per phase, no phase advances without GATE PASS.
+  Plan: `docs/superpowers/plans/2026-08-05-phase-2-tail-plan.md` (lives on
+  `docs/user-onboarding`, not yet merged to `main`). Baseline re-measured at fork: 751/0/3.**
+  **Phase A (Codex hook spike) GATE PASS @ `64f2bcf`.** Live-probed pinned `codex-cli 0.146.0`
+  (not inferred from docs): headline finding `turn_id` is STABLE across a `Stop`
+  `decision:"block"` continuation (2/2 runs) — unblocks decision 17's drain-by-`turn_id`
+  keying, no founder escalation needed. Trust hash-invalidates on both command AND
+  non-command (`timeout`) field changes; `hooks.json`+inline `[hooks]` merge+warn confirmed;
+  `PostToolUse apply_patch` `tool_input.command` is raw patch-DSL text (pins the path-
+  extraction rule); `codex exec` silently skips untrusted hooks with **zero** warning (gap
+  beyond the docs, recorded). Fixtures + field inventory + trust writeup:
+  `docs/verify/codex-spike.md`. Gate found 2 non-blocking prose overclaims (fixed same round).
+  **Phase B (toml config loader) GATE PASS @ `0c6c428`, after 2 fix rounds — closes the
+  onboarding round's recorded debt above** (`mcp_destructive` now read; invalid TOML now a
+  real hard error on CLI verbs + daemon startup). `cli/src/config.rs`: `McpDestructive`
+  enum + `Config`/`load()` (D16 line-numbered hard error), all 5 legacy read sites migrated,
+  scanner deleted. **Round 1 GATE FAIL:** implementer routed every production call site
+  through a tolerant `load_or_default`, making the hard-error path unreachable — silent
+  scope-narrowing of an explicit, pre-decided plan constraint, not founder-ratified. Fixed:
+  CLI verbs now propagate real errors; daemon hard-fails once at startup, stays tolerant
+  mid-tick (avoids the repo's own documented launchd `KeepAlive` respawn-loop scar).
+  `memorycmds`' fail-open reads deliberately NOT migrated — collides with the pre-existing
+  pinned INV-M4 "hook always appends signal" invariant; gate ratified this as sound,
+  disclosed, non-blocking. **Round 2 GATE FAIL (narrow):** the fix's new mid-tick-survival
+  test and its commit message overclaimed proving the *budget* path degrades gracefully;
+  it actually only exercised a different read (`read_memory_enabled`) because of a debug
+  env-override seam bypassing the budget path entirely — signature-defect-shaped (confident
+  claim, no measurement behind it), caught by the gate rather than shipped. Round 3 fixed
+  the false claim and added a real discriminating test (real on-disk `store_budget_bytes`,
+  no env override) — the skeptic independently reproduced the mutation probe (old test
+  blind to a forced hard-error regression, new test catches it). Suite 751→762/0/3;
+  clippy+fmt clean debug+release; no test seams in release `strings`.
+  **Phase C (Codex 2.1 adapter) DONE — task ACs C1–C4 GATE PASS, and Phase C EXIT REACHED
+  @ `7212ba8`.** C1 `emitter_turn` + restart-safe dedup; C2 `agentrec hook codex` (three-event
+  emitter + `files_written` accumulator); C3 init/doctor/uninstall codex hook management;
+  C4 `import codex` (K-series, real-corpus derived: 616 rollout files, 100% importable).
+  **Two founder-ratified mid-phase fixes:** content-aware dedup — Codex's `Stop` fires twice
+  with an identical `turn_id` on a block-continuation and identity-only dedup was silently
+  dropping the second WITH its new `files_written` (real attribution data loss) — and a
+  `model` field on `SignalEvent`, without which Codex rich turns shipped with zero model
+  attribution. **O5 met live** (real `claude -p` session + real interactive Codex session
+  through the un-bypassed `/hooks` trust flow; sequential, not simultaneous; zero
+  cross-attribution by jq-scoped queries). **O5 found a blocking product defect, fixed
+  @ `3c4f598`:** Codex spawns hook processes with cwd = its LAUNCH directory, not the repo
+  root, and the installed entry is bare — so a subdirectory launch silently minted a second
+  `.agentrec/signal.jsonl` under `sub/`, invisible to the daemon, no error. Fixed by walking
+  up to the nearest `.agentrec/` (git-style), **both emitters**, chosen over baking an
+  absolute `--root` (that is this repo's 39-orphan scar). **`3c4f598`'s own message then
+  carried an unmeasured claim** — that Claude Code pins hook cwd to the project root, making
+  its defect "latent" — **measured FALSE** (`ecd09bc`): Claude inherits the launch dir too, so
+  that defect was real and live. claimd gap **founder-waived** (`baeee84`): nothing in Phase C
+  is claim-attested. Suite 762→866/0/3.
+  **Phase D (Protocol 1.0 freeze) GATE PASS @ `8d8e1db` (Fable, 10/10 ACs).** D0 landed the
+  D7 dropped-signal count on the epoch-start record (decision 51) first as a durable marker;
+  the freeze commit then stamped `PROTOCOL.md` **1.0 (frozen 2026-08-06)** with 29 conformance
+  fixtures (`docs/fixtures/conformance/{valid,tolerated,invalid}` + manifest test
+  `cli/tests/conformance.rs`). Founder review of the freeze diff is asserted in `8d8e1db`'s
+  commit message; **no ledger row records it** (provenance noted at plan exit — founder
+  attestation welcome). Suite 866→876/0/4.
+  **Phase E (MCP read 2.2) GATE PASS @ `d5b3deb` (E-commits `f48b519`/`75ae1de`/`d851408`/
+  `f4a96c3`).** `agentrec mcp`: stdio JSON-RPC server, five read tools; `diff`/`blame`
+  payloads byte-equal to `--json` (parity-pinned), `log` returns typed `Page<TurnSummary>`
+  (P4b decision 12), `recall` returns `RecallPage` (delta 14). PROTOCOL delta across the
+  whole phase = exactly the additive §8 `agentrec_status` row (first post-freeze additive
+  change). Suite 876→926/0/4. Residuals: no real MCP host has spoken to the server yet;
+  Codex repo-local `mcp_servers` honoring unconfirmed.
+  **Phase F (MCP destructive 2.3) GATE PASS @ `670fba3` — 4 rounds; rounds 2–3 failed on
+  RECORD defects only, never code.** F1 mode gating + matrix (`e264d7c` fixed §8
+  `allow_modified` text first — delta 15); F2 `UndoCoordinator` preview + path reservations;
+  F3 confirm-mode request ledger + `agentrec approve`/deny (D23 10-min expiry); F4 auto-mode
+  two-phase tokened execute (spend-before-write, crash matrix); F5 `origin` cli/mcp
+  discriminator (delta 11). Finding 11(b) fix `e32d247` (mid-revert failure-path persistence
+  surfaced + fault injection). **Blocker closures:** self-healing E2E run LIVE on the release
+  binary (`d8c69e3`, `docs/verify/f-exit-self-healing.md` — confirm + auto legs, token-hash
+  cryptographic tie, teardown 5→5; agent identity simulated via hook emitter, disclosed);
+  finding 13 (unbounded `undo-requests.jsonl`) recorded `78fbc36`. Gate-round-2/3 record
+  fixes `64f6b68`/`670fba3`: false `reserve`+`approve` join corrected to `request`+`execute`;
+  false flake name `hook_kill_9_closes_open_epoch` provenance-pinned (never existed — real
+  recorded flake is `approve.rs::a_killed_approve_never_leaves_a_phantom_approval`, 1/26 and
+  2/~14, disposition founder-owned); seam-sentence over-claim fixed. Suite **987/0/4**
+  (measured 4×), clippy debug+release + fmt clean, release-seam grep zero hits.
+  **Standing debts (recorded, founder-owned):** coordinator-layer `allow_modified` is
+  downgrade-with-warning, not refusal — §8's refusal exists only at the transport rail;
+  `undo-requests.jsonl` unbounded (reclaim needs a decision-register entry); Phase D founder
+  review unledgered; kill-9 flake disposition.
+  **Next: plan-exit checklist (in progress), then merge vehicle for `feat/phase-2-tail`.**
+  **O5 Phase C exit criterion re-run LIVE (2026-08-05):** the prior round's Claude leg was
+  direct hook-invocation, not a live process — closed by a genuine `claude -p` session (both
+  legs re-driven live, one `log.jsonl`, zero jq-scoped cross-attribution). Along the way it
+  found the prior round's `files:[]` diagnosis was mis-attributed (D6/`transcript_path` were
+  both true facts but neither was the actual cause — a controlled repro pins it to a
+  fs-watcher/bracket-timing race instead, a new undocumented defect surface) and falsified
+  `3c4f598`'s "Claude Code sets cwd to the project root" assumption (measured: it doesn't; the
+  walk-up fix earns its keep for claude for the measured reason, not the assumed one). Full
+  writeup: `docs/verify/o5-two-tool-session.md`; ledger: `VERIFY-LEDGER.md` § "O5". Not fixed,
+  not gated by a skeptic — verification only, recorded for founder disposition.
 - **User-onboarding docs round (delivered 2026-08-04, branch `docs/user-onboarding`).** README
   restructured for new users: quickstart (`init` → `import claude` → `doctor` → read verbs),
   mermaid architecture diagram, How-it-works glossary (rich/bare, bracketing, epochs, git turns),
@@ -29,10 +153,9 @@ carries only current state, what's next, and standing debts.
   **Found+fixed: today's squash `23a2e0d` (via f6cadea's untrack of `docs/`) had removed
   `docs/blame-demo.gif` from the remote, breaking README's demo image on GitHub — the three
   demo files are re-tracked; the rest of `docs/` stays local per the untrack decision.**
-  Recorded, NOT fixed (founder-owned normative doc): IMPLEMENTATION.md ACs J1/J2/I3 claim
-  config behavior that does not exist — `mcp_destructive` is written by `init` but read by
-  nothing, invalid TOML is silently tolerated (no "hard error with line number"), no
-  user-supplied scrub-rule key exists.
+  The J1/J2/I3 config debt recorded here (mcp_destructive read by nothing; invalid TOML
+  silently tolerated) was CLOSED by Phase B's config loader (`0c6c428`, 2026-08-05) — see the
+  Phase 2 tail bullet above. The user-supplied scrub-rule key still does not exist.
 - **Release-version gate + `agentrec-release` skill (delivered 2026-08-04, UNCOMMITTED on
   `main`, not gated by a skeptic, never exercised by a real tag).** Closes the
   "4 files bumped by hand, no CI enforcement of match" gap recorded at v0.2.0. Three
@@ -672,6 +795,13 @@ carries only current state, what's next, and standing debts.
   runner. Bound raised to 300 ms (founder decision 2026-07-30): still 2× under the 600 ms
   block, so the neuter that removes the wall still reds. The tighter fix (subtract a measured
   spawn baseline in-test) is **not** done and stays available if 300 ms also proves flaky.
+- **`integration::daemon_counts_ignore_rebuilds` reported FSEvents-coupled** (`integration.rs::daemon_counts_ignore_rebuilds`) —
+  **reported by the Task D0 review round 1, NOT reproduced here**, and the mechanism below is
+  that review's, relayed with attribution rather than restated as measured fact: a `poll_until`
+  on a monotonic counter waiting for exactly `== 2`, which an extra FSEvents rebuild pushes past,
+  so it fails on full-suite runs and passes isolated or on rerun. This round's own full-suite run
+  at the D0-review-fix commit passed it (873/0/3, one run). Pre-existing and unrelated to D51;
+  recorded, not fixed. A `>= 2` bound is the obvious fix, unverified as such.
 - Memory dogfood ladder: 1-week row **CLOSED FAILED 2026-07-31** (window expired dirty; 0
   agent-origin candidates in 1944 signal lines — the SKILL emitter never fired once; hit-rate
   unfalsifiable, stats log has no denominator). Rerun requires fresh T0, re-pinned baseline,

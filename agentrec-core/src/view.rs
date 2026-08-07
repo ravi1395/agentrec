@@ -7,7 +7,7 @@
 
 use crate::memory::{self, Pin};
 use crate::record::{FileEntry, LogRecord, TurnRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Why an interval of wall time carries no recording coverage.
 ///
@@ -286,7 +286,9 @@ pub fn load_ledger(path: &std::path::Path) -> Ledger {
     use std::io::BufRead;
 
     let mut ledger = Ledger::default();
-    let Ok(file) = std::fs::File::open(path) else {
+    // fsguard: this is a second log reader that `record::load_log`'s guard
+    // does not cover.
+    let Ok(file) = crate::fsguard::open_regular(path) else {
         return ledger;
     };
     for line in std::io::BufReader::new(file).lines() {
@@ -385,7 +387,12 @@ pub struct Page<T> {
 /// such a cursor by first match re-delivers every record between the two
 /// occurrences. `after_occurrence` disambiguates: it is the 0-based index of
 /// this id among the records sharing it, in ledger order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `Deserialize` (E2): the MCP read tools hand the cursor to the agent as
+/// data and take it back on the next call, so the round-trip needs a reader
+/// as well as a writer. Purely additive — no CLI path deserializes a cursor
+/// (no CLI verb accepts one), and the field set is unchanged, so nothing the
+/// serializer emits moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub after_id: String,
     /// Which record bearing `after_id` this cursor sits after, counting from
@@ -433,7 +440,14 @@ impl TurnQuery {
 }
 
 /// A turn, reduced to what a list renders.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` (E2): `agentrec_log` returns `Page<TurnSummary>` verbatim
+/// (P4b decision 12 — the MCP log tool mirrors `list()`, NOT `log --json`,
+/// which emits protocol JSONL). Additive and CLI-invisible: the only CLI
+/// reader of this type is `cmds.rs`'s rich-rate window, which counts `grade`
+/// and `imported` and never serializes a summary
+/// (`grep -rn TurnSummary cli/src/`).
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnSummary {
     pub id: String,
     pub grade: String,
@@ -745,11 +759,24 @@ pub struct MemoryHit {
 /// A page of recall hits plus the flags that split `recall_cmd`'s empty-
 /// state branches (F3 `capped`, F10 `store_corrupt`, PD3 `store_empty`).
 ///
-/// Deliberately NOT `Serialize` — decision 3 requires `--json` to emit only
-/// `page.items`, never these flags; leaving the type unserializable makes
-/// that structurally impossible to violate by accident, not merely
-/// conventional (the adapter must explicitly reach for `.page.items`).
-#[derive(Debug, Clone)]
+/// **`Serialize` since E3, reversing this type's original stance — read the
+/// reversal, do not re-derive it.** Until MCP 2.2 this type was deliberately
+/// left unserializable, so that decision 3 ("`recall --json` emits only
+/// `page.items`, never these flags") was structurally impossible to violate
+/// by accident rather than merely conventional. Delta decision 14 requires
+/// the opposite on the MCP wire: `agentrec_recall` returns the WHOLE page
+/// including `capped`/`store_corrupt`/`store_empty`, because hiding store
+/// corruption from an agent consumer would violate the same gap-honesty
+/// stance the CLI's human renderer already honors. Both cannot be had; the
+/// derive lands and the structural guard is replaced by a **test** one:
+/// `recall --json`'s byte contract is pinned by
+/// `cli/tests/fixtures/golden/recall_json_{hits,empty_store,no_match,stale_pin}.golden`,
+/// and the CLI adapter (`memorycmds::recall_cmd`) still reaches for
+/// `.page.items` explicitly. A future edit that serialized the whole page
+/// from the CLI reds those four goldens. That is the compensating control —
+/// strictly weaker than "does not compile", and named here so it is not
+/// mistaken for the old guarantee.
+#[derive(Debug, Clone, Serialize)]
 pub struct RecallPage {
     pub page: Page<MemoryHit>,
     /// The verify walk stopped at [`RECALL_VERIFY_CAP`] with candidates still
@@ -1145,7 +1172,11 @@ impl RepositoryView {
             .filter(|t| t.files.iter().any(|f| f.path == q.path))
             .collect();
 
-        let disk_bytes = std::fs::read(self.root.join(&q.path)).ok();
+        // fsguard on a WIRE-SUPPLIED working-tree path. This one needed no
+        // hostile precondition at all: default config, read-only tool, and
+        // any repo that merely CONTAINS a named pipe hung the MCP server the
+        // moment an agent blamed that path.
+        let disk_bytes = crate::fsguard::read_regular(&self.root.join(&q.path)).ok();
         let current_hash = disk_bytes.as_deref().map(crate::store::hash_bytes);
 
         let state = match q.line {
@@ -1600,6 +1631,10 @@ fn load_text(store: &crate::store::BlobStore, hash: Option<&str>) -> Option<Stri
 }
 
 #[cfg(test)]
+// Test code reads its own tempdir fixtures; no attacker-supplied FIFO can
+// block these, so the fsguard wrappers buy nothing. Scoped to this module
+// so production reads in this file stay lint-enforced (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::record::{EpochRecord, FileEntry};
@@ -1609,6 +1644,7 @@ mod tests {
             v: 1,
             event: event.to_string(),
             ts: ts.to_string(),
+            dropped_signals: 0,
         })
     }
 
@@ -1645,6 +1681,7 @@ mod tests {
             merges: vec![],
             imported: None,
             files_complete: None,
+            origin: None,
             files,
         }
     }

@@ -1,13 +1,17 @@
 //! agentrec CLI: init, record (daemon), log, status, diff, blame, undo, hook
 //! (called by agent lifecycle hooks), doctor.
 
+mod approvecmd;
 mod cmds;
+mod config;
 mod daemon;
 mod doctorcmd;
 mod fmt;
+mod hookcmds;
 mod importcmd;
 mod initcmd;
 mod loglock;
+mod mcpcmd;
 mod memlock;
 mod memorycmds;
 mod noise;
@@ -19,7 +23,7 @@ mod uninstallcmd;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +47,13 @@ enum Command {
         /// Skip agent hook installation (bare-turn capture only).
         #[arg(long)]
         no_hook: bool,
+        /// Also install Codex's three lifecycle hooks (UserPromptSubmit,
+        /// PostToolUse[apply_patch], Stop) into `.codex/hooks.json` or an
+        /// existing inline `[hooks]` table in `.codex/config.toml`. Off by
+        /// default — unlike Claude Code, Codex integration is opt-in
+        /// (IMPLEMENTATION.md 454).
+        #[arg(long)]
+        codex: bool,
         /// Skip writing/loading the per-repo service unit (launchd/systemd).
         #[arg(long)]
         no_service: bool,
@@ -139,10 +150,22 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         files: Vec<String>,
     },
+    /// Approve a pending agent undo request (confirm mode) and execute it.
+    /// With no id, lists the requests still awaiting a decision (D23).
+    Approve {
+        /// Request id, full or an unambiguous prefix. Omit to list pending
+        /// requests instead of approving one.
+        id: Option<String>,
+    },
+    /// Deny a pending agent undo request. Nothing is written to the worktree.
+    Deny {
+        /// Request id, full or an unambiguous prefix.
+        id: String,
+    },
     /// Internal: invoked by agent lifecycle hooks; reads the hook payload on stdin.
     #[command(hide = true)]
     Hook {
-        /// Tool identity, e.g. "claude".
+        /// Tool identity, e.g. "claude" or "codex".
         tool: String,
     },
     /// Remove agentrec from this repo: hooks, service unit, and archive
@@ -320,8 +343,14 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Serve this repository's read tools to an MCP host over stdio
+    /// (newline-delimited JSON-RPC 2.0). Long-lived: the host spawns it and
+    /// speaks on stdin/stdout. Reads are file-based, so it works with the
+    /// recorder daemon stopped. Config is read once at startup — changing
+    /// `mcp_destructive` requires a restart.
+    Mcp,
     /// Import history from another agent tool's transcript store (Claude
-    /// Code only). `--dry-run` classifies and reports without writing;
+    /// Code or Codex). `--dry-run` classifies and reports without writing;
     /// omitting it persists imported turns into this repo's `log.jsonl`,
     /// scoped to sessions whose `cwd` resolves under `--root`.
     Import {
@@ -351,21 +380,118 @@ enum ImportSource {
         #[arg(long)]
         json: bool,
     },
+    /// Classify (and, without `--dry-run`, persist) Codex's
+    /// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl transcript corpus
+    /// (K-series, Phase 2 tail C4). `--dry-run` is read-only classification
+    /// only; omitting it persists imported turns into `log.jsonl` for
+    /// sessions in scope of `--root` — idempotent and safe to interrupt,
+    /// same contract as `import claude`.
+    Codex {
+        /// Read-only classify-and-report mode — no writes. Omit to persist
+        /// imported turns into this repo's `log.jsonl`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Corpus root containing a `sessions/` dir (mirrors the real
+        /// `~/.codex` layout). Defaults to `~/.codex`.
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Emit the machine-readable report instead of the text form.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Walk from `start` up through ancestors looking for a directory containing
+/// a `.agentrec/` subdirectory — mirrors git's `.git` discovery. Returns the
+/// nearest such ancestor (closest to `start`, including `start` itself), or
+/// `None` if the search reaches the filesystem root without finding one.
+fn discover_agentrec_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        if dir.join(".agentrec").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        // `?` on the None case: reaching the filesystem root without a
+        // `.agentrec/` is discovery failure, handled by the caller.
+        dir = dir.parent()?;
+    }
+}
+
+/// Root resolution for the `hook` subcommand ONLY — every other verb keeps
+/// using the shared `root` computed in `main` below, byte-identically to
+/// before this function existed. Scoped this narrowly because O5
+/// (`docs/verify/o5-two-tool-session.md`) measured LIVE that Codex (and,
+/// latently, Claude) spawn their hook process with cwd = wherever the agent
+/// itself was launched from, not necessarily the repo root: the installed
+/// hook entry is the bare command `agentrec hook codex`/`agentrec hook
+/// claude`, no `--root`, so a launch from a subdirectory silently minted a
+/// second `.agentrec/` there — invisible to the daemon watching the true
+/// root, with NO error, since `record.rs::open_append` creates parent dirs
+/// unconditionally. Silent total data loss.
+///
+/// Precedence: an explicit `--root` always wins outright — discovery is the
+/// DEFAULT for an *absent* root, never an override of one the user supplied.
+/// When no explicit root is given, walk up from `cwd` for the nearest
+/// ancestor already carrying a `.agentrec/` dir. Chosen specifically over
+/// baking an absolute path into the installed hook command string, which is
+/// this repo's own documented scar (39 orphaned LaunchAgents from a stale
+/// baked `--root`; see CLAUDE.md's "Founder-pending" section) — walking up
+/// survives repo moves/renames and handles launches from any subdirectory.
+///
+/// Discovery failure (no `.agentrec/` anywhere up to the filesystem root)
+/// falls back to `cwd`, deliberately NOT an error: INV-M4 pins the hook path
+/// as fail-open — it must always append the start/stop signal and exit 0,
+/// even against a repo that was never `init`ed at all. Falling back to `cwd`
+/// (which is exactly what happened unconditionally before this change) keeps
+/// that contract intact for the no-`--root` case; erroring out here would
+/// have silently broken `cli/tests/integration.rs::hook_fail_open_and_budget`'s
+/// uninitialized-repo leg had it not pinned an explicit `--root` (which
+/// bypasses discovery outright and so was never at risk) — the fallback
+/// exists so a future no-`--root` variant of that same scenario keeps
+/// failing open instead of hard-erroring.
+fn resolve_hook_root(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit.to_path_buf();
+    }
+    discover_agentrec_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Root resolution for the `mcp` subcommand. Same discovery RULE as the hook
+/// path — an explicit `--root` wins outright, otherwise walk up from cwd via
+/// [`discover_agentrec_root`] — deliberately reusing that one function rather
+/// than adding a second rule. An MCP host spawns the server with cwd set to
+/// whatever it considers the workspace, which O5 measured is not reliably the
+/// repo root.
+///
+/// The FAILURE POSTURE differs from [`resolve_hook_root`], which is why this
+/// is its own wrapper rather than a shared one: the hook path is pinned
+/// fail-open by INV-M4 and falls back to cwd, but a long-lived read server
+/// that silently answers against a non-repo would report an empty history
+/// forever. Discovery failure here resolves to cwd only so that
+/// `mcpcmd::run`'s startup precondition can name the offending directory in
+/// its hard error.
+fn resolve_mcp_root(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit.to_path_buf();
+    }
+    discover_agentrec_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn main() {
     let cli = Cli::parse();
-    let root = cli
-        .root
+    let explicit_root = cli.root.clone();
+    let root = explicit_root
+        .clone()
         .or_else(|| std::env::current_dir().ok())
         .expect("cannot determine working directory");
     let result = match cli.command {
         Command::Init {
             no_hook,
+            codex,
             no_service,
             service,
             dry_run,
-        } => initcmd::run(&root, no_hook, no_service, service, dry_run),
+        } => initcmd::run(&root, no_hook, codex, no_service, service, dry_run),
         Command::Record => daemon::run(&root),
         Command::Log {
             all,
@@ -389,7 +515,12 @@ fn main() {
             allow_modified,
             files,
         } => readcmds::undo(&root, turn.as_deref(), confirm, allow_modified, &files),
-        Command::Hook { tool } => cmds::hook(&root, &tool),
+        Command::Approve { id } => approvecmd::approve(&root, id.as_deref()),
+        Command::Deny { id } => approvecmd::deny(&root, &id),
+        Command::Hook { tool } => {
+            let hook_root = resolve_hook_root(explicit_root.as_deref(), &root);
+            cmds::hook(&hook_root, &tool)
+        }
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not
             // a command error (no "agentrec: <message>" line) — just a
@@ -446,6 +577,10 @@ fn main() {
             replace_pin,
         } => memorycmds::verify(&root, &id, confirm, &drop_pin, &replace_pin),
         Command::Forget { id, reason } => memorycmds::forget(&root, &id, reason.as_deref()),
+        Command::Mcp => {
+            let mcp_root = resolve_mcp_root(explicit_root.as_deref(), &root);
+            mcpcmd::run(&mcp_root)
+        }
         Command::Import { source } => importcmd::run(&root, source),
     };
     if let Err(message) = result {
@@ -492,4 +627,80 @@ pub fn undo_guard_path(root: &std::path::Path) -> PathBuf {
 pub struct UndoGuard {
     pub paths: Vec<String>,
     pub until_ms: u64,
+}
+
+#[cfg(test)]
+mod hook_root_discovery_tests {
+    use super::{discover_agentrec_root, resolve_hook_root};
+
+    /// Regression fixture: an `.agentrec/` at `tmp`, with no `--root` given
+    /// and a cwd several levels below it.
+    fn init_root() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".agentrec")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn discovers_root_from_a_subdirectory_several_levels_deep() {
+        let tmp = init_root();
+        let sub = tmp.path().join("a/b/c/d");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(discover_agentrec_root(&sub), Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn discovers_root_when_invoked_from_the_root_itself_no_regression() {
+        let tmp = init_root();
+        assert_eq!(
+            discover_agentrec_root(tmp.path()),
+            Some(tmp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn discovery_failure_returns_none_when_no_agentrec_exists_up_the_tree() {
+        // A fresh tempdir, never `init`ed, with no `.agentrec/` at or above
+        // it (system temp roots never carry one).
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(discover_agentrec_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_cwd_on_discovery_failure_fail_open_inv_m4() {
+        // INV-M4: the hook path must always append and exit 0, even against
+        // a repo that was never `init`ed. No-`--root` + no `.agentrec/`
+        // anywhere must resolve to cwd (which is exactly what happened
+        // unconditionally before this change), not fail.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_hook_root(None, tmp.path()),
+            tmp.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn explicit_root_wins_over_discovery() {
+        // cwd itself carries a `.agentrec/` (discovery would find cwd), but
+        // an explicit root pointing elsewhere must win outright.
+        let cwd_tmp = init_root();
+        let explicit_tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_hook_root(Some(explicit_tmp.path()), cwd_tmp.path()),
+            explicit_tmp.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn explicit_root_wins_even_when_it_has_no_agentrec_dir() {
+        // An explicit --root is trusted outright; it is never validated
+        // against discovery, matching every other subcommand's existing
+        // (unchanged) contract.
+        let explicit_tmp = tempfile::tempdir().unwrap();
+        let cwd_tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_hook_root(Some(explicit_tmp.path()), cwd_tmp.path()),
+            explicit_tmp.path().to_path_buf()
+        );
+    }
 }
