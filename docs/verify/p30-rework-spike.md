@@ -69,5 +69,8 @@ gap → spec-as-written excludes ALL 1331 candidate events.
 - Plan-start commit: `e1efbe5`.
 - `rg -c 'load_log' cli/src`: cmds.rs 10, daemon.rs 5, importcmd.rs 5,
   memorycmds.rs 1, purgecmd.rs 13, readcmds.rs 2 (total 36).
-- Suite baseline: see appended figure below (run completed after this doc's
-  first draft; command `cargo test --workspace -- --test-threads=3`).
+- Suite baseline: **1035 passed / 0 failed / 4 ignored** (19 test-binary
+  result lines summed; `cargo test --workspace -- --test-threads=3` at
+  `aadefc5`, 2026-08-08 00:02 IST). Note: a first capture attempt piped
+  through `tail -30` and reported only the last binary (230) — discarded,
+  not a suite figure; this is the corrected full-capture run.
