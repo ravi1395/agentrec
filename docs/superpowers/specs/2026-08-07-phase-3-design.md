@@ -390,12 +390,11 @@ into a next agent session's context ("what happened here lately").
 6. **Search over same-id duplicate turns** — cursors must use occurrence
    ordinals (P4b lesson pinned in code already).
 
-## Open questions (founder)
+## Open questions — RESOLVED by founder (2026-08-07, in-session)
 
-1. Does `alerts.jsonl` enter PROTOCOL (wire) or stay implementation-private?
-   Leaning: private in 3.2, promote on first external-consumer demand.
-2. `stats` default `--since`: all-history or 30d? Leaning 30d (import
-   backfill window symmetry), `--since all` available.
-3. Bisect `--test` command execution: sandbox/no? Leaning: none — it is the
-   user's own command on their own machine, same trust as running it by hand
-   (documented, not silently assumed).
+1. `alerts.jsonl`: implementation-private in 3.2; promote to PROTOCOL on
+   first external-consumer demand.
+2. `stats` default `--since`: 30 days; `--since all` available.
+3. Bisect `--test`: no sandbox — user's own command on their own machine,
+   documented explicitly.
+4. Decision 5 (alerts surface, pull-only, no push channel): founder-confirmed.
