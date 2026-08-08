@@ -1,0 +1,26 @@
+stdout:
+stats window: since all until <TS> · rework-window 7d
+
+turns: total 1 (rich 1, bare 0) · imported 0
+  by tool: claude=1
+  by model: m1=1
+
+files (churn_bytes, dangling_refs):
+  a.txt  churn_bytes=6 dangling_refs=0
+  b.bin  churn_bytes=0 dangling_refs=0
+    undercounted: 1 skipped, 0 withheld entries not reflected in churn_bytes
+  c.env  churn_bytes=0 dangling_refs=0
+    undercounted: 0 skipped, 1 withheld entries not reflected in churn_bytes
+
+share (raw counts, not percentages — buckets use different units, see docs):
+  agent=3 human=0 unattributable=0 imported=0
+
+rework (approx_lower):
+  measurable=1 reworked=0 rate=0.0000 (approx_lower)
+  excluded: censored_recent=0 excluded_imported=0 excluded_unknown_mtime=0
+  disclosed (not excluded): gap_overlapped=0 undo_unevaluable_c=0 unparsed_ended=0
+
+--stderr--
+
+--exit--
+0

@@ -19,6 +19,7 @@ mod purgecmd;
 mod readcmds;
 mod service;
 mod state;
+mod statscmd;
 mod uninstallcmd;
 
 use clap::{Parser, Subcommand};
@@ -357,6 +358,22 @@ enum Command {
         #[command(subcommand)]
         source: ImportSource,
     },
+    /// Per-repository analytics: turn census, file churn, agent-vs-human
+    /// share, and the rework rate — every figure printed beside its
+    /// exclusion counts (read-only; no daemon required).
+    Stats {
+        /// How far back to look: `<N>d`/`<N>h`/`<N>m`/`<N>s`, or `all` for
+        /// full history. Defaults to 30 days.
+        #[arg(long, default_value = "30d")]
+        since: statscmd::SinceArg,
+        /// N in "reworked within N days of the write event".
+        #[arg(long = "rework-window", default_value_t = agentrec_core::stats::DEFAULT_REWORK_WINDOW_DAYS)]
+        rework_window: u32,
+        /// Emit `serde_json` of the exact `StatsResult` `RepositoryView::stats`
+        /// returned, instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -582,6 +599,11 @@ fn main() {
             mcpcmd::run(&mcp_root)
         }
         Command::Import { source } => importcmd::run(&root, source),
+        Command::Stats {
+            since,
+            rework_window,
+            json,
+        } => statscmd::stats(&root, since, rework_window, json),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");

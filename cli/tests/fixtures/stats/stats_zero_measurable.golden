@@ -1,0 +1,19 @@
+stdout:
+stats window: since <TS> until <TS> · rework-window 7d
+
+turns: total 0 (rich 0, bare 0) · imported 0
+
+files: (none in window)
+
+share (raw counts, not percentages — buckets use different units, see docs):
+  agent=0 human=0 unattributable=0 imported=0
+
+rework (approx_lower):
+  measurable=0 reworked=0 no measurable events
+  excluded: censored_recent=0 excluded_imported=0 excluded_unknown_mtime=0
+  disclosed (not excluded): gap_overlapped=0 undo_unevaluable_c=0 unparsed_ended=0
+
+--stderr--
+
+--exit--
+0
