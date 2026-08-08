@@ -3,6 +3,7 @@
 
 mod annotatecmd;
 mod approvecmd;
+mod bisectcmd;
 mod cmds;
 mod config;
 mod daemon;
@@ -409,6 +410,53 @@ enum Command {
         #[arg(long)]
         md: bool,
     },
+    /// Binary-search recorded turns for the first one whose state fails a
+    /// command you supply. Each probe materializes into a fresh scratch
+    /// directory under the system temp root: bisect never writes to the
+    /// working tree or to `.agentrec/`.
+    ///
+    /// FIDELITY: a probe state is the working tree minus later agent turns;
+    /// not a historical snapshot. Human edits, untracked files and build
+    /// output stay exactly as they are now, so bisect answers "which agent
+    /// turn introduced the failure given everything else stays current".
+    /// (This sentence is pinned by `cli/tests/bisect.rs`; it must stay
+    /// byte-identical to `agentrec_core::bisect::FIDELITY`.)
+    ///
+    /// The --test command is NOT sandboxed: it runs through your shell with
+    /// full ambient authority — network, credentials, and the real repository
+    /// are all reachable from it. Only pass a command you would run yourself.
+    ///
+    /// --good/--bad are taken on trust: bisect does not verify that the good
+    /// state passes or that the bad state fails.
+    Bisect {
+        /// Shell command run at each probe, with cwd set to the scratch
+        /// directory. Exit 0 = good, nonzero = bad.
+        #[arg(long)]
+        test: String,
+        /// A turn known to be good. Defaults to the state before the first
+        /// turn in the sequence.
+        #[arg(long)]
+        good: Option<String>,
+        /// A turn known to be bad. Defaults to the newest turn.
+        #[arg(long)]
+        bad: Option<String>,
+        /// Admit bare turns as subtraction and as probe candidates. Prints a
+        /// misattribution warning: a bare turn is an unattributed activity
+        /// window, so naming one is not evidence an agent wrote it.
+        #[arg(long)]
+        include_bare: bool,
+        /// Re-run the command this many extra times per probe; runs that
+        /// disagree make the probe unanswerable rather than picking a side.
+        #[arg(long, default_value_t = 0)]
+        flaky_retries: u32,
+        /// Leave each probe's scratch directory on disk and print its path.
+        #[arg(long)]
+        keep: bool,
+        /// Emit `serde_json` of the exact `BisectResult` instead of the text
+        /// report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -646,6 +694,24 @@ fn main() {
             json,
         } => searchcmd::search(&root, pattern, regex, content, json),
         Command::Annotate { range, json, md } => annotatecmd::annotate(&root, range, json, md),
+        Command::Bisect {
+            test,
+            good,
+            bad,
+            include_bare,
+            flaky_retries,
+            keep,
+            json,
+        } => bisectcmd::bisect(
+            &root,
+            test,
+            good,
+            bad,
+            include_bare,
+            flaky_retries,
+            keep,
+            json,
+        ),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
