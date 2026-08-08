@@ -231,7 +231,12 @@ pub(crate) fn compute_search(
     }
 
     // Pagination mirrors `select_turns`/`RepositoryView::diff`'s cursor walk
-    // exactly, over `hits` instead of the ledger's turn vec.
+    // exactly, over `hits` instead of the ledger's turn vec. A zero page size
+    // has no honest continuation to report (mirrors `TurnQuery`/`DiffQuery`'s
+    // `limit: Some(0)` refusal) — refused before the cursor is even resolved.
+    if page_size == 0 {
+        return Err(SearchError::Cursor(CursorError::ZeroLimit));
+    }
     let start = match &cursor {
         None => 0,
         Some(c) => {
@@ -453,27 +458,52 @@ mod tests {
 
     // ---- same-id duplicate turns: both occurrences returned, cursor -------
 
+    /// Gate round-2 B1: the ORIGINAL two-occurrence/page_size-1 shape put the
+    /// page boundary right after the FIRST t_DUP hit, where `after_occurrence
+    /// == 0` and naive first-match cursor resolution are indistinguishable —
+    /// two independent mutations (resolving `.next()` instead of
+    /// `.nth(after_occurrence)`; always minting `after_occurrence: 0`) both
+    /// passed every assertion here. THREE same-id hits with `page_size: 2`
+    /// puts the boundary after the SECOND occurrence, where a correct cursor
+    /// carries `after_occurrence == 1` — a value neither mutation can
+    /// produce by accident — and gives page 2 a THIRD, distinctly-timestamped
+    /// occurrence to re-identify, so first-match resolution (which would
+    /// land back on the second occurrence) is caught by content, not just by
+    /// count.
     #[test]
-    fn duplicate_turn_id_both_occurrences_hit_and_cursor_resumes_without_redelivery() {
+    fn duplicate_turn_id_all_occurrences_hit_and_cursor_resumes_without_redelivery() {
         let tmp = tempfile::tempdir().unwrap();
         let objects = tmp.path().join("objects");
-        // Two DISTINCT records sharing id "t_DUP" (P4b shape: a pre-fix
+        // THREE distinct records sharing id "t_DUP" (P4b shape: a pre-fix
         // daemon's orphan-recovery double-emit / a resumed import
-        // `sessionId`), both carrying the search term in their tool field so
-        // each mints its own hit.
+        // `sessionId`, extended here to three), each with a distinct `ended`
+        // so a delivered hit's occurrence is identifiable by content, not
+        // only by position.
+        let mut dup0 = turn("t_DUP", Some("needle-tool"), None, vec![]);
+        dup0.ended = "2020-06-01T00:00:01.000Z".to_string();
+        let mut dup1 = turn("t_DUP", Some("needle-tool"), None, vec![]);
+        dup1.ended = "2020-06-01T00:00:02.000Z".to_string();
+        let mut dup2 = turn("t_DUP", Some("needle-tool"), None, vec![]);
+        dup2.ended = "2020-06-01T00:00:03.000Z".to_string();
         let l = ledger(vec![
-            LogRecord::Turn(turn("t_DUP", Some("needle-tool"), None, vec![])),
+            LogRecord::Turn(dup0),
             LogRecord::Turn(turn("t_other", Some("unrelated"), None, vec![])),
-            LogRecord::Turn(turn("t_DUP", Some("needle-tool"), None, vec![])),
+            LogRecord::Turn(dup1),
+            LogRecord::Turn(dup2),
         ]);
 
-        // page_size 1 forces the cursor boundary to land INSIDE the
-        // duplicate id's two hits.
-        let page1 = compute_search(&l, &objects, &q("needle-tool", false), None, 1).unwrap();
-        assert_eq!(page1.page.items.len(), 1);
-        assert_eq!(page1.page.items[0].turn_id, "t_DUP");
-        let cursor = page1.page.next.clone().expect("more hits remain");
-        assert_eq!(cursor.after_occurrence, 0, "sits after the FIRST t_DUP hit");
+        // page_size 2 forces the boundary to land after the SECOND t_DUP hit.
+        let page1 = compute_search(&l, &objects, &q("needle-tool", false), None, 2).unwrap();
+        assert_eq!(page1.page.items.len(), 2);
+        assert_eq!(page1.page.items[0].ts, "2020-06-01T00:00:01.000Z");
+        assert_eq!(page1.page.items[1].ts, "2020-06-01T00:00:02.000Z");
+        let cursor = page1.page.next.clone().expect("a third hit remains");
+        assert_eq!(
+            cursor.after_occurrence, 1,
+            "sits after the SECOND t_DUP hit (0-based) — a value neither the \
+             first-match-resolution mutation nor the always-mint-0 mutation \
+             can produce"
+        );
 
         let page2 = compute_search(
             &l,
@@ -486,10 +516,59 @@ mod tests {
         assert_eq!(
             page2.page.items.len(),
             1,
-            "the second t_DUP hit, not re-delivered, not skipped"
+            "exactly the THIRD t_DUP hit — first-match resolution would \
+             re-deliver the second occurrence instead, landing at length 2"
         );
         assert_eq!(page2.page.items[0].turn_id, "t_DUP");
+        assert_eq!(
+            page2.page.items[0].ts, "2020-06-01T00:00:03.000Z",
+            "must be the THIRD occurrence by content, not a re-delivered second"
+        );
         assert!(page2.page.next.is_none());
+    }
+
+    /// A cursor minted under one query (here, `--regex`) must never be
+    /// honored against a different query (here, the same pattern read as a
+    /// plain substring) — the fingerprint discrimination `TurnQuery`/
+    /// `DiffQuery` already rely on, pinned here for `search` too.
+    #[test]
+    fn cursor_minted_under_regex_is_a_query_mismatch_reused_as_substring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = tmp.path().join("objects");
+        let l = ledger(vec![
+            LogRecord::Turn(turn("t_1", Some("needle-tool"), None, vec![])),
+            LogRecord::Turn(turn("t_2", Some("needle-tool"), None, vec![])),
+        ]);
+        let regex_query = q("needle-tool", true);
+        let page1 = compute_search(&l, &objects, &regex_query, None, 1).unwrap();
+        let cursor = page1.page.next.clone().expect("a second hit remains");
+
+        let substring_query = q("needle-tool", false);
+        let err = compute_search(
+            &l,
+            &objects,
+            &substring_query,
+            Some(cursor),
+            SEARCH_PAGE_SIZE,
+        )
+        .unwrap_err();
+        assert_eq!(err, SearchError::Cursor(CursorError::QueryMismatch));
+    }
+
+    // ---- page_size == 0 has no honest continuation -------------------------
+
+    #[test]
+    fn zero_page_size_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = tmp.path().join("objects");
+        let l = ledger(vec![LogRecord::Turn(turn(
+            "t_1",
+            Some("needle-tool"),
+            None,
+            vec![],
+        ))]);
+        let err = compute_search(&l, &objects, &q("needle-tool", false), None, 0).unwrap_err();
+        assert_eq!(err, SearchError::Cursor(CursorError::ZeroLimit));
     }
 
     // ---- file-snapshot blobs never read -------------------------------

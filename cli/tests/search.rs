@@ -189,6 +189,28 @@ fn invalid_regex_pattern_is_a_clean_error_not_a_panic() {
 }
 
 // ---------------------------------------------------------------------------
+// Gate round-2 A1: dangling_prompt_refs renders (as 0) even in the
+// no-matches branch — zeros-always-render precedent from T2's stats.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_matches_still_renders_dangling_prompt_refs_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    seed_turn(
+        root,
+        base_turn("t_NOMATCH000000000000000001", Some("claude"), None, root),
+    );
+
+    let out = agentrec(root, &["search", "no-such-term-anywhere"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no matches"), "{text}");
+    assert!(text.contains("dangling_prompt_refs=0"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
 // --content: reserved, errors rather than silently degrading
 // ---------------------------------------------------------------------------
 

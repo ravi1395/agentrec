@@ -66,16 +66,16 @@ fn field_label(f: MatchedField) -> &'static str {
     }
 }
 
+/// Gate round-2 A1: `dangling_prompt_refs` renders EVERY time, including
+/// zero and including the no-matches branch — the zeros-always-render
+/// precedent `statscmd::render_rework` already set for every one of
+/// `ReworkRate`'s disclosure fields.
 fn render_search(page: &SearchPage) -> String {
     if page.page.items.is_empty() {
-        let mut out = "search: no matches\n".to_string();
-        if page.dangling_prompt_refs != 0 {
-            out.push_str(&format!(
-                "dangling_prompt_refs={}\n",
-                page.dangling_prompt_refs
-            ));
-        }
-        return out;
+        return format!(
+            "search: no matches\ndangling_prompt_refs={}\n",
+            page.dangling_prompt_refs
+        );
     }
     let mut out = String::new();
     for hit in &page.page.items {
@@ -86,7 +86,15 @@ fn render_search(page: &SearchPage) -> String {
         page.dangling_prompt_refs
     ));
     if page.page.next.is_some() {
-        out.push_str("more results available (paged)\n");
+        // Gate round-2: the CLI has no `--limit`/page-2 flag today (plan
+        // decision, recorded at commit 3108e9e — `SearchQuery` carries no
+        // page-size field, so this verb has no way to request a further
+        // page). "more results available (paged)" was a dead end; this
+        // names the one actionable option a human has today and the one a
+        // machine caller has via `--json`'s `page.next` cursor.
+        out.push_str(
+            "more results available — narrow the pattern, or consume page.next via --json\n",
+        );
     }
     out
 }
