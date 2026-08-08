@@ -17,6 +17,7 @@ mod memorycmds;
 mod noise;
 mod purgecmd;
 mod readcmds;
+mod searchcmd;
 mod service;
 mod state;
 mod statscmd;
@@ -374,6 +375,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Substring (default) or regex search over stored prompt text, turn
+    /// metadata (tool/model), and file paths (read-only; no daemon required).
+    Search {
+        /// Substring, or a regex when `--regex` is passed.
+        pattern: String,
+        /// Treat `pattern` as a regex rather than a plain substring.
+        #[arg(long)]
+        regex: bool,
+        /// RESERVED, not implemented: search inside file-snapshot content
+        /// rather than prompts/metadata/paths. Errors rather than silently
+        /// degrading to the metadata search this command performs today.
+        #[arg(long)]
+        content: bool,
+        /// Emit `serde_json` of the exact `SearchPage` `RepositoryView::search`
+        /// returned, instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +623,12 @@ fn main() {
             rework_window,
             json,
         } => statscmd::stats(&root, since, rework_window, json),
+        Command::Search {
+            pattern,
+            regex,
+            content,
+            json,
+        } => searchcmd::search(&root, pattern, regex, content, json),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
