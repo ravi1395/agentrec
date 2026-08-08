@@ -7,11 +7,13 @@
 //! text (rendering primitives shared with the CLI's formatters), pathenc
 //! (OS path → wire-string conversion decision — never lossy), stats
 //! (per-repository analytics fold), search (substring/regex search over
-//! prompts and turn metadata).
+//! prompts and turn metadata), bisect (probe-state reverse-apply walk for
+//! the first-bad-turn search).
 //! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
 //! disagree, the doc wins and the code is a bug.
 
 pub mod annotate;
+pub mod bisect;
 pub mod diff;
 pub mod engine;
 pub mod fsguard;

@@ -1012,6 +1012,28 @@ impl RepositoryView {
             crate::search::SEARCH_PAGE_SIZE,
         )
     }
+
+    /// The probe state at sequence position `after` (Phase 3.0 T5, spec
+    /// §3.0.4) — the path→action edits that turn a copy of the CURRENT
+    /// working tree into "the working tree minus later agent turns".
+    /// Definitions, and the reverse-apply order, live in [`crate::bisect`].
+    ///
+    /// The seam exists so the CLI driver never constructs a [`BlobStore`]
+    /// itself: the only I/O this whole feature performs against the
+    /// repository is the CAS reads behind this call plus reading
+    /// `log.jsonl`. Nothing under `.agentrec/`, and nothing in the working
+    /// tree, is ever written by bisect.
+    pub fn bisect_probe_state(
+        &self,
+        seq: &[&TurnRecord],
+        after: Option<usize>,
+    ) -> Result<crate::bisect::ProbeState, Vec<crate::bisect::Unanswerable>> {
+        crate::bisect::probe_state(
+            seq,
+            after,
+            &crate::store::BlobStore::new(self.objects_dir()),
+        )
+    }
 }
 
 /// The one selection + pagination walk behind [`RepositoryView::list_of`] and
