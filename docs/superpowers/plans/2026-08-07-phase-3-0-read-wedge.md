@@ -210,8 +210,14 @@ test layout; Test: `cli/tests/` new integration file `stats.rs`.
 - Text output prints every figure WITH its exclusion counts beside it (spec
   honesty rule); zero-measurable renders literally `no measurable events`
   (golden-pinned).
-- `--json` byte-equal to serializing `StatsResult` (parity test, same pattern
-  as diff/blame parity pins).
+- `--json` parity with `StatsResult` — AMENDED at T2 gate (byte-equality is
+  impossible: `window.until` is a wall-clock read inside the fold): parity =
+  top-level key-set proof + field-for-field equality on every field except
+  `window.until`, which is bounded between timestamps taken before/after the
+  invocation (a measurement, not a redaction). Goldens may normalize clock
+  tokens ONLY via a task-local normalizer scoped to the window line; the
+  shared NORMALIZE_TABLE stays untouched. This is the precedent pattern for
+  any future verb carrying a query-time field (digest, 3.2).
 - Read-only: parity test asserts zero writes under `.agentrec/` across the
   invocation (mirror of the P5 status zero-write parity test).
 - Golden for text on the hand-computed fixture; `--json` golden additive-only
