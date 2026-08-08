@@ -303,6 +303,31 @@ fn scratch_dir(n: u64) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// THE one write-open in this feature: guard the target, then write it.
+///
+/// Every byte bisect puts on disk goes through here, so the fsguard write-half
+/// obligation is discharged in exactly one place instead of once per call site
+/// — and, unlike a guard inlined into `materialize`/`copy_tree` (both of which
+/// need a whole repository fixture and a scratch path this process chooses at
+/// random), this shape is directly testable: a unit test can plant a FIFO at
+/// the target and assert the refusal. That test is what stops the guard from
+/// being deletable with every check still green.
+///
+/// The targets do live under a scratch root this process just minted, and
+/// nothing in this file creates anything but directories and regular files
+/// inside it. The guard is here anyway because the write-half gate is
+/// per-SITE, not per-argument-provenance: it makes that reasoning checkable
+/// rather than asserted. Cost is one `stat` per written file.
+fn guarded_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    if agentrec_core::fsguard::is_nonregular(target) {
+        return Err(format!(
+            "scratch target {} is not a regular file — refusing to write",
+            target.display()
+        ));
+    }
+    std::fs::write(target, bytes).map_err(|e| format!("scratch write {}: {e}", target.display()))
+}
+
 /// Copy the working tree into `scratch`, then apply the probe state's edits.
 /// Returns how many working-tree entries could not be reproduced.
 fn materialize(root: &Path, scratch: &Path, state: &ProbeState) -> Result<u64, String> {
@@ -320,20 +345,7 @@ fn materialize(root: &Path, scratch: &Path, state: &ProbeState) -> Result<u64, S
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("scratch mkdir {}: {e}", parent.display()))?;
                 }
-                // fsguard [guard]: the target lives under a scratch root this
-                // process just minted, and `copy_tree` never creates anything
-                // but directories and regular files inside it — but the write
-                // half of the gate is per-SITE, not per-argument-provenance,
-                // and a guard makes that reasoning checkable instead of
-                // asserted. Costs one lstat per written file.
-                if agentrec_core::fsguard::is_nonregular(&target) {
-                    return Err(format!(
-                        "scratch target {} is not a regular file",
-                        target.display()
-                    ));
-                }
-                std::fs::write(&target, bytes)
-                    .map_err(|e| format!("scratch write {}: {e}", target.display()))?;
+                guarded_write(&target, bytes)?;
             }
         }
     }
@@ -382,14 +394,7 @@ fn copy_tree(src: &Path, dst: &Path, at_root: bool) -> Result<u64, String> {
             // through the guarded helper rather than `fs::read`.
             let bytes = agentrec_core::fsguard::read_regular(&from)
                 .map_err(|e| format!("read {}: {e}", from.display()))?;
-            // fsguard [guard]: same reasoning as `materialize`'s write.
-            if agentrec_core::fsguard::is_nonregular(&to) {
-                return Err(format!(
-                    "scratch target {} is not a regular file",
-                    to.display()
-                ));
-            }
-            std::fs::write(&to, bytes).map_err(|e| format!("write {}: {e}", to.display()))?;
+            guarded_write(&to, &bytes)?;
         } else {
             skipped += 1;
         }
@@ -463,6 +468,67 @@ fn render_text(r: &BisectResult) -> String {
 mod tests {
     use super::*;
     use agentrec_core::bisect::GapWindow;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
+
+    /// The write-half fsguard obligation, exercised rather than asserted.
+    ///
+    /// Opening a path that resolves to a FIFO blocks the calling thread
+    /// forever, which is the whole reason `scripts/check-write-opens.sh`
+    /// exists. Before this test the guard was deletable with the script's
+    /// counts unchanged AND the whole bisect suite green — i.e. the allowlist
+    /// entry's rationale rested on nothing executable. Deleting the
+    /// `is_nonregular` call in `guarded_write` must red this test (and, if the
+    /// guard were gone, the write would HANG here rather than fail, which is
+    /// the hazard itself).
+    #[test]
+    #[cfg(unix)]
+    fn guarded_write_refuses_a_fifo_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("target");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let err = guarded_write(&fifo, b"payload").expect_err("a fifo must be refused");
+        assert!(
+            err.contains("is not a regular file"),
+            "refusal must name the reason: {err}"
+        );
+        // The refusal is a refusal, not a silent skip: nothing was written.
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the fifo must still be a fifo"
+        );
+    }
+
+    /// The paired ALLOW case: over-rejection is silent, so a guard needs a
+    /// test for what must still go through (this repo's recorded
+    /// refusal-predicate lesson).
+    #[test]
+    fn guarded_write_still_writes_an_ordinary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ordinary.txt");
+        guarded_write(&target, b"first").expect("a new path must be writable");
+        assert_eq!(
+            agentrec_core::fsguard::read_regular(&target).unwrap(),
+            b"first"
+        );
+        // And overwriting an existing regular file — the case `copy_tree`
+        // then `materialize` produce on every probe.
+        guarded_write(&target, b"second").expect("an existing regular file must be writable");
+        assert_eq!(
+            agentrec_core::fsguard::read_regular(&target).unwrap(),
+            b"second"
+        );
+    }
 
     fn r(verdict: Verdict) -> BisectResult {
         BisectResult {
