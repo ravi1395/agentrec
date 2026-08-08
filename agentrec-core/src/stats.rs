@@ -112,9 +112,11 @@ pub struct FileChurn {
 /// Agent-vs-human share of change.
 ///
 /// **Units, stated because they are not all the same** (disclosed rather than
-/// hidden): `agent` and `imported` count (turn, file) write entries recorded
-/// in the ledger; `unattributable` counts BOTH bare-turn write entries AND
-/// files whose divergence falls after a recording gap; `human` counts FILES
+/// hidden): `agent` and `imported` count (turn, file) entries recorded in the
+/// ledger — ALL entries, deletes included, because a deletion is a change
+/// (the same reading rework clause (b) takes); `unattributable` counts BOTH
+/// bare-turn entries AND files whose divergence falls after a recording gap
+/// (again all entries, not only writes); `human` counts FILES
 /// whose current on-disk content diverges from the last `after` any turn
 /// recorded for them — the `human-edited-since` display predicate, which is
 /// the only evidence of an unrecorded edit that exists. The four are
@@ -127,19 +129,20 @@ pub struct FileChurn {
 /// defined bucket.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ChangeShare {
-    /// Write entries of rich, non-git, non-imported turns.
+    /// All entries of rich, non-git, non-imported turns — a delete entry is
+    /// a change and is counted here, not held out as a non-write.
     pub agent: u64,
     /// Files currently diverging from their last recorded `after` (see the
     /// unit note above). Entries whose `after` was synthesized are never
     /// counted — derived bytes are not observed fact (PROTOCOL import honesty).
     pub human: u64,
-    /// Write entries of bare turns (an unattributed activity window, never
+    /// All entries of bare turns (an unattributed activity window, never
     /// rendered as agent activity) PLUS divergent files whose divergence
     /// could have happened inside a recording gap. Spec §3.0.1: gaps are a
     /// third bucket and are "never allocated to either side", so such a file
     /// must not land in `human`.
     pub unattributable: u64,
-    /// Write entries of imported turns — no epoch coverage, own bucket.
+    /// All entries of imported turns — no epoch coverage, own bucket.
     pub imported: u64,
 }
 
@@ -175,6 +178,13 @@ pub struct ReworkRate {
     /// date the change — the modification time is unknowable, so the event is
     /// unjudgeable. This one DOES shrink `measurable`.
     pub excluded_unknown_mtime: u64,
+    /// DISCLOSURE ONLY — denominator-CANDIDATE turns (rich, non-git,
+    /// non-undo) whose `ended` could not be parsed, so none of their entries
+    /// could be placed in time and the whole turn was skipped. Counted per
+    /// TURN, not per entry. Additive to the plan's nine-field contract,
+    /// because a silently dropped turn is exactly the undisclosed exclusion
+    /// the honesty rule exists to forbid.
+    pub unparsed_ended: u64,
     /// DISCLOSURE ONLY — `tool: "agentrec"` undo turns ending inside some
     /// measurable event's window. Clause (c) of the spec's numerator keys on a
     /// `reverts` field that does not exist before 3.1, so those turns cannot be
@@ -433,21 +443,29 @@ pub(crate) fn compute_stats(
         }
     }
     // `human`: files whose live bytes diverge from the last `after` anyone
-    // recorded for them. Keyed off the LAST touching entry in the whole
-    // ledger, not the windowed subset — a divergence is measured against the
-    // most recent recorded truth regardless of when it was recorded.
+    // recorded for them. Keyed off the LATEST-DATED touching entry in the
+    // whole ledger (not the windowed subset, and NOT the last one in file
+    // order): `import claude` appends historically-dated turns after live
+    // ones, so ledger position is not time order. Ledger position breaks
+    // ties between equal `ended` values.
     let paths: BTreeSet<&str> = windowed
         .iter()
         .flat_map(|(_, t, _)| t.files.iter().map(|e| e.path.as_str()))
         .collect();
     for path in paths {
-        let Some((last_turn, last)) = all.iter().rev().find_map(|(t, _)| {
-            t.files
-                .iter()
-                .rev()
-                .find(|e| e.path == path)
-                .map(|e| (*t, e))
-        }) else {
+        let Some((last_turn, last)) = all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (t, ended))| {
+                t.files
+                    .iter()
+                    .rev()
+                    .find(|e| e.path == path)
+                    .map(|e| (*ended, i, *t, e))
+            })
+            .max_by_key(|(ended, i, _, _)| (*ended, *i))
+            .map(|(_, _, t, e)| (t, e))
+        else {
             continue;
         };
         if last.after_synthesized == Some(true) {
@@ -484,6 +502,7 @@ pub(crate) fn compute_stats(
         excluded_imported: 0,
         gap_overlapped: 0,
         excluded_unknown_mtime: 0,
+        unparsed_ended: 0,
         undo_unevaluable_c: 0,
     };
     // Windows of measurable events; undo turns are matched against these.
@@ -495,7 +514,11 @@ pub(crate) fn compute_stats(
         if t.grade != "rich" || is_git(t) || is_undo(t) {
             continue;
         }
-        let Some(t_end) = *ended else { continue };
+        let Some(t_end) = *ended else {
+            // An unplaceable turn is skipped — and said so (A2).
+            rework.unparsed_ended += 1;
+            continue;
+        };
         for e in t.files.iter().filter(|e| is_write_op(e)) {
             if is_imported(t) {
                 rework.excluded_imported += 1;
@@ -506,16 +529,27 @@ pub(crate) fn compute_stats(
                 continue;
             }
             let win_end = t_end.saturating_add(window_ms);
-            // Later turns touching this file, in ledger order.
+            // Later turns touching this file, in ledger order. Used only by
+            // the rework hit test below, which time-filters its own matches.
             let later: Vec<&(&TurnRecord, Option<u64>)> = all
                 .iter()
                 .skip(idx + 1)
                 .filter(|(u, _)| u.files.iter().any(|f| f.path == e.path))
                 .collect();
+            // "Nothing recorded after this event" is a question about TIME,
+            // not about ledger position: `import claude` appends turns dated
+            // in the past, so a backfill import sitting later in the file
+            // must not count as evidence of a later change (and, symmetrically,
+            // a live turn appended before it must still count).
+            let recorded_after_in_time = all.iter().enumerate().any(|(j, (u, u_end))| {
+                j != *idx
+                    && u_end.is_some_and(|ue| ue > t_end)
+                    && u.files.iter().any(|f| f.path == e.path)
+            });
             // Unknown-mtime: nothing recorded after this event, the file's
             // live bytes disagree with what was recorded, and no gap exists to
             // date the change. Checked BEFORE anything counts the event.
-            if later.is_empty() && e.after_synthesized != Some(true) {
+            if !recorded_after_in_time && e.after_synthesized != Some(true) {
                 if let Some(recorded) = &e.after {
                     let diverged =
                         read_current_hash(root, &e.path).as_deref() != Some(recorded.as_str());
@@ -535,12 +569,12 @@ pub(crate) fn compute_stats(
             }
             // Clauses (a) and (b): the file is subsequently modified or
             // deleted inside the window by a change no rich turn covers. Undo
-            // turns are neither coverage nor uncovered change — clause (c) is
-            // what would judge them, and it cannot fire before 3.1.
+            // turns are grade `rich`, so they are not matched here and do not
+            // suppress a match either — clause (c) is what would judge them,
+            // and it cannot fire before 3.1. (An `is_undo` exclusion would be
+            // dead code: no undo turn is graded bare.)
             let reworked = later.iter().any(|(u, u_end)| {
-                u.grade == "bare"
-                    && u_end.is_some_and(|ue| ue >= t_end && ue <= win_end)
-                    && !is_undo(u)
+                u.grade == "bare" && u_end.is_some_and(|ue| ue >= t_end && ue <= win_end)
             });
             if reworked {
                 rework.reworked += 1;
@@ -968,8 +1002,10 @@ mod tests {
     #[test]
     fn pre_reverts_undo_turn_in_window_discloses_but_shrinks_nothing() {
         // Discriminating fixture: the undo turn touches THE SAME FILE as the
-        // rework event, so a rule that treated it as coverage (it is
-        // grade rich) or as an uncovered change would move `reworked`.
+        // rework event, so a rule that treated it as coverage (it is grade
+        // rich) would move `reworked`. Only that direction is pinned here —
+        // an undo turn is never grade `bare`, so the fixture cannot
+        // discriminate a rule that counted it as an uncovered change.
         // Base ledger (no undo): t1 rich writes a.rs at NOW-20d,
         //   t2 bare touches a.rs at NOW-19d -> measurable 1, reworked 1.
         // With t_undo (tool "agentrec") at NOW-18d, inside t1's window:
@@ -1191,6 +1227,97 @@ mod tests {
         assert_eq!(s.share.imported, 1);
         assert_eq!(s.share.human, 2);
         assert_eq!(s.share.unattributable, 0);
+    }
+
+    #[test]
+    fn a_delete_entry_is_a_change_and_counts_in_agent() {
+        // Gate B1, founder-pinned: share counts ALL entries, deletes
+        // included. One rich claude turn with a create AND a delete.
+        // hand: agent 2, human 0 (neither file exists on disk and neither
+        // entry records an `after`), unattributable 0, imported 0.
+        let tmp = tmp();
+        let led = ledger_of(vec![LogRecord::Turn(turn(
+            "t1",
+            "rich",
+            Some("claude"),
+            NOW - 20 * DAY_MS,
+            vec![
+                entry("a.rs", "create", None, None),
+                entry("gone.rs", "delete", None, None),
+            ],
+        ))]);
+        let s = compute_stats(&led, tmp.path(), &opts(7), NOW).unwrap();
+        assert_eq!(s.share.agent, 2);
+        assert_eq!(s.share.human, 0);
+        assert_eq!(s.share.unattributable, 0);
+        assert_eq!(s.share.imported, 0);
+    }
+
+    #[test]
+    fn a_backfilled_import_appended_later_but_dated_earlier_is_not_later_in_time() {
+        // `import claude` appends historically-dated turns AFTER live ones, so
+        // ledger position is not time order. Fixture:
+        //   t_live: rich claude, ended NOW-20d, a.rs after = hash("recorded")
+        //   t_imp:  imported,    ended NOW-40d, a.rs after = hash("old")
+        //           — appended SECOND, dated FIRST.
+        //   disk a.rs = "old" (matches the IMPORT's after, not the live one).
+        // Under time order (correct):
+        //   - t_imp is not "recorded after" t_live, so t_live's event is still
+        //     undateable -> excluded_unknown_mtime 1, measurable 0.
+        //   - the latest-DATED entry for a.rs is t_live's, whose `after`
+        //     ("recorded") disagrees with disk -> human 1.
+        // Under ledger order (the defect) both flip: the import would look
+        // later, suppressing the exclusion, and its `after` would match disk,
+        // giving human 0. Also hand-counted: excluded_imported 1 (the
+        // import's own entry), agent 1, imported 1.
+        let tmp = tmp();
+        std::fs::write(tmp.path().join("a.rs"), b"old").unwrap();
+        let recorded = hash_bytes(b"recorded");
+        let old = hash_bytes(b"old");
+        let mut imp = turn(
+            "t_imp",
+            "rich",
+            Some("claude"),
+            NOW - 40 * DAY_MS,
+            vec![entry("a.rs", "modify", None, Some(&old))],
+        );
+        imp.imported = Some(true);
+        let led = ledger_of(vec![
+            LogRecord::Turn(turn(
+                "t_live",
+                "rich",
+                Some("claude"),
+                NOW - 20 * DAY_MS,
+                vec![entry("a.rs", "modify", None, Some(&recorded))],
+            )),
+            LogRecord::Turn(imp),
+        ]);
+        let s = compute_stats(&led, tmp.path(), &opts(7), NOW).unwrap();
+        assert_eq!(s.rework.excluded_unknown_mtime, 1);
+        assert_eq!(s.rework.measurable, 0);
+        assert_eq!(s.rework.excluded_imported, 1);
+        assert_eq!(s.share.human, 1);
+        assert_eq!(s.share.agent, 1);
+        assert_eq!(s.share.imported, 1);
+    }
+
+    #[test]
+    fn a_candidate_turn_with_unparseable_ended_is_skipped_and_disclosed() {
+        // A2: a rich turn nothing can place in time is dropped from the fold —
+        // and says so. hand: unparsed_ended 1, measurable 0.
+        let tmp = tmp();
+        let mut t = turn(
+            "t1",
+            "rich",
+            Some("claude"),
+            NOW - 20 * DAY_MS,
+            vec![entry("a.rs", "modify", None, None)],
+        );
+        t.ended = "not a timestamp".to_string();
+        let led = ledger_of(vec![LogRecord::Turn(t)]);
+        let s = compute_stats(&led, tmp.path(), &opts(7), NOW).unwrap();
+        assert_eq!(s.rework.unparsed_ended, 1);
+        assert_eq!(s.rework.measurable, 0);
     }
 
     #[test]
