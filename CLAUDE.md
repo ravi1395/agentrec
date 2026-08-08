@@ -14,6 +14,49 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **Phase 3.0 T5 bisect — GATE PASS at `db1475a` (2026-08-08, branch `feat/phase-3-0`),
+  after 4 skeptic rounds; rounds 2–4 failed on the RECORD only, never code.** T0–T4 were
+  already gated (see HANDOFF-era notes in git log; suite entering T5 was 1119/0/4). T5:
+  `agentrec-core/src/bisect.rs` (pure reverse-apply probe-state walk, latest-first;
+  earliest-post-probe `before` pinned by hand-derived 3-turn fixture) + `cli/src/bisectcmd.rs`
+  (scratch materialization, binary-search driver, `--flaky-retries`, `--keep`, `--json`) —
+  commits `e1d342d`/`343191e` + fix rounds `2fe981d`/`63e45da`/`a7a5f9a` + claims
+  `0c17b18`/`19c1d77`/`2c293f0`/`d6cfd2d`/`db1475a`. Suite **1150/0/4** (kill-9 approve flake
+  fired once, isolated rerun 3× green); clippy debug+release + fmt clean; write-open gate
+  **58 write-opens / 32 allowlisted functions**, exit 0 (was 57/31 at c2d726c).
+  - **Round 1 blockers (code-adjacent):** two unguarded write-opens (`check-write-opens.sh`
+    red at HEAD — clippy covers only the read half) and four CLI claims whose evidence pinned
+    an abandoned commit while the invalidating `tried`-hoist fix was itself untested. Fixed by
+    extraction: ONE `guarded_write` helper (is_nonregular before write), one `[guard]`
+    allowlist entry, FIFO refusal + ALLOW unit tests; the neutered FIFO test HANGS (the real
+    hazard) rather than reds.
+  - **Rounds 2–4 were this repo's signature class, three-for-three: correct code, false
+    justification prose.** (2) allowlist entries filed under `[nonexist]` whose definition is
+    false for `materialize`, while the commit message claimed `[guard]`; (3) a "needs a whole
+    repository fixture" necessity claim refuted by the skeptic writing the supposedly-
+    impossible tests against the pre-extraction tree; (4) a claim replay "wrapped in a 300s
+    alarm so a hang fails the guard" that structurally cannot — SIGALRM kills the exec'd
+    `cargo`, the hung test binary orphans to PPID 1 holding the pipe, `grep -q` blocks on EOF
+    forever. Final replay (clm_4GN4NYVB) alarms the test binary directly (resolved via
+    `--message-format=json`), hang direction MEASURED: exit 1 at exactly the alarm window,
+    zero orphans, reproduced independently by the closing skeptic.
+  - **Claims: 15 EVIDENCED, none STALE** (12 T5 + T4-debt `clm_2DPQ2RZE` re-evidenced after
+    T5's own lib.rs/view.rs edits staled it + 2 superseders left EVIDENCED-not-retracted).
+    Recorded: every `grep -q` re-evidence event stores the empty-string output_blob (20/21;
+    guard regex is the only discriminator); the `[1-9][0-9]*` guard admits a single-survivor
+    `1 passed` when a named test disappears (pre-existing class, collides with the
+    founder-owned cargo-multi-test-filters lesson — unresolved).
+  - **Recorded residuals, founder-owned:** `--keep` untested; scratch-dir leak on
+    materialize/run_test error paths (OS reaps); same-id collapsible-duplicate turns occupy
+    two sequence slots (collapse on `view::same_revert` is the mechanical fix if wanted);
+    gap-window over-listing with no `--good` (safe direction, unpinned boundary);
+    delete-branch never materialized end-to-end; FIDELITY constant not tied to main.rs's
+    doc copy; replay prewarm (`cargo --no-run`) unbounded by the alarm (a `.cargo-lock`
+    contention still hangs); no real-corpus bisect run — that is plan-exit item, still open;
+    per-probe whole-tree copy (no gitignore filtering) never exercised beyond fixtures;
+    nested vendored `.agentrec/` now copied every probe, cost unbounded; all probes darwin.
+  - **Next: plan exit** (frozen-clone dogfood runs for all four verbs → `docs/verify/p30-exit.md`,
+    PROTOCOL-untouched proof vs plan-start, whole-sub-phase Fable gate), then 3.1/3.2.
 - **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
   pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
   four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal
