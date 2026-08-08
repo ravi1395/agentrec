@@ -55,8 +55,38 @@ carries only current state, what's next, and standing debts.
     contention still hangs); no real-corpus bisect run — that is plan-exit item, still open;
     per-probe whole-tree copy (no gitignore filtering) never exercised beyond fixtures;
     nested vendored `.agentrec/` now copied every probe, cost unbounded; all probes darwin.
-  - **Next: plan exit** (frozen-clone dogfood runs for all four verbs → `docs/verify/p30-exit.md`,
-    PROTOCOL-untouched proof vs plan-start, whole-sub-phase Fable gate), then 3.1/3.2.
+  - **PLAN EXIT REACHED (2026-08-08): whole-sub-phase Fable gate GATE PASS after 1 fix
+    round — all round-1 blockers were RECORD defects, zero code defects across the whole
+    sub-phase.** Exit evidence: `docs/verify/p30-exit.md` (commit `4273592` + record fixes
+    `4891db1`). All four verbs ran against a frozen dogfood clone, `.agentrec/` hash
+    byte-identical each verb; suite 1150/0/4 re-measured independently by the gate;
+    `load_log` 36 = 36 per-file; PROTOCOL.md untouched `e1efbe5..HEAD`; T0 "rework stays
+    headline" honored (measurable 2581 ≥ 20). Gate re-ran the T5 tree-hash proof (two
+    mutation directions) and hand-re-derived a stats fixture + boundary-mutation probe
+    itself. **3.1 planning is unblocked.**
+    - **Round-1 blockers, closed:** five in-span claims staled by T5's main.rs edits and
+      never re-evidenced (re-confirmed, `4891db1`); a false sentence in the exit doc
+      claiming a SIGTERM'd bisect run was "stronger" evidence than a clean exit — inverted:
+      the killed run never left the read phase, real-corpus write-path evidence for bisect
+      is VACUOUS and rests on the fixture tree-hash test alone (stated in the doc now).
+    - **Big product finding (founder-owned, no spec envelope breached): bisect cannot
+      complete one probe on the real corpus** — ≥14 min/probe at 99% CPU (lower bound;
+      `target/` excluded from the clone), ~12 probes for a real bisection. Mechanism
+      profiled twice: `store.rs::get` re-hashes every blob it reads, no opt-out, per probe
+      over the 1.5 GB CAS. E2E tail item 4 (hand-known first-bad on real corpus) honestly
+      recorded UNSATISFIED; gate ruled it non-blocking (tail script is not an exit item;
+      the logic claim is fixture-proven with mutation probes).
+    - **Founder-pending from this exit:** `claimd waive clm_7ABS991MHZPBGF54NPGWJSWH8P`
+      (junk probe claim `x`/`true` committed at `391d08d`; waive is human-reserved BY
+      CONVENTION ONLY — gate verified the verb has no technical actor gate, which is why
+      the agent not running it matters; gate ruled founder-pending disposition suffices,
+      precedent `baeee84`). Also: stats renders rework LAST behind an unbounded 4262-line
+      churn table — met item 4's wording but is structurally the demotion shape T0
+      described; a render-order/`--limit` decision is the founder's. Search paging has no
+      CLI consumer (cursor is `--json`-only, deferred to 3.2's MCP consumer by a T3
+      adjudication). All-verb evidence is darwin/single-machine; Linux leg never run on
+      this HEAD. Kill-9 approve flake got a third data point (failed in-suite at the gate,
+      green isolated ×1).
 - **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
   pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
   four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal
