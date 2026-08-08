@@ -979,6 +979,25 @@ impl RepositoryView {
             .unwrap_or(0);
         crate::stats::compute_stats(&self.ledger(), &self.root, opts, now_ms)
     }
+
+    /// Substring/regex search over stored prompt text, turn metadata
+    /// (`tool`/`model`), and file paths (Phase 3.0 T3, spec §3.0.2).
+    /// Definitions live in [`crate::search`]. A pure read: reads
+    /// `log.jsonl` and, for the prompt field, the CAS; never reads
+    /// file-SNAPSHOT blobs.
+    pub fn search(
+        &self,
+        q: &crate::search::SearchQuery,
+        cursor: Option<Cursor>,
+    ) -> Result<crate::search::SearchPage, crate::search::SearchError> {
+        crate::search::compute_search(
+            &self.ledger(),
+            &self.objects_dir(),
+            q,
+            cursor,
+            crate::search::SEARCH_PAGE_SIZE,
+        )
+    }
 }
 
 /// The one selection + pagination walk behind [`RepositoryView::list_of`] and
