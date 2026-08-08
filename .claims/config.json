@@ -9,7 +9,8 @@
       "VERIFY-LEDGER.md",
       "IMPLEMENTATION.md",
       "docs/**",
-      "scripts/**"
+      "scripts/**",
+      "claim:clm_7ABS991MHZPBGF54NPGWJSWH8P"
     ],
     "denylist": [
       "true",
