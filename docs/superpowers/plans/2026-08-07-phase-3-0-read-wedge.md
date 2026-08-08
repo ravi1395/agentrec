@@ -262,6 +262,10 @@ lib.rs; Modify: `cli/src/main.rs` + thin adapter; Test: core unit +
   inside a file blob → zero hits).
 - CLI: `agentrec search <q> [--regex] [--json]`, `--json` parity with
   `SearchPage`, zero-write assertion.
+- KNOWN-OPEN (T3 gate adjudication (a)): CLI has no `--limit`/`--cursor`
+  surface — cursor rides `--json` for scripts/core-API consumers; the CLI
+  cursor surface lands with the MCP work (3.2), which is the real cursor
+  consumer. Do not rediscover as a defect.
 - `--content` flag exists in clap and errors `content search not implemented`
   (spec-reserved slot; test pins the error, guarding against silent
   degradation to metadata search).
