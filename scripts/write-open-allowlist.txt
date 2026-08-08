@@ -66,3 +66,5 @@ cli/src/uninstallcmd.rs::remove_codex_mcp         2  # same read-then-copy-then-
 
 # ---- [nonexist] guarded by a non-existence precondition -------------------
 cli/src/initcmd.rs::run                           1  # default config.toml written only inside `if !config.exists()`, so a FIFO at that path makes exists() true and the write is skipped
+cli/src/bisectcmd.rs::materialize                 1  # is_nonregular(&target) before writing a probe state's bytes into the scratch dir
+cli/src/bisectcmd.rs::copy_tree                   1  # is_nonregular(&to) before writing a copied working-tree file into the scratch dir

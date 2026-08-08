@@ -316,7 +316,126 @@ fn a_flaky_command_makes_the_probe_unanswerable() {
         "expected a flaky_disagreement report, got {v}"
     );
     assert_eq!(v["verdict"]["kind"], "ambiguous_span", "{v}");
+    // `probes` counts points at which the command RAN — a flaky probe ran it
+    // and is counted, unlike a state-unanswerable probe which never runs it.
+    // HAND-DERIVED: endpoints lo=-1 / hi=3 (t4), candidates 0,1,2. Every probe
+    // is flaky here, so each candidate is tried exactly once (midpoint 1, then
+    // 2, then 0) and none narrows anything → 3 probes, 3 flaky reports.
+    assert_eq!(v["probes"], 3, "{v}");
+    assert_eq!(v["unanswerable"].as_array().unwrap().len(), 3, "{v}");
     let _ = std::fs::remove_file(&counter);
+}
+
+/// A probe point already rejected must NOT be re-probed after the search
+/// narrows: answerability does not change with the endpoints, so re-probing
+/// would run the command twice at one point (inflating `probes`, whose
+/// contract is "points at which the command was executed") and file a second
+/// `FlakyDisagreement` for the same turn.
+///
+/// This is the discriminating fixture for that: it REDS if the driver's
+/// `tried` set is scoped to the narrowing loop instead of the whole search.
+///
+/// HAND-COMPUTED FIXTURE. `f.txt` is rewritten by five turns whose `before`
+/// bytes are ok0, ok1, FLAKY, BAD, BAD2, and the working tree is left at
+/// BAD3. The command is deterministic ("does f.txt contain BAD?") EXCEPT on
+/// the FLAKY content, where it alternates per invocation, so probing the one
+/// state that shows FLAKY always disagrees with itself.
+///
+/// Probe after index i leaves f.txt at seq[i+1]'s before:
+///   after t1 → "ok1"   good
+///   after t2 → "FLAKY" flaky
+///   after t3 → "BAD"   bad
+///   after t4 → "BAD2"  bad
+/// Endpoints are lo=-1 (baseline) and hi=4 (t5); candidates are 0..=3.
+///   probe 1: midpoint of 0..=3 is 1 → FLAKY → flaky, tried={1}
+///   probe 2: nearest untried to 1 is 2 → "BAD" → bad → hi=2
+///   probe 3: candidates now 0..=1, midpoint 0 → "ok1" → good → lo=0
+///   then: the only candidate left is 1, already tried → no verdict, so the
+///   span is seq[1..=2] = t2,t3.
+/// Totals: probes = 3, unanswerable = exactly ONE entry (t2, flaky).
+///
+/// With `tried` reset per narrowing, index 1 is offered again at the last
+/// step, the command runs there a fourth time, and t2 is reported flaky
+/// TWICE — so both assertions below discriminate.
+#[test]
+fn a_rejected_probe_point_is_never_re_probed_after_narrowing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    std::fs::write(root.join("f.txt"), "BAD3").unwrap();
+    let befores = ["ok0", "ok1", "FLAKY", "BAD", "BAD2"];
+    for (n, body) in befores.iter().enumerate() {
+        let h = put(root, body);
+        seed(
+            root,
+            LogRecord::Turn(turn(
+                &format!("t{}", n + 1),
+                root,
+                "rich",
+                &format!("2026-01-01T00:00:0{}.000Z", n + 1),
+                vec![fe("f.txt", Some(h), "modify")],
+            )),
+        );
+    }
+
+    let counter = tmp.path().parent().unwrap().join(format!(
+        "agentrec-bisect-reprobe-{}.count",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&counter);
+    let cmd = format!(
+        "if grep -q FLAKY f.txt; then n=$(cat {c} 2>/dev/null || echo 0); echo $((n+1)) > {c}; [ $((n % 2)) -eq 0 ]; else ! grep -q BAD f.txt; fi",
+        c = counter.display()
+    );
+
+    let out = agentrec(
+        root,
+        &["bisect", "--test", &cmd, "--flaky-retries", "1", "--json"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    let ids: Vec<&str> = v["verdict"]["ids"]
+        .as_array()
+        .expect("ambiguous span")
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["t2", "t3"], "{v}");
+    assert_eq!(v["probes"], 3, "index 1 must not be probed twice: {v}");
+    let un = v["unanswerable"].as_array().unwrap();
+    assert_eq!(
+        un.len(),
+        1,
+        "t2 must be reported flaky once, not twice: {v}"
+    );
+    assert_eq!(un[0]["turn_id"], "t2");
+    assert_eq!(un[0]["reason"], "flaky_disagreement");
+    let _ = std::fs::remove_file(&counter);
+}
+
+/// A NESTED `.agentrec/` is ordinary data — only the repository's own store is
+/// skipped. Copying it silently at every depth contradicted `copy_skipped`'s
+/// "counted, never silently dropped" contract, so the skip is root-scoped.
+#[test]
+fn a_nested_agentrec_directory_is_copied_into_the_probe_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    four_turn_fixture(root);
+    std::fs::create_dir_all(root.join("vendor/.agentrec")).unwrap();
+    std::fs::write(root.join("vendor/.agentrec/marker"), "nested").unwrap();
+
+    // The probe passes only if the nested file reached the scratch tree; the
+    // root store must NOT be there (copying it would make every probe pay for
+    // the whole history).
+    let cmd = "test -f vendor/.agentrec/marker && test ! -e .agentrec";
+    let out = agentrec(root, &["bisect", "--test", cmd, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid json");
+    assert!(v["probes"].as_u64().unwrap() >= 1, "{v}");
+    // Every probe's command exited 0, so the search never found a bad state
+    // and simply returns the trusted bad endpoint, t4.
+    assert_eq!(v["verdict"]["turn_id"], "t4", "{v}");
+    assert_eq!(v["copy_skipped"], 0, "{v}");
 }
 
 /// Two records under one id whose `files` differ are a genuine collision (the

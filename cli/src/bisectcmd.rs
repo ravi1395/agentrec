@@ -306,7 +306,7 @@ fn scratch_dir(n: u64) -> Result<PathBuf, String> {
 /// Copy the working tree into `scratch`, then apply the probe state's edits.
 /// Returns how many working-tree entries could not be reproduced.
 fn materialize(root: &Path, scratch: &Path, state: &ProbeState) -> Result<u64, String> {
-    let skipped = copy_tree(root, scratch)?;
+    let skipped = copy_tree(root, scratch, true)?;
     for (path, action) in &state.files {
         // `path` passed core's lexical containment check, so this join
         // provably stays inside `scratch`.
@@ -320,6 +320,18 @@ fn materialize(root: &Path, scratch: &Path, state: &ProbeState) -> Result<u64, S
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("scratch mkdir {}: {e}", parent.display()))?;
                 }
+                // fsguard [guard]: the target lives under a scratch root this
+                // process just minted, and `copy_tree` never creates anything
+                // but directories and regular files inside it — but the write
+                // half of the gate is per-SITE, not per-argument-provenance,
+                // and a guard makes that reasoning checkable instead of
+                // asserted. Costs one lstat per written file.
+                if agentrec_core::fsguard::is_nonregular(&target) {
+                    return Err(format!(
+                        "scratch target {} is not a regular file",
+                        target.display()
+                    ));
+                }
                 std::fs::write(&target, bytes)
                     .map_err(|e| format!("scratch write {}: {e}", target.display()))?;
             }
@@ -330,23 +342,32 @@ fn materialize(root: &Path, scratch: &Path, state: &ProbeState) -> Result<u64, S
 
 /// Recursive copy of ordinary files and directories.
 ///
-/// `.agentrec` is deliberately NOT copied: it is the recorder's own store
-/// (multi-GiB on a long-lived repo), never part of the product under test, and
-/// copying it would make every probe pay for the whole history. `.git` IS
-/// copied — a test command may legitimately depend on being in a repository.
+/// The repository's own `.agentrec` is deliberately NOT copied: it is the
+/// recorder's store (multi-GiB on a long-lived repo), never part of the
+/// product under test, and copying it would make every probe pay for the whole
+/// history. `.git` IS copied — a test command may legitimately depend on being
+/// in a repository.
+///
+/// That skip is scoped to the ROOT level (`at_root`) deliberately. It used to
+/// fire at every depth, which silently dropped a NESTED `.agentrec/` — another
+/// repository's store, vendored or checked in under this one — while
+/// [`agentrec_core::bisect::BisectResult::copy_skipped`]'s contract says
+/// entries the copy cannot reproduce are counted, never silently dropped.
+/// Only this repository's own store is special; a nested one is ordinary data
+/// and is copied like anything else.
 ///
 /// Anything that is not a regular file or directory (symlink, socket, fifo) is
 /// skipped and COUNTED, never silently dropped: a probe run against a tree
 /// missing them may fail for reasons that have nothing to do with any turn.
 /// The materializer never recreating symlinks is also what makes core's
 /// lexical path check sufficient.
-fn copy_tree(src: &Path, dst: &Path) -> Result<u64, String> {
+fn copy_tree(src: &Path, dst: &Path, at_root: bool) -> Result<u64, String> {
     let mut skipped = 0u64;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read dir {}: {e}", src.display()))?;
         let name = entry.file_name();
-        if name == ".agentrec" {
+        if at_root && name == ".agentrec" {
             continue;
         }
         let from = entry.path();
@@ -355,12 +376,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<u64, String> {
             .map_err(|e| format!("stat {}: {e}", from.display()))?;
         if meta.file_type().is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| format!("mkdir {}: {e}", to.display()))?;
-            skipped += copy_tree(&from, &to)?;
+            skipped += copy_tree(&from, &to, false)?;
         } else if meta.file_type().is_file() {
             // fsguard: the working tree is user-controlled, so the read goes
             // through the guarded helper rather than `fs::read`.
             let bytes = agentrec_core::fsguard::read_regular(&from)
                 .map_err(|e| format!("read {}: {e}", from.display()))?;
+            // fsguard [guard]: same reasoning as `materialize`'s write.
+            if agentrec_core::fsguard::is_nonregular(&to) {
+                return Err(format!(
+                    "scratch target {} is not a regular file",
+                    to.display()
+                ));
+            }
             std::fs::write(&to, bytes).map_err(|e| format!("write {}: {e}", to.display()))?;
         } else {
             skipped += 1;
