@@ -306,12 +306,11 @@ fn scratch_dir(n: u64) -> Result<PathBuf, String> {
 /// THE one write-open in this feature: guard the target, then write it.
 ///
 /// Every byte bisect puts on disk goes through here, so the fsguard write-half
-/// obligation is discharged in exactly one place instead of once per call site
-/// — and, unlike a guard inlined into `materialize`/`copy_tree` (both of which
-/// need a whole repository fixture and a scratch path this process chooses at
-/// random), this shape is directly testable: a unit test can plant a FIFO at
-/// the target and assert the refusal. That test is what stops the guard from
-/// being deletable with every check still green.
+/// obligation is discharged in exactly one place, under one allowlist entry,
+/// instead of once per call site. Taking the target as a parameter also makes
+/// the refusal directly testable: a unit test plants a FIFO at the path and
+/// asserts the error, which is what stops the guard from being deletable with
+/// every other check still green.
 ///
 /// The targets do live under a scratch root this process just minted, and
 /// nothing in this file creates anything but directories and regular files
