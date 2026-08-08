@@ -262,9 +262,18 @@ $ wc -l bisect-true.txt
 |---|---|---|---|---|
 | `bisect --test 'true' --keep` (killed at 14:22) | 143 (SIGTERM) | `b879ac1c…1cab` | `b879ac1c…1cab` | yes |
 
-The zero-write property held even for a run terminated mid-flight: the clone's
-`.agentrec/` manifest hash is unchanged after a `kill`, which is a stronger
-read-only result than a clean exit would have given.
+The zero-write property held for a run terminated mid-flight — but this is a
+WEAKER result than a clean exit would have given, not a stronger one (the
+original sentence here claimed the opposite; corrected at the sub-phase gate's
+direction, which refuted it from this document's own evidence). The killed run
+never left the READ phase: the `sample(1)` stack in 3d(iii) puts it in
+`probe_state → BlobStore::get → compress256` (2516/2519 samples) and 3d(ii)
+records that no scratch directory ever materialized — so `scratch_dir()`,
+`materialize()`, `copy_tree()`, `guarded_write()` and `remove_dir_all()` were
+all never entered. The real-corpus zero-write evidence for bisect is therefore
+vacuous for the WRITE path; that property rests on the fixture integration
+test alone (`cli/tests/bisect.rs` tree-hash assertion, mutation-probed in both
+directions at the T5 and sub-phase gates).
 
 Three separate claims, kept apart deliberately:
 
