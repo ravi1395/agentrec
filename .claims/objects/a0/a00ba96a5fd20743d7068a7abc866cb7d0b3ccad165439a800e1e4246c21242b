@@ -1,0 +1,5 @@
+error: unexpected argument 'golden_stats_zero_measurable' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.
