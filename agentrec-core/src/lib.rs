@@ -11,6 +11,7 @@
 //! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
 //! disagree, the doc wins and the code is a bug.
 
+pub mod annotate;
 pub mod diff;
 pub mod engine;
 pub mod fsguard;

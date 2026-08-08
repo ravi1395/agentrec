@@ -980,6 +980,20 @@ impl RepositoryView {
         crate::stats::compute_stats(&self.ledger(), &self.root, opts, now_ms)
     }
 
+    /// Join already-parsed `git blame` ranges against turn records + CAS
+    /// blobs (Phase 3.0 T4, spec §3.0.3). Definitions — and the normative
+    /// best-effort precision contract — live in [`crate::annotate`].
+    ///
+    /// Git is deliberately NOT reachable from here: the caller supplies
+    /// [`crate::annotate::BlameRange`]s it parsed itself, keeping core
+    /// git-free. A pure read of `log.jsonl` + the CAS; writes nothing.
+    pub fn annotate(
+        &self,
+        ranges: &[crate::annotate::BlameRange],
+    ) -> crate::annotate::AnnotateResult {
+        crate::annotate::attribute(&self.ledger(), &self.objects_dir(), ranges)
+    }
+
     /// Substring/regex search over stored prompt text, turn metadata
     /// (`tool`/`model`), and file paths (Phase 3.0 T3, spec §3.0.2).
     /// Definitions live in [`crate::search`]. A pure read: reads
