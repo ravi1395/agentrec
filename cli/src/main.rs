@@ -1,6 +1,7 @@
 //! agentrec CLI: init, record (daemon), log, status, diff, blame, undo, hook
 //! (called by agent lifecycle hooks), doctor.
 
+mod annotatecmd;
 mod approvecmd;
 mod cmds;
 mod config;
@@ -393,6 +394,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Join `git blame` over a git range against recorded turns: which
+    /// turn(s), if any, wrote each blamed line range (read-only; no daemon
+    /// required). Line attribution is BEST-EFFORT — turns record file-level
+    /// snapshots, not per-line provenance — and every output mode says so.
+    Annotate {
+        /// A git range, e.g. `HEAD~5..HEAD`.
+        range: String,
+        /// Emit `serde_json` of the exact `AnnotateResult`
+        /// `RepositoryView::annotate` returned, instead of the text report.
+        #[arg(long, conflicts_with = "md")]
+        json: bool,
+        /// Render as Markdown (still carrying the best-effort disclaimer).
+        #[arg(long)]
+        md: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -629,6 +645,7 @@ fn main() {
             content,
             json,
         } => searchcmd::search(&root, pattern, regex, content, json),
+        Command::Annotate { range, json, md } => annotatecmd::annotate(&root, range, json, md),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
