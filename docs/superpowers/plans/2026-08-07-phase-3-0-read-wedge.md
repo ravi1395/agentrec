@@ -129,7 +129,10 @@ prints the bucket table; doc committed. Commit:
   all `Serialize`; `RepositoryView::stats(&self, opts: &StatsOptions) ->
   Result<StatsResult, StatsError>`. `ReworkRate` carries
   `{ measurable, reworked, rate: Option<f64>, censored_recent,
-  excluded_imported, gap_overlapped, excluded_unknown_mtime, undo_unevaluable_c }`
+  excluded_imported, gap_overlapped, excluded_unknown_mtime, undo_unevaluable_c,
+  unparsed_ended }` (last field added at T1 gate — disclosure count of candidate
+  turns with unparseable `ended`; T2 renders it like every other exclusion count,
+  including when 0)
   — `gap_overlapped` is a DISCLOSURE count, not an exclusion (T0 amendment,
   founder-ruled: gap-overlapped windows stay measurable; rate labeled
   **approximate lower bound** — two disclosed channels, spec §3.0.1 — in
