@@ -40,7 +40,14 @@ impl FromStr for SinceArg {
                 "invalid duration '{s}' (expected e.g. '30d' or 'all')"
             ));
         }
-        let (num, unit) = s.split_at(s.len() - 1);
+        // Char-boundary-safe split of the final character as the unit — a
+        // byte-index split (`s.len() - 1`) panics on any multibyte trailing
+        // char (e.g. '3µ'), turning a bad-input case into exit 101 instead
+        // of a clap-level error.
+        let (num, unit) = match s.char_indices().last() {
+            Some((idx, _)) => s.split_at(idx),
+            None => (s, ""),
+        };
         let n: u64 = num
             .parse()
             .map_err(|_| format!("invalid duration '{s}' (expected e.g. '30d' or 'all')"))?;
@@ -179,6 +186,17 @@ fn render_share(s: &ChangeShare) -> String {
     )
 }
 
+/// spec §3.0.1 requires the OUTPUT (not just the machine-readable
+/// `rate_bound` token) to say the rate is an approximate lower bound and to
+/// NAME both disclosed bias channels — a recording gap hiding an edit
+/// (undercount) and a dropped start signal stripping bracket coverage so
+/// agent activity reads as a bare-turn "rework" hit (overcount). Neither
+/// channel is measured (see `ReworkRate::rate_bound`'s doc comment in
+/// `agentrec-core/src/stats.rs`); this line only names them.
+const RATE_BOUND_CHANNELS_LINE: &str = "rate is an approximate lower bound: edits hidden in \
+     recording gaps are invisible (undercount); a dropped start signal can strip bracket \
+     coverage so agent activity reads as rework (overcount)";
+
 fn render_rework(r: &ReworkRate) -> String {
     let rate_line = match r.rate {
         Some(rate) => format!("rate={rate:.4} ({bound})", bound = r.rate_bound),
@@ -187,11 +205,13 @@ fn render_rework(r: &ReworkRate) -> String {
     format!(
         "rework ({bound}):\n  \
          measurable={measurable} reworked={reworked} {rate_line}\n  \
+         {channels}\n  \
          excluded: censored_recent={censored} excluded_imported={imported} excluded_unknown_mtime={unknown_mtime}\n  \
          disclosed (not excluded): gap_overlapped={gap} undo_unevaluable_c={undo_c} unparsed_ended={unparsed}\n",
         bound = r.rate_bound,
         measurable = r.measurable,
         reworked = r.reworked,
+        channels = RATE_BOUND_CHANNELS_LINE,
         censored = r.censored_recent,
         imported = r.excluded_imported,
         unknown_mtime = r.excluded_unknown_mtime,

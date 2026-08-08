@@ -274,6 +274,27 @@ fn bad_duration_is_a_clap_level_error() {
     );
 }
 
+/// B2 (gate round 2): a multibyte trailing char in `--since` must be a
+/// clap-level error, not a panic. `SinceArg::from_str` used to split the
+/// unit off with a byte-index slice (`s.len() - 1`), which panics on any
+/// non-ASCII final char instead of producing a well-formed `Err`.
+#[test]
+fn multibyte_bad_duration_is_a_clap_level_error_not_a_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+    let out = agentrec(root, &["stats", "--since", "3\u{b5}"]); // "3µ"
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected clap usage-error exit code, not a panic: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid duration"),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn rework_window_flag_maps_to_stats_options() {
     let tmp = tempfile::tempdir().unwrap();
@@ -312,6 +333,12 @@ fn text_output_carries_every_disclosure_field_including_zeros() {
         "undo_unevaluable_c=0",
         "unparsed_ended=0",
         "approx_lower",
+        // B1 (gate round 2): the OUTPUT, not just the machine `approx_lower`
+        // token, must say the rate is an approximate lower bound and name
+        // both disclosed bias channels.
+        "approximate lower bound",
+        "undercount",
+        "overcount",
     ] {
         assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
     }
@@ -481,6 +508,35 @@ fn log_bytes(root: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// A3 (gate round 2): every path under `.agentrec/`, relative, mapped to its
+/// byte length. Enumerating the whole tree (rather than checking only the
+/// specific files/dirs the fixture already knows about) catches a NEW stray
+/// file or directory `stats` might create — a mutation the earlier,
+/// named-path-only version of this test could not see.
+fn snapshot_agentrec_tree(root: &Path) -> std::collections::BTreeMap<String, u64> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, u64>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if let Ok(meta) = entry.metadata() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(rel, meta.len());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(&root.join(".agentrec"), &root.join(".agentrec"), &mut out);
+    out
+}
+
 #[test]
 fn stats_and_stats_json_write_nothing_under_agentrec_dir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -492,6 +548,7 @@ fn stats_and_stats_json_write_nothing_under_agentrec_dir() {
     let state_before = std::fs::read_to_string(&state_path).unwrap();
     let store_before = total_store_bytes(root);
     let log_before = log_bytes(root);
+    let tree_before = snapshot_agentrec_tree(root);
 
     for args in [
         vec!["stats", "--since", "all"],
@@ -513,6 +570,11 @@ fn stats_and_stats_json_write_nothing_under_agentrec_dir() {
             log_bytes(root),
             log_before,
             "{args:?} appended to log.jsonl"
+        );
+        assert_eq!(
+            snapshot_agentrec_tree(root),
+            tree_before,
+            "{args:?} changed the .agentrec/ tree (new/removed/resized entry)"
         );
     }
 }

@@ -17,6 +17,7 @@ share (raw counts, not percentages — buckets use different units, see docs):
 
 rework (approx_lower):
   measurable=1 reworked=0 rate=0.0000 (approx_lower)
+  rate is an approximate lower bound: edits hidden in recording gaps are invisible (undercount); a dropped start signal can strip bracket coverage so agent activity reads as rework (overcount)
   excluded: censored_recent=0 excluded_imported=0 excluded_unknown_mtime=0
   disclosed (not excluded): gap_overlapped=0 undo_unevaluable_c=0 unparsed_ended=0
 
