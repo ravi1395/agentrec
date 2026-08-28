@@ -73,14 +73,11 @@ Also rejected, from this design round:
 1. attest is an **agentrec subsystem** (`agentrec attest …`), not claimd v2, not a
    third tool. One product story: record + prove.
 2. **Tests are the claim language.** Claims are derived from framework-native test
-   identities via adapters emitting structured verdicts. No claim DSL exists.
-   **Corrected during plan review (2026-08-28): `cargo test
-   --message-format=json` does NOT carry per-test results on this repo's
-   stable toolchain — measured, only compiler messages come back. Discovery
-   uses `--list`; result interpretation uses libtest's one stable summary
-   line (`test result: ok. N passed; M failed; K ignored; … filtered out`),
-   parsed once by the adapter, not per-claim — see the implementation plan's
-   phase 1 finding 2b for the full channel decision.**
+   identities via adapters emitting structured verdicts (`cargo test
+   --message-format=json` first). No claim DSL exists. **See "Review
+   findings" below — this decision's stated mechanism was measured false
+   during plan review and needs ratification of a replacement, not a
+   unilateral rewrite.**
 3. **Evidence capture is passive**, joined to agentrec turn records: every captured
    test run references the `turn_id` it happened inside, chaining prompt → diff →
    test run → verdict.
@@ -107,6 +104,55 @@ Also rejected, from this design round:
 9. **PROTOCOL.md is untouched in v1.** Attest wire formats are documented in a new
    `ATTEST-FORMAT.md` (draft status, explicitly unstable) until the subsystem earns
    a protocol section. The frozen PROTOCOL 1.0 gains nothing until then.
+
+## Review findings (2026-08-28, plan-review rounds — need founder ratification)
+
+Four rounds of adversarial plan review (`docs/superpowers/plans/
+2026-08-28-attest-plan.md`) measured real gaps against the decisions above.
+These are reported, not silently applied — an agent narrowing its own
+founder-confirmed commitment unprompted is this repo's own recorded
+"indistinguishable from dodging" line. Ratify or redirect each before phase
+2 dispatch.
+
+1. **Decision 2's mechanism is measured false.** `cargo test
+   --message-format=json` carries only compiler messages on this repo's
+   stable toolchain (`rustc 1.97.1`, no pin), never per-test results —
+   verified directly against this repo's own test binaries, twice, in
+   independent review rounds. What stable DOES give, measured: `--list`
+   for discovery; libtest's one stable summary line per target-scoped run
+   for result interpretation (`--exact` must be scoped by `--test <name>` /
+   `--lib` / `--bin`, or a colliding test name across targets — a REAL case
+   here, see decision 4's note below — cross-attributes). Candidate
+   replacement mechanism, NOT yet ratified: `--list` + target-scoped
+   summary-line parsing, one adapter-owned parser (not a per-claim recipe,
+   so it doesn't reopen lesson 1). Full record of what was tried and ruled
+   out: plan phase 1, item 2b.
+2. **Decision 4's `claim-false` permanence collides with a measured live
+   flake.** Nothing in the spec or plan currently produces the `flaky`
+   verdict decision 4 itself declares. This repo has a recorded flake
+   (`approve.rs::a_killed_approve_never_leaves_a_phantom_approval`,
+   CLAUDE.md) that a naive single-run verify would mint as a PERMANENT
+   `claim-false`. Constraint, not yet a designed mechanism: `attest verify`
+   must not write `claim-false` from a single run — some retry-and-compare
+   policy is needed before phase 4 is buildable as specced (precedent:
+   `bisectcmd`'s `--flaky-retries`). Phase 4's task pins the policy.
+3. **The daemon-purity invariant below needed its enforcement mechanism
+   corrected, twice.** First: a claimed clippy-lint transitivity guarantee
+   doesn't exist (clippy has no interprocedural analysis — fixture-verified).
+   Second: even the weaker "per-site census" claim doesn't hold as a clippy
+   `disallowed-methods` entry, because 19 files in this repo (test fixtures,
+   `daemon.rs`'s own `#[cfg(test)] mod tests`) already carry a blanket
+   `#![allow(clippy::disallowed_methods)]` for an unrelated lint (the
+   fsguard FIFO-read guard) that would silently exempt every
+   `Command::new` site inside them too, the moment this lint fires on that
+   method. Candidate replacement, matching this repo's own precedent for
+   exactly this shape (`scripts/check-write-opens.sh`, a standalone script
+   with its OWN allowlist file, immune to attribute-based suppression):
+   a dedicated script scanning non-test `cli/src` + `agentrec-core/src` for
+   `Command::new` against an explicit allowlist. Scope, honestly: catches
+   direct calls in production, non-test code only; does not prove
+   non-reachability through another module, and does not cover test code.
+   See plan phase 4 for the mechanism as currently drafted.
 
 ## Architecture
 
@@ -138,10 +184,9 @@ Components (all in the existing two-crate workspace):
 
 - `agentrec-core/src/attest/` — events, fold, claim identity, verdict types. Pure;
   no process spawning in core.
-- `cli/src/attest/adapter_cargo.rs` — discovery (`cargo test -- --list`), result
-  interpretation (libtest's stable summary-line grammar, not
-  `--message-format=json` — see decision 2's correction), per-test replay
-  invocation. The adapter trait is the seam later adapters (node:test, jest,
+- `cli/src/attest/adapter_cargo.rs` — discovery, result interpretation, and
+  per-test replay invocation per the channel ratified from "Review findings"
+  above. The adapter trait is the seam later adapters (node:test, jest,
   pytest) implement.
 - `cli/src/attest/capture.rs` — the passive tap: `agentrec attest run -- <cmd>`
   wrapper, plus recognition of test invocations arriving through the existing hook
@@ -171,18 +216,11 @@ returns as its own plan; nothing here depends on them.
 
 - `attest.jsonl` is append-only; corrections are appended events. No rewrite class
   exists for it in v1 (adding one requires a decision-register entry).
-- The daemon never executes repo-authored commands. **Corrected during plan
-  review (the prior wording was false by construction: `cli` compiles to one
-  `agentrec` binary, so every attest module already lives in "the daemon
-  binary").** Enforced as: every `std::process::Command::new` call site in
-  the binary is an explicit, lint-caught, individually-reviewed exception
-  (`clippy.toml disallowed-methods` + per-site `#[allow]`, the fsguard
-  precedent) — a census, not a transitivity proof. **Disclosed residual:
-  this catches a DIRECT `Command::new` added to `daemon.rs` (0 there today
-  outside test fixtures); it cannot and does not prove no call is reachable
-  from the daemon's own functions through another module's `#[allow]`'d
-  spawn (e.g. phase 4's own `coverage.rs`) — closing that needs real
-  call-graph analysis, out of v1 scope, and is not claimed here.**
+- The daemon never executes repo-authored commands. Enforced by construction: no
+  attest execution code path lives in the daemon binary path. **See "Review
+  findings" above — this wording and its enforcement mechanism both needed
+  correction during plan review; ratify the replacement there before
+  treating this line as binding.**
 - An author's own run can never produce CONFIRMED — `evidence` and `verdict` are
   disjoint event kinds written by disjoint code paths.
 - `recipe-invalid` never blocks a gate by itself; it queues a retry and surfaces in
