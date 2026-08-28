@@ -163,8 +163,14 @@ returns as its own plan; nothing here depends on them.
 
 - `attest.jsonl` is append-only; corrections are appended events. No rewrite class
   exists for it in v1 (adding one requires a decision-register entry).
-- The daemon never executes repo-authored commands. Enforced by construction: no
-  attest execution code path lives in the daemon binary path.
+- The daemon never executes repo-authored commands. **Corrected during plan
+  review (the prior wording was false by construction: `cli` compiles to one
+  `agentrec` binary, so every attest module already lives in "the daemon
+  binary").** Enforced as: every `std::process::Command::new` call site in
+  the binary is an explicit, lint-caught, individually-reviewed exception
+  (`clippy.toml disallowed-methods` + per-site `#[allow]`, the fsguard
+  precedent) — a census, not a transitivity proof; no call reachable from
+  the daemon's own event-processing functions is exempted.
 - An author's own run can never produce CONFIRMED — `evidence` and `verdict` are
   disjoint event kinds written by disjoint code paths.
 - `recipe-invalid` never blocks a gate by itself; it queues a retry and surfaces in
