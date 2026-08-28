@@ -73,8 +73,14 @@ Also rejected, from this design round:
 1. attest is an **agentrec subsystem** (`agentrec attest …`), not claimd v2, not a
    third tool. One product story: record + prove.
 2. **Tests are the claim language.** Claims are derived from framework-native test
-   identities via adapters emitting structured verdicts (`cargo test
-   --message-format=json` first). No claim DSL exists.
+   identities via adapters emitting structured verdicts. No claim DSL exists.
+   **Corrected during plan review (2026-08-28): `cargo test
+   --message-format=json` does NOT carry per-test results on this repo's
+   stable toolchain — measured, only compiler messages come back. Discovery
+   uses `--list`; result interpretation uses libtest's one stable summary
+   line (`test result: ok. N passed; M failed; K ignored; … filtered out`),
+   parsed once by the adapter, not per-claim — see the implementation plan's
+   phase 1 finding 2b for the full channel decision.**
 3. **Evidence capture is passive**, joined to agentrec turn records: every captured
    test run references the `turn_id` it happened inside, chaining prompt → diff →
    test run → verdict.
@@ -132,9 +138,11 @@ Components (all in the existing two-crate workspace):
 
 - `agentrec-core/src/attest/` — events, fold, claim identity, verdict types. Pure;
   no process spawning in core.
-- `cli/src/attest/adapter_cargo.rs` — discovery (`cargo test -- --list`), structured
-  run (`--message-format=json` / libtest JSON), per-test replay invocation. The
-  adapter trait is the seam later adapters (node:test, jest, pytest) implement.
+- `cli/src/attest/adapter_cargo.rs` — discovery (`cargo test -- --list`), result
+  interpretation (libtest's stable summary-line grammar, not
+  `--message-format=json` — see decision 2's correction), per-test replay
+  invocation. The adapter trait is the seam later adapters (node:test, jest,
+  pytest) implement.
 - `cli/src/attest/capture.rs` — the passive tap: `agentrec attest run -- <cmd>`
   wrapper, plus recognition of test invocations arriving through the existing hook
   path; writes `evidence` events joined to the open turn.
@@ -169,8 +177,12 @@ returns as its own plan; nothing here depends on them.
   binary").** Enforced as: every `std::process::Command::new` call site in
   the binary is an explicit, lint-caught, individually-reviewed exception
   (`clippy.toml disallowed-methods` + per-site `#[allow]`, the fsguard
-  precedent) — a census, not a transitivity proof; no call reachable from
-  the daemon's own event-processing functions is exempted.
+  precedent) — a census, not a transitivity proof. **Disclosed residual:
+  this catches a DIRECT `Command::new` added to `daemon.rs` (0 there today
+  outside test fixtures); it cannot and does not prove no call is reachable
+  from the daemon's own functions through another module's `#[allow]`'d
+  spawn (e.g. phase 4's own `coverage.rs`) — closing that needs real
+  call-graph analysis, out of v1 scope, and is not claimed here.**
 - An author's own run can never produce CONFIRMED — `evidence` and `verdict` are
   disjoint event kinds written by disjoint code paths.
 - `recipe-invalid` never blocks a gate by itself; it queues a retry and surfaces in

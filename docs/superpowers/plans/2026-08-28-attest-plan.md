@@ -126,29 +126,54 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
        `--match` regexes, not one adapter-owned parse of a fixed two-token
        grammar). **Solved, no further ruling needed.**
      - Phase 4's `attest verify` (single-test replay, the ONLY path that
-       produces a `claim-false` verdict): run that one test with
-       `--exact <name>`, read the process exit code (`0` = pass, `101` =
-       libtest's fixed fail code) — measured directly, no output parsing at
-       all. **Solved, no further ruling needed.**
+       produces a `claim-false` verdict) — **exit code ALONE is NOT
+       sufficient; corrected after round-3 review found it collapses a
+       4-state taxonomy into 2 values.** Measured directly: exit `0` for
+       BOTH a passing test AND a test that no longer exists (`--exact` on a
+       missing name silently matches zero tests, "0 passed … N filtered
+       out", exit 0) AND an `#[ignore]`d test (exit 0, "0 passed; 1
+       ignored"); exit `101` for BOTH a genuine assertion failure AND a
+       build that doesn't compile. Naive exit-code verify would CONFIRM a
+       deleted test (this repo's own recorded `claimd-vacuous-confirm-on-
+       rename` lesson, reborn) and permanently `claim-false` a broken build
+       (spec decision 4 makes `claim-false` permanent — the worst place for
+       this ambiguity to land). Real mechanism, two steps: (1) `--list`
+       membership precheck — if `<name>` isn't listed, verdict is
+       `recipe-invalid` immediately, no execution; (2) if listed, run
+       `--exact <name>` and parse libtest's ONE stable summary line
+       (`test result: ok. N passed; M failed; K ignored; … filtered out`)
+       — `1 passed` → confirmed, `1 failed` → claim-false, `1 ignored` →
+       recipe-invalid (never confirmed-by-skip), anything else (crash
+       before the summary line prints, build failure) → recipe-invalid.
+       This is the SAME parser as the bulk-capture item below, not a second
+       mechanism — write it once, phase 4 and phase 3 both call it.
+       **No longer "solved, no ruling needed" — folded into the single
+       written ruling below**, since it's the same channel decision as bulk
+       capture, just applied to a batch of one.
      - Phase 3's bulk `attest run -- cargo test` (evidence capture across a
-       whole-suite invocation, needs PER-TEST attribution within one run):
-       this is the one place with no clean stable answer. Options, unranked,
-       for the spike to weigh: (i) parse libtest's stable `test <name> ...
-       ok|FAILED` summary lines — ONE adapter-owned parser, not a per-claim
-       recipe, versioned against a fixture of real libtest output, fails
-       closed (unparseable batch → evidence stored with a `parse_failed`
-       flag and the raw blob kept, never silently dropped) — this revises
-       the LETTER of rejected-list item 5, which named stdout parsing
-       without this distinction; the spike must say so explicitly if chosen,
-       for founder sign-off, not silently. (ii) `cargo-nextest` (not
-       installed here either) as a second external tool dependency beside
-       cargo-llvm-cov. (iii) N individual `--exact` invocations instead of
-       one batch run — no parsing, but is one process-spawn per test,
-       measure its wall-time cost against phase-1's suite-scale numbers
-       before ruling it out.
-     - **Exit requirement for 2b: a written ruling on the bulk-capture
-       channel, same founder-sign-off gate as item 4 below** (this is now
-       two gated rulings out of one spike, not one).
+       whole-suite invocation, needs PER-TEST attribution within one run) —
+       same channel question as verify, at batch scale. Options for the
+       spike to weigh, using the verify-path parser above as the default:
+       (i) the same stable summary-line parser, extended to per-test `test
+       <name> ... ok|FAILED` lines within one run — ONE adapter-owned
+       parser, not a per-claim recipe, versioned against a fixture of real
+       libtest output, fails closed (unparseable batch → evidence stored
+       with a `parse_failed` flag and the raw blob kept, never silently
+       dropped) — this revises the LETTER of rejected-list item 5, which
+       named stdout parsing without this distinction; the spike must say so
+       explicitly, for founder sign-off, not silently. (ii) `cargo-nextest`
+       (not installed here either) as a second external tool dependency
+       beside cargo-llvm-cov. (iii) N individual `--exact` invocations
+       instead of one batch run — reuses the verify-path parser exactly,
+       no new code, but is one process-spawn per test — measure its
+       wall-time cost against phase-1's suite-scale numbers before ruling
+       it out.
+     - **Exit requirement for 2b: a written ruling covering BOTH the
+       verify-path parser (mandatory — no fallback exists) AND the
+       bulk-capture channel (the three options above), same founder-
+       sign-off gate as item 4 below** (this is now two gated rulings out
+       of one spike, not one — the verify-path piece is not optional, only
+       its bulk-capture extension is).
   3. ~~The cargo JSON test-event field for `test_identity`'s target
      component~~ — **moot after finding 2b: there is no such field on
      stable.** The target name doesn't need extracting from output at all —
@@ -180,11 +205,18 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
 
 ## Phase 2 — claim core: events, fold, derive (pure, no execution)
 
-- Files: `agentrec-core/src/attest/events.rs`, `agentrec-core/src/attest/fold.rs`,
+- Files: `agentrec-core/src/attest.rs` (new — the module-root file that
+  `pub mod`s `events`/`fold`/`types`; this repo has zero directory modules
+  today — `find agentrec-core/src cli/src -name mod.rs` is empty — so the
+  established convention is a sibling `<name>.rs` beside the `<name>/`
+  directory, 2018-edition style, not `attest/mod.rs`), `agentrec-core/src/
+  attest/events.rs`, `agentrec-core/src/attest/fold.rs`,
   `agentrec-core/src/attest/types.rs` (new — see ownership note below),
   `agentrec-core/src/lib.rs` (register `pub mod attest;`, `lib.rs:15-33`'s
   existing `pub mod` list is the pattern), `ATTEST-FORMAT.md`
-  (draft-unstable header).
+  (draft-unstable header). 6 files — over the ≤2–3/task guideline at phase
+  granularity; `/pchunker` should split `attest.rs`+`types.rs`+`lib.rs`
+  (plumbing) from `events.rs`+`fold.rs` (the actual logic + its test).
 - **Type ownership, pinned (phase 3's adapter and phase 2's fold share these —
   a seam neither side may re-declare):** `TestIdentity` and `StructuredResult`
   are defined in `agentrec-core/src/attest/types.rs`, NOT in `cli`. Core's
@@ -220,14 +252,31 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
   source access; phase 2 only consumes the resulting `body_hash` field and
   runs the reconciliation, both pure):
   - Location resolution, the piece the original brace-scan draft never
-    solved: `cargo test -- --list` gives fully module-qualified names (e.g.
-    `daemon::tests::nested_gitignore_precedence: test` — VERIFIED this
-    session against this repo's own binaries) but no file path.
-    `cargo metadata --format-version=1` gives each `[[test]]` target's exact
-    `src_path` (VERIFIED — e.g. `cli/tests/bisect.rs` for the `bisect`
-    target); for lib/bin unit tests, the target's own root file plus its
-    `mod` tree. This is enough to know exactly which file(s) to search per
-    test, no ambiguity, no whole-tree scan.
+    solved, and TWO DIFFERENT CASES, not one — round-3 review found the
+    first draft only handled the easy one:
+    - **Integration-test targets** (`cli/tests/*.rs`, one file per
+      `[[test]]`): `cargo metadata --format-version=1` gives the target's
+      exact `src_path` DIRECTLY (VERIFIED — e.g. `cli/tests/bisect.rs` for
+      the `bisect` target) — `syn`-parse that one file, done.
+    - **Unit tests inside `#[cfg(test)] mod tests { ... }` in a lib/bin's
+      own source** (e.g. `daemon::tests::nested_gitignore_precedence`,
+      VERIFIED live at `cli/src/daemon.rs:2866+` via `cargo test --
+      --list`) — `cargo metadata`'s `src_path` for these targets is only
+      the CRATE ROOT (`cli/src/main.rs` / `agentrec-core/src/lib.rs`,
+      VERIFIED), not the file the test lives in. Resolve by walking `mod
+      <name>;` declarations with `syn`, starting at the root, matching each
+      segment of the qualified test name's module path (`daemon::tests::…`
+      → find `mod daemon;` in the root → resolve to `daemon.rs` per Rust's
+      standard file convention (`<name>.rs` or `<name>/mod.rs` — this repo
+      uses zero `mod.rs` files today, confirmed, so expect the former) →
+      recurse for `tests` inside it). **Disclosed incompleteness, fails
+      closed to `body_hash: None`, never silently wrong:** `#[path = "..."]`
+      overrides, `include!()`, and `cfg`-gated alternate `mod` declarations
+      are NOT resolved by this walk — real but rare shapes; a test whose
+      module path hits one just gets no rename continuity, the safe
+      fallback already specified below.
+    This is enough to know exactly which file(s) to search per test, no
+    ambiguity, no whole-tree scan, for either case.
   - Body extraction: parse the resolved file with `syn` (already vendored —
     `Cargo.lock` pins both `syn` and `proc-macro2`; use the real crate, not
     a hand-rolled scanner — this repo's own recorded lesson,
@@ -257,10 +306,22 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
 
 ## Phase 3 — cargo adapter + passive capture
 
-- Files: `cli/src/attest/adapter_cargo.rs`, `cli/src/attest/capture.rs`,
+- Files: `cli/src/attest.rs` (new — module-root, same 2018-edition
+  no-`mod.rs` convention as phase 2's `agentrec-core/src/attest.rs`),
+  `cli/src/attest/adapter_cargo.rs`, `cli/src/attest/capture.rs`,
   `cli/src/attest/statuscmd.rs` (new — minimal read-only status surface, see
   below), `cli/tests/attest_capture.rs`, wiring in `cli/src/main.rs` (hidden
-  subcommands `attest derive`, `attest run`, `attest status`).
+  subcommands `attest derive`, `attest run`, `attest status`), `cli/
+  Cargo.toml` (new dependency: `syn` + `proc-macro2`, needed for rename
+  location-resolution below — currently `syn` reaches this workspace only
+  transitively as a proc-macro build dependency of `clap_derive`/
+  `serde_derive`, confirmed via `cargo tree -i syn`; this is a NEW direct
+  runtime dependency, not free, needs `features = ["full", "parsing",
+  "printing"]` for the token-stream hashing below and is a checked field
+  in `.github/scripts/check-versions.sh` at release time per CLAUDE.md's
+  release section). 7 files — over the ≤2–3/task guideline; `/pchunker`
+  should split `attest.rs`+`Cargo.toml`+`statuscmd.rs` from
+  `adapter_cargo.rs`+`capture.rs`+its test.
 - **`attest status` is built here, minimally.** It's referenced by this
   phase's own AC (below), by the E2E tail item 2, and by spec:171
   ("`recipe-invalid` never blocks a gate by itself; it queues a retry and
@@ -295,10 +356,15 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
   already reads. Missing/stale `open.json` → no open turn → the AC's existing
   dirty-bit/dev-loop-only path, not a new failure mode.
 - ACs: `attest derive` on a fixture crate (new, `cli/tests/fixtures/
-  attest_sample_crate/`) creates one claim per discovered test, idempotent
-  re-run appends nothing; renaming a fixture test with its body unchanged →
-  re-derive reuses the old ClaimId, changing the body too → new claim (phase
-  2's reconciliation rule, exercised end-to-end here); `attest run --
+  attest_sample_crate/`, and it MUST carry both a `tests/` integration
+  target AND a `#[cfg(test)] mod tests { ... }` inside its own `src/` —
+  phase 2's two location-resolution cases each need a live exerciser, not
+  just the easier integration-target case) creates one claim per discovered
+  test, idempotent re-run appends nothing; renaming a fixture test with its
+  body unchanged → re-derive reuses the old ClaimId, changing the body too
+  → new claim, exercised against BOTH the integration-target test and the
+  `mod tests`-shaped unit test (phase 2's reconciliation rule + both
+  location-resolution paths, end-to-end); `attest run --
   cargo test` inside a hook-bracketed session records evidence joined to that
   turn (fixture: emit the open-bracket signal first, the O5-proven pattern);
   a `cargo test` invocation arriving through the existing hook signal path
@@ -321,8 +387,10 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
   `/pchunker` should split the daemon delta (security-sensitive, gets its own
   task + the heaviest review) from replaycmd+coverage+main.rs wiring.**
 - Contract: `attest verify [--all-stale|<id>]` extracts pinned HEAD via
-  `git archive`, scrubbed env, adapter-runs the single test, appends verdict per
-  spec taxonomy; coverage maps per phase-1 ruling; daemon consults maps on write
+  `git archive`, scrubbed env, adapter-runs the single test via phase 1
+  finding 2b's `--list`-membership-precheck + summary-line-parse mechanism
+  (NOT bare exit code — see phase 1), appends verdict per spec taxonomy;
+  coverage maps per phase-1 ruling; daemon consults maps on write
   events it already receives and appends `stale`.
   **Purity check — a lint gives an auditable census, not a transitivity
   proof; state that honestly, don't oversell it.** `clippy::disallowed_methods`
@@ -339,10 +407,16 @@ Nobody has measured cargo-llvm-cov per-test granularity cost on this repo.
   path lives in the daemon binary path" — false by construction: `cli`
   compiles to a single `agentrec` binary, `main.rs:9: mod daemon;` alongside
   every other module including `attest/*`, so ALL attest code already lives
-  in "the daemon binary". The invariant this plan can actually deliver:
-  every `Command::new` call site in the binary is an explicit, audited
-  exception, and none of them is reachable from the daemon's own
-  event-processing functions without going through one.).
+  in "the daemon binary". The invariant this plan can actually deliver, and
+  no more: every `Command::new` call site in the binary is an explicit,
+  audited exception. **Disclosed residual, not solved here:** this catches
+  a DIRECT call added to `daemon.rs` (0 there today outside test fixtures);
+  it does NOT prove no call is reachable from the daemon's own functions
+  THROUGH another module's `#[allow]`'d spawn — phase 4's own `coverage.rs`
+  is exactly that shape (daemon consults it for staleness; coverage.rs
+  spawns cargo-llvm-cov). Closing that needs real call-graph analysis, out
+  of v1 scope. Spec corrected to match — don't let a later round re-claim
+  transitive coverage this mechanism doesn't have.).
   Add `std::process::Command::new` to `clippy.toml`'s `disallowed-methods`
   list (`clippy.toml:42`), crate-wide — confirmed the list already exists
   and exemptions are per-site `#[allow(clippy::disallowed_methods)]`
