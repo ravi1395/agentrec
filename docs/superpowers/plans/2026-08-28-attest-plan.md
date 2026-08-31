@@ -360,7 +360,10 @@ question.
   `annotatecmd.rs`, no logic changes). 6 core files + the
   annotation sweep, well over budget — `/pchunker` should split the daemon
   delta (security-sensitive, its own task + heaviest review) from
-  replaycmd+coverage+main.rs, and the clippy entry + annotation sweep from
+  replaycmd+coverage+main.rs, and the clippy entry + annotation sweep
+  (whose file set must ALSO include Phase 3's already-landed
+  `adapter_cargo.rs` — its spawn sites need per-site allows before the
+  baseline-green AC can pass, and it isn't in this phase's files list) from
   both.
 - Contract: `attest verify [--all-stale|<id>]` extracts pinned HEAD via
   `git archive`, scrubbed env, adapter-runs the single test via Phase 1
@@ -443,11 +446,13 @@ question.
   --workspace --all-targets --all-features -- -D warnings` is CLEAN at
   HEAD after the annotation sweep (the baseline-green half — proves the
   sweep found every site, including the `doctorcmd.rs` test-mod one);
-  then plant one unannotated `std::process::Command::new` in `daemon.rs`
-  production code (before its `#[cfg(test)]` at the tail), confirm the
-  same command fails NAMING the planted line, remove it (proves the
-  census catches a direct call; transitive reach is disclosed-unproven,
-  above).
+  then plant one unannotated `std::process::Command::new` INSIDE AN
+  EXISTING production fn of `daemon.rs` (an unreferenced new fn co-fires
+  `dead_code` under `-D warnings`, which also "names the line" and lets
+  the probe pass with `clippy.toml` untouched), confirm the same command
+  fails with `clippy::disallowed_methods` specifically naming the planted
+  line, remove it (proves the census catches a direct call; transitive
+  reach is disclosed-unproven, above).
 - Verification: `cargo test --test attest_verify` + the mutation probes in
   the task file run live; **also run at least one real repo test binary
   (`cli/tests/golden.rs` or `cli/tests/integration.rs`) inside a `git

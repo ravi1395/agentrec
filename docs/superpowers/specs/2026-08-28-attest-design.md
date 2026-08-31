@@ -121,7 +121,10 @@ Also rejected, from this design round:
 
 ## Review findings (2026-08-28 rounds; dispositions updated 2026-08-31)
 
-Five rounds of adversarial plan review (`docs/superpowers/plans/
+Repeated rounds of adversarial plan review (no count stated on purpose —
+this repo's record shows an embedded tally is undercounted by one on every
+next verdict; the git log of the plan doc is the authoritative count)
+(`docs/superpowers/plans/
 2026-08-28-attest-plan.md`) measured real gaps against the decisions above.
 Each was reported rather than silently applied — an agent narrowing its own
 founder-confirmed commitment unprompted is this repo's own recorded
