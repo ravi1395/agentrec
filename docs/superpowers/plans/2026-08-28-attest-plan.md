@@ -127,7 +127,7 @@ question.
     `opaque_call_counts_as_importable_with_no_file_entries` exists as a
     `#[test]` fn in BOTH `cli/tests/import_codex.rs:204` and `cli/tests/
     import_claude.rs:201` — the same collision that motivates Phase 2's
-    target-scoped `ClaimId`). Any result-interpretation mechanism the spike
+    target-scoped `TestIdentity`). Any result-interpretation mechanism the spike
     lands on MUST be scoped to one target (`--test <name>` / `--lib` /
     `--bin agentrec`, derived from that test's `cargo metadata` target
     kind), never a bare unscoped `--exact`.
@@ -324,7 +324,10 @@ question.
   architecture invariant is "consumers never need the daemon running — all
   reads are file-based." Read the daemon's persisted mirror, `.agentrec/
   open.json` (`cli/src/daemon.rs:2071`'s comment names it explicitly, same
-  file the crash-recovery journal reads). Missing/stale `open.json` → no
+  file the crash-recovery journal reads; its serializer `OrphanJournal` is
+  a private struct in `daemon.rs` — capture either gets it `pub(crate)` or
+  reads the JSON's `id` field directly, task's call). Missing/stale
+  `open.json` → no
   open turn → the existing dirty-bit/dev-loop-only path, not a new failure
   mode.
 - ACs: `attest derive` on the fixture crate creates one claim per
@@ -349,10 +352,12 @@ question.
   `agentrec-core/src/daemon.rs`, which does not exist; the daemon lives in
   the `cli` crate (`cli/src/main.rs:9: mod daemon;`) — `cli/src/main.rs`
   (register `attest verify`), `cli/tests/attest_verify.rs`, `clippy.toml`
-  (one `disallowed-methods` entry, purity mechanism below) plus per-site
-  `#[allow]` annotations on the ~13 existing production spawn sites
-  (annotation-only edits across `service.rs`/`importcmd.rs`/`doctorcmd.rs`/
-  `bisectcmd.rs`/`annotatecmd.rs`, no logic changes). 6 core files + the
+  (one `disallowed-methods` entry, purity mechanism below) plus the
+  annotation sweep — 14 sites: 13 per-site `#[allow]`s on existing
+  production spawns + one module-scoped allow on `doctorcmd.rs`'s test mod
+  (details in the mechanism section; annotation-only edits across
+  `service.rs`/`importcmd.rs`/`doctorcmd.rs`/`bisectcmd.rs`/
+  `annotatecmd.rs`, no logic changes). 6 core files + the
   annotation sweep, well over budget — `/pchunker` should split the daemon
   delta (security-sensitive, its own task + heaviest review) from
   replaycmd+coverage+main.rs, and the clippy entry + annotation sweep from
@@ -393,15 +398,20 @@ question.
     kept here so nobody resurrects it:** it claimed existing blanket
     `#![allow(clippy::disallowed_methods)]` attributes (written for the
     fsguard FIFO-read lint) would silently exempt production spawn sites.
-    Measured round 5: those blanket allows exist ONLY in test code — all
-    20 `cli/tests/*.rs` files (file-level) and the `#[cfg(test)] mod
-    tests` blocks in src files (module-scoped, e.g. `daemon.rs:2870`).
-    ZERO of the 13 production spawn sites sits under any existing allow —
-    so the entry delivers a complete per-site census over exactly the
-    production surface. Test code IS silently exempted by those
-    pre-existing attributes — disclosed and acceptable: test spawns (123
-    measured in `cli/tests`) are out of scope by design, the same
-    exclusion any alternative mechanism drew. The standalone-script
+    Measured rounds 5–6: those blanket allows exist ONLY in test code —
+    all 20 `cli/tests/*.rs` files (file-level) and MOST BUT NOT ALL
+    `#[cfg(test)] mod tests` blocks in src files (module-scoped, e.g.
+    `daemon.rs:2870`, `service.rs:695`; **`doctorcmd.rs`'s test mod at
+    `:943` carries NO allow and holds a `Command::new` at `:1106` — that
+    mod needs a module-scoped allow added as part of this sweep, making
+    the sweep 14 annotation sites, not 13**; re-verify which src test mods
+    carry allows at task time, this inventory drifts). ZERO of the 13
+    production spawn sites sits under any existing allow — so the entry
+    delivers a complete per-site census over exactly the production
+    surface. Test spawns are exempted (mostly by pre-existing attributes,
+    plus the one added above) — disclosed and acceptable: test code (123
+    sites in `cli/tests` + a handful in src test mods) is out of scope by
+    design, the same exclusion any alternative mechanism drew. The standalone-script
     alternative (mirroring `scripts/check-write-opens.sh`) was dropped:
     its precedent needed ~100 lines of cfg-classifying awk that took 7
     gate rounds to converge and still carries a disclosed residual — the
@@ -428,10 +438,16 @@ question.
   the recorded probe-hygiene scar); daemon appending `stale` concurrently
   with a CLI `attest verify` appending `verdict` produces no torn line in
   `attest.jsonl` (the shared attest-lock test, global constraints + Phase
-  3); clippy reds on an unannotated `Command::new` added to `daemon.rs`
-  production code (plant-probe: add one, confirm `cargo clippy
-  --all-targets -D warnings` fails on it, remove it — proves the census
-  catches a direct call; transitive reach is disclosed-unproven, above).
+  3); the purity census probed in BOTH directions (one-directional probes
+  are this repo's recorded vacuous-verify class): first, `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings` is CLEAN at
+  HEAD after the annotation sweep (the baseline-green half — proves the
+  sweep found every site, including the `doctorcmd.rs` test-mod one);
+  then plant one unannotated `std::process::Command::new` in `daemon.rs`
+  production code (before its `#[cfg(test)]` at the tail), confirm the
+  same command fails NAMING the planted line, remove it (proves the
+  census catches a direct call; transitive reach is disclosed-unproven,
+  above).
 - Verification: `cargo test --test attest_verify` + the mutation probes in
   the task file run live; **also run at least one real repo test binary
   (`cli/tests/golden.rs` or `cli/tests/integration.rs`) inside a `git

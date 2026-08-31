@@ -213,11 +213,13 @@ returns as its own plan; nothing here depends on them.
 
 - `attest.jsonl` is append-only; corrections are appended events. No rewrite class
   exists for it in v1 (adding one requires a decision-register entry).
-- The daemon never executes repo-authored commands. Enforced by construction: no
-  attest execution code path lives in the daemon binary path. **See "Review
-  findings" above — this wording and its enforcement mechanism both needed
-  correction during plan review; ratify the replacement there before
-  treating this line as binding.**
+- The daemon never executes repo-authored commands. Enforced as a census of
+  direct spawn call sites (plan Phase 4's clippy `disallowed-methods`
+  mechanism — `daemon.rs` production code carries no exemption, so a
+  direct spawn added there reds the build), explicitly NOT a transitivity
+  proof and NOT "no attest code in the daemon binary" (everything is one
+  binary; the earlier by-construction wording was false and is retired —
+  correction history in Review findings item 3).
 - An author's own run can never produce CONFIRMED — `evidence` and `verdict` are
   disjoint event kinds written by disjoint code paths.
 - `recipe-invalid` never blocks a gate by itself; it queues a retry and surfaces in
