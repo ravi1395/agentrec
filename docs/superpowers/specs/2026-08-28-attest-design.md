@@ -73,11 +73,16 @@ Also rejected, from this design round:
 1. attest is an **agentrec subsystem** (`agentrec attest …`), not claimd v2, not a
    third tool. One product story: record + prove.
 2. **Tests are the claim language.** Claims are derived from framework-native test
-   identities via adapters emitting structured verdicts (`cargo test
-   --message-format=json` first). No claim DSL exists. **See "Review
-   findings" below — this decision's stated mechanism was measured false
-   during plan review and needs ratification of a replacement, not a
-   unilateral rewrite.**
+   identities via adapters emitting structured verdicts. No claim DSL exists.
+   *Mechanism amended by founder ratification 2026-08-31 (the original
+   `--message-format=json` channel was measured to carry no per-test data
+   on stable — Review findings item 1):* discovery via per-target
+   `--list`; single-test verify via a staged pipeline (build → `--list`
+   membership precheck → target-scoped run, verdict from the summary
+   line's counts, never bare exit code); bulk capture via ONE
+   adapter-owned parser of libtest's per-test output lines,
+   fixture-versioned, failing closed to a `parse_failed` evidence flag —
+   one parser per adapter, never a per-claim recipe (lesson 1 holds).
 3. **Evidence capture is passive**, joined to agentrec turn records: every captured
    test run references the `turn_id` it happened inside, chaining prompt → diff →
    test run → verdict.
@@ -104,55 +109,48 @@ Also rejected, from this design round:
 9. **PROTOCOL.md is untouched in v1.** Attest wire formats are documented in a new
    `ATTEST-FORMAT.md` (draft status, explicitly unstable) until the subsystem earns
    a protocol section. The frozen PROTOCOL 1.0 gains nothing until then.
+10. **(added 2026-08-31) Renaming a test carries its claim history forward
+    under a stable id.** `ClaimId` is a stable surrogate minted at first
+    derive (machine-scoped ULID, the turn-id scheme), NOT an identity
+    hash — an identity-derived key cannot survive a rename, since test
+    identity includes the fn name. The fold maintains the
+    identity→claim-id mapping; rename detection is adapter-side
+    (body-hash match within one derive run), fold applies the
+    already-resolved result. No hand-authored rename annotations (lesson
+    1 holds).
 
-## Review findings (2026-08-28, plan-review rounds — need founder ratification)
+## Review findings (2026-08-28 rounds; dispositions updated 2026-08-31)
 
-Four rounds of adversarial plan review (`docs/superpowers/plans/
+Five rounds of adversarial plan review (`docs/superpowers/plans/
 2026-08-28-attest-plan.md`) measured real gaps against the decisions above.
-These are reported, not silently applied — an agent narrowing its own
+Each was reported rather than silently applied — an agent narrowing its own
 founder-confirmed commitment unprompted is this repo's own recorded
-"indistinguishable from dodging" line. Ratify or redirect each before phase
-2 dispatch.
+"indistinguishable from dodging" line. Dispositions:
 
-1. **Decision 2's mechanism is measured false.** `cargo test
-   --message-format=json` carries only compiler messages on this repo's
-   stable toolchain (`rustc 1.97.1`, no pin), never per-test results —
-   verified directly against this repo's own test binaries, twice, in
-   independent review rounds. What stable DOES give, measured: `--list`
-   for discovery; libtest's one stable summary line per target-scoped run
-   for result interpretation (`--exact` must be scoped by `--test <name>` /
-   `--lib` / `--bin`, or a colliding test name across targets — a REAL case
-   here, see decision 4's note below — cross-attributes). Candidate
-   replacement mechanism, NOT yet ratified: `--list` + target-scoped
-   summary-line parsing, one adapter-owned parser (not a per-claim recipe,
-   so it doesn't reopen lesson 1). Full record of what was tried and ruled
-   out: plan phase 1, item 2b.
+1. **Decision 2's original mechanism measured false → RATIFIED replacement
+   2026-08-31.** The replacement channel is now written INTO decision 2
+   above (the single copy — earlier review rounds kept a full duplicate
+   here and the duplicate went stale, so this entry is deliberately just a
+   pointer). Measurement record: plan Phase 1, Probe B.
 2. **Decision 4's `claim-false` permanence collides with a measured live
-   flake.** Nothing in the spec or plan currently produces the `flaky`
-   verdict decision 4 itself declares. This repo has a recorded flake
-   (`approve.rs::a_killed_approve_never_leaves_a_phantom_approval`,
-   CLAUDE.md) that a naive single-run verify would mint as a PERMANENT
-   `claim-false`. Constraint, not yet a designed mechanism: `attest verify`
-   must not write `claim-false` from a single run — some retry-and-compare
-   policy is needed before phase 4 is buildable as specced (precedent:
-   `bisectcmd`'s `--flaky-retries`). Phase 4's task pins the policy.
-3. **The daemon-purity invariant below needed its enforcement mechanism
-   corrected, twice.** First: a claimed clippy-lint transitivity guarantee
-   doesn't exist (clippy has no interprocedural analysis — fixture-verified).
-   Second: even the weaker "per-site census" claim doesn't hold as a clippy
-   `disallowed-methods` entry, because 19 files in this repo (test fixtures,
-   `daemon.rs`'s own `#[cfg(test)] mod tests`) already carry a blanket
-   `#![allow(clippy::disallowed_methods)]` for an unrelated lint (the
-   fsguard FIFO-read guard) that would silently exempt every
-   `Command::new` site inside them too, the moment this lint fires on that
-   method. Candidate replacement, matching this repo's own precedent for
-   exactly this shape (`scripts/check-write-opens.sh`, a standalone script
-   with its OWN allowlist file, immune to attribute-based suppression):
-   a dedicated script scanning non-test `cli/src` + `agentrec-core/src` for
-   `Command::new` against an explicit allowlist. Scope, honestly: catches
-   direct calls in production, non-test code only; does not prove
-   non-reachability through another module, and does not cover test code.
-   See plan phase 4 for the mechanism as currently drafted.
+   flake** (a recorded flaky test in this repo — named in plan Phase 4 and
+   CLAUDE.md; a single-run verify would mint it PERMANENT claim-false).
+   Disposition: constraint accepted; `attest verify` never writes
+   `claim-false` from one run; plan Phase 4 owns the retry-and-compare
+   policy and carries a falsifiable flaky-fixture AC. Not restated here.
+3. **The daemon-purity invariant's enforcement mechanism was corrected
+   twice, and one correction rested on a false premise since retracted.**
+   Round 2 claimed clippy proves transitivity — false, clippy has no
+   interprocedural analysis (fixture-verified). Round 4 then claimed
+   clippy can't even deliver a per-site census because existing blanket
+   `#![allow]`s would suppress it — measured false in round 5: those
+   allows exist only in TEST code; zero production spawn sites sit under
+   one. Settled mechanism (plan Phase 4, the single copy): clippy
+   `disallowed-methods` entry + per-site allows, a census of direct
+   production call sites, explicitly NOT a transitivity proof.
+4. **Rename continuity → decision 10 above (added 2026-08-31).** The
+   data-model consequence (stable surrogate `ClaimId`, not an identity
+   hash) is in the decision text; mechanism in plan Phase 2/3.
 
 ## Architecture
 
@@ -169,7 +167,7 @@ One new store file plus reuse of everything agentrec already has:
 Event kinds over `attest.jsonl` (state = deterministic fold, exactly like claimd's
 surviving core, reimplemented in Rust):
 
-- `derive`   — a test was discovered; claim created/updated (id = stable test identity hash)
+- `derive`   — a test was discovered; claim created/updated (id = stable surrogate, decision 10)
 - `evidence` — a captured run: structured result, output blob hash, HEAD, dirty bit, turn_id
 - `verdict`  — an independent replay result: confirmed | claim-false | recipe-invalid | flaky-observation
 - `stale`    — daemon-written scope hit: which claim, which file write triggered it
@@ -185,9 +183,8 @@ Components (all in the existing two-crate workspace):
 - `agentrec-core/src/attest/` — events, fold, claim identity, verdict types. Pure;
   no process spawning in core.
 - `cli/src/attest/adapter_cargo.rs` — discovery, result interpretation, and
-  per-test replay invocation per the channel ratified from "Review findings"
-  above. The adapter trait is the seam later adapters (node:test, jest,
-  pytest) implement.
+  per-test replay invocation per decision 2's ratified channel. The adapter
+  trait is the seam later adapters (node:test, jest, pytest) implement.
 - `cli/src/attest/capture.rs` — the passive tap: `agentrec attest run -- <cmd>`
   wrapper, plus recognition of test invocations arriving through the existing hook
   path; writes `evidence` events joined to the open turn.

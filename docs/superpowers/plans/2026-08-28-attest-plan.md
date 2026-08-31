@@ -3,10 +3,11 @@
 Status: draft, not chunked, not dispatched. Spec:
 `docs/superpowers/specs/2026-08-28-attest-design.md` — read it first; its "Lessons
 from claimd" section is the rejected-approaches register and is binding. Its
-"Review findings" section (added during this plan's review) reports measured
-gaps against founder-confirmed decisions 2, 4, and the daemon-purity
-invariant — those three are NOT yet ratified; this plan proceeds on the
-candidate replacements stated there, flagged wherever they matter below.
+"Review findings" section records what five review rounds measured; the two
+open founder decisions it surfaced were both RULED 2026-08-31 (decision 2's
+replacement channel ratified; rename continuity = decision 10, stable
+surrogate ClaimId). Remaining founder gate: Phase 1's coverage-granularity
+ruling (exit criterion 3/7), which needs the spike's numbers first.
 
 **Editorial note (round 5): this plan was previously ~490 lines and had
 drifted into re-deriving the same facts in 3–4 places per topic, which is
@@ -29,14 +30,17 @@ as evidence-first cards. New: `agentrec-core/src/attest/` (pure events+fold),
 
 ## Decisions log (founder-confirmed; executors may not re-litigate)
 
-Numbered 1–9 in the spec's "Founder decisions" section. The ones executors hit
-daily: (2) no claim DSL — adapters generate recipes, mechanism under review,
-see spec's "Review findings"; (4) verdicts are claim-false / recipe-invalid /
-flaky, only claim-false is permanent — `flaky`'s producer is not yet designed,
-see Phase 4; (5) coverage scope, over-stale when unsure; (6) daemon never
-executes tests — enforcement mechanism under review, see spec's "Review
-findings"; (9) PROTOCOL.md untouched — formats go in `ATTEST-FORMAT.md`
-marked unstable.
+Numbered 1–10 in the spec's "Founder decisions" section. The ones executors
+hit daily: (2) no claim DSL — adapters generate recipes; channel ratified
+2026-08-31, canonical statement in the spec's decision 2, staged pipeline in
+Phase 1 Probe B; (4) verdicts are claim-false / recipe-invalid / flaky, only
+claim-false is permanent — `flaky`'s producer lands in Phase 4 (retry
+policy, falsifiable AC); (5) coverage scope, over-stale when unsure; (6)
+daemon never executes tests — enforcement is Phase 4's clippy census
+(disclosed: direct-call census, not a transitivity proof); (9) PROTOCOL.md
+untouched — formats go in `ATTEST-FORMAT.md` marked unstable; (10) rename
+carries claim history under a stable surrogate `ClaimId` (ruled 2026-08-31,
+mechanism in Phases 2/3).
 
 ## Infeasible / rejected (with the code reason)
 
@@ -131,44 +135,62 @@ question.
     `#[ignore]`d test both exit `0`; a genuine failure and a build that
     doesn't compile both exit `101`. A mechanism that treats exit code as
     the verdict will CONFIRM a deleted test or PERMANENTLY `claim-false` a
-    broken build (spec decision 4 makes `claim-false` permanent). The
-    summary line's counts (not the exit code) are the thing to parse.
-  - This is the SAME channel decision for Phase 4's single-test `attest
-    verify` and Phase 3's bulk `attest run -- cargo test` (many tests, one
-    invocation) — the spike should rule on both from one investigation, not
-    two. Phase 3's case additionally needs to decide between: (i) the same
-    target-scoped summary-line parser, extended to per-test `test <name>
-    ... ok|FAILED` lines within one run — one adapter-owned parser, not a
-    per-claim recipe (lesson 1), fails closed (unparseable batch → evidence
-    kept with a `parse_failed` flag, raw blob retained, never silently
-    dropped); (ii) `cargo-nextest` as a second external tool dependency; (iii)
-    N individual scoped-`--exact` invocations, reusing the same parser as
-    Phase 4, at the cost of one process-spawn per test — measure against
-    Probe A's suite-scale numbers before ruling it out.
+    broken build (spec decision 4 makes `claim-false` permanent).
+    **The single-test verify pipeline is therefore STAGED — this is the one
+    canonical statement of it; Phase 4 points here, doesn't restate:**
+    (1) build the target (`cargo build --tests` scoped) — build failure →
+    `recipe-invalid` (cause: build), nothing runs; (2) `--list` membership
+    precheck on the built binary — name absent → `recipe-invalid` (cause:
+    missing), nothing runs; (3) target-scoped `--exact` run, parse the ONE
+    summary line's COUNTS — `1 passed` → confirmed-candidate (see Phase
+    4's flaky-retry policy before any verdict is final), `1 failed` →
+    claim-false-candidate, `1 ignored` → `recipe-invalid` (cause: ignored,
+    never confirmed-by-skip); no summary line at all (SIGABRT,
+    `process::exit` mid-harness) → `recipe-invalid` (cause: harness). Each
+    `recipe-invalid` carries its distinct cause so the states stay
+    distinguishable downstream.
+  - This is the SAME channel for Phase 4's single-test `attest verify` and
+    Phase 3's bulk `attest run -- cargo test` (many tests, one invocation).
+    **Bulk mechanism RATIFIED by the founder 2026-08-31 (option (i) of the
+    three the review surfaced): the same target-scoped summary parser,
+    extended to per-test `test <name> ... ok|FAILED` lines within one run —
+    one adapter-owned parser, not a per-claim recipe (lesson 1), versioned
+    against a fixture of real libtest output, fails closed (unparseable
+    batch → evidence kept with a `parse_failed` flag, raw blob retained,
+    never silently dropped; the bulk path writes EVIDENCE only, never
+    verdicts, so parser drift is bounded to a flagged capture, never a
+    wrong verdict).** Rejected alternatives, for the record: `cargo-nextest`
+    (second external tool dep beside cargo-llvm-cov, own output contract to
+    adjudicate) and N scoped-`--exact` invocations (~1150 spawns per suite
+    run; spike may still measure this as a fallback figure if cheap to do).
+    The spike VALIDATES the ratified parser against real captured libtest
+    output from this repo's own suite — it no longer chooses.
 - Exit criteria (explicit, downstream contract):
   1. A table of wall-time/bytes for Probe A (a) and (b), both MEASURED not
      estimated.
   2. Probe A (d)'s finding as a plain yes/no with evidence.
   3. A WRITTEN ruling on Probe A: per-test vs suite-level coverage fallback
      (spec decision 5 sanctions the fallback).
-  4. A WRITTEN ruling on Probe B: the exact result-interpretation mechanism
-     for both the single-test (verify) and bulk (capture) cases, honoring
-     the measured constraints above. **This ruling, once written, is the
-     candidate replacement for spec decision 2's mechanism — flag it back
-     to the founder for ratification per the spec's "Review findings"
-     section; don't let it stand as a self-ratified decision.**
+  4. Probe B validation evidence: the founder-ratified parser (above) run
+     against a captured fixture of this repo's real libtest output — a
+     whole-target run and a single-`--exact` run, both parsed, per-test
+     results matching the run's own summary-line counts; plus one
+     deliberately corrupted fixture proving the fail-closed path
+     (`parse_failed`, raw blob kept). The channel decision itself is
+     already made (spec decision 2, ratified 2026-08-31) — this item is
+     evidence it holds on real output, not a re-opened ruling.
   5. The chosen coverage map's schema sketch for Phase 4's consumer.
   6. `IMPLEMENTATION.md` §attest section created (`grep -n '^#.*[Aa]ttest'
      IMPLEMENTATION.md` non-empty).
-  7. **Rulings 3 and 4 require founder sign-off before Phase 2 dispatch
-     begins.** No pre-set numeric bar for ruling 3 (no basis before the
+  7. **Ruling 3 (coverage granularity) requires founder sign-off before
+     Phase 2 dispatch begins.** No pre-set numeric bar (no basis before the
      numbers exist) — the founder reads the measured table, not a threshold
      the spike author picks alone.
 - Failure exit (Probe A): if child-process coverage is unattainable for
   integration tests, the ruling documents scope = "unit-test claims only,
   integration claims stale on any src write" — still shippable, honest.
-- Verification: the findings doc has items 1, 2, 5 measured/produced as
-  specified; items 3/4 are the two rulings + recorded founder sign-off;
+- Verification: the findings doc has items 1, 2, 4, 5 measured/produced as
+  specified; item 3 is the coverage ruling + recorded founder sign-off;
   item 6 is the grep above; commit `spike: attest coverage economics +
   adapter output channel on the dogfood corpus`.
 
@@ -192,31 +214,44 @@ question.
     TestIdentity, body_hash: Option<[u8; 32]>, renamed_from:
     Option<TestIdentity> }`, `Evidence`, `Verdict`, `Stale`, `Human`,
     `ManualDeclare` — serde JSONL round-trip.
-  - `fold_claims(&[AttestEvent]) -> BTreeMap<ClaimId, ClaimState>`;
-    `ClaimId = hash(adapter_id, test_identity)`, and `test_identity` MUST
-    include the cargo target/binary component, not just the bare fn name
-    (measured collision, Phase 1 Probe B — `ClaimId` collapsing two
-    different tests into one claim silently cross-attributes their
-    evidence/verdicts). The target name comes from the adapter's own
-    per-target `--list` invocation loop (Phase 3) — no JSON field involved,
-    there isn't one on stable.
+  - **`ClaimId` is a STABLE SURROGATE, not an identity hash** (founder-ruled
+    2026-08-31, resolving the round-5 contradiction: an identity-derived
+    hash cannot survive a rename, since `test_identity` includes the fn
+    name). Minted once at first derive — machine-scoped ULID, same scheme
+    as turn ids — and never changes for the life of the claim.
+    `fold_claims(&[AttestEvent]) -> BTreeMap<ClaimId, ClaimState>` also
+    maintains the `test_identity → ClaimId` mapping internally (latest
+    identity wins per claim; `ClaimState` carries its current
+    `test_identity`).
+  - `test_identity` MUST include the cargo target/binary component, not
+    just the bare fn name (measured collision, Phase 1 Probe B — two
+    identically-named fns in different targets must map to two claims, or
+    their evidence/verdicts silently cross-attribute). The target name
+    comes from the adapter's own per-target `--list` invocation loop
+    (Phase 3) — no JSON field involved, there isn't one on stable.
   - `ClaimState` carries the spec's state machine plus STALE overlay, plus
-    `last_body_hash: Option<[u8; 32]>` and `renamed_from:
-    Option<TestIdentity>` (mirroring the `Derive` event fields above — fold
-    just copies them onto state, no reconciliation logic lives in core).
-- **Decided (founder, this session): renaming a `#[test]` fn carries claim
-  continuity — same `ClaimId`, history preserved — not a fresh DERIVED
-  claim.** `fold_claims` is a DUMB APPLIER of this: if a `Derive` event
-  carries `renamed_from: Some(old_identity)`, look up the claim currently
-  keyed by `old_identity`'s `ClaimId`, re-key it to the new identity's
-  `ClaimId`, carry its history forward. Fold does not detect renames itself
-  — it has no way to represent "which identities this derive invocation did
-  NOT see" from a flat append-only event stream, and shouldn't try. That
-  detection — comparing the new `discover()` set against previously-known
-  identities, computing `body_hash` for anything that vanished-and-appeared
-  in the same run, matching hashes — happens in `attest derive` (Phase 3,
-  `cli`), which has both sets in memory at command time and writes the
-  already-resolved `renamed_from` into the event it emits. Phase 3 owns:
+    `test_identity` (current), `last_body_hash: Option<[u8; 32]>` and
+    `renamed_from: Option<TestIdentity>` (mirroring the `Derive` event
+    fields — fold copies them onto state, no reconciliation logic in core).
+  - Verdict naming, normalized once: the wire event kind is
+    `flaky-observation` (spec §event kinds); the fold state it produces is
+    `FLAKY`; spec decision 4's word "flaky" names that state. One concept,
+    three casings — don't invent a fourth.
+- **Decided (founder, ruled again 2026-08-31): renaming a `#[test]` fn
+  carries claim continuity — the SAME `ClaimId`, history preserved — not a
+  fresh DERIVED claim.** The stable-surrogate id above is what makes this
+  implementable. `fold_claims` is a DUMB APPLIER: a `Derive` event carrying
+  `renamed_from: Some(old_identity)` plus the OLD claim's `claim_id` (the
+  adapter looks it up and writes it into the event) updates that claim's
+  `test_identity` to the new one — same `ClaimId`, same history, identity
+  remapped. Fold does not detect renames itself — it has no way to
+  represent "which identities this derive invocation did NOT see" from a
+  flat append-only event stream, and shouldn't try. That detection —
+  comparing the new `discover()` set against previously-known identities,
+  computing `body_hash` for anything that vanished-and-appeared in the same
+  run, matching hashes — happens in `attest derive` (Phase 3, `cli`), which
+  has both sets in memory at command time and writes the already-resolved
+  `renamed_from` + old `claim_id` into the event it emits. Phase 3 owns:
   locating a test's source (cargo metadata's `src_path` for integration
   targets; a `mod`-tree walk from the crate root for unit tests inside
   `#[cfg(test)] mod tests` — the real shape of `daemon.rs`'s own tests,
@@ -231,9 +266,9 @@ question.
   verdict(recipe-invalid) then verdict(confirmed) ends CONFIRMED (retryable
   proven); author-run evidence alone can never reach CONFIRMED
   (state-machine test); a `Derive` event with `renamed_from: Some(old)`
-  re-keys an existing claim's full history under the new identity without
-  losing prior evidence/verdicts (state-machine test, not exercised
-  end-to-end here — Phase 3's fixture AC does that).
+  continues the existing claim under the SAME `ClaimId` — identity
+  remapped, zero prior evidence/verdicts lost (state-machine test, not
+  exercised end-to-end here — Phase 3's fixture AC does that).
 - Verification: `cargo test -p agentrec-core attest::` green; commit
   `attest: claim events + deterministic fold (core, pure)`.
 
@@ -255,10 +290,13 @@ question.
   transitively as a proc-macro build dependency of `clap_derive`/
   `serde_derive`; this is a genuinely new runtime dependency with real
   `features` needs (parsing + token-stream hashing), not free, and is NOT
-  currently a field `check-versions.sh` tracks). 8 files, well over budget
-  — `/pchunker` should split the fixture crate + `attest.rs` + `Cargo.toml`
-  from `adapter_cargo.rs` + `capture.rs` + its test, and `statuscmd.rs`
-  from both.
+  currently a field `check-versions.sh` tracks), `cli/src/attest/lock.rs`
+  (the `attest.jsonl` append lock — global constraints assign the
+  first-writer wiring HERE: adapt `loglock.rs`/`memlock.rs`'s API shape,
+  daemon-takes-the-lock delta included so Phase 4's daemon writer finds it
+  ready). 9 files, well over budget — `/pchunker` should split the fixture
+  crate + `attest.rs` + `Cargo.toml` from `adapter_cargo.rs` +
+  `capture.rs` + its test, and `statuscmd.rs` + `lock.rs` from both.
 - **`attest status` is built here, minimally.** Referenced by this phase's
   own AC, the E2E tail, and spec's `recipe-invalid`-surfaces-in-status
   clause — no other phase owns it. Scope: read `attest.jsonl`, fold, render
@@ -267,9 +305,12 @@ question.
   is a Phase 4/5 extension of this same file, not a new one.
 - Contract (produces): adapter trait `discover() -> Vec<TestIdentity>`,
   `run(filter) -> Vec<StructuredResult>` — both types owned by
-  `agentrec-core::attest::types` (Phase 2); channel per Phase 1's ruling
-  (item 4), scoped per-target as that ruling requires. Capture writes
-  `evidence` events with `turn_id` = open turn, blob = output into CAS.
+  `agentrec-core::attest::types` (Phase 2); channel = the founder-ratified
+  parser (spec decision 2 / Phase 1 Probe B — target-scoped, fails closed),
+  validated by Phase 1 item 4's fixture evidence before this phase builds
+  on it. Capture writes `evidence` events with `turn_id` = open turn, blob
+  = output into CAS; ALL `attest.jsonl` appends in this phase go through
+  `lock.rs` (files list above).
 - **Capture has two paths, both in scope (spec's capture-component bullet
   defines both):** (1) the explicit `agentrec attest run -- <cmd>` wrapper;
   (2) recognition of test invocations arriving through the existing hook
@@ -307,19 +348,22 @@ question.
   daemon delta (stale-marking only) in `cli/src/daemon.rs` — not
   `agentrec-core/src/daemon.rs`, which does not exist; the daemon lives in
   the `cli` crate (`cli/src/main.rs:9: mod daemon;`) — `cli/src/main.rs`
-  (register `attest verify`), `cli/tests/attest_verify.rs`, a new
-  standalone script (`scripts/check-attest-exec-boundary.sh` or similar,
-  see purity mechanism below) + its allowlist file, wired into the CI lint
-  job beside `scripts/check-write-opens.sh`. 7 files, well over budget —
-  `/pchunker` should split the daemon delta (security-sensitive, its own
-  task + heaviest review) from replaycmd+coverage+main.rs, and the new
-  script from both.
+  (register `attest verify`), `cli/tests/attest_verify.rs`, `clippy.toml`
+  (one `disallowed-methods` entry, purity mechanism below) plus per-site
+  `#[allow]` annotations on the ~13 existing production spawn sites
+  (annotation-only edits across `service.rs`/`importcmd.rs`/`doctorcmd.rs`/
+  `bisectcmd.rs`/`annotatecmd.rs`, no logic changes). 6 core files + the
+  annotation sweep, well over budget — `/pchunker` should split the daemon
+  delta (security-sensitive, its own task + heaviest review) from
+  replaycmd+coverage+main.rs, and the clippy entry + annotation sweep from
+  both.
 - Contract: `attest verify [--all-stale|<id>]` extracts pinned HEAD via
-  `git archive`, scrubbed env, adapter-runs the single test via Phase 1's
-  ruling (item 4) — target-scoped, summary-line-based, NOT bare exit code
-  — appends verdict per spec taxonomy; coverage maps per Phase 1's ruling
-  (item 3); daemon consults maps on write events it already receives and
-  appends `stale`.
+  `git archive`, scrubbed env, adapter-runs the single test via Phase 1
+  Probe B's staged verify pipeline (build → `--list` precheck →
+  target-scoped run + summary counts; the canonical statement lives there,
+  not restated here) — appends verdict per spec taxonomy; coverage maps
+  per Phase 1's ruling (item 3); daemon consults maps on write events it
+  already receives and appends `stale` (through Phase 3's `lock.rs`).
 - **`flaky` verdict producer — currently designed nowhere, must land
   here.** Spec decision 4 declares `flaky` and makes `claim-false`
   permanent; this repo has a recorded live flake
@@ -331,58 +375,63 @@ question.
   `flaky-observation` instead. This task pins the exact policy (retry
   count, what counts as "disagree"); not designed further here.
 - **Purity check for "the daemon never executes repo-authored commands"
-  — mechanism corrected twice during review, use the CURRENT one, don't
-  resurrect either predecessor:**
-  1. A same-file `grep`/`awk` scan (round 1's draft) is blind to a spawn
-     reachable through a sibling module — rejected.
-  2. A `clippy.toml disallowed-methods` entry for `Command::new` (round 2's
-     draft) doesn't deliver even a per-site census in this repo: 19 files
-     (test fixtures, plus `daemon.rs`'s own `#[cfg(test)] mod tests` at
-     `daemon.rs:2866`) already carry a blanket `#![allow(clippy::
-     disallowed_methods)]` for an unrelated lint (the fsguard FIFO-read
-     guard) — that attribute silently exempts everything in scope
-     regardless of which config entry fires, so most of the codebase's
-     `Command::new` sites (measured: 123 in `cli/tests`, plus the 4 in
-     `daemon.rs`'s own test module) get zero review the moment this entry
-     lands — rejected.
-  3. **Current mechanism: a standalone script, this repo's own precedent
-     for exactly this shape** (`scripts/check-write-opens.sh` — "scans
-     production source for write-open call sites and fails on any not in
-     `scripts/write-open-allowlist.txt`"). A new script scans non-test
-     `cli/src` + `agentrec-core/src` for `Command::new` call sites against
-     its OWN allowlist file (immune to clippy's attribute-based
-     suppression, since it isn't clippy). Wire into the CI lint job beside
-     `check-write-opens.sh`. **Scope this claim honestly, the way the
-     write-open script's own header does: catches an unannotated DIRECT
-     `Command::new` in non-test production code only. It does NOT prove no
-     call is reachable from the daemon's functions through another
-     module's allowlisted spawn (e.g. this same phase's `coverage.rs`,
-     which legitimately spawns `cargo-llvm-cov`) — that needs real
-     call-graph analysis, out of v1 scope, not claimed by this mechanism.
-     It does NOT cover test code (123 measured `Command::new` sites in
-     `cli/tests`, all legitimate, out of scope by design — same as the
-     write-open script's own test exclusion).** Budget the annotation pass
-     for the real production count — re-enumerate exactly at task time
-     (measured this round: `daemon.rs` 4 sites all inside its own
-     `#[cfg(test)]` block so zero production; the non-test production
-     count across `cli/src`+`agentrec-core/src` needs a fresh count scoped
-     to non-test code specifically, not the raw 19).
+  — mechanism settled after two review corrections; this is the CANONICAL
+  statement, and the correction history matters because a round-4 rejection
+  of this mechanism rested on a false premise (measured false in round 5):**
+  - **Mechanism: `clippy.toml` `disallowed-methods` entry for
+    `std::process::Command::new`, per-site `#[allow(clippy::
+    disallowed_methods)]` on each legitimate spawn — the fsguard precedent
+    (`clippy.toml:42`, exemption style documented at `clippy.toml:38`).**
+    The 13 existing production spawn sites (measured round 5, per-file:
+    `service.rs` 6, `importcmd.rs` 4, `doctorcmd.rs` 1, `bisectcmd.rs` 1,
+    `annotatecmd.rs` 1, `daemon.rs` 0 — re-enumerate at task time, counts
+    drift) each get a per-site allow + one-line justification. New attest
+    spawn sites (`adapter_cargo.rs`, `replaycmd.rs`, `coverage.rs`) get
+    the same. `daemon.rs` production code gets NONE — a direct spawn added
+    there reds the build.
+  - **Why the round-4 "clippy can't even census" rejection was wrong,
+    kept here so nobody resurrects it:** it claimed existing blanket
+    `#![allow(clippy::disallowed_methods)]` attributes (written for the
+    fsguard FIFO-read lint) would silently exempt production spawn sites.
+    Measured round 5: those blanket allows exist ONLY in test code — all
+    20 `cli/tests/*.rs` files (file-level) and the `#[cfg(test)] mod
+    tests` blocks in src files (module-scoped, e.g. `daemon.rs:2870`).
+    ZERO of the 13 production spawn sites sits under any existing allow —
+    so the entry delivers a complete per-site census over exactly the
+    production surface. Test code IS silently exempted by those
+    pre-existing attributes — disclosed and acceptable: test spawns (123
+    measured in `cli/tests`) are out of scope by design, the same
+    exclusion any alternative mechanism drew. The standalone-script
+    alternative (mirroring `scripts/check-write-opens.sh`) was dropped:
+    its precedent needed ~100 lines of cfg-classifying awk that took 7
+    gate rounds to converge and still carries a disclosed residual — the
+    repo's own `awk-cannot-lex-rust` lesson — while clippy is
+    compiler-integrated and already wired into CI.
+  - **Honest scope, unchanged through every round: a census of direct
+    call sites, NOT a transitivity proof.** It does not prove no call is
+    reachable from the daemon's functions through another module's
+    allowed spawn (this phase's own `coverage.rs`, spawning
+    cargo-llvm-cov, is exactly that shape). Real call-graph analysis is
+    out of v1 scope and not claimed.
 - ACs: mutation probe — break the tested fn, verify → claim-false; delete
-  the test, verify → recipe-invalid (via the `--list` membership check,
-  not exit code — a deleted test and a build failure must NOT both resolve
-  the same way; the AC needs a companion assertion that the build itself
-  was green, to actually discriminate the two); restore + verify →
-  confirmed (retry proven end-to-end); flaky-test fixture (a test that
-  passes/fails nondeterministically) → `flaky-observation`, never
-  `claim-false`, per the retry policy above; write to a covered file →
-  daemon appends stale for exactly the mapped claims (and over-stale for
-  unmapped-but-suspect per Phase 1's ruling); build with a stale binary
-  hazard guarded (`cargo build` before probe — the recorded probe-hygiene
-  scar); daemon appending `stale` concurrently with a CLI `attest verify`
-  appending `verdict` produces no torn line in `attest.jsonl` (the
-  adapted-lock append test, global constraints); the new script reds if an
-  unannotated `Command::new` is added to non-test `cli/src`/`agentrec-core/
-  src` (plant-probe: add one, confirm the script fails, remove it).
+  the test (build stays green), verify → `recipe-invalid` with cause
+  `missing`, AND the test asserts the cause field is `missing` not
+  `build` — Phase 1's staged pipeline is what discriminates a deleted test
+  from a broken build, and this AC proves both stages fire distinctly (a
+  second probe breaks the build instead and asserts cause `build`);
+  restore + verify → confirmed (retry proven end-to-end); flaky-test
+  fixture (a test that passes/fails nondeterministically) →
+  `flaky-observation`, never `claim-false`, per the retry policy above;
+  write to a covered file → daemon appends stale for exactly the mapped
+  claims (and over-stale for unmapped-but-suspect per Phase 1's ruling);
+  build with a stale binary hazard guarded (`cargo build` before probe —
+  the recorded probe-hygiene scar); daemon appending `stale` concurrently
+  with a CLI `attest verify` appending `verdict` produces no torn line in
+  `attest.jsonl` (the shared attest-lock test, global constraints + Phase
+  3); clippy reds on an unannotated `Command::new` added to `daemon.rs`
+  production code (plant-probe: add one, confirm `cargo clippy
+  --all-targets -D warnings` fails on it, remove it — proves the census
+  catches a direct call; transitive reach is disclosed-unproven, above).
 - Verification: `cargo test --test attest_verify` + the mutation probes in
   the task file run live; **also run at least one real repo test binary
   (`cli/tests/golden.rs` or `cli/tests/integration.rs`) inside a `git
@@ -406,10 +455,10 @@ question.
   block); `attest report --range` emits md+json bundle with provenance
   chains.
 - ACs: golden for the report on a fixture log; gate exit-code table test
-  (all four verdict kinds × blocking/fyi — `flaky-observation` only
-  produces once Phase 4's retry policy lands, don't stub it here); review
-  flow test via scripted stdin — n-with-note appends the note verbatim;
-  fyi items never appear in review or gate output.
+  (all four verdict kinds × blocking/fyi, `flaky-observation` events
+  supplied by Phase 4's producer — landed by merge order before this
+  phase); review flow test via scripted stdin — n-with-note appends the
+  note verbatim; fyi items never appear in review or gate output.
 - Verification: `cargo test --test attest_gate` + goldens; commit
   `attest: review cards, advisory gate, attestation report`.
 
@@ -427,8 +476,10 @@ heaviest gate. Phase 5 is UX polish on proven substrate.
 1. On agentrec itself: `attest derive` → claims ≈ test count.
 2. Real session: implement a small change with Claude Code, watch evidence attach
    to the session's turns via `attest status`.
-3. Break a function, `attest verify --all-stale` → exactly the mapped claims go
-   claim-false; fix; re-verify → confirmed.
+3. Break a function AND COMMIT the break (replay extracts pinned HEAD via
+   `git archive` — an uncommitted break is invisible to it and the step
+   silently confirms), `attest verify --all-stale` → exactly the mapped
+   claims go claim-false; revert the commit; re-verify → confirmed.
 4. `attest report --range main..HEAD` → bundle names the prompt that produced the
    change (provenance chain end-to-end).
 5. One manual-declare blocking item; `attest gate` red; `attest review` y; gate
