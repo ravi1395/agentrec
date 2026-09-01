@@ -521,3 +521,43 @@ its complete test set — no "pending" rows remain.
 ## 9. Cross-cutting test strategy
 
 Unit tests live beside code in `agentrec-core` (engine state machine exhaustively table-tested: every boundary-source × grade × op combination). Integration tests drive the real binary against tempdir fixtures — scripted mutation bursts, synthetic signal files, planted secrets, kill -9 harness. The undo torture harness (D36) is the adversarial tier above integration: randomized interleavings, nightly, public, launch-gating. The protocol conformance fixture suite (N1) doubles as the regression net for every consumer. Perf and soak checks run nightly in CI. Every AC in this document maps to at least one automated test except B4/B8 and H++ (nightly) and launch items (WS7), which are checklist-verified.
+
+## §attest — acceptance criteria
+
+Acceptance criteria for the `attest` subsystem (spec:
+`docs/superpowers/specs/2026-08-28-attest-design.md`; plan:
+`docs/superpowers/plans/2026-08-28-attest-plan.md`). ACs are appended here **per
+phase, before that phase's code lands** (house rule), each numbered
+`AC-ATTEST-P<phase>-<n>` and each mapped to at least one automated test or, where
+no runnable check exists, marked manual with the reason. Formats introduced by
+this subsystem live in `ATTEST-FORMAT.md` marked unstable — `PROTOCOL.md` is
+untouched (spec decision 9).
+
+### Phase 1 — spike (exit criteria 1–7)
+
+Evidence: `docs/verify/attest-coverage-spike.md` (Probe A) and
+`docs/verify/attest-output-channel-spike.md` (Probe B). Suite baseline at the
+branch fork, uninstrumented, `cargo test --workspace -- --test-threads=3`:
+**1035 passed / 0 failed / 4 ignored, 207.84 s**.
+
+**AC-ATTEST-P1-1.** Wall-time/bytes table for Probe A (a) suite-level and (b)
+per-test, both measured, extrapolations labeled. — **MET**: (a) measured;
+(b) 50-test sample measured, full-suite projection labeled EXTRAPOLATION
+(Probe A §2–§4).
+**AC-ATTEST-P1-2.** Probe A (d) answered as a plain yes/no with pasted evidence:
+does a spawned `agentrec` child's `cli/src` execution appear in the spawning
+test's map? — **MET**: YES for children exiting normally, NO for children killed
+by SIGKILL (Probe A §5).
+**AC-ATTEST-P1-3.** Written ruling on per-test vs suite-level coverage. —
+**PENDING-FOUNDER**: recommendation written (per-test, file granularity, declared
+under-scope rule for SIGKILLed children — Probe A §7); the founder rules.
+**AC-ATTEST-P1-4.** Probe B parser validated against real captured libtest
+output, including a corrupted-fixture fail-closed proof. — **OWNED BY PROBE B**;
+not claimed by the Probe A round. See the Probe B doc for its status.
+**AC-ATTEST-P1-5.** Schema sketch of the chosen coverage map for Phase 4's
+consumer. — **MET** (Probe A §6): per-test identity → covered file set, file
+granularity, with a child-killed scope flag.
+**AC-ATTEST-P1-6.** This §attest section exists
+(`grep -n '^#.*[Aa]ttest' IMPLEMENTATION.md` non-empty). — **MET**.
+**AC-ATTEST-P1-7.** Founder sign-off on ruling 3 recorded before Phase 2
+dispatch begins. — **PENDING-FOUNDER**.
