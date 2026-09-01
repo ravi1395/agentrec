@@ -34,8 +34,9 @@ carries only current state, what's next, and standing debts.
   `cargo llvm-cov` fails on Homebrew `rustc 1.97.1` (no `llvm-profdata` in the sysroot) —
   export `LLVM_COV`/`LLVM_PROFDATA` from the rustup component; the plan names
   `cli/tests/bisect.rs` as a spawn site but that file lives on `feat/phase-3-0`, not `main`.
-  **Exit criterion 7 (coverage granularity ruling) is PENDING-FOUNDER — Phase 2 dispatch
-  waits on it.** claimd: `.claims/` is untracked on `main` since `23a2e0d`; the 273-claim log
+  **Exit criterion 7 RULED 2026-09-01: recommendation adopted (per-test, file granularity;
+  binary-spawning tests staled on `cli/src/**` writes until Phase 4 detects both channels).
+  Phase 2 dispatched.** claimd: `.claims/` is untracked on `main` since `23a2e0d`; the 273-claim log
   lives only on `feat/phase-3-0`; three new claims here are local-only, and claimd's coverage
   lint does not count `manual` claims toward file coverage.
 - **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),

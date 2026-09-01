@@ -444,6 +444,11 @@ granularity, with the raw `.profdata` discarded after projection.
 
 ## 7. Exit criterion 3 — RULING RECOMMENDATION (awaiting founder sign-off)
 
+> **RULED 2026-09-01 (founder):** recommendation adopted as written — per-test, file
+> granularity, killed/incomplete-child tests staled on `cli/src/**` writes; until Phase 4
+> can detect both under-attribution channels, every binary-spawning test is staled on such
+> writes. Recorded in `IMPLEMENTATION.md` AC-ATTEST-P1-3/-7.
+
 **Recommendation, awaiting founder sign-off — the founder rules, not the spike
 author. Phase 2 dispatch is gated on this sign-off (plan exit criterion 7).**
 

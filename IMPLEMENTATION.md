@@ -554,8 +554,14 @@ does a spawned `agentrec` child's `cli/src` execution appear in the spawning
 test's map? — **MET**: YES for children exiting normally, NO for children killed
 by SIGKILL (Probe A §5).
 **AC-ATTEST-P1-3.** Written ruling on per-test vs suite-level coverage. —
-**PENDING-FOUNDER**: recommendation written (per-test, file granularity, declared
-under-scope rule for SIGKILLed children — Probe A §7); the founder rules.
+**MET (founder-ruled 2026-09-01):** the Probe A §7 recommendation is adopted as
+written — per-test coverage at FILE granularity; any test whose spawned child was
+killed (or whose coverage is otherwise known-incomplete) is staled on any write
+under `cli/src/**`; suite-level remains the sanctioned degraded fallback (spec
+decision 5). Detection of the two under-attribution channels (SIGKILLed child,
+untemplated-child profraw leak) is a Phase 4 contract obligation: until both are
+detected, EVERY binary-spawning test is staled on any `cli/src/**` write (the
+coarser rule Probe A §7 offers as the honest interim).
 **AC-ATTEST-P1-4.** Probe B parser validated against real captured libtest
 output, including a corrupted-fixture fail-closed proof. — **MET**:
 `docs/verify/attest-output-channel-spike.md` § "Result" — the ratified parser
@@ -568,4 +574,6 @@ granularity, with a child-killed scope flag.
 **AC-ATTEST-P1-6.** This §attest section exists
 (`grep -n '^#.*[Aa]ttest' IMPLEMENTATION.md` non-empty). — **MET**.
 **AC-ATTEST-P1-7.** Founder sign-off on ruling 3 recorded before Phase 2
-dispatch begins. — **PENDING-FOUNDER**.
+dispatch begins. — **MET:** founder ruled 2026-09-01 in session, adopting the
+recommendation; the manual claim `clm_2D3J0S3FNM6VSQX367GGN1FTQZ` covering
+Probe A was attested by the founder. Phase 2 dispatched the same day.
