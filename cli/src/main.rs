@@ -2,6 +2,7 @@
 //! (called by agent lifecycle hooks), doctor.
 
 mod approvecmd;
+mod attest;
 mod cmds;
 mod config;
 mod daemon;
@@ -167,6 +168,14 @@ enum Command {
     Hook {
         /// Tool identity, e.g. "claude" or "codex".
         tool: String,
+    },
+    /// Internal: the `attest` subsystem (claims derived from tests). Hidden
+    /// until Phase 5 — the surface is not stable and `ATTEST-FORMAT.md` is
+    /// explicitly outside `PROTOCOL.md` versioning.
+    #[command(hide = true)]
+    Attest {
+        #[command(subcommand)]
+        cmd: AttestCmd,
     },
     /// Remove agentrec from this repo: hooks, service unit, and archive
     /// .agentrec/ to a sibling directory. Nothing is ever deleted.
@@ -401,6 +410,17 @@ enum ImportSource {
     },
 }
 
+#[derive(Subcommand)]
+enum AttestCmd {
+    /// Read-only summary of `.agentrec/attest.jsonl`: claim counts by status,
+    /// the STALE overlay count, and the dev-loop-only (dirty-tree) figure.
+    Status {
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Walk from `start` up through ancestors looking for a directory containing
 /// a `.agentrec/` subdirectory — mirrors git's `.git` discovery. Returns the
 /// nearest such ancestor (closest to `start`, including `start` itself), or
@@ -521,6 +541,9 @@ fn main() {
             let hook_root = resolve_hook_root(explicit_root.as_deref(), &root);
             cmds::hook(&hook_root, &tool)
         }
+        Command::Attest { cmd } => match cmd {
+            AttestCmd::Status { json } => attest::statuscmd::run(&root, json),
+        },
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not
             // a command error (no "agentrec: <message>" line) — just a

@@ -1,5 +1,9 @@
 [workspace]
 members = ["agentrec-core", "cli"]
+# Test fixture crate: a package on purpose (the attest cargo adapter runs
+# `cargo` against it), never a workspace member. It also carries its own
+# empty `[workspace]` table.
+exclude = ["cli/tests/fixtures/attest_sample_crate"]
 resolver = "2"
 
 [workspace.package]

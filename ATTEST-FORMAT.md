@@ -20,8 +20,9 @@ requires a decision-register entry). Corrections are made by appending.
 
 Unlike `log.jsonl`, this file has **multiple routine writers**: CLI commands
 append `evidence` / `verdict` / `human` / `manual-declare`, and the daemon
-appends `stale`. Every writer — the daemon included — will take the append lock
-once Phase 3 lands `cli/src/attest/lock.rs`; that file does not exist yet.
+appends `stale`. Every writer — the daemon included — takes the append lock in
+`cli/src/attest/lock.rs` (`append_attest_locked`, blocking); the daemon's own
+`stale` writer lands in Phase 4 and must use the same call.
 
 Every event carries `kind` (the serde tag) and `ts` (unix milliseconds), and
 names the claim it applies to with `claim_id`.

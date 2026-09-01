@@ -679,3 +679,67 @@ The `STALE` overlay rule is stated once, in `ATTEST-FORMAT.md` § "The `STALE`
 overlay" — it narrows the spec's Architecture line (amended in place there too)
 and is what AC-ATTEST-P2-1, the recipe-invalid/flaky overlay tests and
 AC-ATTEST-P2-16 verify.
+
+### Phase 3A — attest append lock + `attest status` + fixture crate
+
+Scope: `cli/src/attest.rs`, `cli/src/attest/{lock,statuscmd}.rs`,
+`cli/src/main.rs` (hidden `attest status` subcommand), `Cargo.toml`
+(`[workspace] exclude`), `.gitignore`, `cli/tests/fixtures/attest_sample_crate/`,
+`cli/tests/attest_status.rs`.
+
+**AC numbering, reserved:** `AC-ATTEST-P3-1..9` belong to chunk A (this block).
+Chunk B (`adapter_cargo.rs`, `capture.rs`, `attest derive`/`attest run`) appends
+from `AC-ATTEST-P3-10` onward.
+
+**AC-ATTEST-P3-1.** `agentrec attest status` on a freshly `init`ed root (no
+`attest.jsonl` at all) prints every count as zero and exits 0 — a missing log is
+an empty log, never an error. — `attest_status::
+ac_p3_1_status_on_a_fresh_root_is_all_zeros_and_exits_zero`
+**AC-ATTEST-P3-2.** Claim counts are rendered per `ClaimStatus`, one status per
+line in a fixed order, and match the fold of the log — including the `STALE`
+overlay count, which is an overlay and not a status. — `attest_status::
+ac_p3_2_counts_by_status_and_stale_overlay_match_the_folded_log`
+**AC-ATTEST-P3-3.** `--json` emits one object carrying the same numbers as the
+text form; every text figure has a JSON key. — `attest_status::
+ac_p3_3_json_carries_the_same_numbers_as_the_text_form`
+**AC-ATTEST-P3-4.** A malformed line and an unknown-`kind` line are each
+surfaced with their own count and neither is fatal: the surrounding events still
+fold and the exit code is 0. — `attest_status::
+ac_p3_4_malformed_and_unknown_kind_lines_are_surfaced_and_not_fatal`
+**AC-ATTEST-P3-5.** Concurrent appenders through `append_attest_locked`
+(N threads × K events) leave exactly N×K parseable lines and zero unparsed
+lines, and an append WAITS while another writer holds the lock — the Phase 4
+concurrent-append AC, landed early with the lock. — `attest::lock::tests::
+ac_p3_5_concurrent_appenders_leave_no_torn_lines_phase4_concurrent_append_ac`
+and `attest::lock::tests::
+an_append_blocks_while_another_writer_holds_the_lock`. **Rider, measured:** the
+concurrent-append test is NOT discriminating on macOS/APFS — an
+acquire-then-immediately-release neuter leaves it green at 256 KiB, 2 MiB and
+32 MiB batches, because `write_all` to an `O_APPEND` fd did not short-write
+and interleave at any size tried. The blocking test is the discriminating
+half: an isolated neuter (`libc::flock` replaced by `let rc = 0`, lock file
+still opened) reds it alone, 1 failed / 5 passed. Both tests are in-crate unit
+tests, not `cli/tests/attest_status.rs`: `append_attest_locked` lives in the
+`agentrec` binary crate, which has no lib target for an integration test to
+link against.
+**AC-ATTEST-P3-6.** Every `attest.jsonl` writer takes the append lock, the
+daemon included — `loglock.rs`'s daemon exemption is deliberately NOT copied,
+because for `attest.jsonl` the daemon is one routine writer among several
+(it appends `stale`). — **Documented contract**, stated in `cli/src/attest/
+lock.rs`'s module doc; `append_attest_locked` is the single choke point that
+makes it structural. No automated check exists in chunk A because the daemon's
+`stale` writer does not exist until Phase 4; Phase 4 wires it and owns the
+enforcing test. Marked manual for that reason.
+**AC-ATTEST-P3-7.** The fixture crate is excluded from the parent workspace:
+`cargo metadata --no-deps` at the workspace root does not list the
+`attest_sample_crate` package. — `attest_status::
+ac_p3_7_fixture_crate_is_absent_from_the_parent_workspace`
+**AC-ATTEST-P3-8.** `attest status` reports the dev-loop-only figure: the number
+of claims whose LATEST `evidence` event carries `dirty: true`. Counted from the
+event stream in append order, because `ClaimState` carries no dirty field. —
+`attest_status::ac_p3_8_dirty_latest_evidence_is_counted_as_dev_loop_only`
+**AC-ATTEST-P3-9.** The fixture crate exercises BOTH of Phase 2's
+location-resolution shapes — a `tests/integration.rs` integration target and a
+`#[cfg(test)] mod tests` inside `src/lib.rs`, each with ≥2 `#[test]` fns, plus
+one `#[ignore]`d test — and builds standalone. — `attest_status::
+ac_p3_9_fixture_crate_has_both_test_target_shapes`
