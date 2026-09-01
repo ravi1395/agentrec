@@ -14,6 +14,30 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **attest v1 Phase 1 spike — Fable skeptic GATE PASS at `59fbbf7` (2026-09-01, branch
+  `feat/attest`, cut from `main`; round 1 FAILED on one record blocker, narrow re-gate PASSED).**
+  Findings only, no product code: `docs/verify/attest-coverage-spike.md` (Probe A),
+  `docs/verify/attest-output-channel-spike.md` + `docs/fixtures/attest/` (Probe B),
+  `IMPLEMENTATION.md` §attest (AC-ATTEST-P1-1..7). Baseline on this branch 1035/0/4.
+  Measured: suite-level instrumented run +0.5% wall (quietness not re-verified before it);
+  per-test isolated capture extrapolated from a 50-test stratified sample to a ~2–13 min
+  range (median-based lower bound to a mean-based upper bound dominated by one 21.5 s test —
+  never quote either end bare); spawned `agentrec` child coverage IS attributed to the
+  spawning test (measured YES), but a SIGKILLed child writes no profraw and this repo
+  SIGKILLs daemons routinely, plus an untemplated-child `.profraw` leak of UNDETERMINED
+  mechanism — two under-attribution channels, detection mechanism for neither yet (disclosed
+  in the schema sketch). Founder-ratified libtest parser validated on real captured output,
+  fails closed on a corrupted fixture. **Round-1 blocker:** the pasted SIGKILL probe script had
+  a relative binary path its own `cd` broke, so run as pasted both legs reported a profraw —
+  the "reproduced identically" sentence was false of the pasted text (fixed by extracting the
+  block out of the doc and running that). Environment facts worth knowing: stock
+  `cargo llvm-cov` fails on Homebrew `rustc 1.97.1` (no `llvm-profdata` in the sysroot) —
+  export `LLVM_COV`/`LLVM_PROFDATA` from the rustup component; the plan names
+  `cli/tests/bisect.rs` as a spawn site but that file lives on `feat/phase-3-0`, not `main`.
+  **Exit criterion 7 (coverage granularity ruling) is PENDING-FOUNDER — Phase 2 dispatch
+  waits on it.** claimd: `.claims/` is untracked on `main` since `23a2e0d`; the 273-claim log
+  lives only on `feat/phase-3-0`; three new claims here are local-only, and claimd's coverage
+  lint does not count `manual` claims toward file coverage.
 - **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
   pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
   four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal

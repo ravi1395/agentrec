@@ -354,7 +354,7 @@ done
 ```
 
 ```
-SIGTERM: init_rc=0 alive_at_kill=yes wait_rc=0   record_profraw=1 bytes=142360
+SIGTERM: init_rc=0 alive_at_kill=yes wait_rc=0 record_profraw=1 bytes=142360
 SIGKILL: init_rc=0 alive_at_kill=yes wait_rc=137 record_profraw=0 bytes=0
 ```
 
