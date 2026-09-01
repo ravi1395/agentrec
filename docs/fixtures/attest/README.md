@@ -1,10 +1,12 @@
 # Attest Phase 1 Probe B fixtures
 
 Real captured libtest output from this repo's own suite (`cargo 1.97.1`,
-target: `cli/tests/import_claude.rs`, 38 `#[test]` fns, 36 run + 1 `#[ignore]`d
-+ 1 filtered by the exact-match target-scoping). All captured on this branch
-(`feat/attest`), working tree otherwise unmodified — no `.rs`/`Cargo`/
-`IMPLEMENTATION.md` files touched.
+target: `cli/tests/import_claude.rs`, 38 `#[test]` fns in source, 37 compiled
+in this debug build — the 38th is behind `#[cfg(not(debug_assertions))]` at
+`cli/tests/import_claude.rs:1576` — of which 36 passed + 1 `#[ignore]`d,
+0 filtered out, per `whole-target.txt`'s own summary line). All captured on
+this branch (`feat/attest`), working tree otherwise unmodified — no
+`.rs`/`Cargo`/`IMPLEMENTATION.md` files touched.
 
 | File | Command | Exit |
 |---|---|---|

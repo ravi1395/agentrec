@@ -542,8 +542,13 @@ branch fork, uninstrumented, `cargo test --workspace -- --test-threads=3`:
 
 **AC-ATTEST-P1-1.** Wall-time/bytes table for Probe A (a) suite-level and (b)
 per-test, both measured, extrapolations labeled. — **MET**: (a) measured;
-(b) 50-test sample measured, full-suite projection labeled EXTRAPOLATION
-(Probe A §2–§4).
+(b) 50-test sample measured (24 of its 25 integration samples executed; one is
+`#[ignore]`d), full-suite projection labeled EXTRAPOLATION (Probe A §2–§4).
+Riders that must travel with the figures: the instrumented-run overhead of
++0.5% (208.96 s vs 207.84 s) was measured without re-verifying machine
+quietness immediately before the instrumented run; the per-test range of
+~2–13 min is a median-based lower bound and a mean-based upper bound, the
+latter dominated by a single 21.5 s test.
 **AC-ATTEST-P1-2.** Probe A (d) answered as a plain yes/no with pasted evidence:
 does a spawned `agentrec` child's `cli/src` execution appear in the spawning
 test's map? — **MET**: YES for children exiting normally, NO for children killed
@@ -552,8 +557,11 @@ by SIGKILL (Probe A §5).
 **PENDING-FOUNDER**: recommendation written (per-test, file granularity, declared
 under-scope rule for SIGKILLed children — Probe A §7); the founder rules.
 **AC-ATTEST-P1-4.** Probe B parser validated against real captured libtest
-output, including a corrupted-fixture fail-closed proof. — **OWNED BY PROBE B**;
-not claimed by the Probe A round. See the Probe B doc for its status.
+output, including a corrupted-fixture fail-closed proof. — **MET**:
+`docs/verify/attest-output-channel-spike.md` § "Result" — the ratified parser
+resolves all five staged-pipeline states across six fixtures with per-test
+tallies matching each run's own summary line, and fails closed
+(`parse_failed`, raw blob retained) on the deliberately corrupted fixture.
 **AC-ATTEST-P1-5.** Schema sketch of the chosen coverage map for Phase 4's
 consumer. — **MET** (Probe A §6): per-test identity → covered file set, file
 granularity, with a child-killed scope flag.
