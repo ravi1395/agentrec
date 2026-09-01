@@ -8,5 +8,8 @@
 //! Module-root file, not `attest/mod.rs`: this repo uses zero directory
 //! modules (`find agentrec-core/src cli/src -name mod.rs` is empty).
 
+pub mod adapter_cargo;
+pub mod capture;
+pub mod derivecmd;
 pub mod lock;
 pub mod statuscmd;

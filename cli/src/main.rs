@@ -419,6 +419,20 @@ enum AttestCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Discover this crate's tests and append the `derive` events that mint
+    /// (or carry forward, across a rename) their claims. Idempotent.
+    Derive {
+        /// The crate to discover, if not the repo root.
+        #[arg(long = "crate", value_name = "PATH")]
+        crate_path: Option<PathBuf>,
+    },
+    /// Run a test command, showing its output unchanged, and record one
+    /// `evidence` event per known test. Exits with the command's own status.
+    Run {
+        /// The command to run, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 /// Walk from `start` up through ancestors looking for a directory containing
@@ -543,6 +557,16 @@ fn main() {
         }
         Command::Attest { cmd } => match cmd {
             AttestCmd::Status { json } => attest::statuscmd::run(&root, json),
+            AttestCmd::Derive { crate_path } => {
+                attest::derivecmd::run(&root, crate_path.as_deref())
+            }
+            // The wrapped command's own exit status is the user-visible one —
+            // `attest run` must be transparent to a script downstream.
+            AttestCmd::Run { cmd } => match attest::capture::run_wrapped(&root, &cmd) {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(e) => Err(e),
+            },
         },
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not

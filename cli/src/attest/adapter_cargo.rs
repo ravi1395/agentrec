@@ -1,0 +1,1078 @@
+//! The cargo [`Adapter`]: test discovery, the ratified libtest output parser,
+//! the staged single-test verify pipeline, and test-body hashing for rename
+//! detection.
+//!
+//! # The parser is ratified, not invented here
+//!
+//! Spec decision 2 / plan Phase 1 "Probe B" pin the channel: per-test
+//! `test <name> ... ok|FAILED|ignored` lines plus the ONE summary line
+//! (`test result: ok. N passed; M failed; K ignored; …`), with the per-test
+//! tallies CROSS-CHECKED against the summary. A mismatch, or a missing summary,
+//! fails closed — `parse_failed: true`, raw output retained, no per-test result
+//! trusted. [`parse_libtest`] is a faithful port of the Python validated in
+//! `docs/verify/attest-output-channel-spike.md`, and
+//! [`tests::ac_p3_19_every_spike_fixture_parses_to_its_documented_state`] runs
+//! it against every fixture that doc records a state for.
+//!
+//! **One extension over the spike script, load-bearing:** a bulk
+//! `cargo test` run emits SEVERAL libtest sections (one per target, plus
+//! doc-tests), each with its own summary. The spike script parsed one. Here the
+//! output is SPLIT INTO SECTIONS at each summary line and the ratified parser is
+//! applied per section, so a whole-target capture of a multi-target crate does
+//! not fail its own cross-check by tallying every section against the last
+//! summary. A single-section capture — every fixture in `docs/fixtures/attest/`
+//! — takes the identical path it did in the spike.
+//!
+//! # State mapping, stated once
+//!
+//! The spike doc records five derived states; [`StructuredResult`] has three
+//! fields. This is the whole mapping — the per-fixture tests assert all three
+//! fields, so the doc's wording and this code cannot drift apart silently:
+//!
+//! | spike state                     | `outcome`       | `recipe_invalid` | `parse_failed` |
+//! |---------------------------------|-----------------|------------------|----------------|
+//! | `confirmed-candidate`           | `Passed`        | `None`           | `false`        |
+//! | `claim-false-candidate`         | `Failed`        | `None`           | `false`        |
+//! | `recipe-invalid (ignored)`      | `Ignored`       | `Ignored`        | `false`        |
+//! | `recipe-invalid (missing)`      | `None`          | `Missing`        | `false`        |
+//! | `recipe-invalid (harness)`      | `None`          | `Harness`        | `true`         |
+//! | tally != summary                | `None`          | `None`           | `true`         |
+//! | `bulk-evidence` (per test line) | the line's word | `None`           | `false`        |
+//!
+//! The `ignored` row sets BOTH fields on purpose: `TestOutcome::Ignored` is what
+//! libtest reported, `RecipeInvalidCause::Ignored` is the interpretation "this
+//! claim is unverifiable" — `types.rs` keeps them separate types for exactly
+//! this reason, and dropping either loses information the doc records.
+//! The `harness` row is the only combination neither `StructuredResult`
+//! constructor produces, so it is built field by field.
+
+use agentrec_core::attest::types::{
+    RecipeInvalidCause, StructuredResult, TestIdentity, TestOutcome,
+};
+use quote::ToTokens;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// The [`Adapter`] surface below — `RunFilter`, `RunOutcome`, `CargoAdapter`,
+// its `run`, and the staged single-test pipeline `single_test_result` feeds —
+// is this phase's declared CONTRACT (plan Phase 3 "Contract (produces)") and is
+// consumed by Phase 4's `attest verify`. Phase 3's own production callers use
+// only `discover_with_hashes` and `bulk_results`, so the rest is exercised by
+// this module's tests and allowed dead rather than deleted and rebuilt.
+
+/// What a caller asks [`Adapter::run`] to execute.
+///
+/// Never a bare unscoped `--exact`: a test fn name can collide across targets
+/// in one workspace (measured, real — plan Phase 1), so every variant names its
+/// target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RunFilter {
+    /// Every test in one target.
+    Target { target: String },
+    /// The staged single-test pipeline: build → `--list` precheck → scoped
+    /// `--exact` run.
+    Exact { target: String, fn_path: String },
+}
+
+/// The result of one [`Adapter::run`], plus what it took to produce it.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct RunOutcome {
+    pub results: Vec<StructuredResult>,
+    /// Everything the child wrote, stdout and stderr, for the CAS blob.
+    pub raw: String,
+    /// `None` when the child was killed by a signal.
+    pub exit_code: Option<i32>,
+}
+
+/// A test-runner backend. One implementation today (cargo); the trait exists
+/// because Phase 4's `attest verify` consumes it and the plan's contract names
+/// it.
+#[allow(dead_code)]
+pub trait Adapter {
+    fn discover(&self, crate_root: &Path) -> Result<Vec<TestIdentity>, String>;
+    fn run(&self, crate_root: &Path, filter: &RunFilter) -> Result<RunOutcome, String>;
+}
+
+#[allow(dead_code)]
+pub struct CargoAdapter;
+
+// ---------------------------------------------------------------------------
+// Target enumeration
+// ---------------------------------------------------------------------------
+
+/// One built test executable, as `cargo test --no-run --message-format=json`
+/// reports it.
+#[derive(Clone, Debug)]
+pub struct TargetInfo {
+    /// Package name, kept because the run-side invocation is `-p <pkg>
+    /// --test <t>` / `--lib`: [`TestIdentity::target`] is the bare target name
+    /// and loses the package, so package scope is RECOMPUTED here at run time
+    /// rather than encoded into the identity (which is Phase 2's type and not
+    /// this phase's to change).
+    #[allow(dead_code)]
+    pub package: String,
+    pub name: String,
+    /// `lib` / `test` / `bin` — the target kind, which decides the scoping flag.
+    pub kind: String,
+    pub src_path: PathBuf,
+    pub executable: PathBuf,
+}
+
+impl TargetInfo {
+    /// The cargo flags that scope an invocation to exactly this target.
+    #[allow(dead_code)]
+    fn scope_args(&self) -> Vec<String> {
+        let mut args = vec!["-p".to_string(), self.package.clone()];
+        match self.kind.as_str() {
+            "lib" => args.push("--lib".to_string()),
+            "bin" => {
+                args.push("--bin".to_string());
+                args.push(self.name.clone());
+            }
+            _ => {
+                args.push("--test".to_string());
+                args.push(self.name.clone());
+            }
+        }
+        args
+    }
+}
+
+fn cargo_bin() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+}
+
+/// Build every test target and return the artifacts. `cargo test --no-run
+/// --message-format=json` DOES carry per-artifact data on stable (the missing
+/// piece is per-TEST results, which is why the output parser exists).
+///
+/// `CARGO_TARGET_DIR` is pinned to the crate's own `target/` so a nested build
+/// can never land in a parent workspace's target dir — this repo has a recorded
+/// scar from exactly that.
+fn build_targets(crate_root: &Path) -> Result<Vec<TargetInfo>, String> {
+    // attest: sanctioned spawn (Phase 4 census)
+    let out = Command::new(cargo_bin())
+        .args(["test", "--no-run", "--message-format=json"])
+        .current_dir(crate_root)
+        .env("CARGO_TARGET_DIR", crate_root.join("target"))
+        .output()
+        .map_err(|e| format!("cannot run cargo in {}: {e}", crate_root.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo test --no-run failed in {}:\n{}",
+            crate_root.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut targets = Vec::new();
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) else {
+            continue;
+        };
+        let target = &msg["target"];
+        let (Some(name), Some(src)) = (
+            target.get("name").and_then(|n| n.as_str()),
+            target.get("src_path").and_then(|p| p.as_str()),
+        ) else {
+            continue;
+        };
+        let kind = target
+            .get("kind")
+            .and_then(|k| k.as_array())
+            .and_then(|k| k.first())
+            .and_then(|k| k.as_str())
+            .unwrap_or("test")
+            .to_string();
+        // `package_id` is `path+file:///...#name@version` or `registry+...#name@ver`;
+        // the fragment's name half is what `-p` wants.
+        let package = msg
+            .get("package_id")
+            .and_then(|p| p.as_str())
+            .map(package_name_from_id)
+            .unwrap_or_default();
+        targets.push(TargetInfo {
+            package,
+            name: name.to_string(),
+            kind,
+            src_path: PathBuf::from(src),
+            executable: PathBuf::from(exe),
+        });
+    }
+    targets.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
+    Ok(targets)
+}
+
+/// `path+file:///a/b#0.0.0` → `b`; `path+file:///a/b#name@1.2.3` → `name`.
+fn package_name_from_id(id: &str) -> String {
+    let (before, frag) = match id.split_once('#') {
+        Some((b, f)) => (b, f),
+        None => (id, ""),
+    };
+    if let Some((name, _ver)) = frag.split_once('@') {
+        return name.to_string();
+    }
+    // A bare-version fragment (`#0.0.0`): the name is the last path segment.
+    if !frag.is_empty() && frag.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return before
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    if frag.is_empty() {
+        return before
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+    }
+    frag.to_string()
+}
+
+/// `<exe> --list` → the `<name>: test` lines. No `--format=json` (unstable).
+fn list_tests(exe: &Path) -> Result<Vec<String>, String> {
+    // attest: sanctioned spawn (Phase 4 census)
+    let out = Command::new(exe)
+        .arg("--list")
+        .output()
+        .map_err(|e| format!("cannot run {} --list: {e}", exe.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(|n| n.trim().to_string())
+        .collect())
+}
+
+impl Adapter for CargoAdapter {
+    fn discover(&self, crate_root: &Path) -> Result<Vec<TestIdentity>, String> {
+        let mut out = Vec::new();
+        for target in build_targets(crate_root)? {
+            for name in list_tests(&target.executable)? {
+                out.push(TestIdentity::new(target.name.clone(), name));
+            }
+        }
+        // Sorted so derive order — and therefore the ids it mints — is
+        // reproducible run to run.
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn run(&self, crate_root: &Path, filter: &RunFilter) -> Result<RunOutcome, String> {
+        let targets = match build_targets(crate_root) {
+            Ok(t) => t,
+            Err(e) => {
+                // Stage 1: the target did not build. Nothing runs.
+                let identity = match filter {
+                    RunFilter::Exact { target, fn_path } => TestIdentity::new(target, fn_path),
+                    RunFilter::Target { target } => TestIdentity::new(target, ""),
+                };
+                return Ok(RunOutcome {
+                    results: vec![StructuredResult::recipe_invalid(
+                        identity,
+                        RecipeInvalidCause::Build,
+                    )],
+                    raw: e,
+                    exit_code: Some(101),
+                });
+            }
+        };
+
+        let want = match filter {
+            RunFilter::Target { target } | RunFilter::Exact { target, .. } => target,
+        };
+        let target = targets
+            .iter()
+            .find(|t| &t.name == want)
+            .ok_or_else(|| format!("no cargo target named {want} in {}", crate_root.display()))?;
+
+        let mut args = vec!["test".to_string()];
+        args.extend(target.scope_args());
+        if let RunFilter::Exact { fn_path, .. } = filter {
+            // Stage 2: `--list` membership precheck. A name absent from the
+            // built binary is `missing`, and libtest would report that as a
+            // 0/0/0 run with exit 0 — indistinguishable from success by exit
+            // code alone.
+            let listed = list_tests(&target.executable)?;
+            if !listed.iter().any(|n| n == fn_path) {
+                return Ok(RunOutcome {
+                    results: vec![StructuredResult::recipe_invalid(
+                        TestIdentity::new(&target.name, fn_path),
+                        RecipeInvalidCause::Missing,
+                    )],
+                    raw: String::new(),
+                    exit_code: Some(0),
+                });
+            }
+            args.push("--".to_string());
+            args.push("--exact".to_string());
+            args.push(fn_path.clone());
+        }
+
+        // attest: sanctioned spawn (Phase 4 census)
+        let out = Command::new(cargo_bin())
+            .args(&args)
+            .current_dir(crate_root)
+            .env("CARGO_TARGET_DIR", crate_root.join("target"))
+            .output()
+            .map_err(|e| format!("cannot run cargo test: {e}"))?;
+
+        // Stage 3: parse. stdout ONLY — libtest writes results there while
+        // cargo writes progress to stderr, and merging them first lets a
+        // `Compiling` line interleave into a per-test match. The CAS blob keeps
+        // both.
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let results = match filter {
+            RunFilter::Exact { fn_path, .. } => {
+                vec![single_test_result(
+                    &TestIdentity::new(&target.name, fn_path),
+                    &stdout,
+                )]
+            }
+            RunFilter::Target { .. } => bulk_results(&stdout, std::slice::from_ref(&target.name)),
+        };
+        Ok(RunOutcome {
+            results,
+            raw: format!("{stdout}{stderr}"),
+            exit_code: out.status.code(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The ratified libtest parser
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Summary {
+    pub passed: usize,
+    pub failed: usize,
+    pub ignored: usize,
+}
+
+/// One libtest run's worth of output: everything up to and including one
+/// summary line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    pub per_test: Vec<(String, TestOutcome)>,
+    pub summary: Option<Summary>,
+    /// The ratified fail-closed flag: no summary, or per-test tallies that
+    /// disagree with it.
+    pub parse_failed: bool,
+    pub detail: Option<String>,
+}
+
+fn parse_per_test(line: &str) -> Option<(String, TestOutcome)> {
+    let rest = line.strip_prefix("test ")?;
+    let (name, status) = rest.rsplit_once(" ... ")?;
+    let outcome = match status.trim_end() {
+        "ok" => TestOutcome::Passed,
+        "FAILED" => TestOutcome::Failed,
+        "ignored" => TestOutcome::Ignored,
+        _ => return None,
+    };
+    if name.is_empty() || name.contains(' ') {
+        return None;
+    }
+    Some((name.to_string(), outcome))
+}
+
+/// `test result: ok. 36 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.31s`
+///
+/// All six fields are required, in order — the truncated `test result: ok. 36
+/// pass` in the corrupted fixture must NOT match, which is what puts that
+/// capture on the fail-closed path.
+fn parse_summary(line: &str) -> Option<Summary> {
+    let rest = line.strip_prefix("test result: ")?;
+    let rest = rest
+        .strip_prefix("ok. ")
+        .or_else(|| rest.strip_prefix("FAILED. "))?;
+    let fields: Vec<&str> = rest.split("; ").collect();
+    if fields.len() != 6 {
+        return None;
+    }
+    let counted = |i: usize, label: &str| -> Option<usize> {
+        let (n, l) = fields[i].split_once(' ')?;
+        if l != label {
+            return None;
+        }
+        n.parse::<usize>().ok()
+    };
+    let passed = counted(0, "passed")?;
+    let failed = counted(1, "failed")?;
+    let ignored = counted(2, "ignored")?;
+    counted(3, "measured")?;
+    counted(4, "filtered out")?;
+    if !fields[5].starts_with("finished in ") {
+        return None;
+    }
+    Some(Summary {
+        passed,
+        failed,
+        ignored,
+    })
+}
+
+/// Split raw stdout into libtest sections and apply the ratified cross-check to
+/// each. Never errors: unusable output is a flagged section, never a lost one.
+pub fn parse_libtest(raw: &str) -> Vec<Section> {
+    let mut sections = Vec::new();
+    let mut per_test: Vec<(String, TestOutcome)> = Vec::new();
+    let mut saw_any = false;
+    for line in raw.lines() {
+        if let Some(entry) = parse_per_test(line) {
+            saw_any = true;
+            per_test.push(entry);
+            continue;
+        }
+        if let Some(summary) = parse_summary(line) {
+            saw_any = true;
+            sections.push(finish_section(std::mem::take(&mut per_test), Some(summary)));
+        }
+    }
+    if !per_test.is_empty() || !saw_any {
+        sections.push(finish_section(per_test, None));
+    }
+    sections
+}
+
+fn finish_section(per_test: Vec<(String, TestOutcome)>, summary: Option<Summary>) -> Section {
+    let Some(summary) = summary else {
+        return Section {
+            per_test,
+            summary: None,
+            parse_failed: true,
+            detail: Some(
+                "no summary line found (harness crash / process::exit / SIGABRT)".to_string(),
+            ),
+        };
+    };
+    let mut tally = Summary {
+        passed: 0,
+        failed: 0,
+        ignored: 0,
+    };
+    for (_, outcome) in &per_test {
+        match outcome {
+            TestOutcome::Passed => tally.passed += 1,
+            TestOutcome::Failed => tally.failed += 1,
+            TestOutcome::Ignored => tally.ignored += 1,
+        }
+    }
+    if tally != summary {
+        return Section {
+            per_test,
+            summary: Some(summary),
+            parse_failed: true,
+            detail: Some(format!("per-test tally {tally:?} != summary {summary:?}")),
+        };
+    }
+    Section {
+        per_test,
+        summary: Some(summary),
+        parse_failed: false,
+        detail: None,
+    }
+}
+
+/// Stage 3 of the staged single-test pipeline: interpret a scoped `--exact`
+/// capture for the one test it named. See this module's state-mapping table.
+#[allow(dead_code)]
+pub fn single_test_result(identity: &TestIdentity, stdout: &str) -> StructuredResult {
+    let sections = parse_libtest(stdout);
+    // A scoped `--exact` run produces exactly one libtest section. More than one
+    // means the invocation was not scoped after all — refuse to interpret it.
+    let Some(section) = sections.first() else {
+        return harness(identity);
+    };
+    if sections.len() > 1 {
+        return StructuredResult {
+            identity: identity.clone(),
+            outcome: None,
+            recipe_invalid: None,
+            parse_failed: true,
+            raw_blob: None,
+        };
+    }
+    if section.parse_failed {
+        return match section.summary {
+            None => harness(identity),
+            Some(_) => StructuredResult {
+                identity: identity.clone(),
+                outcome: None,
+                recipe_invalid: None,
+                parse_failed: true,
+                raw_blob: None,
+            },
+        };
+    }
+    let summary = section.summary.expect("checked parse_failed above");
+    let total = summary.passed + summary.failed + summary.ignored;
+    if total == 0 {
+        return StructuredResult::recipe_invalid(identity.clone(), RecipeInvalidCause::Missing);
+    }
+    if total == 1 && summary.ignored == 1 {
+        // Both fields: what libtest reported AND the interpretation.
+        let mut r = StructuredResult::recipe_invalid(identity.clone(), RecipeInvalidCause::Ignored);
+        r.outcome = Some(TestOutcome::Ignored);
+        return r;
+    }
+    if total == 1 && summary.passed == 1 {
+        return StructuredResult::outcome(identity.clone(), TestOutcome::Passed);
+    }
+    if total == 1 && summary.failed == 1 {
+        return StructuredResult::outcome(identity.clone(), TestOutcome::Failed);
+    }
+    // More than one test ran under an `--exact` filter: not a single-test
+    // verdict. Fail closed rather than pick one.
+    StructuredResult {
+        identity: identity.clone(),
+        outcome: None,
+        recipe_invalid: None,
+        parse_failed: true,
+        raw_blob: None,
+    }
+}
+
+#[allow(dead_code)]
+fn harness(identity: &TestIdentity) -> StructuredResult {
+    StructuredResult {
+        identity: identity.clone(),
+        outcome: None,
+        recipe_invalid: Some(RecipeInvalidCause::Harness),
+        parse_failed: true,
+        raw_blob: None,
+    }
+}
+
+/// Bulk interpretation: one [`StructuredResult`] per per-test line, with the
+/// section's target attached.
+///
+/// `targets` pairs positionally with the sections — see
+/// [`section_targets`] for where the names come from and what happens when the
+/// pairing does not hold. A section whose target is unknown yields identities
+/// with an EMPTY target, which no claim can match, so such results are reported
+/// as undeclared rather than mis-attributed.
+pub fn bulk_results(stdout: &str, targets: &[String]) -> Vec<StructuredResult> {
+    let sections = parse_libtest(stdout);
+    let mut out = Vec::new();
+    for (i, section) in sections.iter().enumerate() {
+        let target = targets.get(i).cloned().unwrap_or_default();
+        for (name, outcome) in &section.per_test {
+            let identity = TestIdentity::new(target.clone(), name.clone());
+            if section.parse_failed {
+                // Fail closed: the identity is kept so the capture is
+                // attributable, the OUTCOME is dropped because the section's
+                // own cross-check says it cannot be trusted.
+                out.push(StructuredResult {
+                    identity,
+                    outcome: None,
+                    recipe_invalid: section
+                        .summary
+                        .is_none()
+                        .then_some(RecipeInvalidCause::Harness),
+                    parse_failed: true,
+                    raw_blob: None,
+                });
+            } else {
+                out.push(StructuredResult::outcome(identity, *outcome));
+            }
+        }
+    }
+    out
+}
+
+/// Target names for the sections of a bulk `cargo test`, read from cargo's own
+/// stderr markers in execution order.
+///
+/// cargo prints `Running unittests src/lib.rs (target/debug/deps/<name>-<hash>)`
+/// / `Running tests/<file>.rs (…)` / `Doc-tests <crate>` before each test
+/// binary, on stderr, sequentially — so the Nth marker names the Nth stdout
+/// section. Returns an empty vec when the marker count does not match the
+/// section count, which makes every identity's target empty and every result
+/// undeclared: a wrong target silently cross-attributes evidence, an empty one
+/// is loudly counted.
+pub fn section_targets(stderr: &str, sections: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in stderr.lines() {
+        let line = line.trim_start();
+        if line.starts_with("Doc-tests ") {
+            names.push("doc-tests".to_string());
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("Running ") else {
+            continue;
+        };
+        // `… (target/debug/deps/<name>-<hash>)`
+        let Some(open) = rest.rfind('(') else {
+            continue;
+        };
+        let path = rest[open + 1..].trim_end_matches(')');
+        let Some(file) = path.rsplit('/').next() else {
+            continue;
+        };
+        let name = match file.rsplit_once('-') {
+            Some((n, _hash)) => n,
+            None => file,
+        };
+        names.push(name.to_string());
+    }
+    if names.len() != sections {
+        return Vec::new();
+    }
+    names
+}
+
+// ---------------------------------------------------------------------------
+// Body hashing (rename detection input)
+// ---------------------------------------------------------------------------
+
+/// sha256 of a test fn's BODY BLOCK as a token stream, so reformatting, comment
+/// edits and whitespace do not read as a body change. Only a real edit to the
+/// body's tokens moves the hash.
+///
+/// The body ALONE, deliberately: hashing the whole `ItemFn` would fold the fn's
+/// own NAME into the hash, and then a rename — the exact event this hash exists
+/// to detect — would always change it. The cost is that two tests with identical
+/// bodies hash alike; [`crate::attest::derivecmd`] handles that by refusing to
+/// adopt an ambiguous donor rather than guessing.
+///
+/// **What the module walk does NOT resolve — measured limitation, not a
+/// promise:** `#[path = "…"]` module attributes, `include!`-ed sources, and
+/// tests generated by a macro. In each case the fn is not found and the
+/// identity simply gets no hash, which costs rename detection for that test
+/// (a rename then mints a fresh claim) and costs nothing else. `#[cfg]`-gated
+/// modules are walked by NAME only — a `#[cfg(test)] mod tests` and a
+/// `#[cfg(not(test))] mod tests` in one file would collide, and the first wins.
+pub fn body_hashes(targets: &[TargetInfo], identities: &[TestIdentity]) -> BodyHashes {
+    let mut by_target: BTreeMap<&str, &TargetInfo> = BTreeMap::new();
+    for t in targets {
+        by_target.insert(t.name.as_str(), t);
+    }
+    let mut out = BTreeMap::new();
+    for identity in identities {
+        let Some(target) = by_target.get(identity.target.as_str()) else {
+            continue;
+        };
+        if let Some(hash) = hash_test_fn(&target.src_path, &identity.fn_path) {
+            out.insert(identity.clone(), hash);
+        }
+    }
+    out
+}
+
+pub type BodyHashes = BTreeMap<TestIdentity, [u8; 32]>;
+
+/// Resolve `mod::path::fn_name` from a target's root source file and hash it.
+fn hash_test_fn(root_src: &Path, fn_path: &str) -> Option<[u8; 32]> {
+    let mut segments: Vec<&str> = fn_path.split("::").collect();
+    let fn_name = segments.pop()?;
+    let file = agentrec_core::fsguard::read_regular_to_string(root_src).ok()?;
+    let ast = syn::parse_file(&file).ok()?;
+    let item = find_fn(&ast.items, root_src, &segments, fn_name)?;
+    Some(sha256(item.block.to_token_stream().to_string().as_bytes()))
+}
+
+/// Descend `segments` through inline `mod x { … }` blocks AND file modules
+/// (`mod x;` → `x.rs` or `x/mod.rs`, resolved relative to the CURRENT file's
+/// directory the way rustc does), then find `fn <name>` in the reached module.
+fn find_fn(
+    items: &[syn::Item],
+    current_file: &Path,
+    segments: &[&str],
+    fn_name: &str,
+) -> Option<syn::ItemFn> {
+    let Some((head, tail)) = segments.split_first() else {
+        return items.iter().find_map(|item| match item {
+            syn::Item::Fn(f) if f.sig.ident == fn_name => Some(f.clone()),
+            _ => None,
+        });
+    };
+    for item in items {
+        let syn::Item::Mod(m) = item else { continue };
+        if m.ident != *head {
+            continue;
+        }
+        if let Some((_brace, inner)) = &m.content {
+            return find_fn(inner, current_file, tail, fn_name);
+        }
+        // File module: `mod x;`
+        let dir = module_dir(current_file);
+        for candidate in [
+            dir.join(format!("{head}.rs")),
+            dir.join(head).join("mod.rs"),
+        ] {
+            let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&candidate) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            return find_fn(&ast.items, &candidate, tail, fn_name);
+        }
+        return None;
+    }
+    None
+}
+
+/// The directory `mod x;` inside `file` resolves against: the file's own
+/// directory for `lib.rs` / `main.rs` / `mod.rs`, otherwise a subdirectory
+/// named after the file.
+fn module_dir(file: &Path) -> PathBuf {
+    let parent = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    match file.file_name().and_then(|n| n.to_str()) {
+        Some("lib.rs") | Some("main.rs") | Some("mod.rs") => parent,
+        Some(name) => parent.join(name.trim_end_matches(".rs")),
+        None => parent,
+    }
+}
+
+/// sha256 as raw bytes, via core's `hash_bytes` (`"sha256:<hex>"`) so this
+/// crate needs no `sha2` dependency of its own.
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let hex = agentrec_core::store::hash_bytes(bytes);
+    let hex = hex.strip_prefix("sha256:").unwrap_or(&hex);
+    let raw = hex.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (raw[i * 2] as char).to_digit(16).unwrap_or(0);
+        let lo = (raw[i * 2 + 1] as char).to_digit(16).unwrap_or(0);
+        *slot = (hi * 16 + lo) as u8;
+    }
+    out
+}
+
+/// Discover, and hash every discovered test's body, in one build.
+pub fn discover_with_hashes(crate_root: &Path) -> Result<(Vec<TestIdentity>, BodyHashes), String> {
+    let targets = build_targets(crate_root)?;
+    let mut identities = Vec::new();
+    for target in &targets {
+        for name in list_tests(&target.executable)? {
+            identities.push(TestIdentity::new(target.name.clone(), name));
+        }
+    }
+    identities.sort();
+    identities.dedup();
+    let hashes = body_hashes(&targets, &identities);
+    Ok((identities, hashes))
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own committed fixtures and tempdir copies.
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../docs/fixtures/attest")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    fn ident() -> TestIdentity {
+        TestIdentity::new("import_claude", "some_test")
+    }
+
+    /// AC-ATTEST-P3-19 — every state `docs/verify/attest-output-channel-spike.md`
+    /// records, asserted as the full `(outcome, recipe_invalid, parse_failed)`
+    /// triple this module's mapping table defines.
+    #[test]
+    fn ac_p3_19_every_spike_fixture_parses_to_its_documented_state() {
+        // `whole-target.txt`: bulk-evidence, 36 ok + 1 ignored, tallies match.
+        let sections = parse_libtest(&fixture("whole-target.txt"));
+        assert_eq!(sections.len(), 1, "{sections:#?}");
+        assert!(!sections[0].parse_failed);
+        assert_eq!(sections[0].per_test.len(), 37);
+        assert_eq!(
+            sections[0].summary,
+            Some(Summary {
+                passed: 36,
+                failed: 0,
+                ignored: 1
+            })
+        );
+        let bulk = bulk_results(&fixture("whole-target.txt"), &["import_claude".into()]);
+        assert_eq!(bulk.len(), 37);
+        assert_eq!(bulk[0].outcome, Some(TestOutcome::Passed));
+        assert!(bulk
+            .iter()
+            .all(|r| !r.parse_failed && r.recipe_invalid.is_none()));
+        assert_eq!(
+            bulk.iter()
+                .filter(|r| r.outcome == Some(TestOutcome::Ignored))
+                .count(),
+            1
+        );
+
+        // `single-exact.txt`: confirmed-candidate.
+        let r = single_test_result(&ident(), &fixture("single-exact.txt"));
+        assert_eq!(r.outcome, Some(TestOutcome::Passed));
+        assert_eq!(r.recipe_invalid, None);
+        assert!(!r.parse_failed);
+
+        // `single-exact-ignored.txt`: recipe-invalid (ignored), both fields.
+        let r = single_test_result(&ident(), &fixture("single-exact-ignored.txt"));
+        assert_eq!(r.outcome, Some(TestOutcome::Ignored));
+        assert_eq!(r.recipe_invalid, Some(RecipeInvalidCause::Ignored));
+        assert!(!r.parse_failed);
+
+        // `single-exact-missing.txt`: recipe-invalid (missing) — exit 0, 0/0/0.
+        let r = single_test_result(&ident(), &fixture("single-exact-missing.txt"));
+        assert_eq!(r.outcome, None);
+        assert_eq!(r.recipe_invalid, Some(RecipeInvalidCause::Missing));
+        assert!(!r.parse_failed);
+
+        // `single-exact-failed.handcrafted.txt`: claim-false-candidate.
+        let r = single_test_result(&ident(), &fixture("single-exact-failed.handcrafted.txt"));
+        assert_eq!(r.outcome, Some(TestOutcome::Failed));
+        assert_eq!(r.recipe_invalid, None);
+        assert!(!r.parse_failed);
+
+        // `corrupted.txt`: fails closed on the missing-summary branch.
+        let raw = fixture("corrupted.txt");
+        let sections = parse_libtest(&raw);
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].parse_failed);
+        assert_eq!(sections[0].summary, None);
+        assert_eq!(sections[0].per_test.len(), 36, "the mangled line drops out");
+        let r = single_test_result(&ident(), &raw);
+        assert_eq!(r.outcome, None);
+        assert_eq!(r.recipe_invalid, Some(RecipeInvalidCause::Harness));
+        assert!(r.parse_failed);
+    }
+
+    /// A summary that PARSES but disagrees with the per-test lines is the
+    /// second fail-closed gate — the spike's corrupted fixture only exercises
+    /// the first.
+    #[test]
+    fn a_tally_that_disagrees_with_the_summary_fails_closed() {
+        let raw = "\nrunning 2 tests\ntest a ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let sections = parse_libtest(raw);
+        assert_eq!(sections.len(), 1);
+        assert!(sections[0].parse_failed);
+        assert!(sections[0].summary.is_some());
+        let r = single_test_result(&ident(), raw);
+        assert!(r.parse_failed);
+        assert_eq!(r.outcome, None);
+        // Not `harness`: a summary WAS found, it just disagreed.
+        assert_eq!(r.recipe_invalid, None);
+
+        // The same branch through `bulk_results`, which is the function BOTH
+        // capture paths call — a disagreeing summary is the likelier real-world
+        // corruption, and the truncated-summary fixture does not exercise it.
+        let bulk = bulk_results(raw, &["tgt".into()]);
+        assert_eq!(bulk.len(), 1);
+        assert!(bulk[0].parse_failed);
+        assert_eq!(bulk[0].outcome, None, "no per-test outcome may be trusted");
+        assert_eq!(bulk[0].recipe_invalid, None, "a summary was found");
+        assert_eq!(bulk[0].identity, TestIdentity::new("tgt", "a"));
+    }
+
+    /// A multi-target `cargo test` is several sections; each is cross-checked
+    /// on its own, which the spike's one-section script could not do.
+    #[test]
+    fn a_multi_target_run_is_cross_checked_per_section() {
+        let raw = "\nrunning 1 test\ntest tests::a ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\ntest b ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let sections = parse_libtest(raw);
+        assert_eq!(sections.len(), 2);
+        assert!(sections.iter().all(|s| !s.parse_failed));
+        let results = bulk_results(raw, &["mylib".into(), "integration".into()]);
+        assert_eq!(results[0].identity, TestIdentity::new("mylib", "tests::a"));
+        assert_eq!(results[1].identity, TestIdentity::new("integration", "b"));
+    }
+
+    #[test]
+    fn section_targets_pairs_markers_with_sections_and_refuses_a_mismatch() {
+        let stderr = "    Finished `test` profile\n     Running unittests src/lib.rs (target/debug/deps/attest_sample_crate-392ca9d12eda1cf9)\n     Running tests/integration.rs (target/debug/deps/integration-12fc9e26ddfc6535)\n   Doc-tests attest_sample_crate\n";
+        assert_eq!(
+            section_targets(stderr, 3),
+            vec!["attest_sample_crate", "integration", "doc-tests"]
+        );
+        // Wrong section count: refuse rather than mis-pair.
+        assert!(section_targets(stderr, 2).is_empty());
+    }
+
+    #[test]
+    fn per_test_and_summary_line_parsers_reject_lookalikes() {
+        assert!(parse_per_test("test a ... CORRUPTED_STATUS").is_none());
+        assert!(parse_per_test("testing a ... ok").is_none());
+        assert!(parse_per_test("test result: ok. 1 passed").is_none());
+        assert_eq!(
+            parse_per_test("test tests::x ... ok"),
+            Some(("tests::x".to_string(), TestOutcome::Passed))
+        );
+        assert!(parse_summary("test result: ok. 36 pass").is_none());
+        assert!(parse_summary("test result: weird. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s").is_none());
+    }
+
+    #[test]
+    fn package_names_come_out_of_every_package_id_shape() {
+        assert_eq!(
+            package_name_from_id("path+file:///a/attest_sample_crate#0.0.0"),
+            "attest_sample_crate"
+        );
+        assert_eq!(
+            package_name_from_id("path+file:///a/b#agentrec@0.2.0"),
+            "agentrec"
+        );
+    }
+
+    // -- fixture-crate driven ------------------------------------------------
+
+    fn copy_fixture_crate() -> tempfile::TempDir {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/attest_sample_crate");
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path();
+        // Only the four TRACKED files — the in-tree fixture also carries a
+        // multi-megabyte `target/` from earlier builds.
+        std::fs::create_dir_all(dst.join("src")).unwrap();
+        std::fs::create_dir_all(dst.join("tests")).unwrap();
+        for rel in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "src/lib.rs",
+            "tests/integration.rs",
+        ] {
+            std::fs::copy(src.join(rel), dst.join(rel)).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn discovery_enumerates_both_target_shapes_with_module_qualified_names() {
+        let tmp = copy_fixture_crate();
+        let found = CargoAdapter.discover(tmp.path()).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                TestIdentity::new("attest_sample_crate", "tests::unit_add_works"),
+                TestIdentity::new("attest_sample_crate", "tests::unit_double_works"),
+                TestIdentity::new("attest_sample_crate", "tests::unit_ignored_test"),
+                TestIdentity::new("integration", "integration_add_works"),
+                TestIdentity::new("integration", "integration_double_works"),
+            ],
+            "discovery must be sorted and cover both shapes"
+        );
+    }
+
+    #[test]
+    fn body_hashes_resolve_inline_mod_tests_and_the_integration_target() {
+        let tmp = copy_fixture_crate();
+        let (ids, hashes) = discover_with_hashes(tmp.path()).unwrap();
+        assert_eq!(hashes.len(), ids.len(), "every discovered test hashed");
+        let unit = TestIdentity::new("attest_sample_crate", "tests::unit_add_works");
+        let before = hashes[&unit];
+
+        // A comment-only edit must NOT move the hash (token stream, not bytes).
+        let lib = tmp.path().join("src/lib.rs");
+        let text = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(
+            &lib,
+            text.replace(
+                "        assert_eq!(add(2, 2), 4);",
+                "        // note\n        assert_eq!(add(2, 2), 4);",
+            ),
+        )
+        .unwrap();
+        let (_, after) = discover_with_hashes(tmp.path()).unwrap();
+        assert_eq!(
+            after[&unit], before,
+            "a comment must not move the body hash"
+        );
+
+        // A real body edit must move it.
+        let text = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(&lib, text.replace("add(2, 2), 4", "add(3, 1), 4")).unwrap();
+        let (_, changed) = discover_with_hashes(tmp.path()).unwrap();
+        assert_ne!(changed[&unit], before);
+    }
+
+    /// AC-ATTEST-P3-23 — the four `recipe-invalid` causes stay distinct on real
+    /// cargo output.
+    #[test]
+    fn ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct() {
+        let tmp = copy_fixture_crate();
+        let root = tmp.path();
+
+        // pass
+        let r = CargoAdapter
+            .run(
+                root,
+                &RunFilter::Exact {
+                    target: "attest_sample_crate".into(),
+                    fn_path: "tests::unit_add_works".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(r.results[0].outcome, Some(TestOutcome::Passed));
+        assert_eq!(r.results[0].recipe_invalid, None);
+
+        // ignored
+        let r = CargoAdapter
+            .run(
+                root,
+                &RunFilter::Exact {
+                    target: "attest_sample_crate".into(),
+                    fn_path: "tests::unit_ignored_test".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            r.results[0].recipe_invalid,
+            Some(RecipeInvalidCause::Ignored)
+        );
+
+        // missing — stage 2 catches it, so nothing runs and exit 0 never
+        // masquerades as a pass.
+        let r = CargoAdapter
+            .run(
+                root,
+                &RunFilter::Exact {
+                    target: "attest_sample_crate".into(),
+                    fn_path: "tests::no_such_test".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            r.results[0].recipe_invalid,
+            Some(RecipeInvalidCause::Missing)
+        );
+        assert!(r.raw.is_empty(), "nothing ran");
+
+        // harness — no summary line at all, from the parser's own branch.
+        assert_eq!(
+            single_test_result(&ident(), "running 1 test\ntest a ... ok\n").recipe_invalid,
+            Some(RecipeInvalidCause::Harness)
+        );
+
+        // build
+        let lib = root.join("src/lib.rs");
+        let text = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(&lib, format!("{text}\nthis is not rust;\n")).unwrap();
+        let r = CargoAdapter
+            .run(
+                root,
+                &RunFilter::Exact {
+                    target: "attest_sample_crate".into(),
+                    fn_path: "tests::unit_add_works".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(r.results[0].recipe_invalid, Some(RecipeInvalidCause::Build));
+    }
+}

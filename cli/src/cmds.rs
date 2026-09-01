@@ -989,6 +989,27 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("Stop");
+
+    // Attest capture path 2 (plan Phase 3): a `PostToolUse` `Bash` firing whose
+    // command is a test runner is an evidence capture, not a turn boundary, so
+    // it RETURNS here rather than falling through.
+    //
+    // Falling through would be wrong, not merely redundant: this function maps
+    // every non-`UserPromptSubmit` event to `"stop"`, so a captured
+    // `PostToolUse` would also append a stop signal and CLOSE the bracket the
+    // evidence is supposed to be joined to. Every other event, `PostToolUse`
+    // included, keeps its existing path untouched — measured before choosing:
+    // no test drives `hook claude` with a `PostToolUse` payload (every
+    // `PostToolUse` test in `cli/tests/` is a `hook codex` one), and
+    // `initcmd.rs` installs only `UserPromptSubmit` + `Stop` for Claude Code, so
+    // today this arm is reached only by a hand-added `PostToolUse` hook or by a
+    // test — installing one is a follow-on, not part of this phase.
+    if event_name == "PostToolUse"
+        && crate::attest::capture::capture_from_hook_payload(root, &payload)
+    {
+        return Ok(());
+    }
+
     let event = match event_name {
         "UserPromptSubmit" => "start",
         _ => "stop",

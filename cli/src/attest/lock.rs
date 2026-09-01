@@ -20,11 +20,6 @@
 //! `attest.jsonl` (`ATTEST-FORMAT.md`: adding one requires a decision-register
 //! entry), so the `try_acquire` half of `memlock.rs` has no caller to serve.
 
-// The append path has no production caller until chunk B's `attest derive` /
-// `attest run` land (this chunk ships the reader, `attest status`). Kept
-// allowed rather than deleted: the plan assigns the first-writer wiring here.
-#![allow(dead_code)]
-
 use agentrec_core::attest::events::{parse_log, AttestEvent, AttestParseCensus};
 use std::fs::File;
 use std::io::Write;

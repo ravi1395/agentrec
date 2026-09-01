@@ -743,3 +743,74 @@ location-resolution shapes — a `tests/integration.rs` integration target and a
 `#[cfg(test)] mod tests` inside `src/lib.rs`, each with ≥2 `#[test]` fns, plus
 one `#[ignore]`d test — and builds standalone. — `attest_status::
 ac_p3_9_fixture_crate_has_both_test_target_shapes`
+
+### Phase 3B — cargo adapter + passive evidence capture
+
+Scope: `cli/src/attest/{adapter_cargo,capture,derivecmd}.rs`, `cli/src/attest.rs`
+(module list), `cli/src/main.rs` (`attest derive` / `attest run`), `cli/src/cmds.rs`
+(the `hook claude` `PostToolUse` arm), `cli/Cargo.toml` (`syn`/`proc-macro2`/`quote`),
+`cli/tests/attest_capture.rs`.
+
+**Phase 4 census hook:** every `std::process::Command::new` site this block adds
+carries a `// attest: sanctioned spawn (Phase 4 census)` comment, so Phase 4's
+`clippy.toml disallowed-methods` entry for `Command::new` has an enumerable
+allow-set rather than a re-discovery problem.
+
+**AC-ATTEST-P3-10.** `attest derive` on the fixture crate creates exactly one
+claim per test libtest itself enumerates — including the `#[cfg(test)] mod tests`
+unit tests inside `src/lib.rs`, the `tests/integration.rs` target's tests, and the
+`#[ignore]`d test (an ignored test is a claim; it is `recipe-invalid` at verify
+time, not absent at derive time). — `attest_capture::
+ac_p3_10_derive_creates_one_claim_per_discovered_test`
+**AC-ATTEST-P3-11.** A second `attest derive` with nothing changed appends
+nothing: `attest.jsonl` is byte-identical before and after. — `attest_capture::
+ac_p3_11_rederive_with_no_change_appends_nothing`
+**AC-ATTEST-P3-12.** Renaming a test fn with its body unchanged makes the next
+`attest derive` reuse the OLD `ClaimId` and write `renamed_from` = the old
+identity; the claim count does not grow. — `attest_capture::
+ac_p3_12_rename_with_an_unchanged_body_reuses_the_claim_id`
+**AC-ATTEST-P3-13.** Renaming a test fn AND changing its body mints a NEW
+`ClaimId` with no `renamed_from` — a body hash is the only rename evidence this
+adapter has, so without it the two tests are two claims. — `attest_capture::
+ac_p3_13_rename_with_a_changed_body_mints_a_new_claim`
+**AC-ATTEST-P3-14.** Changing a known test's body without renaming it appends a
+`derive` carrying the SAME `claim_id`, the new `body_hash`, and no
+`renamed_from`. — `attest_capture::
+ac_p3_14_a_body_change_without_a_rename_rehashes_in_place`
+**AC-ATTEST-P3-15.** `attest run -- cargo test` inside a hook-bracketed session
+writes one `evidence` event per known test, each carrying the open turn's id read
+from `.agentrec/open.json`. — `attest_capture::
+ac_p3_15_run_writes_evidence_joined_to_the_open_turn`
+**AC-ATTEST-P3-16.** The same `cargo test` arriving through the hook path — a
+`PostToolUse` `Bash` payload piped to `agentrec hook claude` — writes evidence of
+the same shape, with no extra ceremony step. — `attest_capture::
+ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence`
+**AC-ATTEST-P3-17.** Evidence captured against a dirty working tree carries
+`dirty: true` and is counted by `attest status` as dev-loop-only. — `attest_capture::
+ac_p3_17_dirty_tree_evidence_renders_as_dev_loop_only`
+**AC-ATTEST-P3-18.** A result for a test no `derive` knows is COUNTED on stderr
+and no event is written for it — evidence is never attached to a claim that does
+not exist. — `attest_capture::
+ac_p3_18_undeclared_results_are_counted_on_stderr_and_not_written`
+**AC-ATTEST-P3-19.** The ratified libtest parser reproduces, for every fixture in
+`docs/fixtures/attest/`, the state `docs/verify/attest-output-channel-spike.md`
+records for it — asserted as the full `(outcome, recipe_invalid, parse_failed)`
+triple, not just the one field a state name mentions. — `attest::adapter_cargo::
+tests::ac_p3_19_every_spike_fixture_parses_to_its_documented_state`
+**AC-ATTEST-P3-20.** Unparseable output fails closed: no per-test outcome is
+trusted, the `evidence` event carries `parse_failed: true`, and the full raw
+output is retained in the CAS and referenced by the event. — `attest_capture::
+ac_p3_20_unparseable_output_writes_parse_failed_evidence_with_the_raw_blob`
+**AC-ATTEST-P3-21.** The test-runner command matcher recognizes a `cargo test`
+invocation and rejects lookalikes (`cargo testfoo`, `cargo build`, a path
+containing the word), so an arbitrary `Bash` tool call is not captured. —
+`attest::capture::tests::ac_p3_21_the_test_runner_matcher_accepts_only_cargo_test`
+**AC-ATTEST-P3-22.** `attest run` tees the child's output to the terminal and
+exits with the child's own status, so wrapping a command does not change what the
+user sees or what a script downstream reads. — `attest_capture::
+ac_p3_22_run_tees_output_and_propagates_the_child_exit_code`
+**AC-ATTEST-P3-23.** The staged single-test pipeline keeps its four
+`recipe-invalid` causes distinct on real cargo output: `missing` (name not in
+`--list`), `ignored` (`#[ignore]`d), `harness` (no summary line), and `build`
+(the target does not compile). — `attest::adapter_cargo::tests::
+ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct`
