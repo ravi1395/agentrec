@@ -256,11 +256,16 @@ magnitude. See §6.
 
 ### **YES — for children that exit normally. NO — for children killed by SIGKILL.**
 
-**How the tests locate the binary.** All four named call sites use
-`env!("CARGO_BIN_EXE_agentrec")` (`cli/tests/approve.rs:25`,
-`cli/tests/golden.rs:236`, `cli/tests/hardening_daemon.rs:24`, and
-`cli/tests/emitter_turn.rs:25`; the plan's `cli/tests/bisect.rs` does not exist
-in this tree). That macro resolves at compile time of the test crate, so under
+**How the tests locate the binary.** Each of the four call sites resolves the
+binary through its own target-local `bin()` helper, which is
+`env!("CARGO_BIN_EXE_agentrec")` in every case — `cli/tests/approve.rs::bin`
+(used by `approve.rs::run`), `cli/tests/golden.rs::bin` (used by
+`golden.rs::agentrec`), `cli/tests/hardening_daemon.rs::bin` (used by
+`hardening_daemon.rs::agentrec`, `::spawn_record` and
+`::spawn_record_with_env`), and `cli/tests/emitter_turn.rs::bin` (used by
+`emitter_turn.rs::agentrec` and `::spawn_record`). The plan's
+`cli/tests/bisect.rs` does not exist in this tree; `emitter_turn.rs` is the
+substitute. That macro resolves at compile time of the test crate, so under
 `cargo llvm-cov` it resolves into `target/llvm-cov-target/debug/agentrec` — the
 **instrumented** binary. Confirmed present and rebuilt under that dir
 (`-rwxr-xr-x 24327288 target/llvm-cov-target/debug/agentrec`).
@@ -317,30 +322,54 @@ evidence that a killed process is captured: its 3 profraw files exceed the 1 a
 non-spawning test writes, so at least one child flushed, but which of that
 test's children were killed and which exited cleanly was **not determined**. The
 standalone probe below is what establishes the SIGKILL behaviour — it spawns the
-instrumented binary directly and signals it (`sigprobe.sh`, throwaway; re-run
-verbatim while writing this section and reproduced identically):
+instrumented binary directly and signals it. The text below is the exact script
+that was executed to produce the output beneath it (extracted from this document
+into a fresh file and run, so the pasted text and the pasted output cannot drift
+apart):
 
 ```zsh
-BIN=target/llvm-cov-target/debug/agentrec
+#!/bin/zsh
+# THROWAWAY spike probe (attest Phase 1, Probe A(d)): does a killed child flush
+# its coverage profile? Run from the repo root.
+BIN=$PWD/target/llvm-cov-target/debug/agentrec   # absolute: the `cd` below breaks a relative path
+W=$(mktemp -d)                                   # scratch, outside the repo
 for sig in TERM KILL; do
-  R=$SP/sigprobe_$sig; rm -rf $R; mkdir -p $R/repo/prof
-  (cd $R/repo && git init -q . && \
-     LLVM_PROFILE_FILE="$R/repo/prof/p-%p-%10m.profraw" $BIN init >/dev/null 2>&1)
-  LLVM_PROFILE_FILE="$R/repo/prof/rec-%p-%10m.profraw" $BIN record --root $R/repo >/dev/null 2>&1 &
+  R=$W/$sig; mkdir -p $R/repo/prof
+  ( cd $R/repo && git init -q . && \
+      LLVM_PROFILE_FILE="$R/repo/prof/p-%p-%10m.profraw" $BIN init >$R/init.log 2>&1 )
+  init_rc=$?
+  LLVM_PROFILE_FILE="$R/repo/prof/rec-%p-%10m.profraw" $BIN record --root $R/repo >$R/rec.log 2>&1 &
   pid=$!
   sleep 3
+  # Did the daemon actually reach its record loop, or exit early? Without this
+  # the KILL leg proves nothing.
+  if kill -0 $pid 2>/dev/null; then alive=yes; else alive=no; fi
   kill -$sig $pid
-  wait $pid 2>/dev/null
+  wait $pid; wait_rc=$?
   sleep 1
-  echo "SIG$sig: record_profraw=$(ls $R/repo/prof/rec-*.profraw 2>/dev/null | wc -l | tr -d ' ')" \
-       "bytes=$(cat $R/repo/prof/rec-*.profraw 2>/dev/null | wc -c | tr -d ' ')"
+  n=$(find $R/repo/prof -name 'rec-*.profraw' | wc -l | tr -d ' ')
+  b=$(find $R/repo/prof -name 'rec-*.profraw' -exec cat {} + 2>/dev/null | wc -c | tr -d ' ')
+  echo "SIG$sig: init_rc=$init_rc alive_at_kill=$alive wait_rc=$wait_rc record_profraw=$n bytes=$b"
 done
 ```
 
 ```
-SIGTERM: record_profraw=1 bytes=142360
-SIGKILL: record_profraw=0 bytes=0
+SIGTERM: init_rc=0 alive_at_kill=yes wait_rc=0   record_profraw=1 bytes=142360
+SIGKILL: init_rc=0 alive_at_kill=yes wait_rc=137 record_profraw=0 bytes=0
 ```
+
+Reading the fields: `init_rc=0` says the fixture repo was really initialised (an
+earlier draft of this script used a **relative** `BIN`, which fails rc=127
+inside the `cd` subshell and makes `record` exit "not initialized" before the
+kill — both legs then print one profraw and the probe proves nothing);
+`alive_at_kill=yes` says the daemon was still running at signal time on both
+legs, i.e. it reached its record loop rather than exiting early; `wait_rc=137`
+(128+9) confirms the KILL leg died *by SIGKILL* rather than exiting on its own,
+while the TERM leg exited 0 through its own shutdown path. Only then does
+`record_profraw=1` vs `0` mean what it says.
+
+The block above was extracted out of this document into a fresh file and
+executed from the repo root; the output is that run's.
 
 A process terminated by SIGKILL never runs its atexit flush, so **no profraw
 exists and its execution is invisible to the map**. This repo kills daemons with
@@ -392,6 +421,17 @@ a test whose child was SIGKILLed has a knowingly incomplete file set, and Phase
 4 should treat such a test as staled by any `cli/src/**` write rather than
 trusting its set. That is the "stale MORE" rule made mechanical.
 
+**Contract gap, stated plainly rather than hidden behind the field name: this
+spike measured TWO under-attribution channels and produced a detection
+mechanism for NEITHER.** (i) SIGKILLed children write no profile at all (§5);
+(ii) untemplated `.profraw` leaks into the repo root whose coverage is merged
+into no test's map, timing-dependent and with an **undetermined** mechanism
+(§8). Nothing in this document tells Phase 4 how to *populate* `child_killed`,
+and no field here detects channel (ii) at all. Until both have a detection
+mechanism, the honest posture is the conservative one spec decision 5
+prescribes: any test that spawns the binary is staled by any `cli/src/**`
+write, whatever its recorded file set says.
+
 **Line/region granularity is not worth keeping**, on the predicate first and
 size second. The staleness predicate Phase 4 evaluates is "did a file in this
 set change"; line ranges would only serve a same-file-different-lines
@@ -417,8 +457,9 @@ Grounded in the numbers above:
    uninstrumented re-run but not re-verified before the instrumented one, §2).
    Per-test capture extrapolates to **~2 min (median-based lower bound) to
    ~13 min (mean-based upper bound, dominated by a single 21.5 s test)** for the
-   full suite, against a 209 s suite run — roughly a 1×–3.7× multiplier on a run
-   that already takes 3.5 minutes, and it is not on any interactive path
+   full suite, against a 209 s suite run — a **0.55×–3.7×** multiplier on a run
+   that already takes 3.5 minutes (the median-based end, 114 s, is *faster*
+   than the suite run), and it is not on any interactive path
    (Phase 4 captures at explicit moments, not per keystroke). Both ends are
    EXTRAPOLATIONS from a 50-test sample and carry the §3/§8 riders.
 2. **Storage is not the obstacle, once projected.** ~283 KB for a full per-test
@@ -479,13 +520,23 @@ mechanism, coarser flag, no per-test kill detection needed.
   design constraint on Phase 4.
 - **Exit criterion 4 (Probe B) is not in scope for this document** and is not
   claimed here; see the sibling doc named at the top.
-- **An instrumented run leaks `.profraw` into the repo root.** 58 files named
-  `default_<hash>_0_<pid>.profraw` appeared at the top of the working tree
-  during the instrumented suite run (children that ran without the templated
-  `LLVM_PROFILE_FILE` in scope). They were moved to the session scratchpad, not
-  deleted. Phase 4 must either set the template explicitly for spawned children
-  or gitignore the pattern, or a coverage run dirties the user's repo — which,
-  in this repo, also means the recorder sees 58 file creations.
+- **An instrumented run leaks untemplated `.profraw` into the repo root, and
+  the mechanism is UNDETERMINED.** Files named
+  `default_<hash>_0_<pid>.profraw` appear at the top of the working tree:
+  **58** during the instrumented suite run here, **5** more during a later
+  round, and the reviewing skeptic independently reproduced it — **2** files
+  during a single `approve` capture, **0** on reruns, so it is
+  timing-dependent. An earlier draft of this document attributed it to
+  "children that ran without the templated `LLVM_PROFILE_FILE` in scope";
+  **that was an unmeasured mechanism claim and is withdrawn** — no `env_clear`
+  or `env_remove` of `LLVM_PROFILE_FILE` exists anywhere in `cli/src` or
+  `cli/tests`, so nothing measured supports it. What IS established: the files
+  exist, and their coverage is **not merged into any test's map**, which makes
+  this a **second under-attribution channel, distinct from the SIGKILL one**.
+  All leaked files were moved to the session scratchpad, never deleted.
+  Phase 4 must both explain the leak and either template or gitignore the
+  pattern — in this repo an un-gitignored leak also means the recorder sees
+  those creations as file mutations.
 - No `.rs` or Cargo file was modified. `cargo llvm-cov` wrote only under
   `target/llvm-cov-target/` (1.0 GB); nothing was written inside `.agentrec/`.
 
