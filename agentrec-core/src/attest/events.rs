@@ -32,7 +32,7 @@ mod hex32 {
         // Byte-slicing below is only safe on ASCII, and the length guard is a
         // BYTE length: a 64-byte string holding a multibyte char would split a
         // char boundary and panic, taking down every reader of the log over
-        // one bad field. `from_str_radix` also accepts `+`/`-` signs and
+        // one bad field. `from_str_radix` also accepts a leading `+` and
         // uppercase, so `"+1"` × 32 would parse and then re-serialize
         // differently — accept only the canonical form this format documents.
         let canonical = text.len() == 64

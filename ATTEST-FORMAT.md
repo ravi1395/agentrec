@@ -171,8 +171,8 @@ re-`derive` and a `stale` all leave a refuted claim exactly where it is, and are
 counted in `ClaimHistory` instead. A permanent refutation that one human
 keypress could erase would not be permanent.
 
-`stale` is included in that list on purpose. The overlay's only exits are the
-two establishing verdicts below, and a refuted claim refuses every verdict — so
+`stale` is included in that list on purpose: a refuted claim refuses every
+verdict, and verdicts are the overlay's only exits (§ "The `STALE` overlay") — so
 an overlay set on one could never clear, and Phase 4 would re-verify a permanent
 refutation forever. A claim that is stale when it becomes `CLAIM_FALSE` has the
 overlay dropped, since a permanent verdict is an established state.

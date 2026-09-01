@@ -213,7 +213,8 @@ pub fn fold_claims(events: &[AttestEvent]) -> FoldResult {
                 by_identity.insert(test_identity.clone(), id.clone());
                 // No status assignment here, deliberately. The claim is born
                 // DERIVED by `ClaimState::new` on first sight of its id; every
-                // LATER derive updates identity, body hash and the index only.
+                // LATER derive updates identity, body hash, `renamed_from`, the
+                // derive counter and the index — never status.
                 // Keying on "first derive" instead would regress an already
                 // established claim whenever the derive is not the first event
                 // for that id — `[evidence, derive]`, `[verdict, derive]` and a
