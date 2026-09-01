@@ -179,6 +179,20 @@ pub enum ParsedAttestLine {
     Blank,
 }
 
+/// Every `kind` string this binary implements — the source of truth
+/// [`parse_line`] uses to tell "a newer agentrec wrote this" from "this line
+/// is damaged". Kept in sync with [`AttestEvent`] by
+/// `tests::ac14_every_variants_kind_string_is_in_the_known_list`, which reds
+/// the day a seventh kind lands without an entry here.
+pub const KNOWN_EVENT_KINDS: [&str; 6] = [
+    "derive",
+    "evidence",
+    "verdict",
+    "stale",
+    "human",
+    "manual-declare",
+];
+
 /// Parse one line, tolerating both unknown kinds and torn JSON. Never returns
 /// an error: a single bad line must not cost the caller the whole log.
 pub fn parse_line(line: &str) -> ParsedAttestLine {
@@ -358,6 +372,30 @@ mod tests {
         assert_eq!(census.events, 1);
         assert_eq!(census.unknown_kind_lines, 1);
         assert_eq!(census.unparsed_lines, 1);
+    }
+
+    #[test]
+    fn ac14_every_variants_kind_string_is_in_the_known_list() {
+        let mut seen = std::collections::BTreeSet::new();
+        for ev in one_of_every_kind() {
+            let value: serde_json::Value = serde_json::to_value(&ev).unwrap();
+            let kind = value
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .expect("every event serializes with a kind tag")
+                .to_string();
+            assert!(
+                KNOWN_EVENT_KINDS.contains(&kind.as_str()),
+                "{kind} is written by AttestEvent but missing from KNOWN_EVENT_KINDS, \
+                 so a malformed line of that kind would be misreported as a newer schema"
+            );
+            seen.insert(kind);
+        }
+        assert_eq!(
+            seen.len(),
+            KNOWN_EVENT_KINDS.len(),
+            "the fixture must cover every kind in the known list: saw {seen:?}"
+        );
     }
 
     #[test]

@@ -614,6 +614,36 @@ ac7_unknown_kind_line_is_tolerated_and_counted`
 carries `blocks_gate() == false`). — `fold::tests::
 ac8_flaky_state_comes_only_from_flaky_observation_and_never_blocks`
 
+**AC-ATTEST-P2-9.** `claim-false` permanence holds against EVERY later event
+kind, not only later verdicts: a `human`, `manual-declare`, `evidence` or
+re-`derive` after a `claim-false` verdict leaves the status `CLAIM_FALSE` and
+`blocks_gate()` true, each counted in history. — `fold::tests::
+ac9_claim_false_survives_a_later_human_answer_and_manual_declare`
+**AC-ATTEST-P2-10.** A `manual-declare` landing on an already-established claim
+records its text and severity without moving the status (a hand-authored event
+never demotes a machine verdict); it sets `DECLARED` only on a fresh claim id. —
+`fold::tests::ac10_manual_declare_on_an_existing_claim_records_without_moving_status`
+**AC-ATTEST-P2-11.** The `test_identity → ClaimId` index is returned to callers
+(`FoldResult::claim_for`, Phase 3's rename-detection lookup) and tracks the LIVE
+identity: after a rename the old identity resolves to nothing and the new one to
+the same `ClaimId`. — `fold::tests::
+ac11_by_identity_tracks_the_live_identity_across_a_rename`
+**AC-ATTEST-P2-12.** A later `derive` carrying `body_hash: None` does not erase a
+hash a previous `derive` recorded. — `fold::tests::
+ac12_a_later_derive_without_a_body_hash_does_not_erase_the_recorded_one`
+**AC-ATTEST-P2-13.** An `evidence` event arriving before any `derive` populates
+`test_identity` from its `StructuredResult` and indexes it; a claim seen only
+through identity-less kinds keeps `test_identity: None`. — `fold::tests::
+ac13_evidence_before_any_derive_still_carries_the_test_identity`
+**AC-ATTEST-P2-14.** Every `AttestEvent` variant's serialized `kind` string is
+present in `events::KNOWN_EVENT_KINDS`, so a seventh kind cannot drift into
+being misreported as a newer schema. — `events::tests::
+ac14_every_variants_kind_string_is_in_the_known_list`
+
+**Signature note for Phase 3:** `fold_claims` returns `FoldResult { claims,
+by_identity }`, not a bare `BTreeMap<ClaimId, ClaimState>` (AC-ATTEST-P2-11).
+States are `result.claims`; the rename lookup is `result.claim_for(&identity)`.
+
 Resolved ambiguity, pinned here because Phase 3 consumes it: the spec's
 "`STALE` … drops on the next verdict" is read as **drops only on a verdict that
 establishes a state (`confirmed` or `claim-false`)**; `recipe-invalid` and

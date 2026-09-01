@@ -135,10 +135,19 @@ The only hand-authored event: an un-testable criterion's text, `blocking` or
 
 ## State machine
 
-`fold_claims(&[AttestEvent]) -> BTreeMap<ClaimId, ClaimState>` is a deterministic
-fold and a **dumb applier**: it detects nothing, decides nothing, and schedules
+`fold_claims(&[AttestEvent]) -> FoldResult` is a deterministic fold and a **dumb
+applier**: it detects nothing, decides nothing, and schedules
 nothing. Every transition below is a mechanical consequence of an event already
-written.
+written. Two further consequences of that, both deliberate:
+
+- A `derive` whose `test_identity` differs from the claim's current one and
+  carries **no** `renamed_from` still remaps that claim's identity, silently.
+  The fold cannot tell an unannounced rename from a writer correcting itself,
+  and guessing would be worse than applying what was written. `attest derive`
+  (Phase 3) is what decides.
+- `body_hash` **merges**: a later `derive` carrying `null` never erases a hash a
+  previous `derive` recorded. Absence means "this derive computed no hash", not
+  "the test has no body".
 
 | From | Event | To | Note |
 |---|---|---|---|
@@ -151,13 +160,21 @@ written.
 | `CLAIM_FALSE` | any `verdict` | `CLAIM_FALSE` | refused transition, counted in history |
 | any but `CLAIM_FALSE` | `verdict: recipe-invalid` | `RECIPE_INVALID{cause}` | retryable; `confirmed` later still reaches `CONFIRMED` |
 | any but `CLAIM_FALSE` | `verdict: flaky-observation` | `FLAKY` | statistical, never blocking |
+| any but `CLAIM_FALSE` | `human` | `HUMAN{answer}` | |
+| — (a fresh claim id) | `manual-declare` | `DECLARED` | |
+| an existing claim | `manual-declare` | unchanged | text and severity recorded; a hand-authored event must not demote a machine verdict |
 | any | `stale` | unchanged status, `STALE` overlay set | |
-| any | `human` | `HUMAN{answer}` | |
+| `CLAIM_FALSE` | **any event of any kind** | `CLAIM_FALSE` | see below |
 
-**Gate blocking:** only `CLAIM_FALSE` blocks (`ClaimStatus::blocks_gate`).
-`RECIPE_INVALID` and `FLAKY` never block on their own — `recipe-invalid` queues a
-retry and surfaces in `attest status`. (An unanswered blocking `manual-declare`
-also blocks, but that is the gate's own read of `manual_severity`, not a status.)
+**`CLAIM_FALSE` is permanent against every later event kind**, not only later
+verdicts: a `human` answer, a `manual-declare`, an `evidence` capture and a
+re-`derive` all leave the status where it is and are counted in `ClaimHistory`
+instead. A permanent refutation that one human keypress could erase would not be
+permanent. (`stale` still sets the overlay — it is not a status.)
+
+**Gate blocking:** `RECIPE_INVALID` and `FLAKY` never block on their own —
+`recipe-invalid` queues a retry and surfaces in `attest status`. See "Gate
+blocking, precisely" below.
 
 ### The `STALE` overlay
 
@@ -168,6 +185,29 @@ The spec says the overlay "drops on the next verdict", which is ambiguous about
 those two. They are exactly the "we still do not know" outcomes, and spec
 decision 5 says stale MORE when unsure, so they do not clear it. Resolved here
 because Phase 3 builds against it.
+
+## The identity index
+
+`FoldResult` returns the `test_identity → ClaimId` index alongside the states
+(`claim_for(&TestIdentity) -> Option<&ClaimId>`). It is part of the contract, not
+internal bookkeeping: `attest derive` (Phase 3) needs exactly this lookup to
+resolve a rename — it must find the OLD claim's id to write into the
+`renamed_from` event. Only identities that are live *now* appear; the one a
+rename moved away from is removed.
+
+`ClaimState.test_identity` is filled from a `derive`, and — when no `derive` has
+been seen yet — from an `evidence` event's `StructuredResult`, so an
+out-of-order or partially-read log still attributes. It stays absent only for a
+claim seen exclusively through kinds that carry no identity at all (a `verdict`,
+`stale` or `human` before its `derive` — a torn tail, or two writers
+interleaving).
+
+## Gate blocking, precisely
+
+`ClaimStatus::blocks_gate()` answers for the **status alone**, and only
+`CLAIM_FALSE` returns true. The gate's other blocking condition — an unanswered
+or rejected `blocking` manual item — is not a status: it is the gate reading
+`manual_severity` against the claim's `human` answer, and it lands in Phase 5.
 
 ## Verdict naming
 
