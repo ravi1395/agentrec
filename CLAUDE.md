@@ -14,6 +14,21 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **attest v1 Phase 2 (pure claim core) — Fable skeptic GATE PASS at `cd94b73` (2026-09-02,
+  `feat/attest`).** `agentrec-core::attest::{types,events,fold}` + `ATTEST-FORMAT.md` (draft,
+  unstable, outside PROTOCOL versioning). Core lib 230→259 tests. Three gate rounds: round 1
+  FAILED on three CODE blockers (hex32 deserializer panicked on a 64-byte multibyte body_hash,
+  taking down every reader; Derive arm regressed EVIDENCED/CONFIRMED to DERIVED on any later
+  derive; STALE on a CLAIM_FALSE claim could never clear), round 2 FAILED on prose only (the
+  narrowed STALE rule restated in full in the spec beside a "single statement" sentence),
+  round 3 PASS. Opus review before the gate had caught a fourth real defect (a `human` event
+  erased permanent claim-false). **Contract deviations Phase 3 must read:** `fold_claims`
+  returns `FoldResult { claims, by_identity }` with `claim_for(&TestIdentity)` (plan amended);
+  STALE clears only on confirmed/claim-false (orchestrator-ratified under decision 5, founder
+  may override; stated once in ATTEST-FORMAT.md § "The STALE overlay"); `stale` on a refuted
+  claim is a history-only no-op; a later `derive` never touches status. Skeptic's open risk:
+  whether `[evidence, derive]` ordering occurs in production depends on Phase 3's writer using
+  `by_identity` for its lookup — Phase 3's fixture must exercise it.
 - **attest v1 Phase 1 spike — Fable skeptic GATE PASS at `59fbbf7` (2026-09-01, branch
   `feat/attest`, cut from `main`; round 1 FAILED on one record blocker, narrow re-gate PASSED).**
   Findings only, no product code: `docs/verify/attest-coverage-spike.md` (Probe A),
