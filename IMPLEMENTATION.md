@@ -577,3 +577,45 @@ granularity, with a child-killed scope flag.
 dispatch begins. — **MET:** founder ruled 2026-09-01 in session, adopting the
 recommendation; the manual claim `clm_2D3J0S3FNM6VSQX367GGN1FTQZ` covering
 Probe A was attested by the founder. Phase 2 dispatched the same day.
+
+### Phase 2 — claim core: events, fold, derive (pure, no execution)
+
+Scope: `agentrec-core/src/attest.rs` + `attest/{types,events,fold}.rs`,
+`agentrec-core/src/lib.rs`, `ATTEST-FORMAT.md`. Pure: no I/O, no process
+execution, no file paths in core. Tests are unit tests inside the module
+(`cargo test -p agentrec-core attest::`).
+
+**AC-ATTEST-P2-1.** Fold of `[derive, evidence, stale, verdict(confirmed)]` ends
+`CONFIRMED` with the `STALE` overlay dropped. — `fold::tests::
+ac1_derive_evidence_stale_confirmed_ends_confirmed_and_unstale`
+**AC-ATTEST-P2-2.** `verdict(recipe-invalid)` then `verdict(confirmed)` ends
+`CONFIRMED` (recipe-invalid proven retryable, not terminal). — `fold::tests::
+ac2_recipe_invalid_then_confirmed_ends_confirmed`
+**AC-ATTEST-P2-3.** An author-run `evidence` event alone can never reach
+`CONFIRMED`; only a `verdict{confirmed}` can. — `fold::tests::
+ac3_author_evidence_alone_never_reaches_confirmed`
+**AC-ATTEST-P2-4.** A `Derive` carrying `renamed_from: Some(old)` plus the old
+claim's `ClaimId` continues that claim under the SAME `ClaimId` — identity
+remapped, zero prior evidence/verdicts lost. — `fold::tests::
+ac4_rename_continues_same_claim_id_losing_no_history`
+**AC-ATTEST-P2-5.** `claim-false` is permanent: a later `verdict{confirmed}`
+does not move the state (it is counted in history only). — `fold::tests::
+ac5_claim_false_is_permanent_against_a_later_confirmed_verdict`
+**AC-ATTEST-P2-6.** Two `TestIdentity` values differing only in the cargo
+target component fold to two distinct claims (no cross-attribution). —
+`fold::tests::ac6_same_fn_name_in_two_targets_folds_to_two_claims`
+**AC-ATTEST-P2-7.** Every event kind survives a JSONL round-trip value-equal,
+and a line carrying an unknown `kind` is tolerated and counted (`ParsedAttestLine
+::UnknownKind`), never fatal to the log. — `events::tests::
+ac7_every_event_kind_round_trips_value_equal` and `events::tests::
+ac7_unknown_kind_line_is_tolerated_and_counted`
+**AC-ATTEST-P2-8.** The `FLAKY` state is produced only by a
+`verdict{flaky-observation}`, and it is a non-blocking state flag (the state
+carries `blocks_gate() == false`). — `fold::tests::
+ac8_flaky_state_comes_only_from_flaky_observation_and_never_blocks`
+
+Resolved ambiguity, pinned here because Phase 3 consumes it: the spec's
+"`STALE` … drops on the next verdict" is read as **drops only on a verdict that
+establishes a state (`confirmed` or `claim-false`)**; `recipe-invalid` and
+`flaky-observation` leave `STALE` set, since those are exactly the "still
+unknown" cases and spec decision 5 says stale MORE when unsure.
