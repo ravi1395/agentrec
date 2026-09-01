@@ -14,9 +14,12 @@ use std::fmt;
 /// carries both.
 ///
 /// The fold never mints: it only reads ids off `derive` events.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ClaimId(String);
+
+/// Crockford base32, the alphabet `crate::id` encodes ULIDs in.
+const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 impl ClaimId {
     /// Mint a fresh id for a newly derived claim.
@@ -29,13 +32,35 @@ impl ClaimId {
         ClaimId(format!("c_{}", crate::id::ulid_with(ms, rand)))
     }
 
-    /// Adopt an id read off the wire.
-    pub fn from_wire(s: impl Into<String>) -> Self {
-        ClaimId(s.into())
+    /// Adopt an id read off the wire, checking its shape: `c_` followed by 26
+    /// Crockford base32 characters.
+    ///
+    /// Validated rather than adopted verbatim because an unvalidated id is a
+    /// silent mis-key: `""` or a turn id pasted into `claim_id` would mint a
+    /// phantom claim that no `derive` ever created and no writer can find
+    /// again. A malformed id makes the LINE unreadable, which the tolerant
+    /// reader already knows how to count.
+    pub fn parse(s: &str) -> Option<Self> {
+        let rest = s.strip_prefix("c_")?;
+        if rest.len() != 26 || !rest.bytes().all(|b| CROCKFORD.contains(&b)) {
+            return None;
+        }
+        Some(ClaimId(s.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaimId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        ClaimId::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "claim_id must be `c_` + 26 Crockford base32 chars, got {text:?}"
+            ))
+        })
     }
 }
 
@@ -182,6 +207,28 @@ mod tests {
         assert!(id.as_str().starts_with("c_"));
         assert_eq!(id.as_str().len(), 28);
         assert!(!id.as_str().starts_with("t_"));
+    }
+
+    #[test]
+    fn claim_ids_are_shape_checked_on_the_way_in() {
+        let good = ClaimId::mint_with(1, &[0u8; 10]);
+        assert_eq!(ClaimId::parse(good.as_str()), Some(good));
+        for bad in [
+            "",
+            "c_",
+            "t_00000000010W3GE1R70W3GE1R7",  // a turn id
+            "00000000010W3GE1R70W3GE1R7",    // no prefix
+            "c_00000000010W3GE1R70W3GE1R",   // 25 chars
+            "c_00000000010W3GE1R70W3GE1R77", // 27 chars
+            "c_00000000010W3GE1R70W3GE1Ru",  // lowercase, not Crockford
+            "c_00000000010W3GE1R70W3GE1RU",  // U is excluded from Crockford
+        ] {
+            assert_eq!(ClaimId::parse(bad), None, "{bad:?} must not parse");
+            assert!(
+                serde_json::from_str::<ClaimId>(&format!("\"{bad}\"")).is_err(),
+                "{bad:?} must not deserialize"
+            );
+        }
     }
 
     #[test]

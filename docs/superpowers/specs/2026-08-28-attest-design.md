@@ -179,7 +179,14 @@ surviving core, reimplemented in Rust):
 
 Claim states (fold output): `DERIVED → EVIDENCED → CONFIRMED | CLAIM-FALSE |
 RECIPE-INVALID(retryable) | FLAKY`, with a `STALE` overlay that queues re-verify and
-drops on the next verdict.
+drops on a verdict that ESTABLISHES a state — `confirmed` or `claim-false`;
+`recipe-invalid` and `flaky-observation` leave it set, and a claim that is
+already `claim-false` never takes the overlay at all (its verdicts are refused,
+so an overlay set on it could never clear). *(Narrowed 2026-09-01 from "drops on
+the next verdict", orchestrator-ratified under decision 5 — over-rechecking
+wastes background time, under-rechecking ships a regression; founder may
+override. Single statement of the rule: `ATTEST-FORMAT.md` § "The `STALE`
+overlay".)*
 
 Components (all in the existing two-crate workspace):
 

@@ -20,8 +20,8 @@ requires a decision-register entry). Corrections are made by appending.
 
 Unlike `log.jsonl`, this file has **multiple routine writers**: CLI commands
 append `evidence` / `verdict` / `human` / `manual-declare`, and the daemon
-appends `stale`. Every writer — the daemon included — takes the append lock
-(`cli/src/attest/lock.rs`, Phase 3).
+appends `stale`. Every writer — the daemon included — will take the append lock
+once Phase 3 lands `cli/src/attest/lock.rs`; that file does not exist yet.
 
 Every event carries `kind` (the serde tag) and `ts` (unix milliseconds), and
 names the claim it applies to with `claim_id`.
@@ -151,40 +151,47 @@ written. Two further consequences of that, both deliberate:
 
 | From | Event | To | Note |
 |---|---|---|---|
-| — | `derive` | `DERIVED` | mints the claim in the fold's map |
-| — | `manual-declare` | `DECLARED` | manual criterion awaiting a human |
+| — (first sight of the claim id) | `derive` | `DERIVED` | mints the claim |
+| — (first sight of the claim id) | `manual-declare` | `DECLARED` | manual criterion awaiting a human |
+| any established status | `derive` | unchanged | identity, body hash and index update; a re-derive only re-asserts that the test exists |
+| any established status | `manual-declare` | unchanged | text and severity recorded; a hand-authored event must not demote a machine verdict |
 | `DERIVED` | `evidence` | `EVIDENCED` | an author's run stops here, always |
 | `EVIDENCED` and later | `evidence` | unchanged | counted in history |
-| any but `CLAIM_FALSE` | `verdict: confirmed` | `CONFIRMED` | the only route to `CONFIRMED` |
-| any but `CLAIM_FALSE` | `verdict: claim-false` | `CLAIM_FALSE` | **permanent** |
-| `CLAIM_FALSE` | any `verdict` | `CLAIM_FALSE` | refused transition, counted in history |
-| any but `CLAIM_FALSE` | `verdict: recipe-invalid` | `RECIPE_INVALID{cause}` | retryable; `confirmed` later still reaches `CONFIRMED` |
-| any but `CLAIM_FALSE` | `verdict: flaky-observation` | `FLAKY` | statistical, never blocking |
-| any but `CLAIM_FALSE` | `human` | `HUMAN{answer}` | |
-| — (a fresh claim id) | `manual-declare` | `DECLARED` | |
-| an existing claim | `manual-declare` | unchanged | text and severity recorded; a hand-authored event must not demote a machine verdict |
-| any | `stale` | unchanged status, `STALE` overlay set | |
-| `CLAIM_FALSE` | **any event of any kind** | `CLAIM_FALSE` | see below |
+| any | `verdict: confirmed` | `CONFIRMED` | the only route to `CONFIRMED` |
+| any | `verdict: claim-false` | `CLAIM_FALSE` | |
+| any | `verdict: recipe-invalid` | `RECIPE_INVALID{cause}` | retryable; a later `confirmed` still reaches `CONFIRMED` |
+| any | `verdict: flaky-observation` | `FLAKY` | statistical |
+| any | `human` | `HUMAN{answer}` | |
+| any | `stale` | status unchanged, `STALE` overlay set | |
+| `CLAIM_FALSE` | **any event of any kind** | `CLAIM_FALSE` | the exception below overrides every row above |
 
 **`CLAIM_FALSE` is permanent against every later event kind**, not only later
-verdicts: a `human` answer, a `manual-declare`, an `evidence` capture and a
-re-`derive` all leave the status where it is and are counted in `ClaimHistory`
-instead. A permanent refutation that one human keypress could erase would not be
-permanent. (`stale` still sets the overlay — it is not a status.)
+verdicts: a `human` answer, a `manual-declare`, an `evidence` capture, a
+re-`derive` and a `stale` all leave a refuted claim exactly where it is, and are
+counted in `ClaimHistory` instead. A permanent refutation that one human
+keypress could erase would not be permanent.
 
-**Gate blocking:** `RECIPE_INVALID` and `FLAKY` never block on their own —
-`recipe-invalid` queues a retry and surfaces in `attest status`. See "Gate
-blocking, precisely" below.
+`stale` is included in that list on purpose. The overlay's only exits are the
+two establishing verdicts below, and a refuted claim refuses every verdict — so
+an overlay set on one could never clear, and Phase 4 would re-verify a permanent
+refutation forever. A claim that is stale when it becomes `CLAIM_FALSE` has the
+overlay dropped, since a permanent verdict is an established state.
+
+**Gate blocking:** only `CLAIM_FALSE` blocks. See "Gate blocking, precisely".
 
 ### The `STALE` overlay
 
-`stale` sets the overlay; a verdict that **establishes a state** — `confirmed` or
-`claim-false` — drops it. `recipe-invalid` and `flaky-observation` leave it set.
+**This is the single statement of the rule; every other document points here.**
 
-The spec says the overlay "drops on the next verdict", which is ambiguous about
-those two. They are exactly the "we still do not know" outcomes, and spec
-decision 5 says stale MORE when unsure, so they do not clear it. Resolved here
-because Phase 3 builds against it.
+`stale` sets the overlay. It is dropped by a verdict that **establishes a
+state** — `confirmed` or `claim-false`. `recipe-invalid` and `flaky-observation`
+leave it set, and `stale` on an already-refuted claim never sets it.
+
+This **narrows** the spec's Architecture line, which said the overlay "drops on
+the next verdict" without saying what the two non-establishing verdicts do. They
+are exactly the "we still do not know" outcomes, and spec decision 5 says stale
+MORE when unsure. Narrowed 2026-09-01, orchestrator-ratified under decision 5;
+the founder may override. The spec line carries the same amendment.
 
 ## The identity index
 
@@ -192,15 +199,22 @@ because Phase 3 builds against it.
 (`claim_for(&TestIdentity) -> Option<&ClaimId>`). It is part of the contract, not
 internal bookkeeping: `attest derive` (Phase 3) needs exactly this lookup to
 resolve a rename — it must find the OLD claim's id to write into the
-`renamed_from` event. Only identities that are live *now* appear; the one a
-rename moved away from is removed.
+`renamed_from` event. The identity a rename moved away from is removed.
+
+The index answers "which claim owns this identity **now**", not "every claim
+carrying it". Two claims can declare one identity — `derive(B, x)` then
+`derive(A, x)`, a writer bug — and then the index holds only `x → A` while `B`
+still carries `x` as its `test_identity`. The fold does not evict `B`'s
+identity: a dumb applier has no basis for deciding which writer was wrong.
 
 `ClaimState.test_identity` is filled from a `derive`, and — when no `derive` has
 been seen yet — from an `evidence` event's `StructuredResult`, so an
 out-of-order or partially-read log still attributes. It stays absent only for a
-claim seen exclusively through kinds that carry no identity at all (a `verdict`,
-`stale` or `human` before its `derive` — a torn tail, or two writers
-interleaving).
+claim seen exclusively through kinds that carry no identity at all: a `verdict`,
+`stale` or `human` arriving before its `derive` (a torn tail, or two writers
+interleaving), and — the one legitimate permanent case — a `manual-declare`
+claim, which describes a criterion no test covers and therefore has no test
+identity to carry.
 
 ## Gate blocking, precisely
 

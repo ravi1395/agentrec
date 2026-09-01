@@ -601,9 +601,12 @@ ac4_rename_continues_same_claim_id_losing_no_history`
 **AC-ATTEST-P2-5.** `claim-false` is permanent: a later `verdict{confirmed}`
 does not move the state (it is counted in history only). — `fold::tests::
 ac5_claim_false_is_permanent_against_a_later_confirmed_verdict`
-**AC-ATTEST-P2-6.** Two `TestIdentity` values differing only in the cargo
-target component fold to two distinct claims (no cross-attribution). —
-`fold::tests::ac6_same_fn_name_in_two_targets_folds_to_two_claims`
+**AC-ATTEST-P2-6.** The cargo target is part of `TestIdentity`'s key: two
+identities differing only in the target component are distinct as map keys, so
+two same-named tests in different targets cannot cross-attribute. — `fold::
+tests::ac6_same_fn_name_in_two_targets_folds_to_two_claims` (the discriminating
+half is the `BTreeSet` assertion; the two-claims half is illustrative, since
+the fixture's two explicit `ClaimId`s would fold apart regardless)
 **AC-ATTEST-P2-7.** Every event kind survives a JSONL round-trip value-equal,
 and a line carrying an unknown `kind` is tolerated and counted (`ParsedAttestLine
 ::UnknownKind`), never fatal to the log. — `events::tests::
@@ -640,12 +643,39 @@ present in `events::KNOWN_EVENT_KINDS`, so a seventh kind cannot drift into
 being misreported as a newer schema. — `events::tests::
 ac14_every_variants_kind_string_is_in_the_known_list`
 
+**AC-ATTEST-P2-15.** A `derive` never regresses an established status: it sets
+`DERIVED` only on first sight of the claim id, and updates identity, body hash
+and the index on every later occurrence. Verified for `[evidence, derive]`,
+`[verdict(confirmed), derive]` with and without a prior derive,
+`[manual-declare, derive]`, and `[evidence(x), derive(y, renamed_from: x)]`. —
+`fold::tests::ac15_a_later_derive_never_regresses_an_established_status`
+**AC-ATTEST-P2-16.** A refuted claim is never left stale: `stale` on a
+`CLAIM_FALSE` claim is counted but sets no overlay, and a claim that is stale
+when it becomes `CLAIM_FALSE` has the overlay dropped — otherwise the overlay
+could never clear and Phase 4 would re-verify a permanent refutation forever. —
+`fold::tests::ac16_a_refuted_claim_is_never_left_stale`
+**AC-ATTEST-P2-17.** When two claims declare one identity (a writer bug), the
+index resolves it to the LATEST declarer and the earlier claim keeps the
+identity it was given — the fold evicts nothing, having no basis to decide which
+writer was wrong. — `fold::tests::
+ac17_two_claims_declaring_one_identity_index_the_latest_writer`
+**AC-ATTEST-P2-18.** A malformed `body_hash` or `claim_id` makes its LINE
+`Unparsed` and never panics — including a 64-BYTE string holding multibyte
+characters (byte-slicing a char boundary would take down every reader), a signed
+`"+1"`×32, uppercase hex, and wrong lengths; only 64 lowercase hex characters
+parse. — `events::tests::
+b1_a_malformed_body_hash_makes_the_line_unparsed_and_never_panics`,
+`events::tests::b1_a_malformed_claim_id_makes_the_line_unparsed`,
+`types::tests::claim_ids_are_shape_checked_on_the_way_in`
+**AC-ATTEST-P2-19.** A `flaky-observation` verdict leaves the `STALE` overlay
+set (the mirror of the recipe-invalid case). — `fold::tests::
+a_flaky_observation_leaves_the_stale_overlay_set`
+
 **Signature note for Phase 3:** `fold_claims` returns `FoldResult { claims,
 by_identity }`, not a bare `BTreeMap<ClaimId, ClaimState>` (AC-ATTEST-P2-11).
 States are `result.claims`; the rename lookup is `result.claim_for(&identity)`.
 
-Resolved ambiguity, pinned here because Phase 3 consumes it: the spec's
-"`STALE` … drops on the next verdict" is read as **drops only on a verdict that
-establishes a state (`confirmed` or `claim-false`)**; `recipe-invalid` and
-`flaky-observation` leave `STALE` set, since those are exactly the "still
-unknown" cases and spec decision 5 says stale MORE when unsure.
+The `STALE` overlay rule is stated once, in `ATTEST-FORMAT.md` § "The `STALE`
+overlay" — it narrows the spec's Architecture line (amended in place there too)
+and is what AC-ATTEST-P2-1, the recipe-invalid/flaky overlay tests and
+AC-ATTEST-P2-16 verify.

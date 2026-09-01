@@ -219,10 +219,11 @@ question.
     hash cannot survive a rename, since `test_identity` includes the fn
     name). Minted once at first derive — machine-scoped ULID, same scheme
     as turn ids — and never changes for the life of the claim.
-    `fold_claims(&[AttestEvent]) -> BTreeMap<ClaimId, ClaimState>` also
-    maintains the `test_identity → ClaimId` mapping internally (latest
-    identity wins per claim; `ClaimState` carries its current
-    `test_identity`).
+    `fold_claims(&[AttestEvent]) -> FoldResult { claims: BTreeMap<ClaimId,
+    ClaimState>, by_identity: BTreeMap<TestIdentity, ClaimId> }` — the
+    identity index is RETURNED, not internal (`claim_for(&TestIdentity)` is
+    Phase 3's rename lookup); detail in `ATTEST-FORMAT.md` § "The identity
+    index".
   - `test_identity` MUST include the cargo target/binary component, not
     just the bare fn name (measured collision, Phase 1 Probe B — two
     identically-named fns in different targets must map to two claims, or

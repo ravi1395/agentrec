@@ -83,14 +83,9 @@ pub struct ClaimState {
     /// not "the test has no body".
     pub last_body_hash: Option<[u8; 32]>,
     pub renamed_from: Option<TestIdentity>,
-    /// The `STALE` overlay: set by a `stale` event, and dropped only by a
-    /// verdict that ESTABLISHES a state (`confirmed` or `claim-false`).
-    ///
-    /// The spec says "drops on the next verdict", which is ambiguous about
-    /// `recipe-invalid` and `flaky-observation`. Those are precisely the "we
-    /// still do not know" outcomes, and spec decision 5 says stale MORE when
-    /// unsure, so they leave the overlay set. Value is the `ts` of the stale
-    /// event that set it.
+    /// The `STALE` overlay — value is the `ts` of the `stale` event that set
+    /// it. The rule for when it is set and dropped is stated once, in
+    /// `ATTEST-FORMAT.md` § "The `STALE` overlay".
     pub stale_since: Option<u64>,
     /// Manual-criterion text and severity, for `manual-declare` claims.
     pub manual_text: Option<String>,
@@ -133,8 +128,15 @@ impl ClaimState {
 pub struct FoldResult {
     /// Folded state, keyed by claim id.
     pub claims: BTreeMap<ClaimId, ClaimState>,
-    /// Current identity → claim id. An identity a rename moved away from is
-    /// removed, so this map holds only identities that are live right now.
+    /// Identity → the LATEST claim that declared it.
+    ///
+    /// An identity a rename moved away from is removed. But two claims CAN
+    /// declare the same identity (a writer bug: `derive(B, x)` then
+    /// `derive(A, x)`), and then the index holds only `x → A` while `B` still
+    /// carries `x` as its `test_identity`. The fold does not evict `B`'s
+    /// identity — a dumb applier has no basis for deciding which writer was
+    /// wrong — so the index answers "who owns this identity now", not "every
+    /// claim carrying it".
     pub by_identity: BTreeMap<TestIdentity, ClaimId>,
 }
 
@@ -209,11 +211,13 @@ pub fn fold_claims(events: &[AttestEvent]) -> FoldResult {
                     entry.last_body_hash = *body_hash;
                 }
                 by_identity.insert(test_identity.clone(), id.clone());
-                // A re-derive never regresses an established state: it only
-                // (re)asserts that the test exists.
-                if entry.history.derives == 1 && !refuted {
-                    entry.status = ClaimStatus::Derived;
-                }
+                // No status assignment here, deliberately. The claim is born
+                // DERIVED by `ClaimState::new` on first sight of its id; every
+                // LATER derive updates identity, body hash and the index only.
+                // Keying on "first derive" instead would regress an already
+                // established claim whenever the derive is not the first event
+                // for that id — `[evidence, derive]`, `[verdict, derive]` and a
+                // rename after any history all take that path.
             }
             AttestEvent::Evidence { result, .. } => {
                 entry.history.evidence += 1;
@@ -260,6 +264,13 @@ pub fn fold_claims(events: &[AttestEvent]) -> FoldResult {
             }
             AttestEvent::Stale { .. } => {
                 entry.history.stale_events += 1;
+                // A permanently refuted claim is never re-queued: the Verdict
+                // arm returns early on CLAIM_FALSE, so an overlay set here
+                // could never be cleared again and Phase 4 would re-verify a
+                // permanent refutation forever.
+                if refuted {
+                    continue;
+                }
                 entry.stale_since = Some(ts);
             }
             AttestEvent::Human { answer, note, .. } => {
@@ -689,6 +700,120 @@ mod tests {
         let bare = fold_claims(&[stale(1, &id)]);
         assert_eq!(bare.claims[&id].test_identity, None);
         assert!(bare.by_identity.is_empty());
+    }
+
+    #[test]
+    fn ac15_a_later_derive_never_regresses_an_established_status() {
+        let i = ident("agentrec--integration", "a_test");
+        let renamed = ident("agentrec--integration", "renamed");
+
+        // [evidence, derive]
+        let id = cid(19);
+        let s = states(&[evidence(1, &id, i.clone()), derive(2, &id, i.clone())]);
+        assert_eq!(s[&id].status, ClaimStatus::Evidenced);
+
+        // [verdict(confirmed), derive]
+        let id = cid(20);
+        let s = states(&[
+            derive(1, &id, i.clone()),
+            verdict(2, &id, VerdictKind::Confirmed),
+            derive(3, &id, i.clone()),
+        ]);
+        assert_eq!(s[&id].status, ClaimStatus::Confirmed);
+
+        // [verdict(confirmed), derive] with no prior derive at all
+        let id = cid(21);
+        let s = states(&[
+            verdict(1, &id, VerdictKind::Confirmed),
+            derive(2, &id, i.clone()),
+        ]);
+        assert_eq!(s[&id].status, ClaimStatus::Confirmed);
+
+        // [manual-declare, derive]
+        let id = cid(22);
+        let s = states(&[
+            AttestEvent::ManualDeclare {
+                ts: 1,
+                claim_id: id.clone(),
+                text: "by hand".into(),
+                severity: ManualSeverity::Blocking,
+            },
+            derive(2, &id, i.clone()),
+        ]);
+        assert_eq!(s[&id].status, ClaimStatus::Declared);
+
+        // [evidence(x), derive(y, renamed_from: x)]
+        let id = cid(23);
+        let folded = fold_claims(&[
+            evidence(1, &id, i.clone()),
+            AttestEvent::Derive {
+                ts: 2,
+                claim_id: id.clone(),
+                test_identity: renamed.clone(),
+                body_hash: None,
+                renamed_from: Some(i.clone()),
+            },
+        ]);
+        assert_eq!(folded.claims[&id].status, ClaimStatus::Evidenced);
+        assert_eq!(folded.claims[&id].test_identity.as_ref(), Some(&renamed));
+
+        // A first derive still mints DERIVED.
+        let id = cid(24);
+        assert_eq!(
+            states(&[derive(1, &id, i)])[&id].status,
+            ClaimStatus::Derived
+        );
+    }
+
+    #[test]
+    fn ac16_a_refuted_claim_is_never_left_stale() {
+        let id = cid(25);
+        let i = ident("agentrec--integration", "a_test");
+        let state = states(&[
+            derive(1, &id, i),
+            stale(2, &id),
+            verdict(3, &id, VerdictKind::ClaimFalse),
+            stale(4, &id),
+        ]);
+        let c = &state[&id];
+        assert_eq!(c.status, ClaimStatus::ClaimFalse);
+        assert!(
+            !c.is_stale(),
+            "a permanent refutation is an established state; a stale overlay \
+             on it could never be cleared and would re-verify forever"
+        );
+        // Both stale events are still counted.
+        assert_eq!(c.history.stale_events, 2);
+    }
+
+    #[test]
+    fn a_flaky_observation_leaves_the_stale_overlay_set() {
+        let id = cid(26);
+        let i = ident("agentrec--integration", "a_test");
+        let state = states(&[
+            derive(1, &id, i),
+            stale(2, &id),
+            verdict(3, &id, VerdictKind::FlakyObservation),
+        ]);
+        assert_eq!(state[&id].status, ClaimStatus::Flaky);
+        assert!(
+            state[&id].is_stale(),
+            "replays that disagreed establish nothing, so the claim stays stale"
+        );
+    }
+
+    #[test]
+    fn ac17_two_claims_declaring_one_identity_index_the_latest_writer() {
+        let a = cid(27);
+        let b = cid(28);
+        let x = ident("agentrec--integration", "contested");
+        let folded = fold_claims(&[derive(1, &b, x.clone()), derive(2, &a, x.clone())]);
+        // The index answers "who owns this identity now".
+        assert_eq!(folded.claim_for(&x), Some(&a));
+        // The earlier claim keeps the identity it was told it had — the fold
+        // has no basis for deciding which writer was wrong.
+        assert_eq!(folded.claims[&b].test_identity.as_ref(), Some(&x));
+        assert_eq!(folded.by_identity.len(), 1);
     }
 
     #[test]

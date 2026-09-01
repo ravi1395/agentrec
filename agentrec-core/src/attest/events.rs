@@ -29,13 +29,31 @@ mod hex32 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
         let opt = Option::<String>::deserialize(d)?;
         let Some(text) = opt else { return Ok(None) };
-        if text.len() != 64 {
-            return Err(serde::de::Error::custom("body_hash must be 64 hex chars"));
+        // Byte-slicing below is only safe on ASCII, and the length guard is a
+        // BYTE length: a 64-byte string holding a multibyte char would split a
+        // char boundary and panic, taking down every reader of the log over
+        // one bad field. `from_str_radix` also accepts `+`/`-` signs and
+        // uppercase, so `"+1"` × 32 would parse and then re-serialize
+        // differently — accept only the canonical form this format documents.
+        let canonical = text.len() == 64
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !canonical {
+            return Err(serde::de::Error::custom(
+                "body_hash must be exactly 64 lowercase hex characters",
+            ));
         }
+        let bytes = text.as_bytes();
         let mut out = [0u8; 32];
         for (i, slot) in out.iter_mut().enumerate() {
-            *slot = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
-                .map_err(|e| serde::de::Error::custom(format!("body_hash: {e}")))?;
+            let hi = (bytes[i * 2] as char)
+                .to_digit(16)
+                .expect("guarded ascii hex");
+            let lo = (bytes[i * 2 + 1] as char)
+                .to_digit(16)
+                .expect("guarded ascii hex");
+            *slot = (hi * 16 + lo) as u8;
         }
         Ok(Some(out))
     }
@@ -208,10 +226,10 @@ pub fn parse_line(line: &str) -> ParsedAttestLine {
         Err(_) => {
             // A `kind` this binary does not know is tolerable; anything else
             // (a known kind missing required fields) is damage.
-            let known = matches!(
-                value.get("kind").and_then(|k| k.as_str()),
-                Some("derive" | "evidence" | "verdict" | "stale" | "human" | "manual-declare")
-            );
+            let known = value
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .is_some_and(|k| KNOWN_EVENT_KINDS.contains(&k));
             if known {
                 ParsedAttestLine::Unparsed
             } else {
@@ -253,6 +271,8 @@ pub fn parse_log(body: &str) -> (Vec<AttestEvent>, AttestParseCensus) {
 mod tests {
     use super::*;
     use crate::attest::types::{RecipeInvalidCause, TestOutcome};
+
+    const ID: &str = "c_00000000010W3GE1R70W3GE1R7";
 
     fn ident() -> TestIdentity {
         TestIdentity::new("agentrec--import_claude", "ac3_zero_bytes")
@@ -351,13 +371,15 @@ mod tests {
         for ev in one_of_every_kind() {
             let line = serde_json::to_string(&ev).unwrap();
             assert!(!line.contains('\n'), "an event must be one JSONL line");
-            match parse_line(&line) {
-                ParsedAttestLine::Event(back) => assert_eq!(*back, ev, "round-trip: {line}"),
+            let back = match parse_line(&line) {
+                ParsedAttestLine::Event(back) => *back,
                 other => panic!("expected an event for {line}, got {other:?}"),
-            }
-            // Re-serializing the parsed value reproduces the same bytes.
-            let again = serde_json::to_string(&ev).unwrap();
-            assert_eq!(again, line);
+            };
+            assert_eq!(back, ev, "round-trip: {line}");
+            // Re-serializing what came BACK off the wire reproduces the same
+            // bytes — serializing `ev` again would only prove serde is a
+            // function of its input.
+            assert_eq!(serde_json::to_string(&back).unwrap(), line);
         }
     }
 
@@ -365,7 +387,7 @@ mod tests {
     fn ac7_unknown_kind_line_is_tolerated_and_counted() {
         let known = serde_json::to_string(&one_of_every_kind()[1]).unwrap();
         let body = format!(
-            "{known}\n{{\"kind\":\"from-the-future\",\"ts\":9,\"claim_id\":\"c_X\"}}\n\nnot json\n"
+            "{known}\n{{\"kind\":\"from-the-future\",\"ts\":9,\"claim_id\":\"c_00000000010W3GE1R70W3GE1R7\"}}\n\nnot json\n"
         );
         let (events, census) = parse_log(&body);
         assert_eq!(events.len(), 1);
@@ -399,6 +421,47 @@ mod tests {
     }
 
     #[test]
+    fn b1_a_malformed_body_hash_makes_the_line_unparsed_and_never_panics() {
+        // Each of these is a `derive` line whose only defect is `body_hash`.
+        // A panic here would take down every reader of the log.
+        let multibyte = "é".repeat(32); // 64 BYTES, 32 chars — splits a char boundary
+        assert_eq!(multibyte.len(), 64);
+        for bad in [
+            multibyte,
+            "+1".repeat(32), // from_str_radix accepts a sign
+            "-1".repeat(32),
+            "AB".repeat(32), // uppercase is not the canonical form
+            "ab".repeat(31), // 62 chars
+            "ab".repeat(33), // 66 chars
+            "zz".repeat(32), // not hex at all
+            String::new(),
+        ] {
+            let line = format!(
+                "{{\"kind\":\"derive\",\"ts\":1,\"claim_id\":\"{ID}\",\"test_identity\":{{\"target\":\"t\",\"fn_path\":\"f\"}},\"body_hash\":\"{bad}\"}}"
+            );
+            assert_eq!(
+                parse_line(&line),
+                ParsedAttestLine::Unparsed,
+                "body_hash {bad:?} must be damage, not a panic"
+            );
+        }
+        // The canonical form still parses.
+        let good = format!(
+            "{{\"kind\":\"derive\",\"ts\":1,\"claim_id\":\"{ID}\",\"test_identity\":{{\"target\":\"t\",\"fn_path\":\"f\"}},\"body_hash\":\"{}\"}}",
+            "ab".repeat(32)
+        );
+        assert!(matches!(parse_line(&good), ParsedAttestLine::Event(_)));
+    }
+
+    #[test]
+    fn b1_a_malformed_claim_id_makes_the_line_unparsed() {
+        for bad in ["", "t_00000000010W3GE1R70W3GE1R7", "c_nope"] {
+            let line = format!("{{\"kind\":\"stale\",\"ts\":1,\"claim_id\":\"{bad}\",\"cause\":\"file-write\",\"path\":\"a.rs\"}}");
+            assert_eq!(parse_line(&line), ParsedAttestLine::Unparsed, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn a_known_kind_written_malformed_is_damage_not_an_unknown_kind() {
         let (_, census) = parse_log("{\"kind\":\"verdict\",\"ts\":1}\n");
         assert_eq!(census.unparsed_lines, 1);
@@ -407,7 +470,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_on_a_known_kind_are_tolerated() {
-        let line = "{\"kind\":\"stale\",\"ts\":1,\"claim_id\":\"c_X\",\"cause\":\"file-write\",\"path\":\"a.rs\",\"future_field\":7}";
+        let line = "{\"kind\":\"stale\",\"ts\":1,\"claim_id\":\"c_00000000010W3GE1R70W3GE1R7\",\"cause\":\"file-write\",\"path\":\"a.rs\",\"future_field\":7}";
         assert!(matches!(parse_line(line), ParsedAttestLine::Event(_)));
     }
 }
