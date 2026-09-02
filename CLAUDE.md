@@ -14,6 +14,52 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **PR #23 CI-red fix: cargo's own ANSI SGR broke attest's target attribution — Fable skeptic
+  GATE PASS at round 2 (`feat/attest`, code identical to the round-1 tree, whose code criteria
+  all passed; unpushed).**
+  Under an explicit `CARGO_TERM_COLOR=always` — which `.github/workflows/ci.yml` sets in a
+  workflow-level `env:` block — cargo colorizes its OWN status lines, putting the escape BEFORE
+  the leading whitespace and the reset BETWEEN the word and its trailing space. So
+  `attest::adapter_cargo::section_targets`'s `trim_start()` stripped nothing,
+  `strip_prefix("Running ")` never matched, no marker paired, and every libtest result landed in
+  an unattributable section: **zero evidence captured, behind one stderr warning.**
+  That reddened the three `test (…)` jobs on run 33650989104. Fixed by
+  `attest::adapter_cargo::strip_sgr`, a narrow `ESC [` digits/`;` `m` scanner applied per line
+  inside `section_targets` — deliberately NOT to `stdout`/`stderr` up front, because
+  `attest::capture::capture_output` writes those same strings to the CAS as the evidence blob and
+  stripping there would silently change stored evidence bytes (the gate confirmed the blob still
+  carries its ESC bytes after a real `attest run`). The new test fails `left: []` with the call
+  site neutered, and fails on the pre-fix tree.
+  **Scope stayed one function, on measurement:** ANSI appears only on cargo's own
+  Compiling/Finished/Running/Doc-tests/error: lines — measured here on a passing and a failing
+  run, and re-measured by the gate over an ignored test and a failing doc-test too — so `parse_per_test`/`parse_summary` need nothing.
+  No CI leg added: `ci.yml` already forces color workflow-wide, so the existing jobs ARE the
+  regression coverage. The gate also fuzzed `strip_sgr` (200k generated strings + hand edge cases:
+  no panic, no hang) and independently reproduced both directions of the repro.
+  **Round 1 GATE FAIL was RECORD-only, and one blocker was this repo's signature defect committed
+  again after the ingested handoff warned about it:** the commit message and TWO source doc
+  comments claimed a "TTY-attached `attest run`" also gets colorized output. **Measured FALSE** —
+  `attest::capture::run_wrapped` spawns the child with `Stdio::piped()` on both streams, so
+  cargo's TTY detection never fires; the gate drove a real `attest run` inside a pty with the
+  variable unset and captured zero ESC bytes. Two further record defects: "four CI test jobs"
+  (three `test (…)` jobs failed; the fourth failing job is `fmt + clippy`, different cause), and
+  an unverifiable "it passed in an earlier full run carrying this fix" — **deleted, not
+  reworded**, since the artifact behind it carried no sha and no per-test line. Round 2 also
+  named two count imprecisions in the replacement text (a suite total that omitted the ignored
+  tests; a provenance sentence naming the wrong sha), both fixed.
+  **Residuals, disclosed:** all measurement is macOS + Homebrew cargo 1.97.1, so the first Linux
+  exercise is CI on push; the `PostToolUse` hook capture path was not driven live under a
+  color-forcing shell (`ac_p3_16` covers it under the env var); `strip_sgr` truncates a line at
+  any NON-SGR escape, so a future cargo emitting e.g. `ESC[K` before a marker would leave it
+  unpaired — loudly, as unattributable — disclosed in the fn doc. **The separate `fmt + clippy`
+  CI failure is NOT this branch's:** `useless_format` in
+  `import_codex.rs::update_only_turn_persists_with_baseline_unknown_never_fabricated` (an
+  argument-less `format!`) fires under CI's clippy 1.98.0; `git diff main...HEAD` for that file is empty and the line is
+  byte-identical on `main`, whose last CI run predates the `dtolnay/rust-toolchain@stable` float.
+  Local clippy is Homebrew 0.1.97 and rustup stable here is 1.96.1, so it cannot be reproduced
+  locally without changing the machine's toolchain. **PR #23 CI therefore stays red on that job
+  regardless of this fix** — founder call on whether to fix it here or separately.
+
 - **attest v1 Phase 5 (review cards, advisory gate, attestation report, `manual-declare`,
   unhide) — Fable skeptic GATE PASS at `22db674` (2026-09-02, `feat/attest`), after three
   FAILED rounds.** `attest {review,gate,report,manual-declare}` unhidden; suite 1159→1179/0/4,
