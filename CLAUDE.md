@@ -14,6 +14,27 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **attest v1 Phase 4 (independent replay + coverage staleness) — Fable skeptic GATE PASS at
+  `7e23ba9` (2026-09-02, `feat/attest`; hygiene follow-up `7c416ff`).** `attest verify`
+  (git-archive extract into a stable per-root dir, `target/` → per-COMMIT cache, scrubbed env
+  via `RunEnv`, staged pipeline with four distinct recipe-invalid causes, flaky policy: 1 run,
+  fail → up to 2 reruns, any pass → flaky-observation, 3 fails → claim-false), `attest coverage`
+  (cargo llvm-cov `show-env` recipe, `.agentrec/attest-coverage.json`, `over_stale` scopes
+  derived from bin targets' source dirs → `cli/src/**` here), daemon stale-marking at the batch
+  flush point through the attest lock (closes AC-P3-6), `clippy.toml` disallows
+  `Command::new` with 27 per-site allows and a two-direction plant probe
+  (`docs/verify/attest-purity-census.md`; direct-call census, not transitivity). Suite
+  1120→1159/0/4. Real defects found by measuring, all fixed: `show-env` quoted/bare mix dropped
+  `RUSTC_WRAPPER` (instrumentation silently absent); same-second commits sharing a build cache
+  served the wrong build; producer ignored the configured coverage path the daemon read; a
+  symlinked `--root` yielded `over_stale: []` (under-staling, the forbidden direction); batched
+  verdict append lost all progress on one Err. Record fix: README's "invalid TOML hard-errors on
+  every verb" was false — it is path-dependent (six `config::load` sites named). Residuals,
+  disclosed: nothing captures this repo's own coverage yet (`cli/src/**` reaching a real map is
+  unit-pinned only); `sweep_leaked_profraw` never fired in any run; `5bd5c0f`'s message says
+  "tempdir" of a stable dir and restates the verdict policy (unpushed; founder call on amend);
+  `approve.rs::a_killed_approve_never_leaves_a_phantom_approval` flaked 1/2 in one gate run
+  (the recorded flake). Phase 5 (review/gate/report/unhide) dispatched.
 - **attest v1 Phase 3 (cargo adapter + passive capture) — Fable skeptic GATE PASS at `78b9fb0`
   (2026-09-02, `feat/attest`).** `cli/src/attest/{lock,statuscmd,adapter_cargo,capture,
   derivecmd}.rs`, hidden `attest {status,derive,run}`, fixture crate
