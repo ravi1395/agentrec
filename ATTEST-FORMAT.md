@@ -235,7 +235,11 @@ point here rather than restating it.**
 Everything else the gate sees is **advisory** — surfaced with its reason, exit
 code 0: `recipe-invalid` (any cause), `flaky`, and the `STALE` overlay.
 
-`fyi` manual claims are in **neither** list. "`fyi` never nags"
+**Refutation outranks severity:** condition 1 is evaluated for every claim
+before any severity handling, so a claim carrying both a `claim-false` verdict
+and an `fyi` `manual-declare` still blocks.
+
+Otherwise, `fyi` manual claims are in **neither** list. "`fyi` never nags"
 (`events.rs::ManualSeverity`) is read literally: an `fyi` claim is never a
 blocker, never an advisory line, and never an `attest review` card — review does
 not prompt for one. It is visible in `attest report` and in `attest status`'s

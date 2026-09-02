@@ -1332,6 +1332,18 @@ is that the fixture holds no **`fyi`** claim, and the ruling changed the handlin
 of `fyi` only — a blocking manual claim renders in `attest report` exactly as it
 did before.
 
+**Correction to `bcccabc`'s commit message.** It said the gate got a "15-row
+exit-code table"; the table it landed had **16** rows: derived, evidenced,
+confirmed, claim-false, recipe-invalid, flaky, claim-false AND blocking manual,
+manual blocking unanswered/yes/no/skip, manual fyi unanswered/yes/no/skip, and
+stale-only. The count was wrong, and the table was wrong in a way the count
+could not show — it was hand-listed, and the `claim-false × fyi` cell was simply
+absent, which is the hole the Fable gate found (`B1`). AC-P5-2's table is now
+GENERATED: **59 rows** (10 statuses × 3 severities × 2 stale = 60, less the one
+cell that writes no events at all, `declared × severity=none × stale=false`).
+The figure is asserted by the test rather than typed here — if the generator
+stops generating, `p5_2_gate_exit_code_table` reds on its own row count.
+
 **The gate's blocking rule is stated once**, in `ATTEST-FORMAT.md` § "Gate
 blocking, precisely" (that section's "lands in Phase 5" future tense is replaced
 by the implemented rule). `gatecmd.rs` and `reviewcmd.rs` point at it and do not
@@ -1347,12 +1359,26 @@ id on stdout. The claim then folds to `DECLARED` and `attest status` counts it.
 (a) has a status for which `ClaimStatus::blocks_gate()` is true (`CLAIM_FALSE`
 only), or (b) carries `manual_severity == Blocking` with a status that is not
 `Human { answer: Yes }` — `DECLARED`, `Human{No}` and `Human{Skip}` all block.
-`recipe-invalid` (any cause), `flaky` and the `STALE` overlay are advisory and
-leave the exit code 0; `fyi` claims appear in neither list. A claim satisfying
-both (a) and (b) is counted once.
-— `attest_gate::p5_2_gate_exit_code_table` (every verdict kind × blocking/fyi ×
-answered/unanswered, asserting exit code AND which ids land under blocking vs
-advisory)
+**(a) is evaluated for every claim before any severity handling**, so a claim
+that is both `CLAIM_FALSE` and `fyi` still blocks; the precedence is stated once
+in `ATTEST-FORMAT.md` § "Gate blocking, precisely". Past the blocking half, an
+`fyi` claim reaches neither list. `recipe-invalid` (any cause), `flaky` and the
+`STALE` overlay are advisory on a non-`fyi` claim and leave the exit code 0. A
+claim satisfying both (a) and (b) is counted once.
+
+The test enumerates the **full cross product**, generated rather than
+hand-listed: 10 status recipes (`DECLARED`, `DERIVED`, `EVIDENCED`, `CONFIRMED`,
+`CLAIM_FALSE`, `RECIPE_INVALID`, `FLAKY`, `HUMAN(yes)`, `HUMAN(no)`,
+`HUMAN(skip)`) × manual severity {none, blocking, fyi} × `STALE` {no, yes} = 60
+cells, of which one writes no events at all and is not a row — **59 rows**. Each
+row seeds real events in its own root, folds them with `agentrec_core`'s own
+fold to learn what the events MEAN, derives the expected exit code and section
+by restating the rule over that folded state, and asserts the binary agrees on
+both. Deriving expectations from the fold rather than from a hand-written list
+is what makes a missing cell impossible: the previous 16-row hand-listed table
+simply had no `CLAIM_FALSE × fyi` row, and the gate returned `PASS (0 blocking)`
+on that shape while `attest status` reported `claim_false: 1`.
+— `attest_gate::p5_2_gate_exit_code_table`
 
 **AC-ATTEST-P5-3.** `recipe-invalid` and `flaky-observation` never produce a
 nonzero `attest gate` exit, on their own or in combination, and the ids appear
@@ -1370,6 +1396,19 @@ a `blocking` manual claim whose status is `DECLARED` or `Human{Skip}` — and th
 next stdin line is read as the note and stored VERBATIM. Each answer is appended
 immediately, so an interrupt keeps the answers already given.
 — `attest_gate::p5_5_review_scripted_stdin_appends_three_human_events`
+
+**Structural gap in AC-P5-5's card, recorded and NOT redesigned (founder-owned).**
+No sanctioned writer can put evidence on a review card. Cards are manual claims;
+`attest run` joins `evidence` to a claim by TEST IDENTITY; a manual claim has no
+test identity by construction. Every card a user sees today therefore reads
+`evidence: none recorded` / `diff: no related turn`, and
+`p5_5_review_scripted_stdin_appends_three_human_events` reaches the populated
+rendering only by seeding an `evidence` event onto a manual claim id — **a shape
+no writer emits**. That test pins the renderer, not a reachable state. The
+rendering is kept (a future writer may attach evidence to manual claims) and
+`reviewcmd.rs`'s module doc now describes what it renders today rather than
+calling itself evidence-first. Deciding what evidence a manual criterion should
+carry is a design question for the founder.
 
 **AC-ATTEST-P5-6.** The card set is computed ONCE per invocation, so `s` does not
 re-ask inside the same run; a skipped card reappears on the NEXT `attest review`.
@@ -1435,7 +1474,15 @@ agreeing case must NOT grow the second clause, or the first test would pass on
 a line that always prints both). The permanence clause is printed only when the
 folded status is `CLAIM_FALSE`, the one status decision 4 makes permanent; any
 other divergence prints `claim status is <STATUS>` without asserting a
-permanence the fold does not enforce.
+permanence the fold does not enforce. That branch is **unreachable through
+sanctioned writers today**, and is retained as a guard rather than a live path.
+Derivation: the divergence fires only when the folded status differs from the
+one the appended verdict implies, and the fold overrides a verdict in exactly
+one place — `CLAIM_FALSE` is permanent, so later verdicts are counted and move
+nothing. Every other verdict assigns its own status unconditionally (a `flaky`
+claim that later confirms becomes `CONFIRMED`), and the `STALE` overlay is not a
+status, so it cannot produce a divergence either. Only `CLAIM_FALSE` can, and
+that is the branch with the permanence clause.
 
 **AC-ATTEST-P5-12.** `attest status --json` gains `recipe_invalid_causes` (a
 per-cause object) and `manual` (blocking/fyi × answered/unanswered counts). Every

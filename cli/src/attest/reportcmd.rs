@@ -92,7 +92,7 @@ pub fn run(root: &Path, json: bool, range: Option<&str>) -> Result<(), String> {
             // for — a wrong question answered without complaint.
             if lo > hi {
                 return Err(format!(
-                    "--range <base>..<head>: base must not be later than head,                      but {base} commits after {head}"
+                    "--range <base>..<head>: base must not be later than head, but {base} commits after {head}"
                 ));
             }
             Some((range.to_string(), lo, hi))

@@ -21,6 +21,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use agentrec_core::attest::events::{AttestEvent, HumanAnswer, ManualSeverity, StaleCause};
+use agentrec_core::attest::fold::{fold_claims, ClaimStatus};
 use agentrec_core::attest::types::{
     ClaimId, RecipeInvalidCause, StructuredResult, TestIdentity, TestOutcome, VerdictKind,
 };
@@ -206,33 +207,38 @@ fn p5_1_manual_declare_appends_and_status_shows_it() {
 // AC-ATTEST-P5-2, P5-3, P5-8
 // ---------------------------------------------------------------------------
 
-/// Every verdict kind × every manual severity/answer combination, each in its
-/// own root so the exit code is attributable to exactly one condition.
+/// The full cross product AC-ATTEST-P5-2 describes, GENERATED rather than
+/// hand-listed: every reachable `ClaimStatus` × manual severity
+/// {none, blocking, fyi} × `STALE` overlay {no, yes}.
+///
+/// Expected sections are derived from the folded state by re-stating the rule
+/// (`ATTEST-FORMAT.md` § "Gate blocking, precisely") over `agentrec_core`'s own
+/// fold — not from the gate's output, which is what is under test. Hand-listing
+/// is what let the `claim-false` × `fyi` cell go missing: it was simply not a
+/// row, and the gate returned `PASS (0 blocking)` on it while `attest status`
+/// reported `claim_false: 1`.
+///
+/// Each row gets its own root holding exactly ONE claim, so the exit code is
+/// attributable to that claim alone.
 #[test]
 fn p5_2_gate_exit_code_table() {
-    // (label, events for one claim, expected exit code, expected section)
-    let cases: Vec<(&str, Vec<AttestEvent>, i32, &str)> = vec![
-        ("derived", vec![derive(1)], 0, "absent"),
-        (
-            "evidenced",
-            vec![derive(1), evidence(1, None, false)],
-            0,
-            "absent",
-        ),
+    // Event recipes reaching each status. `manual-declare`, when the row has a
+    // severity, is appended FIRST so `first_sight` sets `DECLARED` and later
+    // events move the status while the severity persists.
+    let recipes: Vec<(&str, Vec<AttestEvent>)> = vec![
+        ("declared", vec![]),
+        ("derived", vec![derive(1)]),
+        ("evidenced", vec![derive(1), evidence(1, None, false)]),
         (
             "confirmed",
             vec![derive(1), verdict(1, VerdictKind::Confirmed)],
-            0,
-            "absent",
         ),
         (
-            "claim-false",
+            "claim_false",
             vec![derive(1), verdict(1, VerdictKind::ClaimFalse)],
-            1,
-            "blocking",
         ),
         (
-            "recipe-invalid",
+            "recipe_invalid",
             vec![
                 derive(1),
                 verdict(
@@ -242,133 +248,140 @@ fn p5_2_gate_exit_code_table() {
                     },
                 ),
             ],
-            0,
-            "advisory",
         ),
         (
             "flaky",
             vec![derive(1), verdict(1, VerdictKind::FlakyObservation)],
-            0,
-            "advisory",
         ),
-        (
-            "manual blocking unanswered",
-            vec![declare(1, ManualSeverity::Blocking)],
-            1,
-            "blocking",
-        ),
-        (
-            "manual blocking yes",
-            vec![
-                declare(1, ManualSeverity::Blocking),
-                human(1, HumanAnswer::Yes),
-            ],
-            0,
-            "absent",
-        ),
-        (
-            "manual blocking no",
-            vec![
-                declare(1, ManualSeverity::Blocking),
-                human(1, HumanAnswer::No),
-            ],
-            1,
-            "blocking",
-        ),
-        (
-            "manual blocking skip",
-            vec![
-                declare(1, ManualSeverity::Blocking),
-                human(1, HumanAnswer::Skip),
-            ],
-            1,
-            "blocking",
-        ),
-        (
-            "manual fyi unanswered",
-            vec![declare(1, ManualSeverity::Fyi)],
-            0,
-            "absent",
-        ),
-        (
-            "manual fyi yes",
-            vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::Yes)],
-            0,
-            "absent",
-        ),
-        (
-            "manual fyi no",
-            vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::No)],
-            0,
-            "absent",
-        ),
-        (
-            "manual fyi skip",
-            vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::Skip)],
-            0,
-            "absent",
-        ),
-        // Both halves of the rule on ONE claim: the AC says it is counted
-        // once, and only this row can falsify that.
-        (
-            "claim-false AND blocking manual",
-            vec![
-                declare(1, ManualSeverity::Blocking),
-                verdict(1, VerdictKind::ClaimFalse),
-            ],
-            1,
-            "blocking",
-        ),
-        (
-            "stale only",
-            vec![
-                derive(1),
-                AttestEvent::Stale {
-                    ts: 400,
-                    claim_id: cid(1),
-                    cause: StaleCause::FileWrite {
-                        path: "cli/src/x.rs".into(),
-                    },
-                },
-            ],
-            0,
-            "advisory",
-        ),
+        ("human_yes", vec![derive(1), human(1, HumanAnswer::Yes)]),
+        ("human_no", vec![derive(1), human(1, HumanAnswer::No)]),
+        ("human_skip", vec![derive(1), human(1, HumanAnswer::Skip)]),
+    ];
+    let severities: [(&str, Option<ManualSeverity>); 3] = [
+        ("none", None),
+        ("blocking", Some(ManualSeverity::Blocking)),
+        ("fyi", Some(ManualSeverity::Fyi)),
     ];
 
     let id = cid(1).to_string();
-    for (label, events, expected_code, section) in cases {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        seed(root, &events);
-        let o = agentrec(root, &["attest", "gate"]);
-        let text = out(&o);
-        assert_eq!(code(&o), expected_code, "{label}: gate said\n{text}");
-        // The tally never double-counts a claim, whichever half caught it.
-        let want_count = if expected_code == 1 { 1 } else { 0 };
-        assert!(
-            text.contains(&format!("({want_count} blocking)")),
-            "{label}: expected exactly {want_count} blocking in\n{text}"
-        );
+    let mut rows = 0usize;
+    let mut skipped = 0usize;
+    let mut seen_claim_false_fyi = false;
 
-        let json: serde_json::Value =
-            serde_json::from_str(&out(&agentrec(root, &["attest", "gate", "--json"]))).unwrap();
-        let in_blocking = json["blocking"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|i| i["claim_id"] == id);
-        let in_advisory = json["advisory"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|i| i["claim_id"] == id);
-        match section {
-            "blocking" => assert!(in_blocking && !in_advisory, "{label}: {json}"),
-            "advisory" => assert!(in_advisory && !in_blocking, "{label}: {json}"),
-            _ => assert!(!in_blocking && !in_advisory, "{label}: {json}"),
+    for (status_name, recipe) in &recipes {
+        for (sev_name, severity) in severities {
+            for stale in [false, true] {
+                let mut events = Vec::new();
+                if let Some(severity) = severity {
+                    events.push(declare(1, severity));
+                }
+                events.extend(recipe.iter().cloned());
+                if stale {
+                    events.push(AttestEvent::Stale {
+                        ts: 900,
+                        claim_id: cid(1),
+                        cause: StaleCause::FileWrite {
+                            path: "cli/src/x.rs".into(),
+                        },
+                    });
+                }
+                let label = format!("{status_name} × severity={sev_name} × stale={stale}");
+
+                // The fold is the oracle for what this event list MEANS. A
+                // combination it produces no claim for (a `declared` row with
+                // no severity writes no events at all) is not a row.
+                let folded = fold_claims(&events);
+                let Some(state) = folded.claim(&cid(1)) else {
+                    assert!(
+                        events.is_empty(),
+                        "{label}: events were written but folded to no claim"
+                    );
+                    skipped += 1;
+                    continue;
+                };
+
+                // The rule, restated over the fold's truth.
+                let blocks = state.status.blocks_gate()
+                    || (state.manual_severity == Some(ManualSeverity::Blocking)
+                        && !matches!(
+                            state.status,
+                            ClaimStatus::Human {
+                                answer: HumanAnswer::Yes
+                            }
+                        ));
+                let advisory_worthy = matches!(
+                    state.status,
+                    ClaimStatus::RecipeInvalid { .. } | ClaimStatus::Flaky
+                ) || state.is_stale();
+                let expected_section = if blocks {
+                    "blocking"
+                } else if state.manual_severity == Some(ManualSeverity::Fyi) || !advisory_worthy {
+                    "absent"
+                } else {
+                    "advisory"
+                };
+                let expected_code = i32::from(blocks);
+                if *status_name == "claim_false" && sev_name == "fyi" {
+                    seen_claim_false_fyi = true;
+                    assert_eq!(
+                        expected_section, "blocking",
+                        "{label}: refutation must outrank severity"
+                    );
+                }
+
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                seed(root, &events);
+
+                let o = agentrec(root, &["attest", "gate"]);
+                let text = out(&o);
+                assert_eq!(code(&o), expected_code, "{label}: gate said\n{text}");
+                // The tally never double-counts a claim, whichever half caught it.
+                assert!(
+                    text.contains(&format!("({expected_code} blocking)")),
+                    "{label}: expected exactly {expected_code} blocking in\n{text}"
+                );
+
+                let json: serde_json::Value =
+                    serde_json::from_str(&out(&agentrec(root, &["attest", "gate", "--json"])))
+                        .unwrap();
+                let in_blocking = json["blocking"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["claim_id"] == id);
+                let in_advisory = json["advisory"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["claim_id"] == id);
+                match expected_section {
+                    "blocking" => assert!(in_blocking && !in_advisory, "{label}: {json}"),
+                    "advisory" => assert!(in_advisory && !in_blocking, "{label}: {json}"),
+                    _ => assert!(!in_blocking && !in_advisory, "{label}: {json}"),
+                }
+                rows += 1;
+            }
         }
     }
+
+    // Guards against a generator that silently stops generating.
+    assert!(
+        seen_claim_false_fyi,
+        "the claim-false × fyi cell must be in the product"
+    );
+    // The only cell writing no events at all is `declared × none × stale=false`.
+    // Its `stale=true` sibling DOES write one (the `stale` event), which folds
+    // to a claim born `DERIVED` — an odd shape, and the fold's answer for it,
+    // so it stays a row rather than being hand-waved away.
+    assert_eq!(
+        skipped, 1,
+        "only `declared × none × stale=false` has no claim"
+    );
+    assert_eq!(
+        rows, 59,
+        "10 statuses × 3 severities × 2 stale = 60, less the 1 empty cell"
+    );
 }
 
 #[test]
@@ -837,10 +850,17 @@ fn p5_10_range_refuses_a_reversed_pair_and_a_repo_less_root() {
         &["attest", "report", "--range", &format!("{head}..{base}")],
     );
     assert_ne!(code(&rev), 0, "a reversed range must be refused");
+    // The EXACT message, single-spaced: an earlier version lost a `\`
+    // continuation to rustfmt and shipped ~22 literal spaces mid-sentence,
+    // which a `contains` on a fragment could not see.
     let err = String::from_utf8_lossy(&rev.stderr).into_owned();
-    assert!(
-        err.contains("base must not be later than head"),
-        "the error must name the order: {err}"
+    assert_eq!(
+        err.trim(),
+        format!(
+            "agentrec: --range <base>..<head>: base must not be later than head, \
+             but {head} commits after {base}"
+        ),
+        "the error must name the order, single-spaced"
     );
 }
 

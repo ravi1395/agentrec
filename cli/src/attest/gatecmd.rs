@@ -32,21 +32,29 @@ pub fn run(root: &Path, json: bool) -> Result<bool, String> {
     let mut advisory: Vec<Item> = Vec::new();
 
     for claim in folded.claims.values() {
-        // `fyi` manual claims are skipped BEFORE any branch below, so they
-        // reach neither list by any route. Guarding only the manual note
-        // was not enough: a `stale` event on an `fyi` claim still produced an
-        // advisory line, which contradicts `ATTEST-FORMAT.md`'s "visible in
-        // `attest report` and in `attest status`'s counts, and nowhere else".
-        if claim.manual_severity == Some(ManualSeverity::Fyi) {
-            continue;
-        }
         let id = claim.claim_id.to_string();
+        // REFUTATION FIRST, severity second — the precedence is stated once in
+        // `ATTEST-FORMAT.md` § "Gate blocking, precisely". `blocking_reason`
+        // answers the claim-false half before the manual half and returns
+        // `Some` for an `fyi` claim ONLY when it is refuted, so asking it
+        // before the `fyi` skip is exactly the precedence.
+        //
+        // The skip used to run first, and that was a real hole: a claim
+        // carrying both a `claim-false` verdict and an `fyi` `manual-declare`
+        // exited 0 with `PASS (0 blocking)` while `attest status` reported
+        // `claim_false: 1`.
         if let Some(reason) = blocking_reason(claim) {
             blocking.push(Item {
                 claim_id: id,
                 reason,
                 text: claim.manual_text.clone(),
             });
+            continue;
+        }
+        // Past the blocking half, an `fyi` claim reaches no list at all: not
+        // the manual-blocking half (which never fires for `fyi`) and not the
+        // advisories below, `stale` included.
+        if claim.manual_severity == Some(ManualSeverity::Fyi) {
             continue;
         }
         // Advisory conditions. A claim can carry more than one (a stale

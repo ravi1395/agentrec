@@ -1,5 +1,16 @@
-//! `agentrec attest review [--json]` — evidence-first cards for the claims
-//! that need a human.
+//! `agentrec attest review [--json]` — cards for the claims that need a human.
+//!
+//! **What a card actually shows today, stated plainly rather than aspired to.**
+//! Cards are manual claims, and no sanctioned writer attaches evidence to one:
+//! `attest run` joins an `evidence` event to a claim by TEST IDENTITY, and a
+//! manual claim has no test identity by construction (`ATTEST-FORMAT.md` §
+//! "The identity index" names that as the one legitimate permanent case). So
+//! in practice every card renders `evidence: none recorded` and
+//! `diff: no related turn`. The evidence and diff-pointer rendering below is
+//! retained because a future writer may attach evidence to a manual claim, and
+//! it is exercised by test rather than by any live path. Closing the gap —
+//! deciding what evidence a manual criterion should carry — is a founder-owned
+//! design question, deliberately not answered here.
 //!
 //! A card is a `blocking` manual claim (`manual-declare` wrote its text and
 //! severity) whose status is `DECLARED` (never answered) or `HUMAN(skip)`

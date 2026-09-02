@@ -6,11 +6,12 @@ Phase 5 working tree; **sections 6, 7 and 9** were re-run after the 2026-09-02
 founder ruling on `fyi` and the `attest verify` output fix (post-`bcccabc`
 working tree), and carry that re-run's output — their claim ids begin
 `c_01M1H5…`, the first pass's begin `c_01M1H4…`, which is how to tell them
-apart. Sections 1–5 and 8 are first-pass output and were NOT re-run: neither
-fix reaches them (section 5's gate output is a `claim-false` blocker, which the
-`fyi` ruling does not touch, and no section before 6 invokes `attest verify`
-after a refutation). Both passes used the **release** binary
-`target/release/agentrec` against a fresh fixture crate.
+apart. Sections 1–5 and 8 show first-pass output. The re-run **did execute**
+steps 1, 4 and 5 — it had to, to reach a refuted claim — but their output was
+not re-recorded here, because neither fix changes them: section 5's gate output
+is a `claim-false` blocker, which the `fyi` ruling does not touch. What the
+re-run did NOT run at all is `attest run` and `coverage`. Both passes used the
+**release** binary `target/release/agentrec` against a fresh fixture crate.
 
 **Not run on this repository.** The script ran against a throwaway two-test cargo
 crate under the session scratchpad
@@ -33,6 +34,15 @@ below rather than papered over.
 - **Plan step 4 — `attest report --range main..HEAD`.** SUBSTITUTED: the fixture
   crate has no `main` branch history, so the range used its own two shas
   (root commit .. HEAD). Same code path, different revisions.
+- **Review-card evidence — a structural gap, not a run-scope one.** Every card
+  in section 7 reads `evidence: none recorded` / `diff: no related turn`, and
+  re-running this script with a live daemon would not change that. Cards are
+  manual claims; `attest run` joins `evidence` to a claim by TEST IDENTITY; a
+  manual claim has no test identity by construction. **No sanctioned writer can
+  populate a card's evidence today.** The populated rendering exists and is
+  covered by `attest_gate::p5_5_…`, which seeds an `evidence` event onto a
+  manual claim id — a shape no writer emits. Recorded for founder disposition,
+  not redesigned; see `IMPLEMENTATION.md` §attest, AC-ATTEST-P5-5.
 - **The daemon-written `stale` overlay.** No daemon ran, so no `stale` event was
   produced by the real producer; `attest verify --all-stale` correctly reported
   `no claims to verify`. The overlay's rendering in gate/report is covered by
@@ -108,7 +118,7 @@ exit=1
 ### 6. revert the break, re-verify — and the plan step that CANNOT hold
 
 ```
-$ git revert --no-edit HEAD    # 1ff6a8e, src/lib.rs back to `a + b`
+$ git revert --no-edit HEAD    # b7ecdfc, src/lib.rs back to `a + b`
 $ agentrec attest verify --root $S c_01M1H5KC7C5DYQ096ANH3HGFMF
 c_01M1H5KC7C5DYQ096ANH3HGFMF attestdemo::tests::add_is_sum -> verdict confirmed appended (1 run); claim remains CLAIM_FALSE (permanent, decision 4)
 ```
@@ -192,7 +202,10 @@ code and this record.
 The re-run that produced sections 6–7 ran `derive` and `verify` but NOT
 `attest run` or `coverage`, so in that pass no claim carries an `evidence`
 event: `add_is_sum` reached `CLAIM_FALSE` through verify alone and
-`add_is_commutative` stayed `DERIVED`. Its `--range` window also holds 0 claims,
+`add_is_commutative` stayed `DERIVED`. Its log also holds **two** `confirmed`
+verdicts at `b7ecdfc` — the post-revert verify was invoked twice while the
+output wording was being fixed — and both are counted while the claim stays
+refuted, which is decision 4 working, not an artefact. Its `--range` window also holds 0 claims,
 because every event it wrote landed after its last commit. Neither the report
 renderer nor the range filter changed between the two passes; only the
 `last verdict` label did, and the line below carries the current wording.*
