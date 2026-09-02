@@ -200,8 +200,13 @@ fn check_hooks(root: &Path) -> Check {
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Check::fail("hook presence", REMEDY);
     };
-    let has_both = crate::initcmd::event_has_marker(&settings, "UserPromptSubmit")
-        && crate::initcmd::event_has_marker(&settings, "Stop");
+    // Only the BRACKETING pair is required. `init` also installs
+    // `PostToolUse[Bash]` for attest capture, but requiring it here would fail
+    // `doctor` on every repo initialized before that hook existed — and turn
+    // recording, which is what this check is about, does not depend on it.
+    let has_both = crate::initcmd::CLAUDE_BRACKET_EVENTS
+        .iter()
+        .all(|event| crate::initcmd::event_has_marker(&settings, event));
     if has_both {
         Check::pass("hook presence")
     } else {

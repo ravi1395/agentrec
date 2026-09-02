@@ -934,13 +934,20 @@ fn eviction_plan(
 /// carrying a hash needs revisiting this function, not just PROTOCOL.md.
 pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
-    // open.json + memory.jsonl are never themselves a `TurnRecord`, so
-    // every ref in them is "extra" by construction — no validity filter
-    // needed (mirrors `recover_orphan`'s own tolerance of a corrupt
-    // journal: raw bytes are scanned whether or not they parse).
+    // open.json + memory.jsonl + attest.jsonl are never themselves a
+    // `TurnRecord`, so every ref in them is "extra" by construction — no
+    // validity filter needed (mirrors `recover_orphan`'s own tolerance of a
+    // corrupt journal: raw bytes are scanned whether or not they parse).
+    //
+    // `attest.jsonl` carries the CAS hash of a captured test-output blob on
+    // every `evidence` event (`output_blob`, repeated as the result's
+    // `raw_blob` when the capture failed closed). Without it this tick would
+    // evict a blob that only attest cites — the same omission `purge
+    // --orphans` had, fixed in the same change.
     for path in [
         crate::open_path(root),
         agentrec_core::memory::memory_path(root),
+        crate::attest::lock::attest_path(root),
     ] {
         if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) {
             crate::purgecmd::harvest_refs(&text, &mut out);
@@ -997,13 +1004,15 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     // Falling through would be wrong, not merely redundant: this function maps
     // every non-`UserPromptSubmit` event to `"stop"`, so a captured
     // `PostToolUse` would also append a stop signal and CLOSE the bracket the
-    // evidence is supposed to be joined to. Every other event, `PostToolUse`
-    // included, keeps its existing path untouched — measured before choosing:
-    // no test drives `hook claude` with a `PostToolUse` payload (every
-    // `PostToolUse` test in `cli/tests/` is a `hook codex` one), and
-    // `initcmd.rs` installs only `UserPromptSubmit` + `Stop` for Claude Code, so
-    // today this arm is reached only by a hand-added `PostToolUse` hook or by a
-    // test — installing one is a follow-on, not part of this phase.
+    // evidence is supposed to be joined to. `attest_capture::
+    // ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence` pins that: it
+    // drives this arm with a real `PostToolUse` `Bash` payload and asserts
+    // `signal.jsonl` stays empty.
+    //
+    // Only a MATCHED capture returns here. Every other `PostToolUse` —
+    // non-`Bash`, or a `Bash` command that is not a test runner — keeps its
+    // existing path untouched, because `capture_from_hook_payload` returns
+    // false for those.
     if event_name == "PostToolUse"
         && crate::attest::capture::capture_from_hook_payload(root, &payload)
     {
@@ -1658,6 +1667,62 @@ mod tests {
         assert!(
             store.contains(&referenced),
             "eviction dropped a blob referenced by a record it could not parse"
+        );
+    }
+
+    /// AC-ATTEST-P3-24 (eviction half) — mirrors
+    /// `an_unknown_record_type_still_contributes_to_the_protected_ref_set`
+    /// above, for `attest.jsonl`. The daemon's eviction tick runs
+    /// automatically, so a blob cited only by an `evidence` event would be
+    /// silently evicted with no user action at all.
+    #[test]
+    fn ac_p3_24_a_blob_cited_only_by_attest_jsonl_survives_the_eviction_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let captured = store.put(&[0xEEu8; 4_000]).unwrap();
+
+        // One `evidence` event citing that blob, and nothing else does.
+        let attest = crate::attest::lock::attest_path(root);
+        std::fs::create_dir_all(attest.parent().unwrap()).unwrap();
+        let line = serde_json::json!({
+            "kind": "evidence",
+            "ts": 1,
+            "claim_id": "c_00000000010W3GE1R70W3GE1R7",
+            "turn_id": null,
+            "dirty": false,
+            "output_blob": captured,
+            "result": {
+                "identity": {"target": "t", "fn_path": "f"},
+                "outcome": null,
+                "recipe_invalid": null,
+                "parse_failed": true,
+                "raw_blob": captured,
+            }
+        });
+        std::fs::write(&attest, format!("{line}\n")).unwrap();
+
+        assert!(
+            extra_protected_refs(root).contains(&captured),
+            "a blob referenced only by attest.jsonl must stay protected"
+        );
+
+        // Same fixture shape as the unknown-record test above: a real,
+        // parseable turn so the over-budget branch is actually reached and the
+        // survival assertion is not vacuous.
+        let parseable = store.put(&[0xDFu8; 4_000]).unwrap();
+        let turn = turn_with_snapshot("t_ATTESTBLOBPEER0000000001", "peer.bin", &parseable);
+        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+
+        let out = status_report(root, 100).unwrap();
+        assert!(
+            out.contains("would free"),
+            "fixture must reach the eviction dry-run branch: {out}"
+        );
+        assert!(
+            store.contains(&captured),
+            "eviction dropped a blob referenced only by attest.jsonl"
         );
     }
 

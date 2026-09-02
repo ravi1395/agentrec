@@ -285,7 +285,10 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
         println!("[dry-run] would skip Claude Code hook install (--no-hook)");
         println!("[dry-run] would skip Claude Code MCP registration (--no-hook)");
     } else {
-        println!("[dry-run] would install Claude Code hooks (UserPromptSubmit + Stop)");
+        println!(
+            "[dry-run] would install Claude Code hooks (UserPromptSubmit + \
+             PostToolUse[Bash] + Stop)"
+        );
         // Same read-only inspect function the real run decides with, so a dry
         // run can never claim a registration the real run would refuse.
         print_dry_run_mcp("Claude Code", &mcp_json_path(root), mcp_json_state(root));
@@ -511,7 +514,31 @@ fn ensure_gitignore(root: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Merge UserPromptSubmit + Stop hooks into .claude/settings.local.json.
+/// Claude Code's three hook events and their matchers, mirroring
+/// [`CODEX_HOOK_EVENTS`]. `PostToolUse` is scoped to `Bash` by matcher for the
+/// same reason Codex's is scoped to `apply_patch`: only that tool's firings can
+/// carry a test-runner invocation, and an unmatched entry would wake a hook
+/// process on every tool call.
+///
+/// The `PostToolUse` entry feeds attest capture path 2
+/// (`cmds::hook` → `attest::capture::capture_from_hook_payload`). **The payload
+/// field names that path reads — `tool_input.command`, `tool_response.stdout`,
+/// `tool_response.stderr` — are Claude Code's DOCUMENTED names and are not
+/// backed by any captured fixture in this repo** (every committed `PostToolUse`
+/// fixture is a Codex `apply_patch` one). A payload missing them is simply not
+/// captured, so a wrong guess costs evidence, never correctness.
+pub(crate) const CLAUDE_HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("UserPromptSubmit", None),
+    ("PostToolUse", Some("Bash")),
+    ("Stop", None),
+];
+
+/// The two events agentrec's TURN BRACKETING depends on. `doctor` requires
+/// exactly these — `PostToolUse` is an attest-capture addition, and requiring
+/// it would fail `doctor` on every repo initialized before it existed.
+pub(crate) const CLAUDE_BRACKET_EVENTS: &[&str] = &["UserPromptSubmit", "Stop"];
+
+/// Merge Claude Code's hooks into .claude/settings.local.json.
 /// Preserves unrelated hooks; backs up the pre-merge file; aborts untouched
 /// on malformed JSON (IMPLEMENTATION AC A4/A5).
 fn install_claude_hooks(root: &Path) -> Result<bool, String> {
@@ -537,8 +564,8 @@ fn install_claude_hooks(root: &Path) -> Result<bool, String> {
     };
     let mut settings = current.clone();
     let mut changed = false;
-    for event in ["UserPromptSubmit", "Stop"] {
-        let (next, event_changed) = merge_hook(settings, event)?;
+    for (event, matcher) in CLAUDE_HOOK_EVENTS {
+        let (next, event_changed) = merge_hook(settings, event, *matcher)?;
         settings = next;
         changed = changed || event_changed;
     }
@@ -557,9 +584,14 @@ fn install_claude_hooks(root: &Path) -> Result<bool, String> {
 }
 
 /// Add the agentrec hook under `hooks.<event>` unless the marker is present.
+///
+/// `matcher`, when set, goes BESIDE the inner `hooks[]` on the entry — the same
+/// place Codex's shape puts it ([`codex_hook_json_entry`]), which is also
+/// Claude Code's documented `settings.json` shape.
 fn merge_hook(
     mut settings: serde_json::Value,
     event: &str,
+    matcher: Option<&str>,
 ) -> Result<(serde_json::Value, bool), String> {
     if event_has_marker(&settings, event) {
         return Ok((settings, false));
@@ -577,9 +609,15 @@ fn merge_hook(
     let arr = entry
         .as_array_mut()
         .ok_or_else(|| format!("settings \"hooks.{event}\" is not a JSON array"))?;
-    arr.push(serde_json::json!({
-        "hooks": [ { "type": "command", "command": HOOK_COMMAND } ]
-    }));
+    let mut entry = serde_json::Map::new();
+    if let Some(m) = matcher {
+        entry.insert("matcher".to_string(), serde_json::json!(m));
+    }
+    entry.insert(
+        "hooks".to_string(),
+        serde_json::json!([ { "type": "command", "command": HOOK_COMMAND } ]),
+    );
+    arr.push(serde_json::Value::Object(entry));
     Ok((settings, true))
 }
 
@@ -1391,20 +1429,20 @@ mod tests {
         let existing = serde_json::json!({
             "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ] }
         });
-        let (merged, changed) = merge_hook(existing, "Stop").unwrap();
+        let (merged, changed) = merge_hook(existing, "Stop", None).unwrap();
         assert!(changed);
         let stops = merged["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stops.len(), 2); // other-tool preserved, ours appended
-        let (again, changed2) = merge_hook(merged, "Stop").unwrap();
+        let (again, changed2) = merge_hook(merged, "Stop", None).unwrap();
         assert!(!changed2);
         assert_eq!(again["hooks"]["Stop"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn merge_rejects_wrong_shapes() {
-        assert!(merge_hook(serde_json::json!([]), "Stop").is_err());
-        assert!(merge_hook(serde_json::json!({"hooks": []}), "Stop").is_err());
-        assert!(merge_hook(serde_json::json!({"hooks": {"Stop": "x"}}), "Stop").is_err());
+        assert!(merge_hook(serde_json::json!([]), "Stop", None).is_err());
+        assert!(merge_hook(serde_json::json!({"hooks": []}), "Stop", None).is_err());
+        assert!(merge_hook(serde_json::json!({"hooks": {"Stop": "x"}}), "Stop", None).is_err());
     }
 
     // E5: a settings.local.json that exists but fails to READ as UTF-8 text

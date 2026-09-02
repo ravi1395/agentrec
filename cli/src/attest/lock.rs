@@ -252,8 +252,12 @@ mod tests {
     /// lock, another writer's append must WAIT. Under the release-immediately
     /// neuter the waiting append completes at once and this reds.
     ///
-    /// Timing-based, with a 10x margin between the 50 ms "must still be
-    /// waiting" check and the 500 ms hold.
+    /// Timing-based: the holder keeps the lock across a 50 ms sleep and the
+    /// waiter is asserted to be STILL WAITING at the end of it, then the lock
+    /// is dropped and the waiter is joined. There is no fixed hold beyond that
+    /// sleep — the 50 ms is the whole margin, and it is one-sided: a slow
+    /// machine makes the waiter later, never earlier, so this test can fail
+    /// only if the lock genuinely stopped blocking.
     #[test]
     fn an_append_blocks_while_another_writer_holds_the_lock() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -53,7 +53,23 @@ pub fn write_evidence(
     let (events, _) = read_attest(root)?;
     let folded = fold_claims(&events);
 
+    // Resolve claims FIRST, store the blob only if something will cite it.
+    // Storing unconditionally minted one orphan CAS object per run whose
+    // results were all undeclared — a blob no event references, which is
+    // exactly what `purge --orphans` exists to clean up and which nothing
+    // should be creating on a routine path.
     let mut report = CaptureReport::default();
+    let mut resolved = Vec::new();
+    for result in results {
+        match folded.claim_for(&result.identity) {
+            Some(claim_id) => resolved.push((claim_id.clone(), result.clone())),
+            None => report.skipped_undeclared += 1,
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(report);
+    }
+
     let blob = match BlobStore::new(crate::objects_dir(root)).put_result(raw.as_bytes()) {
         PutResult::Stored { hash, .. } => Some(hash),
         PutResult::OverCap => {
@@ -68,18 +84,13 @@ pub fn write_evidence(
 
     let ts = crate::cmds::wall_now_ms();
     let mut batch = Vec::new();
-    for result in results {
-        let Some(claim_id) = folded.claim_for(&result.identity) else {
-            report.skipped_undeclared += 1;
-            continue;
-        };
-        let mut result = result.clone();
+    for (claim_id, mut result) in resolved {
         if result.parse_failed {
             result.raw_blob = blob.clone();
         }
         batch.push(AttestEvent::Evidence {
             ts,
-            claim_id: claim_id.clone(),
+            claim_id,
             turn_id: turn_id.clone(),
             dirty,
             output_blob: blob.clone(),
@@ -99,7 +110,23 @@ pub fn write_evidence(
 /// need the daemon running. Only the `id` field is read, so `OrphanJournal`
 /// stays private to `daemon.rs`. A missing or unreadable journal means "no open
 /// turn", which is a normal state (the dev-loop-only path), not a failure.
+///
+/// **STALENESS GATE (plan: "Missing/stale `open.json` → no open turn").**
+/// `open.json` is a MIRROR of live daemon state, and the daemon removes it when
+/// no turn is open — so a journal left behind by a crashed or killed daemon
+/// names a turn that will never be persisted under that id. Joining evidence to
+/// it would attribute a test run to a turn no reader can ever resolve. The
+/// liveness test is the same one `status`/`doctor` use
+/// (`daemon::daemon_is_running`, an `flock` probe of `.agentrec/daemon.lock`):
+/// no live daemon → treat the journal as stale → `None`.
+///
+/// This is deliberately coarse. It cannot tell a stale journal from a fresh one
+/// while a daemon IS running — that would need the daemon to stamp liveness
+/// into the journal itself, which is a `daemon.rs` change and out of scope here.
 pub fn open_turn_id(root: &Path) -> Option<String> {
+    if !crate::daemon::daemon_is_running(root) {
+        return None;
+    }
     let text = agentrec_core::fsguard::read_regular_to_string(
         &crate::agentrec_dir(root).join("open.json"),
     )
@@ -284,6 +311,9 @@ pub fn capture_from_hook_payload(root: &Path, payload: &serde_json::Value) -> bo
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+//  ^ Test code reads its own tempdir fixtures; there is no attacker-supplied
+//    FIFO to block on. Production reads stay lint-enforced (clippy.toml).
 mod tests {
     use super::*;
 
@@ -313,22 +343,33 @@ mod tests {
         }
     }
 
+    /// AC-ATTEST-P3-25 — the staleness gate. A well-formed `open.json` naming a
+    /// real-looking turn is STILL `None` when no daemon holds the lock, so a
+    /// journal left behind by a killed daemon cannot attribute evidence to a
+    /// turn that will never be persisted.
     #[test]
-    fn a_missing_open_json_is_no_open_turn_not_an_error() {
+    fn ac_p3_25_a_journal_with_no_live_daemon_is_stale_and_yields_no_turn() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(open_turn_id(tmp.path()), None);
+        assert_eq!(open_turn_id(tmp.path()), None, "no .agentrec at all");
         std::fs::create_dir_all(tmp.path().join(".agentrec")).unwrap();
         std::fs::write(tmp.path().join(".agentrec/open.json"), "{ not json").unwrap();
-        assert_eq!(open_turn_id(tmp.path()), None);
+        assert_eq!(open_turn_id(tmp.path()), None, "unreadable journal");
+
         std::fs::write(
             tmp.path().join(".agentrec/open.json"),
             r#"{"id":"t_01ARZ3NDEKTSV4RRFFQ69G5FAV","root":"/x"}"#,
         )
         .unwrap();
         assert_eq!(
-            open_turn_id(tmp.path()).as_deref(),
-            Some("t_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            open_turn_id(tmp.path()),
+            None,
+            "a perfectly readable journal is still stale with no live daemon"
         );
+        // Sanity that the gate — not the parse — is what refused: the same
+        // bytes DO parse to that id.
+        let text = std::fs::read_to_string(tmp.path().join(".agentrec/open.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "t_01ARZ3NDEKTSV4RRFFQ69G5FAV");
     }
 
     #[test]

@@ -241,6 +241,22 @@ fn package_name_from_id(id: &str) -> String {
     frag.to_string()
 }
 
+/// The `<name>: test` lines of a libtest `--list` capture.
+///
+/// Split out from [`list_tests`] so a committed real capture
+/// (`docs/fixtures/attest/list.txt`) can drive the exact line parser discovery
+/// depends on, without spawning anything. The `: test` suffix is required —
+/// libtest also prints `<name>: benchmark` lines and a trailing
+/// `N tests, M benchmarks` summary, and neither is a test identity.
+pub fn parse_list_output(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
 /// `<exe> --list` → the `<name>: test` lines. No `--format=json` (unstable).
 fn list_tests(exe: &Path) -> Result<Vec<String>, String> {
     // attest: sanctioned spawn (Phase 4 census)
@@ -248,12 +264,7 @@ fn list_tests(exe: &Path) -> Result<Vec<String>, String> {
         .arg("--list")
         .output()
         .map_err(|e| format!("cannot run {} --list: {e}", exe.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout
-        .lines()
-        .filter_map(|l| l.strip_suffix(": test"))
-        .map(|n| n.trim().to_string())
-        .collect())
+    Ok(parse_list_output(&String::from_utf8_lossy(&out.stdout)))
 }
 
 impl Adapter for CargoAdapter {
@@ -918,6 +929,33 @@ mod tests {
         );
         assert!(parse_summary("test result: ok. 36 pass").is_none());
         assert!(parse_summary("test result: weird. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s").is_none());
+    }
+
+    /// AC-ATTEST-P3-26 — the discovery line parser, against the committed real
+    /// `--list` capture from this repo's own suite.
+    #[test]
+    fn ac_p3_26_the_list_parser_reads_the_real_list_fixture() {
+        let raw = fixture("list.txt");
+        let names = parse_list_output(&raw);
+        assert_eq!(
+            names.len(),
+            37,
+            "the fixture's own summary line says 37 tests"
+        );
+        assert!(names.contains(&"ac3_zero_bytes_under_agentrec_in_tempdir".to_string()));
+        assert!(names.contains(&"persist::ac5b_oracle_real_corpus_measurement".to_string()));
+        // Every returned name came from a `: test` line, and the trailer lines
+        // (`37 tests, 0 benchmarks`, `EXIT: 0`) are not names.
+        for name in &names {
+            assert!(
+                raw.contains(&format!("{name}: test")),
+                "{name} is not a `: test` line"
+            );
+            assert!(!name.contains(' '), "{name}");
+        }
+        assert!(!names.iter().any(|n| n.contains("benchmark")));
+        // A `: benchmark` line must not be mistaken for a test.
+        assert!(parse_list_output("b: benchmark\nt: test\n") == vec!["t".to_string()]);
     }
 
     #[test]

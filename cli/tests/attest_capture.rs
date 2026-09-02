@@ -17,7 +17,8 @@
 //    lint-enforced (clippy.toml).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentrec")
@@ -103,6 +104,14 @@ fn identity(event: &serde_json::Value, field: &str) -> String {
     format!("{}::{}", event[field]["target"], event[field]["fn_path"]).replace('"', "")
 }
 
+fn signal_lines(root: &Path) -> usize {
+    std::fs::read_to_string(root.join(".agentrec/signal.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
 fn status_json(root: &Path) -> serde_json::Value {
     let out = ok(agentrec(root, &["attest", "status", "--json"]));
     serde_json::from_slice(&out.stdout).unwrap()
@@ -116,6 +125,79 @@ fn edit(root: &Path, rel: &str, from: &str, to: &str) {
         "fixture precondition: {from:?} in {rel}"
     );
     std::fs::write(&path, text.replace(from, to)).unwrap();
+}
+
+fn spawn_record(root: &Path) -> Child {
+    Command::new(bin())
+        .args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn record")
+}
+
+fn send_hook(root: &Path, payload: &str) -> Output {
+    let mut child = Command::new(bin())
+        .args(["hook", "claude", "--root", root.to_str().unwrap()])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Start a real daemon and open a real hook bracket, returning the child and
+/// the turn id the daemon itself minted and mirrored to `.agentrec/open.json`.
+///
+/// A REAL daemon, not a hand-written journal: `open_turn_id` now refuses a
+/// journal with no live daemon (the staleness gate, AC-ATTEST-P3-25), so these
+/// tests would be asserting on `None` otherwise. It also removes the earlier
+/// caveat that only the reader was proven — the id asserted below is the one
+/// `daemon.rs::sync_journal` wrote.
+fn open_bracketed_turn(root: &Path) -> (Child, String) {
+    let daemon = spawn_record(root);
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"go"}"#,
+    );
+    // A watched mutation is what actually opens the turn.
+    std::fs::write(root.join("src/marker.rs"), "// bracket marker\n").unwrap();
+    let id = poll_until(Duration::from_secs(20), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/open.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v.get("id")?.as_str().map(String::from)
+    });
+    match id {
+        Some(id) => (daemon, id),
+        None => panic!("the daemon never opened a turn / mirrored open.json"),
+    }
+}
+
+fn stop_daemon(mut daemon: Child) {
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 }
 
 /// The five tests libtest itself enumerates in the fixture crate.
@@ -297,47 +379,23 @@ fn ac_p3_14_a_body_change_without_a_rename_rehashes_in_place() {
     assert_eq!(status_json(root)["claims"], 5);
 }
 
-/// Write `.agentrec/open.json` the way `daemon.rs::sync_journal` does. Only the
-/// `id` field is read back by capture — see this file's module doc.
-fn write_open_json(root: &Path, id: &str) {
-    let journal = serde_json::json!({
-        "source": "bracket",
-        "tool": "claude",
-        "prompt": null,
-        "session": null,
-        "opened_wall_ms": 1u64,
-        "last_change_wall_ms": 2u64,
-        "root": root.to_string_lossy(),
-        "files": [],
-        "id": id,
-    });
-    std::fs::write(
-        root.join(".agentrec/open.json"),
-        serde_json::to_string(&journal).unwrap(),
-    )
-    .unwrap();
-}
-
-const TURN: &str = "t_01ARZ3NDEKTSV4RRFFQ69G5FAV";
-
 /// AC-ATTEST-P3-15.
 #[test]
 fn ac_p3_15_run_writes_evidence_joined_to_the_open_turn() {
     let tmp = fixture_repo();
     let root = tmp.path();
     ok(agentrec(root, &["attest", "derive"]));
-    // The hook-bracketed session: the open bracket's signal, then the work.
-    ok(agentrec(root, &["hook", "claude"]));
-    write_open_json(root, TURN);
+    let (daemon, turn) = open_bracketed_turn(root);
 
     ok(agentrec(root, &["attest", "run", "--", "cargo", "test"]));
+    stop_daemon(daemon);
 
     let events = attest_events(root);
     let evidence = of_kind(&events, "evidence");
     assert_eq!(evidence.len(), 5, "one per known test: {evidence:#?}");
     assert!(
-        evidence.iter().all(|e| e["turn_id"] == TURN),
-        "every capture joins the open turn: {evidence:#?}"
+        evidence.iter().all(|e| e["turn_id"] == turn),
+        "every capture joins the daemon's own open turn {turn}: {evidence:#?}"
     );
     assert!(evidence.iter().all(|e| e["output_blob"].is_string()));
 
@@ -377,13 +435,7 @@ fn ac_p3_15_run_writes_evidence_joined_to_the_open_turn() {
             ),
         ]
     );
-    // The tree was committed clean before the run, and `target/` is gitignored.
-    assert!(
-        evidence.iter().all(|e| e["dirty"] == false),
-        "a clean tree must not be dev-loop-only: {evidence:#?}"
-    );
     assert_eq!(status_json(root)["evidenced"], 5);
-    assert_eq!(status_json(root)["dev_loop_only"], 0);
 }
 
 /// AC-ATTEST-P3-16 — the same capture with no wrapper, arriving through the
@@ -393,7 +445,8 @@ fn ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence() {
     let tmp = fixture_repo();
     let root = tmp.path();
     ok(agentrec(root, &["attest", "derive"]));
-    write_open_json(root, TURN);
+    let (daemon, turn) = open_bracketed_turn(root);
+    let signals_before = signal_lines(root);
 
     // A real `cargo test` run, whose real output becomes the hook payload's
     // `tool_response` — no invented libtest text.
@@ -412,37 +465,62 @@ fn ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence() {
             "stderr": String::from_utf8_lossy(&real.stderr),
         }
     });
-
-    let mut child = Command::new(bin())
-        .args(["hook", "claude", "--root", root.to_str().unwrap()])
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(payload.to_string().as_bytes())
-        .unwrap();
-    ok(child.wait_with_output().unwrap());
+    ok(send_hook(root, &payload.to_string()));
+    stop_daemon(daemon);
 
     let events = attest_events(root);
-    assert_eq!(of_kind(&events, "evidence").len(), 5, "{events:#?}");
-    assert!(of_kind(&events, "evidence")
-        .iter()
-        .all(|e| e["turn_id"] == TURN));
+    let evidence = of_kind(&events, "evidence");
+    assert_eq!(evidence.len(), 5, "{events:#?}");
+    assert!(evidence.iter().all(|e| e["turn_id"] == turn));
 
-    // A captured test run is evidence, not a turn boundary: it must not have
-    // closed the bracket by appending a stop signal.
-    let signals = std::fs::read_to_string(root.join(".agentrec/signal.jsonl")).unwrap_or_default();
-    assert!(
-        signals.trim().is_empty(),
-        "a captured PostToolUse must append no signal: {signals}"
+    // A captured test run is evidence, not a turn boundary: the arm must not
+    // have fallen through and appended a stop signal, which would have closed
+    // the very bracket this evidence is joined to.
+    assert_eq!(
+        signal_lines(root),
+        signals_before,
+        "a captured PostToolUse must append no signal"
     );
+}
+
+/// AC-ATTEST-P3-25 (integration half) — a journal with no live daemon is
+/// stale, so evidence is recorded UNJOINED rather than attributed to a turn
+/// that will never be persisted. Also the clean-tree half of the dirty bit.
+#[test]
+fn ac_p3_25_a_stale_open_json_yields_unjoined_evidence_on_a_clean_tree() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+    // The shape `daemon.rs::sync_journal` writes — left behind by a daemon
+    // that is not running.
+    std::fs::write(
+        root.join(".agentrec/open.json"),
+        serde_json::json!({
+            "source": "bracket", "tool": "claude", "prompt": null, "session": null,
+            "opened_wall_ms": 1u64, "last_change_wall_ms": 2u64,
+            "root": root.to_string_lossy(), "files": [],
+            "id": "t_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    ok(agentrec(root, &["attest", "run", "--", "cargo", "test"]));
+
+    let events = attest_events(root);
+    let evidence = of_kind(&events, "evidence");
+    assert_eq!(evidence.len(), 5);
+    assert!(
+        evidence.iter().all(|e| e["turn_id"].is_null()),
+        "a stale journal must not be joined: {evidence:#?}"
+    );
+    // The tree was committed clean and both `target/` and `.agentrec/` are
+    // gitignored, so nothing here is dev-loop-only.
+    assert!(
+        evidence.iter().all(|e| e["dirty"] == false),
+        "a clean tree must not be dev-loop-only: {evidence:#?}"
+    );
+    assert_eq!(status_json(root)["dev_loop_only"], 0);
 }
 
 /// AC-ATTEST-P3-17.
@@ -481,6 +559,33 @@ fn ac_p3_18_undeclared_results_are_counted_on_stderr_and_not_written() {
         "evidence must never attach to a claim that does not exist"
     );
     assert_eq!(status_json(root)["claims"], 0);
+    // ...and no CAS blob is left behind either. Storing the captured output
+    // before knowing any event would cite it minted one orphan object per
+    // undeclared run — a blob nothing references, which is exactly what
+    // `purge --orphans` exists to clean up.
+    let objects = root.join(".agentrec/objects");
+    let blobs: Vec<_> = walk_files(&objects);
+    assert!(
+        blobs.is_empty(),
+        "an all-undeclared run must store no blob, found {blobs:?}"
+    );
+}
+
+/// Every regular file under `dir`, recursively. Used to count CAS objects.
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// AC-ATTEST-P3-20 — a fail-closed capture. The output is a REAL libtest shape
@@ -571,5 +676,176 @@ fn the_fixture_crate_is_not_packaged() {
     assert!(
         !listed.contains("attest_sample"),
         "the fixture crate must not be published: {listed}"
+    );
+}
+
+/// AC-ATTEST-P3-24 (purge half) — reproduced before the fix: a root whose only
+/// CAS blob was cited by `evidence` events had that blob archived by
+/// `purge --orphans`, because the protect set harvested `log.jsonl` +
+/// `open.json` + `memory.jsonl` and not `attest.jsonl`.
+#[test]
+fn ac_p3_24_purge_orphans_protects_a_blob_cited_only_by_attest_jsonl() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+    ok(agentrec(root, &["attest", "run", "--", "cargo", "test"]));
+
+    let objects = root.join(".agentrec/objects");
+    let before = walk_files(&objects);
+    assert_eq!(
+        before.len(),
+        1,
+        "fixture precondition: exactly one blob, cited only by attest.jsonl"
+    );
+    let evidence = attest_events(root);
+    let evidence = of_kind(&evidence, "evidence");
+    assert_eq!(evidence.len(), 5);
+    let blob = evidence[0]["output_blob"].as_str().unwrap().to_string();
+    // Nothing else in the repo cites it.
+    let log = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).unwrap_or_default();
+    let hex = blob.strip_prefix("sha256:").unwrap();
+    assert!(!log.contains(hex), "log.jsonl must not cite the blob");
+
+    let out = ok(agentrec(root, &["purge", "--orphans"]));
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("0 orphan"),
+        "an attest-cited blob is not an orphan: {text}"
+    );
+    assert_eq!(
+        walk_files(&objects),
+        before,
+        "purge --orphans reclaimed a blob that attest.jsonl still cites"
+    );
+}
+
+/// AC-ATTEST-P3-27 — `init` installs the `PostToolUse[Bash]` capture hook,
+/// `doctor` passes with it present, and `uninstall` removes it.
+#[test]
+fn ac_p3_27_init_installs_doctor_accepts_and_uninstall_removes_the_capture_hook() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    // `fixture_repo` inits with --no-hook; install the hooks for real here.
+    ok(agentrec(root, &["init", "--no-service"]));
+
+    let settings_path = root.join(".claude/settings.local.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let post = settings["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse installed");
+    let ours = post
+        .iter()
+        .find(|e| {
+            e["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("agentrec hook claude"))
+        })
+        .expect("our PostToolUse entry");
+    assert_eq!(ours["matcher"], "Bash", "scoped by matcher: {ours}");
+    // The bracketing pair is unchanged and still matcher-less.
+    for event in ["UserPromptSubmit", "Stop"] {
+        assert!(settings["hooks"][event].as_array().is_some(), "{event}");
+        assert!(
+            settings["hooks"][event][0]["matcher"].is_null(),
+            "{event} must stay unmatched"
+        );
+    }
+    // Idempotent: a second init adds no duplicate.
+    ok(agentrec(root, &["init", "--no-service"]));
+    let again: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(again["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+
+    // doctor's hook-presence check passes with the third hook present.
+    let doctor = agentrec(root, &["doctor", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let hook_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "hook presence")
+        .expect("hook presence check");
+    assert_eq!(hook_check["status"], "pass", "{hook_check}");
+
+    // uninstall removes all three, leaving no agentrec command behind.
+    ok(agentrec(root, &["uninstall", "--no-service"]));
+    let after = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    assert!(
+        !after.contains("agentrec hook claude"),
+        "uninstall left an agentrec hook behind: {after}"
+    );
+    let after_json: serde_json::Value =
+        serde_json::from_str(&after).unwrap_or(serde_json::json!({}));
+    assert!(
+        after_json["hooks"].get("PostToolUse").is_none(),
+        "the emptied PostToolUse key must be dropped: {after}"
+    );
+}
+
+/// AC-ATTEST-P3-28 — a REAL failing test. Pins the `test result: FAILED.`
+/// summary branch, that the trailing `failures:` block does not inflate the
+/// per-test tally (its lines are bare names, not `test … ... ok` lines), and
+/// that a failing run is ordinary evidence — `parse_failed` stays false.
+#[test]
+fn ac_p3_28_a_real_failing_test_is_captured_as_a_failed_outcome() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+    // Flip one assert in the COPY so the test genuinely fails.
+    edit(
+        root,
+        "src/lib.rs",
+        "assert_eq!(add(2, 2), 4);",
+        "assert_eq!(add(2, 2), 5);",
+    );
+
+    let out = agentrec(root, &["attest", "run", "--", "cargo", "test"]);
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "cargo's own failure status must propagate: {out:?}"
+    );
+
+    let events = attest_events(root);
+    let evidence = of_kind(&events, "evidence");
+    let by_test: std::collections::BTreeMap<String, &serde_json::Value> = evidence
+        .iter()
+        .map(|e| (identity(&e["result"], "identity"), &e["result"]))
+        .collect();
+
+    let failed = by_test["attest_sample_crate::tests::unit_add_works"];
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(
+        failed["parse_failed"], false,
+        "a failure is not a parse error"
+    );
+    assert!(failed["recipe_invalid"].is_null());
+
+    // Its siblings IN THE SAME SECTION are unaffected — one failure must not
+    // poison the target's other results, and the cross-check still balanced
+    // (`1 passed; 1 failed; 1 ignored` against three per-test lines).
+    assert_eq!(
+        by_test["attest_sample_crate::tests::unit_double_works"]["outcome"],
+        "passed"
+    );
+    assert_eq!(
+        by_test["attest_sample_crate::tests::unit_ignored_test"]["outcome"],
+        "ignored"
+    );
+    assert!(
+        evidence
+            .iter()
+            .all(|e| e["result"]["parse_failed"] == false),
+        "no section may fail closed on an ordinary test failure: {evidence:#?}"
+    );
+    // MEASURED, not assumed: cargo stops after the first target that fails, so
+    // the `integration` target never runs and contributes NO evidence. This is
+    // a real property of a bulk capture — a failing run records less than a
+    // green one — pinned here rather than papered over.
+    assert_eq!(by_test.len(), 3, "only the lib section ran: {by_test:#?}");
+    assert!(
+        !by_test.contains_key("integration::integration_add_works"),
+        "cargo never ran the integration target: {by_test:#?}"
     );
 }

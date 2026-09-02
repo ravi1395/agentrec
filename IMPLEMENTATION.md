@@ -748,8 +748,10 @@ ac_p3_9_fixture_crate_has_both_test_target_shapes`
 
 Scope: `cli/src/attest/{adapter_cargo,capture,derivecmd}.rs`, `cli/src/attest.rs`
 (module list), `cli/src/main.rs` (`attest derive` / `attest run`), `cli/src/cmds.rs`
-(the `hook claude` `PostToolUse` arm), `cli/Cargo.toml` (`syn`/`proc-macro2`/`quote`),
-`cli/tests/attest_capture.rs`.
+(the `hook claude` `PostToolUse` arm + the eviction protect set), `cli/src/
+purgecmd.rs` (the `--orphans` / `--path` protect sets), `cli/src/initcmd.rs`
+(`CLAUDE_HOOK_EVENTS`), `cli/src/uninstallcmd.rs`, `cli/src/doctorcmd.rs`,
+`cli/Cargo.toml` (`syn`/`proc-macro2`/`quote`), `cli/tests/attest_capture.rs`.
 
 **Phase 4 census hook:** every `std::process::Command::new` site this block adds
 carries a `// attest: sanctioned spawn (Phase 4 census)` comment, so Phase 4's
@@ -809,8 +811,67 @@ containing the word), so an arbitrary `Bash` tool call is not captured. —
 exits with the child's own status, so wrapping a command does not change what the
 user sees or what a script downstream reads. — `attest_capture::
 ac_p3_22_run_tees_output_and_propagates_the_child_exit_code`
+**AC-ATTEST-P3-24.** A CAS blob cited ONLY by `attest.jsonl` is protected by
+BOTH reclaim paths: `purge --orphans` (manual) does not archive it, and the
+daemon's automatic eviction tick does not evict it. Reproduced before the fix on
+the manual path — a root whose only blob was cited by five `evidence` events
+printed `reclaimed 1 orphaned (superseded) blob(s)`. Both protect sets now
+harvest `attest.jsonl` alongside `log.jsonl` / `open.json` / `memory.jsonl`; the
+two CAS refs any `AttestEvent` carries are `evidence.output_blob` and its
+result's `raw_blob` (`derive.body_hash` is a bare hex token digest with no
+`sha256:` prefix and no CAS object, so the raw scan correctly ignores it). —
+`attest_capture::ac_p3_24_purge_orphans_protects_a_blob_cited_only_by_attest_jsonl`
+and `cmds::tests::ac_p3_24_a_blob_cited_only_by_attest_jsonl_survives_the_eviction_tick`.
+**Mutation-probed:** removing `attest_path` from each protect set reds its own
+test (purge: 0 passed / 1 failed, and the reclaim line reappears verbatim;
+eviction: 0 passed / 1 failed).
+**AC-ATTEST-P3-25.** `open.json` is a MIRROR of live daemon state, so a journal
+left behind by a crashed or killed daemon names a turn that will never be
+persisted. `open_turn_id` gates on the same liveness probe `status`/`doctor` use
+(`daemon::daemon_is_running`): no live daemon → no open turn, and the capture is
+recorded UNJOINED rather than attributed to an unresolvable id. — `attest::
+capture::tests::ac_p3_25_a_journal_with_no_live_daemon_is_stale_and_yields_no_turn`
+and `attest_capture::ac_p3_25_a_stale_open_json_yields_unjoined_evidence_on_a_clean_tree`
+(which also carries the clean-tree half of the dirty bit: `dirty: false`,
+`dev_loop_only: 0`). Mutation-probed: removing the gate reds both.
+**Consequence, deliberate:** AC-ATTEST-P3-15/16 now run a REAL daemon and a real
+hook bracket and assert against the id `daemon.rs::sync_journal` itself wrote —
+which also retires the earlier "only the reader is proven" caveat.
+**AC-ATTEST-P3-26.** The `--list` line parser is driven by the committed real
+capture `docs/fixtures/attest/list.txt`: 37 names, every one from a `: test`
+line, and a `: benchmark` line is never mistaken for a test. — `attest::
+adapter_cargo::tests::ac_p3_26_the_list_parser_reads_the_real_list_fixture`
+**AC-ATTEST-P3-27.** `init` installs Claude Code's `PostToolUse` hook scoped by
+`matcher: "Bash"` (mirroring Codex's `apply_patch` scoping) so capture path 2
+is wired for real and not merely reachable; a second `init` adds no duplicate;
+`doctor`'s hook-presence check passes with it; `uninstall` removes it and drops
+the emptied key. The event list is shared (`initcmd::CLAUDE_HOOK_EVENTS`) rather
+than duplicated, so an installed-but-unenumerated event cannot leak past
+uninstall. `doctor` requires only the BRACKETING pair
+(`initcmd::CLAUDE_BRACKET_EVENTS`) — requiring `PostToolUse` would fail every
+repo initialized before this hook existed, and turn recording does not depend on
+it. — `attest_capture::
+ac_p3_27_init_installs_doctor_accepts_and_uninstall_removes_the_capture_hook`
+**AC-ATTEST-P3-28.** A REAL failing test (one assert flipped in a fixture copy)
+is captured as `outcome: failed` with `parse_failed: false` — a failure is not a
+parse error — its same-section siblings keep their own outcomes, and cargo's
+`101` propagates. Measured and pinned rather than papered over: cargo stops
+after the first target that fails, so the `integration` target never runs and a
+failing bulk capture records 3 results where a green one records 5. —
+`attest_capture::ac_p3_28_a_real_failing_test_is_captured_as_a_failed_outcome`
+**Dependency note.** `check-versions.sh` does not track the three new direct
+deps (`syn`, `proc-macro2`, `quote`) — it asserts the release version across six
+files and has no per-dependency pin check — so a version bump on them is not
+gated by CI. Recorded, not fixed. `syn` is taken with `default-features = false`
+and only `full`, `parsing`, `printing`, `clone-impls`; `Cargo.lock` shows no
+version movement from any of it.
+
 **AC-ATTEST-P3-23.** The staged single-test pipeline keeps its four
-`recipe-invalid` causes distinct on real cargo output: `missing` (name not in
-`--list`), `ignored` (`#[ignore]`d), `harness` (no summary line), and `build`
-(the target does not compile). — `attest::adapter_cargo::tests::
+`recipe-invalid` causes distinct. THREE are driven end to end against real
+cargo output on the fixture crate — `missing` (name absent from `--list`),
+`ignored` (`#[ignore]`d) and `build` (the target does not compile) — alongside a
+real passing run, so a cause is never a pass. The fourth, `harness`, is asserted
+against a SYNTHETIC string (per-test lines with no summary line): reproducing it
+for real needs a test binary that aborts mid-harness, which this fixture crate
+does not have. — `attest::adapter_cargo::tests::
 ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct`

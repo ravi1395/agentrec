@@ -28,7 +28,7 @@ toml = "0.8"
 # what `Cargo.lock` already carries transitively, so adding these edges moves no
 # version. `quote` is here for its `ToTokens` trait — `syn`'s `printing` feature
 # provides the impls but the trait itself lives in `quote`.
-syn = { version = "2.0.118", features = ["full", "parsing", "visit", "printing"] }
+syn = { version = "2.0.118", default-features = false, features = ["full", "parsing", "printing", "clone-impls"] }
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 
