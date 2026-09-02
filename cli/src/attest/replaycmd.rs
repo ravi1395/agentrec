@@ -50,8 +50,9 @@
 use crate::attest::adapter_cargo::{Adapter, CargoAdapter, RunEnv, RunFilter};
 use crate::attest::coveragecmd::attest_target_dir;
 use crate::attest::lock::{append_attest_locked, read_attest};
+use crate::attest::statuscmd::status_label;
 use agentrec_core::attest::events::AttestEvent;
-use agentrec_core::attest::fold::fold_claims;
+use agentrec_core::attest::fold::{fold_claims, ClaimStatus};
 use agentrec_core::attest::types::{
     ClaimId, StructuredResult, TestIdentity, TestOutcome, VerdictKind,
 };
@@ -110,13 +111,6 @@ pub fn run(root: &Path, all_stale: bool, ids: &[String]) -> Result<(), String> {
     // makes partial progress durable.
     for (claim_id, identity) in &selected {
         let (verdict, runs) = replay(&extract, identity)?;
-        println!(
-            "{claim_id} {}::{} -> {} ({runs} run{})",
-            identity.target,
-            identity.fn_path,
-            describe(&verdict),
-            if runs == 1 { "" } else { "s" }
-        );
         append_attest_locked(
             root,
             &[AttestEvent::Verdict {
@@ -126,8 +120,52 @@ pub fn run(root: &Path, all_stale: bool, ids: &[String]) -> Result<(), String> {
                 replay_commit: commit.clone(),
             }],
         )?;
+        // Printed AFTER the append and against a re-fold, because the verdict
+        // this run appended is not always the state the claim ends in:
+        // `claim-false` is permanent (spec decision 4), so a later passing
+        // replay is recorded and counted while the claim stays `CLAIM_FALSE`.
+        // Reporting only the appended verdict said "-> confirmed" about a
+        // claim `attest status` still showed as refuted — two true sentences
+        // that read as a contradiction. When they agree, the line is
+        // unchanged; when they differ, both are stated.
+        let folded_status = folded_status_of(root, claim_id)?;
+        let appended = describe(&verdict);
+        let plural = if runs == 1 { "" } else { "s" };
+        let head = format!("{claim_id} {}::{}", identity.target, identity.fn_path);
+        match folded_status {
+            Some(status) if status != expected_status_label(&verdict) => {
+                let appended_clause =
+                    format!("{head} -> verdict {appended} appended ({runs} run{plural});");
+                println!("{appended_clause} claim remains {status} (permanent, decision 4)");
+            }
+            _ => println!("{head} -> {appended} ({runs} run{plural})"),
+        }
     }
     Ok(())
+}
+
+/// The state label a verdict WOULD produce on a claim with no history that
+/// overrides it. Compared against the re-folded status to detect the one case
+/// where they diverge.
+fn expected_status_label(verdict: &VerdictKind) -> String {
+    let status = match verdict {
+        VerdictKind::Confirmed => ClaimStatus::Confirmed,
+        VerdictKind::ClaimFalse => ClaimStatus::ClaimFalse,
+        VerdictKind::RecipeInvalid { cause } => ClaimStatus::RecipeInvalid { cause: *cause },
+        VerdictKind::FlakyObservation => ClaimStatus::Flaky,
+    };
+    status_label(&status)
+}
+
+/// Re-read and re-fold the log to learn what the claim IS after the append.
+/// Cheap at this scale (one read of a file this command just appended one line
+/// to) and it asks the same reader `attest status` asks, so the two cannot
+/// disagree about the same log.
+fn folded_status_of(root: &Path, claim_id: &ClaimId) -> Result<Option<String>, String> {
+    let (events, _census) = crate::attest::lock::read_attest(root)?;
+    Ok(fold_claims(&events)
+        .claim(claim_id)
+        .map(|c| status_label(&c.status)))
 }
 
 /// Serializes concurrent `attest verify` runs in one root. Separate from

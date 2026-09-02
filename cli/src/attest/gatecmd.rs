@@ -12,8 +12,7 @@
 //! `agentrec: <message>` line is prefixed.
 
 use crate::attest::lock::read_attest;
-use crate::attest::statuscmd::{blocking_reason, cause_label, status_label};
-use agentrec_core::attest::events::ManualSeverity;
+use crate::attest::statuscmd::{blocking_reason, cause_label};
 use agentrec_core::attest::fold::{fold_claims, ClaimStatus};
 use std::path::Path;
 
@@ -55,16 +54,11 @@ pub fn run(root: &Path, json: bool) -> Result<bool, String> {
             }
             _ => {}
         }
-        if claim.manual_severity == Some(ManualSeverity::Fyi) {
-            notes.push(format!(
-                "fyi manual criterion, {}",
-                match claim.status {
-                    ClaimStatus::Human { .. } =>
-                        format!("answered {}", status_label(&claim.status)),
-                    _ => "unanswered".to_string(),
-                }
-            ));
-        }
+        // `fyi` manual claims are deliberately absent from BOTH lists. They
+        // are informational, and the gate is where a release decision is
+        // made — listing an item that can never affect it is the nagging
+        // `fyi` exists to avoid. They remain visible in `attest report` and
+        // in `attest status`'s counts.
         if claim.is_stale() {
             notes.push("stale: a write landed in this claim's coverage scope".to_string());
         }

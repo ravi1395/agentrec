@@ -1,11 +1,16 @@
 //! `agentrec attest review [--json]` — evidence-first cards for the claims
 //! that need a human.
 //!
-//! A card is a manual claim (`manual-declare` wrote its text and severity)
-//! whose status is `DECLARED` (never answered) or `HUMAN(skip)` (deferred, so
-//! ask again next time). `HUMAN(no)` is deliberately NOT re-asked: it is a
-//! recorded rejection that blocks the gate, not an open question. `fyi` claims
-//! ARE cards — they still need an answer; what `fyi` never does is block
+//! A card is a `blocking` manual claim (`manual-declare` wrote its text and
+//! severity) whose status is `DECLARED` (never answered) or `HUMAN(skip)`
+//! (deferred, so ask again next time). `HUMAN(no)` is deliberately NOT
+//! re-asked: it is a recorded rejection that blocks the gate, not an open
+//! question.
+//!
+//! `fyi` claims are NOT cards. They are informational — "`fyi` never nags"
+//! (`events.rs::ManualSeverity`) — so review never prompts for one and the
+//! gate never lists one. An `fyi` claim is visible in `attest report` and in
+//! `attest status`'s counts, and nowhere else
 //! (`ATTEST-FORMAT.md` § "Gate blocking, precisely", the single statement of
 //! that rule).
 //!
@@ -36,7 +41,7 @@ struct Card {
 }
 
 fn needs_a_human(claim: &ClaimState) -> bool {
-    claim.manual_severity.is_some()
+    claim.manual_severity == Some(ManualSeverity::Blocking)
         && matches!(
             claim.status,
             ClaimStatus::Declared
@@ -112,7 +117,9 @@ pub fn run(root: &Path, json: bool) -> Result<(), String> {
         .map(|c| Card {
             claim_id: c.claim_id.clone(),
             text: c.manual_text.clone().unwrap_or_default(),
-            severity: c.manual_severity.unwrap_or(ManualSeverity::Fyi),
+            // `needs_a_human` already required `blocking`, so the default is
+            // unreachable; it is the same value rather than a second answer.
+            severity: c.manual_severity.unwrap_or(ManualSeverity::Blocking),
             status: status_label(&c.status),
             prov: prov.get(&c.claim_id).cloned().unwrap_or_default(),
             evidence_runs: c.history.evidence,

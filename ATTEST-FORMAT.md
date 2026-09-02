@@ -232,13 +232,16 @@ point here rather than restating it.**
    `blocks_gate()` cannot see it: it is the gate reading `manual_severity`
    against the claim's `human` answer.
 
-Everything else is **advisory** — surfaced with its reason, exit code 0:
-`recipe-invalid` (any cause), `flaky`, the `STALE` overlay, and every `fyi`
-manual claim whatever its answer. "`fyi` never nags" means `fyi` never blocks;
-an `fyi` claim still appears as an `attest review` card and as a gate advisory
-line.
+Everything else the gate sees is **advisory** — surfaced with its reason, exit
+code 0: `recipe-invalid` (any cause), `flaky`, and the `STALE` overlay.
 
-A claim meeting both conditions is counted once.
+`fyi` manual claims are in **neither** list. "`fyi` never nags"
+(`events.rs::ManualSeverity`) is read literally: an `fyi` claim is never a
+blocker, never an advisory line, and never an `attest review` card — review does
+not prompt for one. It is visible in `attest report` and in `attest status`'s
+counts, and nowhere else.
+
+A claim meeting both blocking conditions is counted once.
 
 ## Verdict naming
 

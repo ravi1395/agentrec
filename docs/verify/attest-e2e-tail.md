@@ -1,8 +1,11 @@
 # attest v1 — manual E2E tail, run once end to end
 
 Plan: `docs/superpowers/plans/2026-08-28-attest-plan.md` § "Manual E2E tail".
-Run 2026-09-02 on branch `feat/attest` at `09276fd` + the Phase 5 working tree,
-against the **release** binary `target/release/agentrec`.
+Run 2026-09-02 on branch `feat/attest`. The first pass ran at `09276fd` + the
+Phase 5 working tree; sections 6 and 7 were **re-run** after the 2026-09-02
+founder ruling on `fyi` and the `attest verify` output fix (post-`bcccabc`
+working tree), and carry that re-run's output. Both passes used the **release**
+binary `target/release/agentrec` against a fresh fixture crate.
 
 **Not run on this repository.** The script ran against a throwaway two-test cargo
 crate under the session scratchpad
@@ -101,11 +104,8 @@ exit=1
 
 ```
 $ git revert --no-edit HEAD    # 1ff6a8e, src/lib.rs back to `a + b`
-$ agentrec attest verify --root $S c_01M1H4JHN4E5F1XB8AX1BVQX3W
-c_01M1H4JHN4E5F1XB8AX1BVQX3W attestdemo::tests::add_is_sum -> confirmed (1 run)
-$ agentrec attest status --root $S
-  CONFIRMED: 1
-  CLAIM_FALSE: 1
+$ agentrec attest verify --root $S c_01M1H5KC7C5DYQ096ANH3HGFMF
+c_01M1H5KC7C5DYQ096ANH3HGFMF attestdemo::tests::add_is_sum -> verdict confirmed appended (1 run); claim remains CLAIM_FALSE (permanent, decision 4)
 ```
 
 **The plan's step 3 says "revert the commit; re-verify → confirmed". As written
@@ -116,47 +116,44 @@ counts the later `confirmed` verdict and moves nothing
 claim is still `CLAIM_FALSE` above, and the gate below is still red because of
 it. Founder-owned: either the plan's step is reworded, or decision 4 changes.
 
-**Recorded, not fixed, and NOT Phase 5's file:** `attest verify`'s stdout printed
-`-> confirmed` for a claim the fold left `CLAIM_FALSE`. The line reports the
-verdict it appended, which is true, but read beside `attest status` the two
-disagree. Phase 5's report now labels its own line `last verdict appended` and
-carries a comment saying why it can disagree with `status`; `replaycmd.rs`
-(Phase 4) is untouched.
+**Fixed after the first pass, on coordinator direction (AC-ATTEST-P5-13).** The
+first run of this script had `attest verify` print a bare `-> confirmed` for a
+claim the fold left `CLAIM_FALSE` — true of the verdict it appended, but read
+beside `attest status` the two looked contradictory. `replaycmd.rs` now appends
+first, re-folds the log (the same reader `attest status` uses), and prints both
+clauses when they differ; when they agree the line is unchanged. The output
+above is from the re-run. Tests:
+`attest_verify::p5_13_a_passing_replay_on_a_refuted_claim_prints_both` and
+`p5_13_an_agreeing_verdict_keeps_the_short_line`. Phase 5's report line is
+labelled `last verdict appended` for the same reason.
 
 ### 7. manual-declare, review, gate
 
 ```
 $ agentrec attest manual-declare --root $S --text "README documents the add() contract" --severity blocking
-c_01M1H4M7P5G5HKD3MXNQ73743Q
+c_01M1H5MBFTRYC8BWFBAFMV7AN5
 $ agentrec attest manual-declare --root $S --text "CHANGELOG entry is nice to have" --severity fyi
-c_01M1H4M7PFH4JC25HV9PT94W2E
+c_01M1H5MBG8SKEWT2TW76TRY9C4
 
 $ agentrec attest gate --root $S
 blocking:
-  c_01M1H4JHN4E5F1XB8AX1BVQX3W claim-false: independent replay refuted this claim
-  c_01M1H4M7P5G5HKD3MXNQ73743Q blocking manual criterion unanswered — README documents the add() contract
-advisory (never blocks):
-  c_01M1H4M7PFH4JC25HV9PT94W2E fyi manual criterion, unanswered
+  c_01M1H5KC7C5DYQ096ANH3HGFMF claim-false: independent replay refuted this claim
+  c_01M1H5MBFTRYC8BWFBAFMV7AN5 blocking manual criterion unanswered — README documents the add() contract
 attest gate: FAIL (2 blocking)
 exit=1
 
-$ printf 'y\ns\n' | agentrec attest review --root $S
-[1/2] c_01M1H4M7P5G5HKD3MXNQ73743Q (blocking)
+$ printf 'y\n' | agentrec attest review --root $S
+[1/1] c_01M1H5MBFTRYC8BWFBAFMV7AN5 (blocking)
   criterion: README documents the add() contract
   status: DECLARED
   evidence: none recorded
   diff: no related turn
   history: 0 evidence, 0 verdict(s), 0 stale event(s)
   [y]es / [n]o / [s]kip
-[2/2] c_01M1H4M7PFH4JC25HV9PT94W2E (fyi)
-  criterion: CHANGELOG entry is nice to have
-  …
 
 $ agentrec attest gate --root $S
 blocking:
-  c_01M1H4JHN4E5F1XB8AX1BVQX3W claim-false: independent replay refuted this claim
-advisory (never blocks):
-  c_01M1H4M7PFH4JC25HV9PT94W2E fyi manual criterion, answered HUMAN(skip)
+  c_01M1H5KC7C5DYQ096ANH3HGFMF claim-false: independent replay refuted this claim
 attest gate: FAIL (1 blocking)
 exit=1
 ```
@@ -165,10 +162,33 @@ The plan's step 5 — "one manual-declare blocking item; gate red; review y; gat
 green" — **passed for its manual half**: the blocking manual item left the
 blocking list after `y`, dropping the count 2 → 1. The gate did not go fully
 green, because the permanent `claim-false` from step 4 is still there (step 6).
-The `fyi` item was skipped and stayed advisory throughout, never blocking, which
-is the Phase 5 deviation recorded in `IMPLEMENTATION.md` §attest.
+
+**The `fyi` item appears nowhere above, which is the point.** Founder ruling
+2026-09-02 (the plan's Phase 5 AC, "fyi items never appear in review or gate
+output"): `attest review` offered ONE card, not two — the `fyi` item was never
+prompted for — and `attest gate` listed it in neither the blocking nor an
+advisory section, before or after. It is recorded, not dropped:
+
+```
+$ agentrec attest report --root $S --json    # manual claims only
+c_01M1H5MBFTRYC8BWFBAFMV7AN5 blocking 'README documents the add() contract'
+c_01M1H5MBG8SKEWT2TW76TRY9C4 fyi 'CHANGELOG entry is nice to have'
+$ agentrec attest status --root $S --json    # the manual key
+{"blocking": {"answered": 1, "unanswered": 0}, "fyi": {"answered": 0, "unanswered": 1}}
+```
+
+An earlier version of this document showed the `fyi` item as a review card and a
+gate advisory line; that was the pre-ruling behaviour and is gone from both the
+code and this record.
 
 ### 8. report, with and without `--range`
+
+*Provenance: this section is the FIRST pass's output (claim ids `c_01M1H4…`).
+The re-run that produced sections 6–7 stopped after `derive` — it did not
+repeat `attest run` or `coverage` — so its claims are `DERIVED` with no
+evidence and its `--range` window holds 0 claims. Neither the report renderer
+nor the range filter changed between the two passes; only the `last verdict`
+label did, and the line below carries the current wording.*
 
 ```
 $ agentrec attest report --root $S
@@ -206,16 +226,23 @@ actually caused it.
 
 ### 9. status --json additive keys
 
+*Re-run output (post-ruling).*
+
 ```
 $ agentrec attest status --root $S --json    # the two new keys only
 {
   "recipe_invalid_causes": {},
   "manual": {
     "blocking": {"answered": 1, "unanswered": 0},
-    "fyi": {"answered": 1, "unanswered": 0}
+    "fyi": {"answered": 0, "unanswered": 1}
   }
 }
 ```
+
+`fyi.unanswered` stays 1 and cannot be driven to 0 by `attest review`: review
+does not offer `fyi` cards. Answering one requires a `human` event from another
+writer, which nothing in this script produces. The first pass showed
+`fyi.answered: 1` because review prompted for it then; that behaviour is gone.
 
 `recipe_invalid_causes` is empty because no run in this script produced a
 recipe-invalid verdict — that arm is covered by

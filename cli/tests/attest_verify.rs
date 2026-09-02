@@ -968,3 +968,68 @@ fn ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope() {
         "a symlinked root must derive the same scope as a canonical one: {map}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P5-13 — stdout never contradicts `attest status`
+// ---------------------------------------------------------------------------
+
+/// A permanently refuted claim that later replays green: the verdict IS
+/// appended (and counted), the claim does NOT move (spec decision 4). Before
+/// this AC, stdout said `-> confirmed` about a claim `attest status` showed as
+/// `CLAIM_FALSE` — two true statements that read as a contradiction.
+#[test]
+fn p5_13_a_passing_replay_on_a_refuted_claim_prints_both() {
+    let f = Fixture::new();
+    f.derive();
+    let claim = f.claim_for(UNIT_TARGET, UNIT_FN);
+
+    let lib = f.path().join("src/lib.rs");
+    let original = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(&lib, original.replace("    a + b", "    a + b + 1")).unwrap();
+    commit_all(f.path(), "break add");
+    let (_, v) = f.verify(&claim);
+    assert_eq!(
+        v.expect("a verdict must be appended")["verdict"],
+        "claim-false",
+        "precondition: the claim must be refuted before the passing replay"
+    );
+
+    // Restore and COMMIT, so the extract carries the working bytes.
+    std::fs::write(&lib, &original).unwrap();
+    commit_all(f.path(), "restore add");
+    let (stdout, v) = f.verify(&claim);
+    assert_eq!(
+        v.expect("the passing replay's verdict must still be appended")["verdict"],
+        "confirmed",
+        "the verdict event is recorded even though the claim cannot move"
+    );
+
+    assert!(
+        stdout.contains("verdict confirmed appended"),
+        "stdout must name the verdict it appended: {stdout}"
+    );
+    assert!(
+        stdout.contains("claim remains CLAIM_FALSE (permanent, decision 4)"),
+        "stdout must also name the folded status, which differs: {stdout}"
+    );
+
+    // And the two readers agree about the same log.
+    let status = f.agentrec(&["attest", "status", "--json"]);
+    let status: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&status.stdout)).unwrap();
+    assert_eq!(status["claim_false"], 1, "{status}");
+    assert_eq!(status["confirmed"], 0, "{status}");
+}
+
+/// The agreeing case keeps the original one-clause line — the extra clause is
+/// reserved for a real divergence, not printed on every verdict.
+#[test]
+fn p5_13_an_agreeing_verdict_keeps_the_short_line() {
+    let f = Fixture::new();
+    f.derive();
+    let claim = f.claim_for(UNIT_TARGET, UNIT_FN);
+    let (stdout, v) = f.verify(&claim);
+    assert_eq!(v.expect("a verdict")["verdict"], "confirmed");
+    assert!(stdout.contains("-> confirmed ("), "{stdout}");
+    assert!(!stdout.contains("claim remains"), "{stdout}");
+}

@@ -280,25 +280,25 @@ fn p5_2_gate_exit_code_table() {
             "manual fyi unanswered",
             vec![declare(1, ManualSeverity::Fyi)],
             0,
-            "advisory",
+            "absent",
         ),
         (
             "manual fyi yes",
             vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::Yes)],
             0,
-            "advisory",
+            "absent",
         ),
         (
             "manual fyi no",
             vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::No)],
             0,
-            "advisory",
+            "absent",
         ),
         (
             "manual fyi skip",
             vec![declare(1, ManualSeverity::Fyi), human(1, HumanAnswer::Skip)],
             0,
-            "advisory",
+            "absent",
         ),
         // Both halves of the rule on ONE claim: the AC says it is counted
         // once, and only this row can falsify that.
@@ -421,21 +421,55 @@ fn p5_4_gate_json_matches_the_text_verdict() {
 }
 
 #[test]
-fn p5_8_fyi_is_a_card_and_advisory_never_blocking() {
+fn p5_8_fyi_is_absent_from_review_and_gate_but_present_in_report() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     seed(root, &[declare(1, ManualSeverity::Fyi)]);
+    let id = cid(1).to_string();
 
-    let gate: serde_json::Value =
+    // The gate lists it in NEITHER section, and passes.
+    let gate_json: serde_json::Value =
         serde_json::from_str(&out(&agentrec(root, &["attest", "gate", "--json"]))).unwrap();
-    assert_eq!(gate["pass"], true);
-    assert!(gate["blocking"].as_array().unwrap().is_empty());
-    assert_eq!(gate["advisory"][0]["claim_id"], cid(1).to_string());
+    assert_eq!(gate_json["pass"], true);
+    assert!(gate_json["blocking"].as_array().unwrap().is_empty());
+    assert!(
+        gate_json["advisory"].as_array().unwrap().is_empty(),
+        "fyi must not be an advisory line either: {gate_json}"
+    );
+    let gate_text = agentrec(root, &["attest", "gate"]);
+    assert_eq!(code(&gate_text), 0);
+    assert!(
+        !out(&gate_text).contains(&id),
+        "fyi must not appear in gate output at all: {}",
+        out(&gate_text)
+    );
 
+    // Review offers no card and never reads stdin: piping an answer must
+    // append nothing, which is what proves it did not prompt.
     let cards: serde_json::Value =
         serde_json::from_str(&out(&agentrec(root, &["attest", "review", "--json"]))).unwrap();
-    assert_eq!(cards.as_array().unwrap().len(), 1, "fyi must be a card");
-    assert_eq!(cards[0]["severity"], "fyi");
+    assert!(
+        cards.as_array().unwrap().is_empty(),
+        "fyi must not be a card: {cards}"
+    );
+    let before = std::fs::read_to_string(root.join(".agentrec/attest.jsonl")).unwrap();
+    let review = agentrec_stdin(root, &["attest", "review"], "y\n");
+    assert_eq!(code(&review), 0);
+    assert!(!out(&review).contains(&id), "{}", out(&review));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".agentrec/attest.jsonl")).unwrap(),
+        before,
+        "review must not append an answer for an fyi claim"
+    );
+
+    // Recorded, not dropped: report and status still carry it.
+    let report: serde_json::Value =
+        serde_json::from_str(&out(&agentrec(root, &["attest", "report", "--json"]))).unwrap();
+    assert_eq!(report["claims"][0]["claim_id"], id);
+    assert_eq!(report["claims"][0]["severity"], "fyi");
+    let status: serde_json::Value =
+        serde_json::from_str(&out(&agentrec(root, &["attest", "status", "--json"]))).unwrap();
+    assert_eq!(status["manual"]["fyi"]["unanswered"], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +494,7 @@ fn p5_5_review_scripted_stdin_appends_three_human_events() {
         &[
             declare(1, ManualSeverity::Blocking),
             declare(2, ManualSeverity::Blocking),
-            declare(3, ManualSeverity::Fyi),
+            declare(3, ManualSeverity::Blocking),
             // Card 1 has a joined turn, so its diff pointer is real.
             evidence(1, Some("t_01ARZ3NDEKTSV4RRFFQ69G5FAV"), true),
         ],
