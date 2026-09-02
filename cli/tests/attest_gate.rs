@@ -314,6 +314,11 @@ fn p5_2_gate_exit_code_table() {
     let id = cid(1).to_string();
     let mut rows = 0usize;
     let mut skipped = 0usize;
+    // The distinct (status, severity, stale) cells the rows actually cover —
+    // fewer than the row count, and the gap is asserted below rather than
+    // described in prose.
+    let mut axis_cells: std::collections::BTreeSet<(&str, &str, bool)> =
+        std::collections::BTreeSet::new();
     let mut seen_claim_false_fyi = false;
 
     for (status_name, recipe) in &recipes {
@@ -356,6 +361,16 @@ fn p5_2_gate_exit_code_table() {
                 // born `DERIVED` by `ClaimState::new` and never becomes
                 // `DECLARED` (see the `skipped` comment below). It is
                 // asserted positively rather than skipped.
+                axis_cells.insert((
+                    status_label(&state.status),
+                    match state.manual_severity {
+                        None => "none",
+                        Some(ManualSeverity::Blocking) => "blocking",
+                        Some(ManualSeverity::Fyi) => "fyi",
+                    },
+                    state.is_stale(),
+                ));
+
                 let expected_label = if *status_name == "declared" && sev_name == "none" && stale {
                     "derived"
                 } else {
@@ -445,6 +460,20 @@ fn p5_2_gate_exit_code_table() {
     assert_eq!(
         skipped, 1,
         "only `declared × none × stale=false` has no claim"
+    );
+    // 59 rows, but only 55 distinct (status, severity, stale) cells: FOUR
+    // pairs of rows fold to the same axis cell. `declared × none × stale=true`
+    // folds like `derived × none × stale=true` (it writes only the `Stale`
+    // event, so the claim is born DERIVED); and each of `claim_false × {none,
+    // blocking, fyi} × stale=true` folds like its `stale=false` sibling,
+    // because the fold's `Stale` arm returns early on a refuted claim
+    // (`ATTEST-FORMAT.md`: a `stale` leaves a refuted claim exactly where it
+    // is). Those rows still exercise the refuted-stale no-op through the real
+    // binary, so they stay rows. Asserted so the count cannot rot in prose.
+    assert_eq!(
+        axis_cells.len(),
+        55,
+        "59 rows must cover exactly 55 distinct (status, severity, stale) cells: {axis_cells:?}"
     );
     assert_eq!(
         rows, 59,
