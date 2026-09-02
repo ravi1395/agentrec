@@ -14,6 +14,26 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **attest v1 Phase 3 (cargo adapter + passive capture) — Fable skeptic GATE PASS at `78b9fb0`
+  (2026-09-02, `feat/attest`).** `cli/src/attest/{lock,statuscmd,adapter_cargo,capture,
+  derivecmd}.rs`, hidden `attest {status,derive,run}`, fixture crate
+  `cli/tests/fixtures/attest_sample_crate` (both test-target shapes; workspace-excluded; absent
+  from `cargo package`). Suite 1077→1120/0/4. Direct deps added: syn/proc-macro2/quote (no
+  lockfile version movement; NOT tracked by `check-versions.sh` — disclosed debt). Review +
+  gate found four real defects, all fixed with discriminating tests: CAS protect sets (purge
+  AND eviction tick) omitted `attest.jsonl`, so an attest-only blob was archived; the
+  orchestrator's ruling to install Claude `PostToolUse[Bash]` made `cmds::hook`'s unreachable
+  `_ => "stop"` arm live and every non-test Bash call split the turn (PostToolUse now never
+  emits a signal; live-daemon test pins one rich turn); hashing the whole `ItemFn` folded the
+  name in so rename detection could never fire (body block only now); `cargo test 2>&1 | tail`
+  put cargo's `Running` markers in stdout and every result went "undeclared" (both streams
+  scanned; unattributable ≠ undeclared). **Two sessions committed to this branch concurrently
+  on 2026-09-02** (`74a0a2c`, `e106bae` are not this session's); `e106bae` mis-transcribed the
+  skeptic's measurement in three sites — corrected at `78b9fb0`. Open: Claude Code's real
+  PostToolUse Bash payload field names (`tool_response.stdout/stderr`) remain unbacked by any
+  captured fixture — a live `claude -p` session would settle it; `doctor` does not require the
+  PostToolUse entry (pre-existing installs keep passing; a lost entry is undetected);
+  AC-ATTEST-P3-6 (daemon takes the lock) is manual until Phase 4B's daemon writer.
 - **attest v1 Phase 2 (pure claim core) — Fable skeptic GATE PASS at `cd94b73` (2026-09-02,
   `feat/attest`).** `agentrec-core::attest::{types,events,fold}` + `ATTEST-FORMAT.md` (draft,
   unstable, outside PROTOCOL versioning). Core lib 230→259 tests. Three gate rounds: round 1
