@@ -1395,7 +1395,12 @@ unconditionally either way, so the recipe's real status survives) plus a per-row
 `status_label` assertion covering all 59 rows. One row is expected not to match
 its own name and is asserted positively as `derived`: `declared × severity=none
 × stale=true` writes only a `Stale` event, so the claim is born `DERIVED` and
-never becomes `DECLARED`.
+never becomes `DECLARED`. Disclosed with it: those 59 rows cover **58 distinct
+fold states**, because that row folds to the same `ClaimState` shape as
+`derived × severity=none × stale=true`. Nothing is lost for production —
+`ManualDeclare.severity` is a required field, so `DECLARED × severity=none` is
+not a shape the fold can reach at all — but "59 rows" above is a row count, not
+a count of distinct states.
 
 **AC-ATTEST-P5-3.** `recipe-invalid` and `flaky-observation` never produce a
 nonzero `attest gate` exit, on their own or in combination, and the ids appear

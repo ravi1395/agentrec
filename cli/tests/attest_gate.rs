@@ -207,11 +207,12 @@ fn p5_1_manual_declare_appends_and_status_shows_it() {
 // AC-ATTEST-P5-2, P5-3, P5-8
 // ---------------------------------------------------------------------------
 
-/// Maps a recipe's name to the `ClaimStatus` it must actually reach, so a
-/// recipe that silently stalls (e.g. stuck at `DECLARED` because the
-/// severity event landed first and the fold's `ManualDeclare` arm only sets
-/// status on `first_sight`) reds instead of quietly re-testing a different
-/// cell than its row claims to be.
+/// Names a folded `ClaimStatus` with the recipe name that must produce it, so
+/// each row can assert the fold reached its expected status. A recipe that
+/// stalls short of it (e.g. stuck at `DECLARED` because the severity event
+/// landed first and the fold's `ManualDeclare` arm only sets status on
+/// `first_sight`) then reds instead of quietly re-testing a different cell
+/// than its row claims to be.
 fn status_label(status: &ClaimStatus) -> &'static str {
     match status {
         ClaimStatus::Derived => "derived",
@@ -264,12 +265,14 @@ fn status_label(status: &ClaimStatus) -> &'static str {
 fn p5_2_gate_exit_code_table() {
     // Event recipes reaching each status. `manual-declare`, when the row has
     // a severity, is appended AFTER the recipe: the fold's `ManualDeclare`
-    // arm only sets status on `first_sight`, so declaring first would strand
-    // every non-empty recipe at `DECLARED` (`Evidence` only fires out of
-    // `Derived`, `Verdict`/`Human` only progress a status the recipe itself
-    // set) while still writing `manual_severity` unconditionally either way —
-    // appending last reaches the recipe's real status AND carries the
-    // severity.
+    // arm only sets status on `first_sight`, so declaring first strands
+    // exactly the two recipes whose movers require `DERIVED`: `derived`
+    // (the `Derive` arm assigns no status at all) and `evidenced` (the
+    // `Evidence` arm fires only out of `Derived`). The other seven reach
+    // their named status under either ordering, because the `Verdict` and
+    // `Human` arms overwrite any non-refuted status. `manual_severity` is
+    // written unconditionally either way, so appending last reaches every
+    // recipe's real status AND still carries the severity.
     let recipes: Vec<(&str, Vec<AttestEvent>)> = vec![
         ("declared", vec![]),
         ("derived", vec![derive(1)]),
