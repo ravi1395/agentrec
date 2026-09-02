@@ -14,6 +14,51 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **attest v1 Phase 5 (review cards, advisory gate, attestation report, `manual-declare`,
+  unhide) — Fable skeptic GATE PASS at `22db674` (2026-09-02, `feat/attest`), after three
+  FAILED rounds.** `attest {review,gate,report,manual-declare}` unhidden; suite 1159→1179/0/4,
+  clippy `-D warnings` debug+release + fmt clean, goldens unchanged,
+  `scripts/check-write-opens.sh` ok (63/34). **Round 1 (`2ba1e30`) failed on the only CODE
+  blocker of the phase:** `gatecmd.rs` ran its `fyi` skip BEFORE the claim-false check, so a
+  hand-authored `fyi manual-declare` on a `CLAIM_FALSE` claim exited 0 while `attest status`
+  still reported the refutation. Fixed at `c1d4dd5` — the skip now follows `blocking_reason`,
+  so refutation always outranks severity.
+  **Rounds 2–4 all failed on the RECORD, never the code, and each blocker was a COUNT that
+  lived only in a sentence** — this repo's signature defect, three times in one phase:
+  - Round 2 (at `c1d4dd5`): the exit-code table was generated but partly vacuous. The
+    generator appended `manual-declare` FIRST when a row carried a severity, and `fold.rs`'s
+    `ManualDeclare` arm only sets `DECLARED` on `first_sight`, so `derived` (the `Derive` arm
+    assigns no status) and `evidenced` (the `Evidence` arm fires only out of `Derived`)
+    stalled — 8 of 59 rows silently re-testing the `DECLARED` cell under another label, with
+    nothing asserting a row reached the status its name claims. Fixed at `ff8365c`: declare
+    appended AFTER the recipe (`manual_severity` is written unconditionally either way), plus
+    a per-row `status_label` assertion. The one row expected not to match its own name
+    (`declared × none × stale=true`, born `DERIVED` because it writes only a `Stale` event) is
+    asserted positively rather than skipped.
+  - Round 3 (at `ff8365c`): a comment claimed declaring first would strand "every non-empty
+    recipe" — false, only those two strand; the other seven are overwritten by the `Verdict`
+    and `Human` arms. That sentence also contradicted the same commit's own 8-row figure.
+    Fixed at `4063e81`, comments only.
+  - Round 4 (at `4063e81`): "the 59 rows cover 58 distinct fold states" — **transcribed from
+    the gate's own prior residual note without re-derivation**, the recorded failure mode, this
+    time seeded by the skeptic and caught by the skeptic. Measured: **55** distinct
+    (status, severity, stale) cells and 59 distinct `ClaimState` values; there are FOUR
+    collapsing pairs, not one — `declared × none × stale=true` ≡ `derived × none × stale=true`,
+    plus `claim_false × {none, blocking, fyi} × stale=true` ≡ their `stale=false` siblings
+    (the fold's `Stale` arm returns early on a refuted claim). Those three were never disclosed
+    before. Fixed at `22db674` by making the count **executable** — `p5_2` collects each row's
+    axis triple into a `BTreeSet` and asserts `len() == 55` — rather than writing a third prose
+    count. The gate reproduced 55/59 on its own probe and red-verified both mutations
+    (expected-count forced to 59; declare-first ordering restored).
+  **Residuals, disclosed:** the per-row `assert_eq!` names only the FIRST stalled row, so a
+  multi-row regression needs re-running or an external enumeration; the 55-cell assertion pins
+  the current fold's answer, not an independent oracle (a fold regression would move the test
+  and any same-fold probe together); Phase 4's residuals all still stand (nothing captures this
+  repo's own coverage; `sweep_leaked_profraw` never fired; Claude Code's real `PostToolUse`
+  Bash payload field names unbacked by a fixture; `doctor` does not require the `PostToolUse`
+  entry; `attest review`'s cards read "evidence: none recorded" for every real manual claim by
+  construction). **Plan-exit checklist and the PR are NOT done** — `feat/attest` is unpushed
+  since this session's commits.
 - **attest v1 Phase 4 (independent replay + coverage staleness) — Fable skeptic GATE PASS at
   `7e23ba9` (2026-09-02, `feat/attest`; hygiene follow-up `7c416ff`).** `attest verify`
   (git-archive extract into a stable per-root dir, `target/` → per-COMMIT cache, scrubbed env

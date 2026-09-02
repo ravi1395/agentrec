@@ -1403,8 +1403,10 @@ cells**. Four pairs collapse — `declared × none × stale=true` folds like
 sibling, because the fold's `Stale` arm returns early on a refuted claim
 (`ATTEST-FORMAT.md`: a `stale` leaves a refuted claim exactly where it is).
 Those rows still drive the real binary over the refuted-stale no-op, so they
-stay rows. As full `ClaimState` values all 59 differ (`test_identity` and
-`history` separate them); "59 rows" above is a row count, and 55 is the
+stay rows. As full `ClaimState` values all 59 differ, though not by the
+same field: `history` separates all four pairs (`derives` for the
+declared/derived pair, `stale_events` for the three `claim_false` pairs) while
+`test_identity` separates only the declared/derived pair; "59 rows" above is a row count, and 55 is the
 axis-cell count `p5_2_gate_exit_code_table` now asserts. Nothing is lost for
 production: `ManualDeclare.severity` is a required field, so `DECLARED ×
 severity=none` is not a shape the fold can reach at all.
