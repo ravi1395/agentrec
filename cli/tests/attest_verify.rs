@@ -289,6 +289,13 @@ fn ac_p4_5_ignored_then_restored_verifies_again() {
     let v = verdict.expect("a verdict must be appended");
     assert_eq!(v["verdict"], "recipe-invalid", "stdout: {stdout}");
     assert_eq!(v["cause"], "ignored", "stdout: {stdout}");
+    // AC-ATTEST-P4C-11: stdout prints the WIRE casing, so the human line and
+    // the appended event agree. `{:?}` on the cause would print `Ignored`.
+    assert!(
+        stdout.contains("cause: ignored"),
+        "stdout must print the wire casing, not Debug's: {stdout}"
+    );
+    assert!(!stdout.contains("Ignored"), "{stdout}");
 
     // Restore and verify again: `recipe-invalid` is retryable, and this is the
     // end-to-end proof that a claim recovers rather than sticking.
@@ -696,5 +703,234 @@ fn ac_p4c_4_a_relative_crate_path_does_not_nest_the_target_dir() {
     assert!(
         !parent.path().join("target").exists(),
         "nothing may be written to the PARENT's target dir"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P4C-8 — `--all-stale`, and per-claim durability
+// ---------------------------------------------------------------------------
+
+/// A claim id chosen to sort AFTER every derived id. `fold_claims` returns a
+/// `BTreeMap` keyed by `ClaimId`, and `attest verify` walks it in that order,
+/// so this is what makes "the SECOND claim errors" deterministic rather than a
+/// coin flip. Real ids are ULID-shaped and start well below `7Z…`.
+const LAST_CLAIM: &str = "c_7ZZZZZZZZZZZZZZZZZZZZZZZZZ";
+
+/// Append raw attest lines to the fixture's log (no lock needed: nothing else
+/// is running).
+fn append_attest(f: &Fixture, lines: &[String]) {
+    let p = f.path().join(".agentrec/attest.jsonl");
+    let mut body = std::fs::read_to_string(&p).unwrap_or_default();
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    std::fs::write(&p, body).unwrap();
+}
+
+fn stale_line(claim: &str) -> String {
+    format!(
+        r#"{{"kind":"stale","ts":900,"claim_id":"{claim}","cause":"file-write","path":"src/lib.rs"}}"#
+    )
+}
+
+fn verdicts_for(f: &Fixture, claim: &str) -> Vec<String> {
+    let body = std::fs::read_to_string(f.path().join(".agentrec/attest.jsonl")).unwrap_or_default();
+    body.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"] == "verdict" && v["claim_id"] == claim)
+        .map(|v| v["verdict"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn ac_p4c_8_all_stale_verifies_every_stale_claim() {
+    let f = Fixture::new();
+    f.derive();
+    let unit = f.claim_for(UNIT_TARGET, UNIT_FN);
+    let integ = f.claim_for("integration", "integration_add_works");
+    assert_ne!(unit, integ);
+
+    append_attest(&f, &[stale_line(&unit), stale_line(&integ)]);
+
+    let out = f.agentrec(&["attest", "verify", "--all-stale"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        verdicts_for(&f, &unit),
+        vec!["confirmed".to_string()],
+        "{stdout}"
+    );
+    assert_eq!(
+        verdicts_for(&f, &integ),
+        vec!["confirmed".to_string()],
+        "{stdout}"
+    );
+}
+
+/// AC-ATTEST-P4C-9. The durability half: an adapter ERROR on a later claim must
+/// not discard the verdicts already decided.
+///
+/// The error is real, not injected — the second claim names a cargo target that
+/// does not exist in the extract, which `CargoAdapter::run` reports as an `Err`
+/// rather than a verdict. Before the fix every verdict was accumulated in one
+/// batch appended after the loop, so this run persisted NOTHING.
+#[test]
+fn ac_p4c_9_an_error_on_a_later_claim_keeps_the_earlier_verdict() {
+    let f = Fixture::new();
+    f.derive();
+    let unit = f.claim_for(UNIT_TARGET, UNIT_FN);
+
+    append_attest(
+        &f,
+        &[
+            format!(
+                r#"{{"kind":"derive","ts":901,"claim_id":"{LAST_CLAIM}","test_identity":{{"target":"no_such_target","fn_path":"nope"}}}}"#
+            ),
+            stale_line(&unit),
+            stale_line(LAST_CLAIM),
+        ],
+    );
+
+    let out = f.agentrec(&["attest", "verify", "--all-stale"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // The run fails — the error is surfaced, not swallowed.
+    assert!(
+        !out.status.success(),
+        "expected failure:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("no cargo target named"),
+        "stderr must name the real cause: {stderr}"
+    );
+
+    // BOTH halves, or the assert passes vacuously on an empty log.
+    assert_eq!(
+        verdicts_for(&f, &unit),
+        vec!["confirmed".to_string()],
+        "the first claim's verdict must survive the later error:\n{stdout}"
+    );
+    assert!(
+        verdicts_for(&f, LAST_CLAIM).is_empty(),
+        "the erroring claim must mint no verdict"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P4C-6 (producer half) and AC-ATTEST-P4C-7 (producer over_stale)
+// ---------------------------------------------------------------------------
+
+/// The producer half of the one-resolver fix: `attest coverage` must write the
+/// map where `attest_coverage_path` says, not at the hard-coded default.
+///
+/// This is the exact defect: the producer ignored the key while the daemon
+/// honoured it, so with the key set the daemon read a path nothing had written
+/// and silently staled nothing. Asserting BOTH that the configured path exists
+/// AND that the default one does not is what discriminates the fix — before it,
+/// only the default was written.
+#[test]
+fn ac_p4c_6_the_producer_writes_the_configured_coverage_path() {
+    if let Some(why) = coverage_tooling_reason() {
+        eprintln!("SKIP ac_p4c_6: coverage tooling unavailable: {why}");
+        return;
+    }
+    let f = Fixture::new();
+    std::fs::write(
+        f.path().join(".agentrec/config.toml"),
+        "attest_coverage_path = \"custom/cov.json\"\n",
+    )
+    .unwrap();
+    f.derive();
+
+    let out = f.agentrec(&["attest", "coverage", "--all"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "coverage failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        f.path().join("custom/cov.json").is_file(),
+        "the map must be written at the CONFIGURED path:\n{stdout}"
+    );
+    assert!(
+        !f.path().join(".agentrec/attest-coverage.json").exists(),
+        "nothing may be written at the default path when the key is set"
+    );
+    // The stdout line must name the same file, or a user following it looks in
+    // the wrong place.
+    assert!(stdout.contains("custom/cov.json"), "{stdout}");
+}
+
+/// AC-ATTEST-P4C-7 (producer half). A package that builds a BINARY yields a
+/// non-empty `over_stale` from a real producer run.
+///
+/// This closes a gap recorded honestly rather than papered over: before the
+/// generalization, `over_stale_for` keyed on the literal package name
+/// `agentrec`, so no fixture could ever exercise the non-empty branch
+/// end-to-end and only a hand-written map literal covered it. The rule now
+/// derives the scope from the bin target's own source directory, so a fixture
+/// with a `[[bin]]` at `src/main.rs` must yield `src/**`.
+#[test]
+fn ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope() {
+    if let Some(why) = coverage_tooling_reason() {
+        eprintln!("SKIP ac_p4c_7: coverage tooling unavailable: {why}");
+        return;
+    }
+    let f = Fixture::new();
+    // Turn the fixture into a binary-building package, in the tempdir copy
+    // only — the committed fixture crate is untouched, so AC-ATTEST-P4-8's
+    // "no over_stale" assertion keeps its meaning.
+    std::fs::write(
+        f.path().join("src/main.rs"),
+        "fn main() { println!(\"{}\", attest_sample_crate::add(1, 1)); }\n",
+    )
+    .unwrap();
+    let manifest = f.path().join("Cargo.toml");
+    let mut toml = std::fs::read_to_string(&manifest).unwrap();
+    toml.push_str("\n[[bin]]\nname = \"sample_bin\"\npath = \"src/main.rs\"\n");
+    std::fs::write(&manifest, toml).unwrap();
+    commit_all(f.path(), "add a bin target");
+
+    f.derive();
+    let out = f.agentrec(&["attest", "coverage", "--all"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "coverage failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let map: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.path().join(".agentrec/attest-coverage.json")).unwrap(),
+    )
+    .unwrap();
+
+    let integ = &map["tests"]["integration::integration_add_works"];
+    assert!(!integ.is_null(), "integration entry missing: {map}");
+    assert_eq!(
+        integ["over_stale"],
+        serde_json::json!(["src/**"]),
+        "a non-lib target of a package that builds a bin must carry the bin's \
+         source scope: {map}"
+    );
+
+    // The ALLOW half: the lib target does not spawn the binary, so it must
+    // still carry nothing — otherwise "everything is over-stale" would pass
+    // the assert above.
+    let unit = &map["tests"][format!("{UNIT_TARGET}::{UNIT_FN}")];
+    assert!(!unit.is_null(), "unit entry missing: {map}");
+    assert_eq!(
+        unit["over_stale"],
+        serde_json::json!([]),
+        "the lib target must carry no over_stale: {map}"
     );
 }

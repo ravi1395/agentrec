@@ -29,14 +29,16 @@
 //!
 //! (i) A SIGKILLed child writes no profile at all. There is no detector; the
 //! founder ruling (AC-ATTEST-P1-3) covers it structurally instead — every test
-//! in a non-`lib` target of the `agentrec` package gets `over_stale`, whether
-//! or not it actually spawned anything. (ii) Untemplated `default_*.profraw`
+//! in a non-`lib` target of a package that BUILDS A BINARY gets `over_stale`,
+//! whether or not it actually spawned anything. The scope is derived from that
+//! binary's own source directory (`spawn_scopes`), which for this repo is
+//! `cli/src/**`, the value the ruling names. (ii) Untemplated `default_*.profraw`
 //! files leak into the crate root by an UNDETERMINED mechanism; they are moved
 //! aside and COUNTED, which only says "we saw N leaks during this capture" and
 //! not which test lost coverage. Disclosed as coarse, not solved.
 
 use crate::attest::adapter_cargo::{parse_artifact_stream, TargetInfo};
-use crate::attest::coverage::{CoverageEntry, CoverageMap, DEFAULT_COVERAGE_REL};
+use crate::attest::coverage::{CoverageEntry, CoverageMap};
 use crate::attest::lock::read_attest;
 use agentrec_core::attest::fold::fold_claims;
 use agentrec_core::attest::types::{ClaimId, TestIdentity};
@@ -45,9 +47,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The one `over_stale` pattern this producer ever emits.
-pub const OVER_STALE_CLI_SRC: &str = "cli/src/**";
-
 /// The per-root build cache. NOT part of any pinned tree: it is shared across
 /// every capture and every `attest verify` replay in this root, which is the
 /// point — a fresh target dir per run rebuilds the world each time.
@@ -55,8 +54,12 @@ pub fn attest_target_dir(root: &Path) -> PathBuf {
     crate::agentrec_dir(root).join("attest-target")
 }
 
-pub fn coverage_path(root: &Path) -> PathBuf {
-    root.join(DEFAULT_COVERAGE_REL)
+/// Where this producer writes. Delegates to the ONE resolver so the producer
+/// and the daemon cannot disagree — see
+/// [`crate::attest::coverage::resolve_coverage_path`] for what that
+/// disagreement cost.
+pub fn coverage_path(root: &Path, cfg: &crate::config::Config) -> PathBuf {
+    crate::attest::coverage::resolve_coverage_path(root, cfg)
 }
 
 struct LlvmTools {
@@ -159,6 +162,11 @@ pub fn run(
     if !all && ids.is_empty() {
         return Err("specify --all or one or more claim ids".to_string());
     }
+    // A real error on invalid TOML, not a tolerant default: this is a CLI verb,
+    // and D16 makes a malformed config a hard failure on those. Silently
+    // defaulting here would put the map back at the default path while a
+    // daemon reading the same (broken) file did something else.
+    let cfg = crate::config::load(root).map_err(|e| e.to_string())?;
     // CANONICALIZED. This function does not call `adapter_cargo::build_targets`
     // — it runs its own instrumented cargo invocation with an ABSOLUTE
     // `CARGO_TARGET_DIR` (`attest_target_dir(root)`), so the relative-path
@@ -223,6 +231,7 @@ pub fn run(
         tests: BTreeMap::new(),
     };
     let (mut captured, mut skipped) = (0usize, 0usize);
+    let scopes = spawn_scopes(crate_root, &targets);
 
     for (identity, claim_id) in &wanted {
         let Some(target) = targets.iter().find(|t| t.name == identity.target) else {
@@ -249,7 +258,7 @@ pub fn run(
             CoverageEntry {
                 claim_id: claim_id.clone(),
                 files,
-                over_stale: over_stale_for(target),
+                over_stale: over_stale_for(target, &scopes),
                 captured_at,
                 commit: commit.clone(),
             },
@@ -258,13 +267,13 @@ pub fn run(
     }
 
     let leaked = sweep_leaked_profraw(crate_root, &base.join("leaked"))?;
-    write_map_atomically(root, &map)?;
+    write_map_atomically(root, &cfg, &map)?;
 
     println!(
         "captured {captured} test(s), {skipped} skipped (no built target), \
          {leaked} leaked profraw file(s) moved aside"
     );
-    println!("wrote {}", coverage_path(root).display());
+    println!("wrote {}", coverage_path(root, &cfg).display());
     Ok(())
 }
 
@@ -288,14 +297,51 @@ fn source_roots(crate_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// `["cli/src/**"]` for a test that may spawn the binary, `[]` otherwise. The
-/// rule is structural, not measured — see this module's doc comment.
-fn over_stale_for(target: &TargetInfo) -> Vec<String> {
-    if target.kind != "lib" && target.package == "agentrec" {
-        vec![OVER_STALE_CLI_SRC.to_string()]
-    } else {
-        Vec::new()
+/// Every package that builds a BINARY, mapped to the gitignore-style globs
+/// covering that binary's sources.
+///
+/// This is what makes the `over_stale` rule structural instead of a hard-coded
+/// package name. A non-`lib` target of a package that produces a binary MAY
+/// spawn it, and a SIGKILLed child writes no profile — so that test's measured
+/// file set is knowingly incomplete over the binary's sources.
+///
+/// Derived from cargo's own artifact stream: the bin target's `src_path`
+/// parent, made repo-relative. For this repo that is `cli/src/main.rs` ->
+/// `cli/src` -> `cli/src/**` — the pattern the founder ruling names, which the
+/// unit tests pin so the generalization cannot drift off it.
+fn spawn_scopes(crate_root: &Path, targets: &[TargetInfo]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in targets.iter().filter(|t| t.kind == "bin") {
+        let Some(dir) = t.src_path.parent() else {
+            continue;
+        };
+        // Repo-relative or nothing. An ABSOLUTE glob would silently match
+        // nothing — `coverage::match_kind` refuses absolute paths and the
+        // daemon matches repo-relative ones — so a failed strip must produce
+        // no scope rather than an inert pattern that looks like coverage.
+        let Ok(rel) = dir.strip_prefix(crate_root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            continue;
+        }
+        let glob = format!("{rel}/**");
+        let scopes = out.entry(t.package.clone()).or_default();
+        if !scopes.contains(&glob) {
+            scopes.push(glob);
+        }
     }
+    out
+}
+
+/// The binary-spawning `over_stale` scopes for one target, or `[]`. The rule is
+/// structural, not measured — see this module's doc comment.
+fn over_stale_for(target: &TargetInfo, scopes: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    if target.kind == "lib" {
+        return Vec::new();
+    }
+    scopes.get(&target.package).cloned().unwrap_or_default()
 }
 
 /// The instrumented build, in two steps because `cargo llvm-cov` has no single
@@ -531,8 +577,12 @@ fn sweep_leaked_profraw(crate_root: &Path, dest: &Path) -> Result<usize, String>
 /// tmp + rename, so a reader never sees a half-written map. The tmp name is
 /// fresh (pid + millis) and opened `create_new`, so the open cannot land on a
 /// planted FIFO and cannot clobber a concurrent writer's tmp.
-fn write_map_atomically(root: &Path, map: &CoverageMap) -> Result<(), String> {
-    let path = coverage_path(root);
+fn write_map_atomically(
+    root: &Path,
+    cfg: &crate::config::Config,
+    map: &CoverageMap,
+) -> Result<(), String> {
+    let path = coverage_path(root, cfg);
     let dir = path.parent().unwrap_or(root).to_path_buf();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let body =
@@ -580,21 +630,59 @@ mod tests {
 
     #[test]
     fn over_stale_fires_only_for_binary_spawning_targets_of_this_package() {
-        let mk = |package: &str, kind: &str| TargetInfo {
+        // THIS repo's expected pattern, kept as a named constant so the two
+        // asserts below read as one pinned expectation rather than a repeated
+        // literal. The producer derives it; nothing in production hard-codes it.
+        const OVER_STALE_CLI_SRC: &str = "cli/src/**";
+        let mk = |package: &str, kind: &str, src: &str| TargetInfo {
             package: package.into(),
             name: "t".into(),
             kind: kind.into(),
-            src_path: PathBuf::new(),
+            src_path: PathBuf::from(src),
             executable: PathBuf::new(),
         };
+        // The scope map as it is derived from THIS repo's real artifact
+        // stream: one bin, `agentrec`, at `cli/src/main.rs`.
+        let root = Path::new("/r");
+        let scopes = spawn_scopes(
+            root,
+            &[
+                mk("agentrec", "bin", "/r/cli/src/main.rs"),
+                mk("agentrec", "lib", "/r/cli/src/lib.rs"),
+                mk("attest_sample_crate", "lib", "/r/other/src/lib.rs"),
+            ],
+        );
+        // The generalization must still produce exactly the founder-ruled
+        // pattern for this repo — this is what pins it to AC-ATTEST-P1-3.
         assert_eq!(
-            over_stale_for(&mk("agentrec", "test")),
+            scopes.get("agentrec").map(Vec::as_slice),
+            Some([OVER_STALE_CLI_SRC.to_string()].as_slice())
+        );
+
+        assert_eq!(
+            over_stale_for(&mk("agentrec", "test", ""), &scopes),
             vec![OVER_STALE_CLI_SRC]
         );
         // The lib target does not spawn the binary.
-        assert!(over_stale_for(&mk("agentrec", "lib")).is_empty());
-        // Another package's integration tests are not this binary's spawners.
-        assert!(over_stale_for(&mk("attest_sample_crate", "test")).is_empty());
+        assert!(over_stale_for(&mk("agentrec", "lib", ""), &scopes).is_empty());
+        // A package that builds no binary has nothing to spawn.
+        assert!(over_stale_for(&mk("attest_sample_crate", "test", ""), &scopes).is_empty());
+    }
+
+    /// AC-ATTEST-P4C-7. A bin whose `src_path` is not under the crate root
+    /// yields NO scope — never an absolute glob, which `coverage::match_kind`
+    /// refuses outright and which would therefore read as coverage while
+    /// matching nothing.
+    #[test]
+    fn a_bin_outside_the_crate_root_yields_no_scope_rather_than_an_absolute_glob() {
+        let t = TargetInfo {
+            package: "p".into(),
+            name: "p".into(),
+            kind: "bin".into(),
+            src_path: PathBuf::from("/elsewhere/src/main.rs"),
+            executable: PathBuf::new(),
+        };
+        assert!(spawn_scopes(Path::new("/r"), &[t]).is_empty());
     }
 
     #[test]

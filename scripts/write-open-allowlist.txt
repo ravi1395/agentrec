@@ -32,7 +32,7 @@
 agentrec-core/src/record.rs::open_append          2  # is_nonregular(path); the one primitive behind every log/signal/memory append
 agentrec-core/src/undo_coordinator.rs::append_event 2  # is_nonregular(&path) on the undo event ledger
 agentrec-core/src/undo_coordinator.rs::acquire    2  # UndoLock::acquire; is_nonregular(path) on the lock file
-cli/src/attest/lock.rs::open_lock_file          2  # is_nonregular(&path) on the attest lock
+cli/src/attest/lock.rs::open_lock_file_at       2  # is_nonregular(&path) on the lock path (attest.lock, attest-verify.lock)
 cli/src/attest/lock.rs::append_attest_locked   2  # is_nonregular(&path) on attest.jsonl before the append
 cli/src/daemon.rs::sync_journal                   1  # is_nonregular(&tmp) before the open.json tmp write
 cli/src/daemon.rs::acquire_lock                   2  # is_nonregular(&path) on the daemon lock file

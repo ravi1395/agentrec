@@ -967,11 +967,16 @@ ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct`
 ### attest v1 — Phase 4A: `attest verify` (independent replay) + coverage capture
 
 Verdict policy is stated ONCE, in `ATTEST-FORMAT.md` § "Verdict policy"; the
-coverage map schema ONCE, in § "Coverage map". These ACs do not restate either.
+coverage map schema ONCE, in § "Coverage map"; the replay environment ONCE, in
+§ "Replay environment". These ACs do not restate any of the three.
 
 **AC-ATTEST-P4-1.** `attest verify` replays from a `git archive` extract of the
 pinned commit, never a `git worktree add` (which would share `.git` with the
-working tree). A derive-then-verify round trip on the fixture crate yields
+working tree). The extract goes to a STABLE directory
+(`.agentrec/attest-target/extract`), not a fresh tempdir: cargo fingerprints
+include the workspace path, so a new path per run would cold-build every
+replay. Being shared is why concurrent verifies in one root are serialized by
+`.agentrec/attest-verify.lock` (AC-ATTEST-P4C-10). A derive-then-verify round trip on the fixture crate yields
 `confirmed`, and the appended `verdict` event's `replay_commit` equals the
 repo's `git rev-parse HEAD`. —
 `attest_verify::ac_p4_1_derive_then_verify_confirms_and_pins_the_replay_commit`
@@ -1033,6 +1038,21 @@ test cannot link against, so the matching behavior itself is unit-tested in
 producer's wire shape is the one that matcher expects. Neither test alone closes
 the pair. —
 `attest_verify::ac_p4_9_the_producers_wire_shape_carries_both_matcher_inputs`
+
+**Substitution, recorded rather than quietly satisfied (chunk C).** This AC's
+test asserts a hand-written map LITERAL; it never runs the producer. When it was
+written the producer could not be made to emit a non-empty `over_stale` in any
+fixture, because `over_stale_for` keyed on the literal package name `agentrec`.
+Chunk C removed that obstacle — the rule now derives the scope from the bin
+target's own source directory, so
+`ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope` exercises
+the non-empty branch through a REAL producer run on a fixture with a `[[bin]]`.
+**What is still not exercised end-to-end is the `agentrec` package's own
+path**: no test captures coverage of this repo itself, so `cli/src/**` reaching
+a real map is pinned by unit test
+(`coveragecmd::tests::over_stale_fires_only_for_binary_spawning_targets_of_this_package`,
+which asserts `spawn_scopes` derives exactly that constant from this repo's real
+artifact shape) rather than observed. Stated, not closed.
 
 **AC-ATTEST-P4-10.** Missing coverage tooling refuses with exit 2 and writes no
 map, rather than writing an empty one that the daemon would read as "nothing is
@@ -1170,9 +1190,8 @@ plant is reverted by an inverse edit and the file's SHA-256 is recorded before
 and after. — manual; `docs/verify/attest-purity-census.md`
 
 **AC-ATTEST-P4C-3.** `attest verify` runs the replay with a scrubbed
-environment: `env_clear()` plus the allowlist {`PATH`, `HOME`, `CARGO_HOME`,
-`RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `TMPDIR`, `TERM`}, every `LLVM_`-prefixed
-variable, and `CARGO_TARGET_DIR`. Proven in both directions: a canary variable
+environment, per `ATTEST-FORMAT.md` § "Replay environment" — the allowlist is
+stated there and is NOT restated here. Proven in both directions: a canary variable
 set on the `attest verify` child is ABSENT inside the replayed test body, and
 the same fixture asserts `PATH` IS present — absence alone would pass
 vacuously if the parent never set the canary. The pure allowlist filter is
@@ -1197,3 +1216,69 @@ consumes the kind instead of re-deriving it. `over_stale_hit` is deleted. The
 refactor preserved the two `stale` cause shapes. —
 `attest::coverage::tests::match_kind_discriminates_an_exact_file_from_an_over_stale_glob`
 + the unchanged `attest_stale::ac_p4b_1_*` / `ac_p4b_2_*`
+
+**AC-ATTEST-P4C-6.** The producer and the daemon resolve the coverage map's
+location through ONE function (`attest::coverage::resolve_coverage_path`), so
+`attest_coverage_path` cannot be honoured by one and ignored by the other. It
+was: the producer hard-coded the default while the daemon read the key, so with
+the key set the daemon read a path nothing had written, got a legitimate-looking
+"no map captured yet", and staled NOTHING — no error on any channel. Both halves
+are tested against a DECOY map at the other path, so a reader of the wrong file
+is visible rather than merely absent. —
+`attest_verify::ac_p4c_6_the_producer_writes_the_configured_coverage_path` +
+`attest_stale::ac_p4c_6_the_daemon_stales_from_the_configured_coverage_path` +
+`attest::coverage::tests::resolve_coverage_path_honors_the_config_key_and_falls_back_to_the_default`
+
+**AC-ATTEST-P4C-7.** `over_stale` scopes are DERIVED from cargo's artifact
+stream — for each package that builds a binary, the bin target's source
+directory made repo-relative — instead of keying on the literal package name
+`agentrec`. This repo still yields exactly `cli/src/**` (pinned by unit test, so
+the generalization cannot drift off the AC-ATTEST-P1-3 ruling), and a fixture
+package with a `[[bin]]` now yields `src/**` through a real producer run, which
+is what makes the non-empty branch testable at all. A bin whose source lies
+outside the crate root yields NO scope rather than an absolute glob — an
+absolute pattern would read as coverage while matching nothing, since
+`coverage::match_kind` refuses absolute paths. —
+`attest_verify::ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope`
++ `coveragecmd::tests::over_stale_fires_only_for_binary_spawning_targets_of_this_package`
++ `coveragecmd::tests::a_bin_outside_the_crate_root_yields_no_scope_rather_than_an_absolute_glob`
+
+**AC-ATTEST-P4C-8.** `attest verify --all-stale` verifies every stale claim: a
+fixture with two stale claims yields two `verdict` events. Previously untested. —
+`attest_verify::ac_p4c_8_all_stale_verifies_every_stale_claim`
+
+**AC-ATTEST-P4C-9.** A verdict is appended PER CLAIM as it is decided, so an
+error on a later claim cannot discard the work already done. The verdicts used
+to accumulate in one batch appended after the loop, so a single adapter error
+mid-`--all-stale` threw away every verdict computed before it. The error path is
+real, not injected: the second claim names a cargo target absent from the
+extract. Both halves asserted — the first claim's verdict IS on the wire and the
+erroring claim's is NOT — or the test would pass on an empty log. —
+`attest_verify::ac_p4c_9_an_error_on_a_later_claim_keeps_the_earlier_verdict`
+
+**AC-ATTEST-P4C-10.** Concurrent `attest verify` runs in one root are serialized
+by `.agentrec/attest-verify.lock`, held across extract + replay. The extract
+directory is stable and shared (AC-ATTEST-P4-1), so without this a second verify
+deletes and rewrites the first's tree mid-cargo. **This serializes; it does not
+make concurrent verifies parallel-safe** — the second waits for the first. A
+lock SEPARATE from `attest.lock`, which is held only for a single append:
+holding that one across a multi-minute replay would block the daemon's `stale`
+appends for the whole run. **No test, stated plainly rather than cited around:**
+`attest::lock::tests::an_append_blocks_while_another_writer_holds_the_lock`
+exercises `attest.lock` through `acquire_blocking`, NOT `lock_exclusive_at` and
+not `attest-verify.lock`. What the two share is the `flock(LOCK_EX)` primitive;
+the verify lock's own acquisition is unexercised.
+
+**AC-ATTEST-P4C-11.** `attest verify`'s stdout prints the `recipe-invalid`
+cause in the WIRE casing (`ignored`), not Rust's `Debug` casing (`Ignored`), so
+the line and the appended event agree about the same field. Derived from serde
+rather than a hand-written match, so a new variant cannot drift. —
+`attest_verify::ac_p4_5_ignored_then_restored_verifies_again` (asserts the
+stdout text alongside the event's `cause`)
+
+**Mutation probes for chunk C, run live** (`cargo build` before each, per the
+recorded stale-binary hazard). (a) Making `resolve_coverage_path` ignore the
+config reds BOTH AC-P4C-6 halves, each on its decoy assertion. (b) Restoring the
+batched append reds AC-P4C-9 on "the first claim's verdict must survive".
+(c) Restoring the hard-coded `package == "agentrec"` rule reds AC-P4C-7 with the
+whole map printed, `over_stale: []` on every entry.

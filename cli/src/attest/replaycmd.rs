@@ -89,9 +89,20 @@ pub fn run(root: &Path, all_stale: bool, ids: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    // Held for extract + every replay: the extract directory is SHARED and
+    // stable per root, so a second concurrent verify would delete this one's
+    // tree out from under a running cargo. This serializes verifies in a root;
+    // it does not make them concurrent.
+    let _verify_lock = crate::attest::lock::lock_exclusive_at(&verify_lock_path(root))?;
+
     let extract = extract_commit(root, &commit)?;
 
-    let mut batch: Vec<AttestEvent> = Vec::new();
+    // Appended PER CLAIM, not batched at the end. A batch discards every
+    // verdict already computed when a later claim errors — and an adapter
+    // error is reachable (a claim naming a target absent from the extract),
+    // so a long `--all-stale` run could do all the work and persist none of
+    // it. One append per decided verdict costs one lock acquisition each and
+    // makes partial progress durable.
     for (claim_id, identity) in &selected {
         let (verdict, runs) = replay(&extract, identity)?;
         println!(
@@ -101,15 +112,25 @@ pub fn run(root: &Path, all_stale: bool, ids: &[String]) -> Result<(), String> {
             describe(&verdict),
             if runs == 1 { "" } else { "s" }
         );
-        batch.push(AttestEvent::Verdict {
-            ts: now_ms(),
-            claim_id: claim_id.clone(),
-            verdict,
-            replay_commit: commit.clone(),
-        });
+        append_attest_locked(
+            root,
+            &[AttestEvent::Verdict {
+                ts: now_ms(),
+                claim_id: claim_id.clone(),
+                verdict,
+                replay_commit: commit.clone(),
+            }],
+        )?;
     }
-    append_attest_locked(root, &batch)?;
     Ok(())
+}
+
+/// Serializes concurrent `attest verify` runs in one root. Separate from
+/// `attest.lock`, which is held only for the duration of a single append —
+/// holding that one across a multi-minute replay would block the daemon's
+/// `stale` appends for the whole run.
+fn verify_lock_path(root: &Path) -> PathBuf {
+    crate::agentrec_dir(root).join("attest-verify.lock")
 }
 
 fn describe(v: &VerdictKind) -> String {
@@ -117,7 +138,18 @@ fn describe(v: &VerdictKind) -> String {
         VerdictKind::Confirmed => "confirmed".to_string(),
         VerdictKind::ClaimFalse => "claim-false".to_string(),
         VerdictKind::FlakyObservation => "flaky-observation".to_string(),
-        VerdictKind::RecipeInvalid { cause } => format!("recipe-invalid (cause: {cause:?})"),
+        // The WIRE casing, not Rust's `{:?}`. `RecipeInvalidCause` is
+        // `#[serde(rename_all = "kebab-case")]`, so the event says `ignored`
+        // while Debug says `Ignored`; printing Debug made stdout and the
+        // appended line disagree about the same field. Derived from serde
+        // rather than hand-matched, so a new variant cannot drift.
+        VerdictKind::RecipeInvalid { cause } => {
+            let wire = serde_json::to_value(cause)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{cause:?}"));
+            format!("recipe-invalid (cause: {wire})")
+        }
     }
 }
 

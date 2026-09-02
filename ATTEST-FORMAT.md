@@ -304,9 +304,17 @@ of this document.
 }
 ```
 
-`files` are repo-relative and sorted. `over_stale` is `["cli/src/**"]` for every
-test in a non-`lib` target of the `agentrec` package — those tests may spawn the
-binary, and a SIGKILLed child writes no profile at all, so their measured file
-set is knowingly incomplete (founder ruling, AC-ATTEST-P1-3). It is `[]`
-otherwise. A write matches a test when its repo-relative path is in `files`
-**or** matches an `over_stale` pattern.
+`files` are repo-relative and sorted. `over_stale` is non-empty for every test
+in a non-`lib` target of a package that BUILDS A BINARY — those tests may spawn
+it, and a SIGKILLed child writes no profile at all, so their measured file set
+is knowingly incomplete (founder ruling, AC-ATTEST-P1-3). It is `[]` otherwise,
+including for every `lib` target.
+
+The scope is derived, not hard-coded: it is the bin target's own source
+directory, repo-relative, as a `/**` glob. For this repo the binary is
+`cli/src/main.rs`, so the pattern is `["cli/src/**"]` — the value the founder
+ruling names. A bin whose source is not under the crate root contributes NO
+scope; an absolute glob would match nothing while looking like coverage.
+
+A write matches a test when its repo-relative path is in `files` **or** matches
+an `over_stale` pattern.

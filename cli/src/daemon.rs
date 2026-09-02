@@ -150,7 +150,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     // `config.rs` doc — that is deliberate: every per-tick config read this
     // process already does is a read it cannot avoid, and adding another for
     // a switch nobody flips mid-session buys nothing.
-    let mut attest_stale = AttestStaleMarker::new(&crate::config::load_or_default(&root));
+    let mut attest_stale = AttestStaleMarker::new(&root, &crate::config::load_or_default(&root));
 
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
@@ -509,8 +509,9 @@ pub fn run(root: &Path) -> Result<(), String> {
 /// those lines today.
 struct AttestStaleMarker {
     enabled: bool,
-    /// Repo-relative location of the coverage map.
-    rel_path: String,
+    /// Absolute location of the coverage map, from
+    /// `coverage::resolve_coverage_path`.
+    path: PathBuf,
     /// Hash of the map bytes as last loaded — the reload trigger. Bytes, not
     /// mtime: an edit that keeps a file's length and lands inside one
     /// filesystem timestamp tick is exactly the shape the reload test drives.
@@ -522,13 +523,12 @@ struct AttestStaleMarker {
 }
 
 impl AttestStaleMarker {
-    fn new(cfg: &crate::config::Config) -> Self {
+    fn new(root: &Path, cfg: &crate::config::Config) -> Self {
         AttestStaleMarker {
             enabled: cfg.attest_stale,
-            rel_path: cfg
-                .attest_coverage_path
-                .clone()
-                .unwrap_or_else(|| crate::attest::coverage::DEFAULT_COVERAGE_REL.to_string()),
+            // Resolved through the ONE resolver, so the daemon and the
+            // producer cannot disagree about where the map lives.
+            path: crate::attest::coverage::resolve_coverage_path(root, cfg),
             fingerprint: None,
             map: None,
             warned: false,
@@ -612,7 +612,8 @@ impl AttestStaleMarker {
     }
 
     fn refresh(&mut self, root: &Path) {
-        let path = root.join(&self.rel_path);
+        let _ = root;
+        let path = self.path.clone();
         let fingerprint = match agentrec_core::fsguard::read_regular(&path) {
             Ok(bytes) => Some(hash_bytes(&bytes)),
             Err(_) => None,

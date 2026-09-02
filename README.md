@@ -322,9 +322,8 @@ already does for whole git/superseded turns, one level down to individual file e
 flags are independent). This is **display-only**: absent or empty `noise_globs` leaves output
 byte-identical to before the feature existed, `--json` is never affected by it, and `diff` /
 `blame` / `undo` never consult it — a file being visually noisy has nothing to do with whether
-it's revertible or who wrote it. Only a single-line TOML array is recognized (the config parser
-is a hand-rolled scalar-per-line scanner, not a full TOML parser); a multi-line array is not
-picked up and silently behaves as if `noise_globs` were unset.
+it's revertible or who wrote it. The config is parsed with a real TOML parser (Phase B of the Phase 2
+tail), so multi-line arrays are fine.
 
 `log.jsonl` and `signal.jsonl` are append-only by design (history is corrected by appending, never rewritten), with one narrow, manual exception each. `purge --log-duplicates` repairs a `log.jsonl` that a pre-fix daemon (a since-fixed kill-9 crash window) wrote a same-id duplicate turn record into. It archives the whole file, unmodified, to `.agentrec/log.archived.<ts>.jsonl` before touching anything, then rewrites `log.jsonl` dropping only lines that are exact duplicates of an earlier same-id record — a same-id pair that genuinely touched different files is left untouched rather than guessed at. It refuses outright while the daemon is recording, and a run that finds nothing to fix touches no files and creates no archive. `purge --signals-consumed` is the `signal.jsonl` counterpart: it archives the consumed prefix first (only the bytes it is about to drop — the live tail stays in place, and prefix + tail together reconstruct the file), then drops only whole lines the daemon has already consumed (strictly before `state.json`'s byte offset — their prompts are already in `log.jsonl` and the object store), rebasing that offset in the same operation, leaving the unconsumed tail byte-for-byte intact, and refusing — like the above — while the daemon is recording.
 
@@ -339,8 +338,10 @@ picked up and silently behaves as if `noise_globs` were unset.
 | `memory_enabled` | `true` | Kill switch for the automatic memory paths (hook injection + candidate ingestion); manual `remember`/`verify`/`forget` always work |
 | `memory_inject_max` | `5` | Max memory facts injected per prompt |
 | `noise_globs` | `[]` | Display-only folding of noisy file entries in `log`/`show` (see above) |
+| `attest_stale` | `true` | Whether the `record` daemon appends `stale` events to `.agentrec/attest.jsonl` when a write lands in a claim's coverage scope. Off means claims are never marked stale by file writes |
+| `attest_coverage_path` | `.agentrec/attest-coverage.json` | Repo-relative location of the attest coverage map, read by both `attest coverage` (which writes it) and the daemon (which reads it to decide what a write stales) |
 
-Parser caveats worth knowing: the config reader is a deliberate hand-rolled `key = value` line scanner, not a full TOML parser. Flat top-level keys only; comments start at `#`; a missing file, missing key, or unparseable value silently falls back to the default; `noise_globs` must be a **single-line** array. The default config also contains an `mcp_destructive` key — that is reserved for the v2 MCP server and is not read by any code today.
+Parser caveats worth knowing: the config is real TOML (`cli/src/config.rs`). Invalid TOML is a hard error, reported with line and column, on every CLI verb and at daemon startup; a missing file or missing key falls back to the default; a present key with the wrong value type falls back to that key's default, except `mcp_destructive`, whose invalid value is a hard error (it gates agent-driven undo). `attest coverage` also hard-errors on invalid TOML because it must agree with the daemon on `attest_coverage_path`.
 
 Timing constants (quiet window 10 s, debounce 1.5 s, eviction tick 10 min) are compile-time, not configurable.
 

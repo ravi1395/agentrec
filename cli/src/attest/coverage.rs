@@ -7,7 +7,8 @@
 //! READER the daemon consults. The contracted interface:
 //!
 //! ```ignore
-//! pub fn load_coverage_map(root: &Path) -> Result<Option<CoverageMap>, String>;
+//! pub fn resolve_coverage_path(root: &Path, cfg: &Config) -> PathBuf;
+//! pub fn load_coverage_map_at(path: &Path) -> Result<Option<CoverageMap>, String>;
 //! pub fn claims_touched_by(map: &CoverageMap, rel_path: &str) -> Vec<(ClaimId, MatchKind)>;
 //! ```
 //!
@@ -20,7 +21,7 @@ use agentrec_core::attest::types::ClaimId;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The map's default location, relative to the repo root. Overridable via
 /// `config.toml`'s `attest_coverage_path`.
@@ -50,20 +51,33 @@ pub struct CoverageEntry {
     pub commit: String,
 }
 
+/// Where the coverage map lives for this root. **The single resolver**, used by
+/// the PRODUCER (`attest coverage`), the daemon's stale marker, and any reader.
+///
+/// It exists because the producer and the daemon disagreeing is silent and
+/// total: the producer wrote the default path while the daemon read the
+/// configured one, so `load_coverage_map_at` returned `Ok(None)` — a legitimate
+/// "no coverage captured yet" — and nothing was ever staled, with no warning on
+/// any channel. Fixed by construction: there is one function, and a caller that
+/// resolves the path itself is the bug.
+pub fn resolve_coverage_path(root: &Path, cfg: &crate::config::Config) -> PathBuf {
+    root.join(
+        cfg.attest_coverage_path
+            .as_deref()
+            .unwrap_or(DEFAULT_COVERAGE_REL),
+    )
+}
+
 /// Reads the map through fsguard. A missing file is `Ok(None)` — no coverage
 /// captured yet is a normal state, not a failure. Malformed JSON IS an error:
 /// silently treating a corrupt map as "no coverage" would turn every claim
 /// permanently un-staleable with no signal anywhere.
 ///
-/// Chunk B's daemon resolves the configurable `attest_coverage_path` and calls
-/// [`load_coverage_map_at`] directly, so this contracted entry point has no
-/// caller until chunk A lands.
-#[allow(dead_code)]
-pub fn load_coverage_map(root: &Path) -> Result<Option<CoverageMap>, String> {
-    load_coverage_map_at(&root.join(DEFAULT_COVERAGE_REL))
-}
-
-/// Same, for an explicit path (`config.toml`'s `attest_coverage_path`).
+/// Takes an already-resolved path. There is deliberately NO
+/// `load_coverage_map(root)` convenience wrapper: the one that existed
+/// hard-coded [`DEFAULT_COVERAGE_REL`], was `#[allow(dead_code)]`, and is how
+/// the producer/daemon path disagreement survived review. Resolve through
+/// [`resolve_coverage_path`] and pass the result.
 pub fn load_coverage_map_at(path: &Path) -> Result<Option<CoverageMap>, String> {
     let body = match agentrec_core::fsguard::read_regular_to_string(path) {
         Ok(b) => b,
@@ -165,7 +179,29 @@ mod tests {
     #[test]
     fn a_missing_map_is_none_not_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(load_coverage_map(tmp.path()).unwrap(), None);
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            load_coverage_map_at(&resolve_coverage_path(tmp.path(), &cfg)).unwrap(),
+            None
+        );
+    }
+
+    /// AC-ATTEST-P4C-6. The producer and the daemon must resolve the SAME path
+    /// from the same config, including when the key is set — they disagreed
+    /// before, and the disagreement was silent.
+    #[test]
+    fn resolve_coverage_path_honors_the_config_key_and_falls_back_to_the_default() {
+        let root = Path::new("/r");
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(
+            resolve_coverage_path(root, &cfg),
+            root.join(DEFAULT_COVERAGE_REL)
+        );
+        cfg.attest_coverage_path = Some("custom/cov.json".to_string());
+        assert_eq!(
+            resolve_coverage_path(root, &cfg),
+            root.join("custom/cov.json")
+        );
     }
 
     #[test]
@@ -173,7 +209,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".agentrec")).unwrap();
         std::fs::write(tmp.path().join(DEFAULT_COVERAGE_REL), "{not json").unwrap();
-        assert!(load_coverage_map(tmp.path()).is_err());
+        let cfg = crate::config::Config::default();
+        assert!(load_coverage_map_at(&resolve_coverage_path(tmp.path(), &cfg)).is_err());
     }
 
     #[test]

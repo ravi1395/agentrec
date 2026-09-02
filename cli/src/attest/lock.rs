@@ -1,4 +1,6 @@
-//! Dedicated advisory lock guarding appends to `.agentrec/attest.jsonl`.
+//! Advisory locks for the attest subsystem: the append lock guarding
+//! `.agentrec/attest.jsonl`, and the generic [`lock_exclusive_at`] that
+//! `attest verify` uses on `.agentrec/attest-verify.lock`.
 //!
 //! **Every writer takes this lock, the daemon included.** That is the one
 //! deliberate difference from `loglock.rs`, whose module doc exempts the
@@ -19,6 +21,12 @@
 //! There is no non-blocking acquire here and no rewrite class for
 //! `attest.jsonl` (`ATTEST-FORMAT.md`: adding one requires a decision-register
 //! entry), so the `try_acquire` half of `memlock.rs` has no caller to serve.
+//!
+//! [`lock_exclusive_at`] is a SECOND lock, on a different file and for a
+//! different job: serializing `attest verify` runs that share one extract
+//! directory. It is deliberately not `attest.lock` — that one is held only for
+//! the duration of a single append, and holding it across a multi-minute
+//! replay would block the daemon's `stale` appends for the whole run.
 
 use agentrec_core::attest::events::{parse_log, AttestEvent, AttestParseCensus};
 use std::fs::File;
@@ -34,8 +42,35 @@ fn lock_path(root: &Path) -> PathBuf {
     crate::agentrec_dir(root).join("attest.lock")
 }
 
+/// Blocking exclusive lock on an arbitrary `.agentrec/` lock file, for callers
+/// that need to serialize something OTHER than an `attest.jsonl` append.
+///
+/// `attest verify` uses it: every replay in a root extracts into the SAME
+/// directory (`.agentrec/attest-target/extract`, stable so cargo's
+/// path-sensitive fingerprints stay warm), so two concurrent verifies would
+/// delete and rewrite each other's tree mid-run. The lock serializes them —
+/// it does not make them parallel-safe, and the second simply waits.
+///
+/// Returns the held `File`; the lock releases when it drops.
+pub fn lock_exclusive_at(path: &Path) -> Result<File, String> {
+    let file = open_lock_file_at(path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!(
+            "could not lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
 fn open_lock_file(root: &Path) -> Result<File, String> {
-    let path = lock_path(root);
+    open_lock_file_at(&lock_path(root))
+}
+
+fn open_lock_file_at(path: &Path) -> Result<File, String> {
+    let path = path.to_path_buf();
     // Write-side fsguard mirror (the read half is clippy-enforced, the write
     // half is not): a FIFO here blocks the open until a reader appears,
     // wedging every attest writer before the flock is even attempted.

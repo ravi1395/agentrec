@@ -109,6 +109,10 @@ impl Drop for DaemonGuard {
 }
 
 fn write_coverage_map(root: &Path, entries: &[(&str, &str, &[&str], &[&str])]) {
+    write_coverage_map_at(root, ".agentrec/attest-coverage.json", entries)
+}
+
+fn write_coverage_map_at(root: &Path, rel: &str, entries: &[(&str, &str, &[&str], &[&str])]) {
     let tests: Vec<String> = entries
         .iter()
         .map(|(name, claim, files, over)| {
@@ -131,7 +135,11 @@ fn write_coverage_map(root: &Path, entries: &[(&str, &str, &[&str], &[&str])]) {
         r#"{{"version":1,"granularity":"file","tests":{{{}}}}}"#,
         tests.join(",")
     );
-    std::fs::write(root.join(".agentrec/attest-coverage.json"), body).unwrap();
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, body).unwrap();
 }
 
 fn write_derives(root: &Path, claims: &[&str]) {
@@ -470,4 +478,57 @@ fn copy_dir(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P4C-6 — producer and daemon resolve ONE coverage-map path
+// ---------------------------------------------------------------------------
+
+/// The daemon half. With `attest_coverage_path` set, the daemon must stale from
+/// the map at THAT path — and must NOT be rescued by a map sitting at the
+/// default location.
+///
+/// The decoy at the default path is the discriminating part. Before the fix the
+/// producer wrote the default path while the daemon read the configured one, so
+/// a test that only placed the map at the configured path could not tell a
+/// correct daemon from one reading the default. Here the decoy names a
+/// DIFFERENT claim, so whichever file the daemon actually read is visible in
+/// the appended event.
+#[test]
+fn ac_p4c_6_the_daemon_stales_from_the_configured_coverage_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init(root);
+
+    std::fs::write(
+        root.join(".agentrec/config.toml"),
+        "attest_coverage_path = \"custom/cov.json\"\n",
+    )
+    .unwrap();
+
+    // The real map, at the CONFIGURED path.
+    write_coverage_map_at(
+        root,
+        "custom/cov.json",
+        &[("tgt::t0", CLAIM_A, &["src/a.rs"], &[])],
+    );
+    // The decoy, at the DEFAULT path, mapping the same file to another claim.
+    write_coverage_map_at(
+        root,
+        ".agentrec/attest-coverage.json",
+        &[("tgt::t0", CLAIM_B, &["src/a.rs"], &[])],
+    );
+    write_derives(root, &[CLAIM_A, CLAIM_B]);
+
+    let mut daemon = DaemonGuard::spawn(root);
+    write_and_settle(root, "src/a.rs", "fn a() {}");
+    daemon.kill();
+
+    let got: Vec<String> = stales(root).into_iter().map(|(c, _)| c).collect();
+    assert_eq!(
+        got,
+        vec![CLAIM_A.to_string()],
+        "the daemon must read the configured map (CLAIM_A), never the decoy at \
+         the default path (CLAIM_B)"
+    );
 }

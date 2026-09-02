@@ -46,8 +46,16 @@ pub struct Config {
     /// freshness signal, and a repo with no coverage map never reaches the
     /// append path anyway (the daemon does nothing when the map is absent).
     pub attest_stale: bool,
-    /// Phase 4B: override for the coverage map's location. `None` means the
-    /// default, `.agentrec/attest-coverage.json`.
+    /// Phase 4B: override for the coverage map's location, repo-relative.
+    /// `None` means the default, `.agentrec/attest-coverage.json`.
+    ///
+    /// Read by BOTH readers, through the single resolver
+    /// `attest::coverage::resolve_coverage_path`: the producer
+    /// (`attest coverage`, which writes the map) and the `record` daemon
+    /// (which reads it to decide what a write stales). They disagreed once —
+    /// the producer ignored this key — and the failure was silent in the
+    /// dangerous direction: the daemon read a path nothing had written, got a
+    /// legitimate-looking "no map yet", and staled nothing.
     pub attest_coverage_path: Option<String>,
 }
 
