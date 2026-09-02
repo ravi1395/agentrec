@@ -953,9 +953,10 @@ fn ac_p3_20_a_harness_crash_retains_its_raw_output_and_is_counted() {
 /// `PostToolUse[Bash]` for every repo, so an ordinary Bash call that is not a
 /// test runner reaches `cmds::hook`; before this fix it fell through to the
 /// `_ => "stop"` arm and appended a stop signal, closing the open bracket.
-/// Measured by the Fable skeptic gate at `74a0a2c` with a real daemon: one
-/// prompt + two non-test Bash calls + `Stop` wrote start,stop,stop,stop and
-/// produced three rich turns where bracketing requires one. This test pins the
+/// Measured by the Fable skeptic gate on the `f1da261` extract with a real
+/// daemon: one prompt + one non-test Bash call (`ls -la`) + `Stop` wrote
+/// start,stop,stop and produced two rich turns, the first with `files: []`,
+/// where bracketing requires one (`ac_p3_33` reproduces it). This test pins the
 /// MECHANISM (an unmatched `PostToolUse` appends a signal), not that count.
 #[test]
 fn ac_p3_29_no_post_tool_use_event_ever_emits_a_signal() {

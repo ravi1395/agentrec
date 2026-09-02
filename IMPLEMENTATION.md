@@ -893,10 +893,11 @@ sections and yields 5 results, still exiting 101 (measured). —
 installs `PostToolUse[Bash]` for every repo (AC-ATTEST-P3-27), and `cmds::hook`
 maps every non-`UserPromptSubmit` event to `stop` — so before this fix an
 ordinary Bash call (`ls`, `git status`) fell through and appended a stop signal,
-closing the open bracket. Measured by the Fable skeptic gate at `74a0a2c`, with
-a real daemon: one prompt + two non-test Bash calls + `Stop` wrote
-start,stop,stop,stop and produced THREE rich turns where bracketing requires
-one; the test below pins the mechanism (an unmatched `PostToolUse` appends a
+closing the open bracket. Measured by the Fable skeptic gate on the `f1da261` extract, with
+a real daemon: one prompt + ONE non-test Bash call (`ls -la`) + `Stop` wrote
+start,stop,stop and produced TWO rich turns, the first with `files: []`, where
+bracketing requires one (the same shape AC-ATTEST-P3-33's mutation reproduces
+in-tree); the test below pins the mechanism (an unmatched `PostToolUse` appends a
 signal), not that count. `cmds::hook` now returns for EVERY
 `PostToolUse` regardless of capture outcome; unmatched shapes (a non-test Bash
 command, a non-Bash tool) leave `signal.jsonl` byte-identical and write no

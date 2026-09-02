@@ -1006,9 +1006,10 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
     // `PostToolUse[Bash]` for every repo (`initcmd::CLAUDE_HOOK_EVENTS`) — so an
     // ordinary Bash call (`ls`, `git status`) falling through would append a stop
     // signal and CLOSE the open bracket. Measured before this fix by the Fable
-    // skeptic gate at `74a0a2c`, with a real daemon: one prompt + two non-test
-    // Bash calls + `Stop` wrote start,stop,stop,stop and produced THREE rich
-    // turns where bracketing requires one. `attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
+    // skeptic gate on the `f1da261` extract, with a real daemon: one prompt +
+    // one non-test Bash call (`ls -la`) + `Stop` wrote start,stop,stop and
+    // produced TWO rich turns, the first with `files: []`, where bracketing
+    // requires one. `attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
     // pins the unmatched shapes; `ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence`
     // pins the matched one.
     if event_name == "PostToolUse" {
