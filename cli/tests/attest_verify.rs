@@ -942,8 +942,10 @@ fn ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope() {
     // uncanonicalized root failed every strip and produced `[]` on every entry
     // with no warning — and `/tmp` and `/var` are symlinks on macOS, so this is
     // the ordinary case, not an exotic one.
-    let link = f.path().parent().unwrap().join("linked-root");
-    let _ = std::fs::remove_file(&link);
+    // The link lives in its own tempdir so it is removed with the test and two
+    // concurrent runs of this binary cannot race on one fixed path.
+    let link_dir = tempfile::tempdir().unwrap();
+    let link = link_dir.path().join("linked-root");
     std::os::unix::fs::symlink(f.path(), &link).unwrap();
     let out = Command::new(bin())
         .args(["attest", "coverage", "--all", "--root"])
