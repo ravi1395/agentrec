@@ -7,13 +7,16 @@
 //! from earlier builds), `git init`ed and `agentrec init`ed, so a test that
 //! renames a test fn cannot touch the repo.
 //!
-//! **Two of the eighteen tests here run a REAL daemon** — `ac_p3_15` and
-//! `ac_p3_16`, the two that assert on a turn id, both via `open_bracketed_turn`
-//! — so the id they compare against is the one `daemon.rs::sync_journal` itself
-//! wrote, and writer and reader are both proven. `open.json` is written BY HAND
-//! in exactly one test, `ac_p3_25_a_stale_open_json_yields_unjoined_evidence_on_a_clean_tree`,
-//! whose whole subject is a journal left behind with no daemon running. The
-//! remaining fifteen need no daemon at all.
+//! **Three of the twenty-one tests here run a REAL daemon** — `ac_p3_15` and
+//! `ac_p3_16` (which assert on a turn id, both via `open_bracketed_turn`, so the
+//! id they compare against is the one `daemon.rs::sync_journal` itself wrote,
+//! proving writer and reader together) and `ac_p3_33` (which asserts on the
+//! turns the daemon persists). Each owns its child through [`DaemonGuard`], so a
+//! failing assert cannot leak a live daemon. `open.json` is written BY HAND in
+//! exactly one test,
+//! `ac_p3_25_a_stale_open_json_yields_unjoined_evidence_on_a_clean_tree`, whose
+//! whole subject is a journal left behind with no daemon running. The remaining
+//! seventeen need no daemon at all.
 
 #![allow(clippy::disallowed_methods)]
 //  ^ Test code reads its own tempdir fixtures; production reads stay
@@ -179,8 +182,8 @@ fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<
 /// tests would be asserting on `None` otherwise. It also removes the earlier
 /// caveat that only the reader was proven — the id asserted below is the one
 /// `daemon.rs::sync_journal` wrote.
-fn open_bracketed_turn(root: &Path) -> (Child, String) {
-    let daemon = spawn_record(root);
+fn open_bracketed_turn(root: &Path) -> (DaemonGuard, String) {
+    let daemon = DaemonGuard(Some(spawn_record(root)));
     send_hook(
         root,
         r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"go"}"#,
@@ -202,9 +205,19 @@ fn open_bracketed_turn(root: &Path) -> (Child, String) {
     }
 }
 
-fn stop_daemon(mut daemon: Child) {
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+/// RAII rather than an explicit kill after the asserts: a failing assert
+/// unwinds past any such call, leaking an `agentrec record` process that keeps
+/// watching a tempdir root for the rest of the session. `Drop` runs on the
+/// unwind path too. Mirrors `integration.rs`'s `SingleDaemonGuard`.
+struct DaemonGuard(Option<Child>);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// The five tests libtest itself enumerates in the fixture crate.
@@ -395,7 +408,7 @@ fn ac_p3_15_run_writes_evidence_joined_to_the_open_turn() {
     let (daemon, turn) = open_bracketed_turn(root);
 
     ok(agentrec(root, &["attest", "run", "--", "cargo", "test"]));
-    stop_daemon(daemon);
+    drop(daemon);
 
     let events = attest_events(root);
     let evidence = of_kind(&events, "evidence");
@@ -473,7 +486,7 @@ fn ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence() {
         }
     });
     ok(send_hook(root, &payload.to_string()));
-    stop_daemon(daemon);
+    drop(daemon);
 
     let events = attest_events(root);
     let evidence = of_kind(&events, "evidence");
@@ -998,4 +1011,178 @@ fn ac_p3_29_no_post_tool_use_event_ever_emits_a_signal() {
     assert_eq!(lines.len(), 2, "exactly one start and one stop: {lines:#?}");
     assert_eq!(lines[0]["event"], "start");
     assert_eq!(lines[1]["event"], "stop");
+}
+
+/// AC-ATTEST-P3-31 — `cargo test 2>&1`, the ordinary agent shell shape. Every
+/// marker lands on stdout; before the fix `section_targets` scanned only stderr,
+/// found none, emptied every identity's target, and printed "5 result(s) for
+/// undeclared tests skipped" while writing nothing.
+#[test]
+fn ac_p3_31_markers_merged_into_stdout_are_still_attributed() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+
+    let out = ok(agentrec(
+        root,
+        &["attest", "run", "--", "bash", "-c", "cargo test 2>&1"],
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !stderr.contains("undeclared"),
+        "a healthy capture must not be misdiagnosed as undeclared: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unattributable"),
+        "the markers ARE present, on stdout: {stderr}"
+    );
+
+    let events = attest_events(root);
+    let evidence = of_kind(&events, "evidence");
+    assert_eq!(evidence.len(), 5, "{events:#?}");
+    let mut targets: Vec<String> = evidence
+        .iter()
+        .map(|e| {
+            e["result"]["identity"]["target"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(
+        targets,
+        vec!["attest_sample_crate".to_string(), "integration".to_string()],
+        "both targets attributed from stdout markers"
+    );
+}
+
+/// AC-ATTEST-P3-31 (the other half) — when the markers genuinely cannot be
+/// paired, the diagnosis is "unattributable section(s)", NOT "undeclared":
+/// the claims here are perfectly fine and only attribution failed.
+#[test]
+fn ac_p3_31_unpairable_markers_report_unattributable_not_undeclared() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+
+    // Two result sections, ZERO markers on either stream — unpairable.
+    let script = "printf 'running 1 test\\ntest tests::unit_add_works ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n'; \
+                  printf '\\nrunning 1 test\\ntest integration_add_works ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n'";
+    let out = ok(agentrec(
+        root,
+        &["attest", "run", "--", "bash", "-c", script],
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("2 result(s) in unattributable section(s) skipped"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("undeclared"),
+        "the claims exist; only attribution failed: {stderr}"
+    );
+    assert!(
+        of_kind(&attest_events(root), "evidence").is_empty(),
+        "an unattributable result must not be attached to a claim"
+    );
+}
+
+/// Block until the daemon has staged `rel` into the OPEN turn's mirror. Proves
+/// the mutation was actually observed before the next step, instead of racing
+/// the 1.5 s debounce with a fixed sleep.
+fn wait_for_open_file(root: &Path, rel: &str) {
+    let seen = poll_until(Duration::from_secs(20), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/open.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v["files"]
+            .as_array()?
+            .iter()
+            .any(|f| f["path"].as_str() == Some(rel))
+            .then_some(())
+    });
+    assert!(
+        seen.is_some(),
+        "the daemon never staged {rel} into open.json"
+    );
+}
+
+/// Rich turns currently in the log.
+fn rich_turns(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join(".agentrec/log.jsonl")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "turn" && v["grade"] == "rich")
+        .collect()
+}
+
+/// AC-ATTEST-P3-33 — the end-to-end shape the gate's probe found, against a
+/// REAL daemon: a non-test `PostToolUse` in the middle of a bracket must not
+/// split the turn. Before the fix this produced TWO rich turns, the first with
+/// `files: []`, because the unmatched firing fell through to `_ => "stop"`.
+#[test]
+fn ac_p3_33_a_non_test_post_tool_use_does_not_split_a_live_turn() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    let daemon = DaemonGuard(Some(spawn_record(root)));
+    // Wait for the watcher to be armed before mutating anything, or the first
+    // edit can land before the daemon is watching and the test measures noise.
+    let armed = poll_until(Duration::from_secs(20), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/state.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let epoch = v.get("epoch_nonce")?.as_str()?.to_string();
+        let armed = v.get("watcher_armed_nonce")?.as_str()?.to_string();
+        (v.get("pid")?.as_u64()? != 0 && !epoch.is_empty() && armed == epoch).then_some(())
+    });
+    assert!(armed.is_some(), "daemon never armed its watcher");
+
+    ok(send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"go"}"#,
+    ));
+    std::fs::write(root.join("src/a.rs"), "// a\n").unwrap();
+    wait_for_open_file(root, "src/a.rs");
+    // The exact shape the gate probed: an ordinary shell call mid-turn.
+    ok(send_hook(
+        root,
+        r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash",
+            "tool_input":{"command":"ls -la"},
+            "tool_response":{"stdout":"total 0\n","stderr":""}}"#,
+    ));
+    std::fs::write(root.join("src/b.rs"), "// b\n").unwrap();
+    wait_for_open_file(root, "src/b.rs");
+    ok(send_hook(
+        root,
+        r#"{"hook_event_name":"Stop","session_id":"s1"}"#,
+    ));
+
+    poll_until(Duration::from_secs(30), || {
+        (!rich_turns(root).is_empty()).then_some(())
+    })
+    .expect("the daemon never persisted a rich turn");
+    drop(daemon);
+
+    let turns = rich_turns(root);
+    assert_eq!(
+        turns.len(),
+        1,
+        "a mid-bracket shell call must not split the turn: {turns:#?}"
+    );
+    let paths: Vec<String> = turns[0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap_or("").to_string())
+        .collect();
+    for want in ["a.rs", "b.rs"] {
+        assert!(
+            paths.iter().any(|p| p.ends_with(want)),
+            "the single turn must carry {want}: {paths:?}"
+        );
+    }
+    assert!(
+        !paths.is_empty(),
+        "no turn may be the empty-files half of a split"
+    );
 }

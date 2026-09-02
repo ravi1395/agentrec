@@ -608,18 +608,27 @@ pub fn bulk_results(stdout: &str, targets: &[String]) -> Vec<StructuredResult> {
 }
 
 /// Target names for the sections of a bulk `cargo test`, read from cargo's own
-/// stderr markers in execution order.
+/// `Running` / `Doc-tests` markers in execution order.
 ///
-/// cargo prints `Running unittests src/lib.rs (target/debug/deps/<name>-<hash>)`
-/// / `Running tests/<file>.rs (…)` / `Doc-tests <crate>` before each test
-/// binary, on stderr, sequentially — so the Nth marker names the Nth stdout
-/// section. Returns an empty vec when the marker count does not match the
-/// section count, which makes every identity's target empty and every result
-/// undeclared: a wrong target silently cross-attributes evidence, an empty one
-/// is loudly counted.
-pub fn section_targets(stderr: &str, sections: usize) -> Vec<String> {
+/// **BOTH streams are scanned, stdout first.** `cargo test 2>&1 | tail -30` is
+/// an ordinary agent shell shape, and it puts the markers into STDOUT; scanning
+/// only stderr found none, left every identity's target empty, and turned a
+/// perfectly good capture into "5 result(s) for undeclared tests skipped" — a
+/// wrong diagnosis and zero evidence written. The markers live in exactly one
+/// stream per run, so concatenating the two scans cannot double-count.
+///
+/// A count mismatch still returns an empty vec, which is loudly counted as
+/// UNATTRIBUTABLE — a distinct diagnosis from "undeclared"
+/// (see [`crate::attest::capture::CaptureReport`]). A wrong target silently
+/// cross-attributes evidence; an empty one cannot.
+///
+/// The marker shapes: `Running unittests src/lib.rs (target/debug/deps/
+/// <name>-<hash>)`, `Running tests/<file>.rs (…)`, `Doc-tests <crate>`. cargo
+/// emits one before each test binary, sequentially, so the Nth marker names the
+/// Nth section of the results stream.
+pub fn section_targets(stdout: &str, stderr: &str, sections: usize) -> Vec<String> {
     let mut names = Vec::new();
-    for line in stderr.lines() {
+    for line in stdout.lines().chain(stderr.lines()) {
         let line = line.trim_start();
         if line.starts_with("Doc-tests ") {
             names.push("doc-tests".to_string());
@@ -907,15 +916,34 @@ mod tests {
         assert_eq!(results[1].identity, TestIdentity::new("integration", "b"));
     }
 
+    /// AC-ATTEST-P3-31 (unit half) — markers arriving on STDOUT (the
+    /// `cargo test 2>&1` shape) are found, and so are markers on stderr. Only
+    /// one stream carries them per run, so scanning both cannot double-count.
+    #[test]
+    fn ac_p3_31_markers_are_found_on_either_stream() {
+        let markers = "    Finished `test` profile\n     Running unittests src/lib.rs (target/debug/deps/attest_sample_crate-392ca9d12eda1cf9)\n     Running tests/integration.rs (target/debug/deps/integration-12fc9e26ddfc6535)\n   Doc-tests attest_sample_crate\n";
+        let expected = vec![
+            "attest_sample_crate".to_string(),
+            "integration".to_string(),
+            "doc-tests".to_string(),
+        ];
+        // Merged into stdout (`2>&1`) — the shape that previously found none.
+        assert_eq!(section_targets(markers, "", 3), expected);
+        // Separate streams — the plain shape.
+        assert_eq!(section_targets("", markers, 3), expected);
+        // Still refuses to mis-pair on a count mismatch, from either stream.
+        assert!(section_targets(markers, "", 2).is_empty());
+    }
+
     #[test]
     fn section_targets_pairs_markers_with_sections_and_refuses_a_mismatch() {
         let stderr = "    Finished `test` profile\n     Running unittests src/lib.rs (target/debug/deps/attest_sample_crate-392ca9d12eda1cf9)\n     Running tests/integration.rs (target/debug/deps/integration-12fc9e26ddfc6535)\n   Doc-tests attest_sample_crate\n";
         assert_eq!(
-            section_targets(stderr, 3),
+            section_targets("", stderr, 3),
             vec!["attest_sample_crate", "integration", "doc-tests"]
         );
         // Wrong section count: refuse rather than mis-pair.
-        assert!(section_targets(stderr, 2).is_empty());
+        assert!(section_targets("", stderr, 2).is_empty());
     }
 
     #[test]

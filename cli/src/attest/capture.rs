@@ -28,8 +28,19 @@ use std::process::{Command, Stdio};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureReport {
     pub written: usize,
-    /// Results for tests no `derive` knows.
+    /// Results for a NAMED test that no `derive` knows. The user action is
+    /// `attest derive`.
     pub skipped_undeclared: usize,
+    /// Results whose libtest section could not be attributed to a cargo target
+    /// — [`section_targets`] could not pair cargo's `Running` markers with the
+    /// result sections — so the identity carries an EMPTY target and matches no
+    /// claim.
+    ///
+    /// A distinct count from [`Self::skipped_undeclared`] because the two
+    /// prescribe different actions, and conflating them told a user with
+    /// perfectly good claims to run `attest derive` when only the capture's
+    /// target attribution had failed.
+    pub skipped_unattributable: usize,
     /// The captured output exceeded the CAS snapshot cap, so no blob was kept.
     pub blob_over_cap: bool,
     /// Sections that produced NO per-test line and no summary — a harness that
@@ -83,6 +94,9 @@ pub fn write_evidence(
     for result in results {
         match folded.claim_for(&result.identity) {
             Some(claim_id) => resolved.push((claim_id.clone(), result.clone())),
+            // An EMPTY target is the marker `bulk_results` leaves when the
+            // section could not be attributed — not a claim that is missing.
+            None if result.identity.target.is_empty() => report.skipped_unattributable += 1,
             None => report.skipped_undeclared += 1,
         }
     }
@@ -272,7 +286,7 @@ fn tee(pipe: impl std::io::Read, to_stderr: bool) -> String {
 /// different event shapes for the same run.
 pub fn capture_output(root: &Path, stdout: &str, stderr: &str) -> Result<CaptureReport, String> {
     let sections = parse_libtest(stdout);
-    let targets = section_targets(stderr, sections.len());
+    let targets = section_targets(stdout, stderr, sections.len());
     let results = bulk_results(stdout, &targets);
     // A section with no per-test line contributes nothing to `results` — that
     // is the harness-crash shape (`process::abort`, SIGABRT), which used to
@@ -318,6 +332,13 @@ fn report_to_stderr(report: &CaptureReport) {
         eprintln!(
             "agentrec attest: {} result(s) for undeclared tests skipped — run attest derive",
             report.skipped_undeclared
+        );
+    }
+    if report.skipped_unattributable > 0 {
+        eprintln!(
+            "agentrec attest: {} result(s) in unattributable section(s) skipped — cargo's \
+             `Running` markers could not be paired with the result sections",
+            report.skipped_unattributable
         );
     }
     if report.blob_over_cap {

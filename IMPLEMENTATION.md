@@ -882,9 +882,12 @@ ac_p3_27_init_installs_doctor_accepts_and_uninstall_removes_the_capture_hook`
 **AC-ATTEST-P3-28.** A REAL failing test (one assert flipped in a fixture copy)
 is captured as `outcome: failed` with `parse_failed: false` — a failure is not a
 parse error — its same-section siblings keep their own outcomes, and cargo's
-`101` propagates. Measured and pinned rather than papered over: cargo stops
-after the first target that fails, so the `integration` target never runs and a
-failing bulk capture records 3 results where a green one records 5. —
+`101` propagates. Measured and pinned rather than papered over: **on cargo's
+DEFAULT invocation** it stops after the first target that fails, so the
+`integration` target never runs and a failing bulk capture records 3 results
+where a green one records 5. This is a property of the invocation, not of the
+capture — the same fixture under `cargo test --no-fail-fast` runs all three
+sections and yields 5 results, still exiting 101 (measured). —
 `attest_capture::ac_p3_28_a_real_failing_test_is_captured_as_a_failed_outcome`
 **AC-ATTEST-P3-29.** A `PostToolUse` event NEVER maps to a signal. `init`
 installs `PostToolUse[Bash]` for every repo (AC-ATTEST-P3-27), and `cmds::hook`
@@ -899,6 +902,41 @@ signal), not that count. `cmds::hook` now returns for EVERY
 command, a non-Bash tool) leave `signal.jsonl` byte-identical and write no
 attest event, while `UserPromptSubmit`/`Stop` still map to start/stop. —
 `attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
+**AC-ATTEST-P3-30.** Rename donors are scoped to the TARGETS THIS DISCOVERY
+ENUMERATED — which is **not** the same as "the same target", and the earlier
+"target-scoped" wording overstated it. A claim whose target is outside the
+enumerated set is never a donor (so `attest derive --crate <one crate>` cannot
+hand its neighbours' ids away), while a test that MOVES between two enumerated
+targets with its body unchanged carries its claim, which is what keeps history
+across a file move. — `attest::derivecmd::tests::
+a_vanished_identity_outside_this_discoverys_targets_is_never_a_donor` and
+`attest::derivecmd::tests::a_move_between_two_enumerated_targets_is_a_rename`
+**AC-ATTEST-P3-31.** Target attribution scans BOTH output streams for cargo's
+`Running` / `Doc-tests` markers. `cargo test 2>&1 | tail -30` is an ordinary
+agent shell shape and puts the markers on STDOUT; scanning only stderr found
+none, emptied every identity's target, and reported "5 result(s) for undeclared
+tests skipped" with zero evidence written — a wrong diagnosis on a healthy
+capture. When markers still cannot be paired with the sections, the skip is
+counted and reported as **unattributable section(s)**, a diagnosis distinct from
+**undeclared** because the two prescribe different user actions. —
+`attest_capture::ac_p3_31_markers_merged_into_stdout_are_still_attributed` and
+`attest::adapter_cargo::tests::ac_p3_31_markers_are_found_on_either_stream`
+**AC-ATTEST-P3-32.** The daemon-driven tests own their `agentrec record` child
+through an RAII `DaemonGuard`, not an explicit kill after the asserts: a failing
+assert unwinds past such a call and leaks a daemon watching a tempdir root for
+the rest of the session. Verified by the post-suite check that
+`pgrep -fl 'agentrec record'` lists only the dogfood daemon — there is no
+in-suite assertion that can observe its own leak, so this AC is evidenced by
+that external check, not by a test.
+**AC-ATTEST-P3-33.** End-to-end against a REAL daemon: a non-test `PostToolUse`
+in the middle of an open bracket does not split the turn. One prompt, an edit,
+an `ls -la` `PostToolUse`, a second edit, `Stop` → exactly ONE rich turn carrying
+both files. This is the shape the gate's own probe found broken (two rich turns,
+the first with `files: []`), asserted end to end rather than only at the signal
+layer. — `attest_capture::
+ac_p3_33_a_non_test_post_tool_use_does_not_split_a_live_turn`. **Mutation-probed:**
+restoring the `&& capture_from_hook_payload(..)` fall-through reds it with
+`the single turn must carry b.rs: ["src/a.rs"]` — the split reproduced.
 
 **Dependency note.** `check-versions.sh` does not track the three new direct
 deps (`syn`, `proc-macro2`, `quote`) — it asserts the release version across six

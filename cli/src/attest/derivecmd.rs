@@ -18,9 +18,13 @@
 //!   or two new tests do) mints a FRESH id. A wrong adoption silently welds one
 //!   test's history onto another; a fresh id costs only the history.
 //!
-//! The vanished set is scoped to the TARGETS this discovery enumerated. Without
-//! that scope, running `attest derive --crate <one crate>` would see every other
-//! crate's tests as vanished and hand their claim ids to unrelated new tests.
+//! The vanished set is scoped to the TARGETS THIS DISCOVERY ENUMERATED — which
+//! is NOT the same as "the same target". Without that scope, running
+//! `attest derive --crate <one crate>` would see every other crate's tests as
+//! vanished and hand their claim ids to unrelated new tests. Within the
+//! enumerated set a move ACROSS targets (say `lib` → an integration target)
+//! deliberately IS a rename and carries the claim, which is what keeps history
+//! across a file move.
 
 use crate::attest::adapter_cargo::{discover_with_hashes, BodyHashes};
 use crate::attest::lock::{append_attest_locked, read_attest};
@@ -286,17 +290,68 @@ mod tests {
         assert_eq!(counts.new, 2);
     }
 
-    /// A claim in another TARGET is not a rename donor — otherwise deriving one
-    /// crate would hand its neighbours' ids away.
+    /// AC-ATTEST-P3-30 (half 1). The scope is the TARGETS THIS DISCOVERY
+    /// ENUMERATED, not "the same target". A claim whose target is OUTSIDE that
+    /// set is not a donor — otherwise `attest derive --crate <one crate>` would
+    /// hand its neighbours' ids away.
     #[test]
-    fn a_vanished_identity_in_another_target_is_never_a_donor() {
+    fn a_vanished_identity_outside_this_discoverys_targets_is_never_a_donor() {
         let other = TestIdentity::new("other_target", "gone");
         let id = ClaimId::mint();
         let prior = vec![derive(&id, &other, 3)];
-        let new = ident("fresh");
+        let new = ident("fresh"); // target "t" — "other_target" is not enumerated
         let hashes: BodyHashes = [(new.clone(), hash(3))].into_iter().collect();
-        let (_, counts) = plan_derives(&fold_of(&prior), &[new], &hashes);
+        let (_, counts) = plan_derives(&fold_of(&prior), std::slice::from_ref(&new), &hashes);
         assert_eq!(counts.renamed, 0);
         assert_eq!(counts.new, 1);
+    }
+
+    /// AC-ATTEST-P3-30 (half 2), and the correction the gate asked for: within
+    /// the enumerated targets a move ACROSS targets IS a rename, not a new
+    /// claim. Saying donors are "target-scoped" overstated it — moving a test
+    /// body from `lib` to an integration target while both are being discovered
+    /// carries its claim, which is the behaviour that keeps history across a
+    /// file move.
+    #[test]
+    fn a_move_between_two_enumerated_targets_is_a_rename() {
+        let old = TestIdentity::new("lib_target", "moved_test");
+        let id = ClaimId::mint();
+        let prior = vec![derive(&id, &old, 4)];
+
+        // BOTH targets are in this discovery: the test now lives in
+        // `integration`, and `lib_target` still exists with another test.
+        let stay = TestIdentity::new("lib_target", "stays");
+        let moved = TestIdentity::new("integration", "moved_test");
+        let hashes: BodyHashes = [(moved.clone(), hash(4)), (stay.clone(), hash(9))]
+            .into_iter()
+            .collect();
+        let (batch, counts) = plan_derives(&fold_of(&prior), &[stay, moved.clone()], &hashes);
+        assert_eq!(counts.renamed, 1, "a cross-target move carries the claim");
+        assert_eq!(counts.new, 1, "only the genuinely new test mints an id");
+        let carried = batch
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    AttestEvent::Derive {
+                        renamed_from: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("one renamed derive");
+        match carried {
+            AttestEvent::Derive {
+                claim_id,
+                test_identity,
+                renamed_from,
+                ..
+            } => {
+                assert_eq!(claim_id, &id);
+                assert_eq!(test_identity, &moved);
+                assert_eq!(renamed_from.as_ref(), Some(&old));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
