@@ -3,16 +3,18 @@
 //! FILE granularity, with binary-spawning tests carrying a coarse `over_stale`
 //! scope until Phase 4 can detect the two under-attribution channels).
 //!
-//! **STUB, Phase 4B chunk.** The producer (`attest verify`'s coverage capture)
-//! is chunk A's; this file exists so chunk B's daemon consumer can compile and
-//! be tested against the agreed shape. Chunk A's version replaces it. The two
-//! public functions below are the contracted interface and their signatures
-//! must not drift:
+//! The producer is `coveragecmd.rs` (`attest coverage`); this file is the
+//! READER the daemon consults. The contracted interface:
 //!
 //! ```ignore
 //! pub fn load_coverage_map(root: &Path) -> Result<Option<CoverageMap>, String>;
-//! pub fn claims_touched_by(map: &CoverageMap, rel_path: &str) -> Vec<ClaimId>;
+//! pub fn claims_touched_by(map: &CoverageMap, rel_path: &str) -> Vec<(ClaimId, MatchKind)>;
 //! ```
+//!
+//! `claims_touched_by` returns the MATCH KIND with each claim so the daemon can
+//! name the `stale` cause from what actually matched, rather than re-deriving
+//! the discrimination from the entry's fields a second time and risking the two
+//! copies drifting.
 
 use agentrec_core::attest::types::ClaimId;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -73,43 +75,68 @@ pub fn load_coverage_map_at(path: &Path) -> Result<Option<CoverageMap>, String> 
         .map_err(|e| format!("cannot parse {}: {e}", path.display()))
 }
 
-/// Every claim a write to `rel_path` stales: an exact match against an entry's
-/// measured `files`, OR a match against one of its coarse `over_stale` globs.
-/// Deduped, in map order.
-pub fn claims_touched_by(map: &CoverageMap, rel_path: &str) -> Vec<ClaimId> {
-    let mut out: Vec<ClaimId> = Vec::new();
+/// WHY a write to a path stales a claim — and therefore which `stale` cause the
+/// daemon writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    /// The path is one of the entry's MEASURED `files`.
+    ExactFile,
+    /// The path matched one of the entry's coarse `over_stale` globs, carried
+    /// here so the cause can name the scope that fired.
+    OverStale(String),
+}
+
+/// Every claim a write to `rel_path` stales, with the reason it matched: an
+/// exact hit on an entry's measured `files`, or a hit on one of its coarse
+/// `over_stale` globs. Deduped by claim, in map order — the FIRST matching
+/// entry decides a claim's kind, which is the same first-wins rule the daemon
+/// used when it re-derived this itself.
+pub fn claims_touched_by(map: &CoverageMap, rel_path: &str) -> Vec<(ClaimId, MatchKind)> {
+    let mut out: Vec<(ClaimId, MatchKind)> = Vec::new();
     for entry in map.tests.values() {
-        if entry_matches(entry, rel_path) && !out.contains(&entry.claim_id) {
-            out.push(entry.claim_id.clone());
+        let Some(kind) = match_kind(entry, rel_path) else {
+            continue;
+        };
+        if out.iter().any(|(id, _)| id == &entry.claim_id) {
+            continue;
         }
+        out.push((entry.claim_id.clone(), kind));
     }
     out
 }
 
-fn entry_matches(entry: &CoverageEntry, rel_path: &str) -> bool {
-    entry.files.iter().any(|f| f == rel_path) || over_stale_hit(entry, rel_path).is_some()
-}
-
-/// The `over_stale` glob that matches `rel_path`, if any. Gitignore semantics,
-/// the same matcher `noise.rs::NoiseMatcher` and `daemon::IgnoreSet` use, so
-/// `cli/src/**` behaves the way a reader of the config expects.
-pub fn over_stale_hit<'a>(entry: &'a CoverageEntry, rel_path: &str) -> Option<&'a str> {
+/// How `rel_path` matches this entry, if at all. Exact files are checked first:
+/// a path that is both measured AND inside a coarse scope is genuinely
+/// measured, and reporting it as `coverage-incomplete` would understate what is
+/// known.
+///
+/// Glob matching uses gitignore semantics — the same matcher
+/// `noise.rs::NoiseMatcher` and `daemon::IgnoreSet` use — so `cli/src/**`
+/// behaves the way a reader of the config expects.
+pub fn match_kind(entry: &CoverageEntry, rel_path: &str) -> Option<MatchKind> {
+    if entry.files.iter().any(|f| f == rel_path) {
+        return Some(MatchKind::ExactFile);
+    }
     let p = Path::new(rel_path);
     if p.is_absolute() {
         // The matcher asserts on rooted paths; an absolute path was never
         // going to match a repo-relative glob anyway.
         return None;
     }
-    entry.over_stale.iter().map(String::as_str).find(|g| {
-        compile(g)
-            .map(|m| {
-                matches!(
-                    m.matched_path_or_any_parents(p, false),
-                    ignore::Match::Ignore(_)
-                )
-            })
-            .unwrap_or(false)
-    })
+    entry
+        .over_stale
+        .iter()
+        .find(|g| {
+            compile(g)
+                .map(|m| {
+                    matches!(
+                        m.matched_path_or_any_parents(p, false),
+                        ignore::Match::Ignore(_)
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .map(|g| MatchKind::OverStale(g.clone()))
 }
 
 fn compile(glob: &str) -> Option<Gitignore> {
@@ -155,11 +182,38 @@ mod tests {
         let a = ClaimId::parse("c_00000000010W3GE1R70W3GE1R7").unwrap();
         let c = ClaimId::parse("c_00000000010W3GE1R70W3GE1R8").unwrap();
 
-        assert_eq!(claims_touched_by(&map, "src/a.rs"), vec![a]);
-        assert_eq!(claims_touched_by(&map, "cli/src/x.rs"), vec![c]);
+        assert_eq!(
+            claims_touched_by(&map, "src/a.rs"),
+            vec![(a, MatchKind::ExactFile)]
+        );
+        assert_eq!(
+            claims_touched_by(&map, "cli/src/x.rs"),
+            vec![(c, MatchKind::OverStale("cli/src/**".to_string()))]
+        );
         // The ALLOW half: an unmapped path must match nothing, or a
         // match-everything matcher would pass the two asserts above.
         assert!(claims_touched_by(&map, "README.md").is_empty());
         assert!(claims_touched_by(&map, "src/a.rs.bak").is_empty());
+    }
+
+    /// AC-ATTEST-P4C-5. The kind is what the daemon writes its `stale` cause
+    /// from, so the two arms must be distinguishable AND the glob that fired
+    /// must travel with the `OverStale` arm — a bare bool would lose the scope
+    /// the cause names.
+    #[test]
+    fn match_kind_discriminates_an_exact_file_from_an_over_stale_glob() {
+        let map: CoverageMap = serde_json::from_str(&map_json()).unwrap();
+        let exact = &map.tests["t::a"];
+        let coarse = &map.tests["t::c"];
+
+        assert_eq!(match_kind(exact, "src/a.rs"), Some(MatchKind::ExactFile));
+        assert_eq!(
+            match_kind(coarse, "cli/src/x.rs"),
+            Some(MatchKind::OverStale("cli/src/**".to_string()))
+        );
+        // The ALLOW half: neither entry matches a path outside its own scope,
+        // or the two asserts above would pass under a match-everything kind.
+        assert_eq!(match_kind(exact, "cli/src/x.rs"), None);
+        assert_eq!(match_kind(coarse, "src/a.rs"), None);
     }
 }

@@ -79,6 +79,93 @@ pub enum RunFilter {
     Exact { target: String, fn_path: String },
 }
 
+/// The environment a replay child runs with.
+///
+/// `attest verify` scrubs: an inherited variable can change what a test does,
+/// and a verdict is supposed to be a property of the COMMITTED bytes, not of
+/// whoever happened to run it. The allowlist is a pinned decision — widening
+/// it is a founder call, not an implementer's.
+#[derive(Clone, Debug, Default)]
+pub struct RunEnv {
+    /// `env_clear()` plus [`ENV_ALLOWLIST`] and every `LLVM_`-prefixed var.
+    pub scrubbed: bool,
+    /// Applied AFTER the scrub, so a caller can add what it needs.
+    pub extra: Vec<(String, String)>,
+}
+
+/// Kept verbatim across the scrub. `CARGO_TARGET_DIR` is NOT here: the adapter
+/// sets it explicitly after the clear, on every spawn, scrubbed or not.
+pub const ENV_ALLOWLIST: [&str; 7] = [
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "TMPDIR",
+    "TERM",
+];
+
+/// The `LLVM_` prefix passes as a class, not name by name: coverage tooling is
+/// located through `LLVM_COV`/`LLVM_PROFDATA` in this repo (stock
+/// `cargo llvm-cov` fails on a Homebrew rustc without them), and enumerating
+/// them here would rot the day another is added.
+const ENV_ALLOW_PREFIX: &str = "LLVM_";
+
+/// The pure half of the scrub: which of `vars` survive. Split from the spawn so
+/// the allowlist is testable without running cargo.
+pub fn scrubbed_pairs<I>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(k, _)| ENV_ALLOWLIST.contains(&k.as_str()) || k.starts_with(ENV_ALLOW_PREFIX))
+        .collect()
+}
+
+impl RunEnv {
+    /// Inherit this process's environment — every caller but `attest verify`.
+    pub fn inherited() -> Self {
+        RunEnv::default()
+    }
+
+    /// `attest verify`'s replay environment.
+    pub fn scrubbed() -> Self {
+        RunEnv {
+            scrubbed: true,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Must run BEFORE any other `.env()` on `cmd`: `env_clear` drops the
+    /// pairs set before it and keeps the ones set after.
+    fn apply(&self, cmd: &mut Command) {
+        if self.scrubbed {
+            cmd.env_clear();
+            for (k, v) in scrubbed_pairs(std::env::vars()) {
+                cmd.env(k, v);
+            }
+        }
+        for (k, v) in &self.extra {
+            cmd.env(k, v);
+        }
+    }
+}
+
+/// Absolute, symlink-resolved crate root.
+///
+/// Load-bearing, not tidiness: [`build_targets`] pins `CARGO_TARGET_DIR` to
+/// `crate_root.join("target")` while ALSO setting `current_dir(crate_root)`, so
+/// a RELATIVE `--crate agentrec-core` yielded the relative value
+/// `agentrec-core/target`, which cargo then resolved against the CHILD's cwd —
+/// producing `agentrec-core/agentrec-core/target`. Measured live on a clone of
+/// this repo: 284 MB written to the wrong place, and the stray directory then
+/// made the tree dirty. An absolute path cannot compound.
+pub fn canonical_crate_root(crate_root: &Path) -> Result<PathBuf, String> {
+    crate_root
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve crate root {}: {e}", crate_root.display()))
+}
+
 /// The result of one [`Adapter::run`], plus what it took to produce it.
 #[derive(Clone, Debug)]
 pub struct RunOutcome {
@@ -102,7 +189,12 @@ pub trait Adapter {
     /// `discover_with_hashes` instead, so nothing dispatches this dynamically.
     #[allow(dead_code)]
     fn discover(&self, crate_root: &Path) -> Result<Vec<TestIdentity>, String>;
-    fn run(&self, crate_root: &Path, filter: &RunFilter) -> Result<RunOutcome, String>;
+    fn run(
+        &self,
+        crate_root: &Path,
+        filter: &RunFilter,
+        env: &RunEnv,
+    ) -> Result<RunOutcome, String>;
 }
 
 pub struct CargoAdapter;
@@ -157,10 +249,18 @@ fn cargo_bin() -> String {
 ///
 /// `CARGO_TARGET_DIR` is pinned to the crate's own `target/` so a nested build
 /// can never land in a parent workspace's target dir — this repo has a recorded
-/// scar from exactly that.
-fn build_targets(crate_root: &Path) -> Result<Vec<TargetInfo>, String> {
-    // attest: sanctioned spawn (Phase 4 census)
-    let out = Command::new(cargo_bin())
+/// scar from exactly that. `crate_root` reaches here ALREADY canonicalized by
+/// the adapter's entry points; see [`canonical_crate_root`] for why a relative
+/// path here nested the target dir.
+fn build_targets(crate_root: &Path, env: &RunEnv) -> Result<Vec<TargetInfo>, String> {
+    // Spawns `cargo` (from $CARGO or PATH) to build the crate's test targets.
+    // The adapter is the sanctioned test-runner boundary; the daemon never
+    // calls it.
+    #[allow(clippy::disallowed_methods)]
+    let mut cmd = Command::new(cargo_bin());
+    // `apply` first: it may `env_clear`, which drops earlier `.env()` calls.
+    env.apply(&mut cmd);
+    let out = cmd
         .args(["test", "--no-run", "--message-format=json"])
         .current_dir(crate_root)
         .env("CARGO_TARGET_DIR", crate_root.join("target"))
@@ -274,7 +374,8 @@ pub fn parse_list_output(stdout: &str) -> Vec<String> {
 
 /// `<exe> --list` → the `<name>: test` lines. No `--format=json` (unstable).
 fn list_tests(exe: &Path) -> Result<Vec<String>, String> {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns the BUILT libtest binary with `--list`. `exe` comes from cargo's own artifact stream, not from repo content.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new(exe)
         .arg("--list")
         .output()
@@ -284,8 +385,9 @@ fn list_tests(exe: &Path) -> Result<Vec<String>, String> {
 
 impl Adapter for CargoAdapter {
     fn discover(&self, crate_root: &Path) -> Result<Vec<TestIdentity>, String> {
+        let crate_root = &canonical_crate_root(crate_root)?;
         let mut out = Vec::new();
-        for target in build_targets(crate_root)? {
+        for target in build_targets(crate_root, &RunEnv::inherited())? {
             for name in list_tests(&target.executable)? {
                 out.push(TestIdentity::new(target.name.clone(), name));
             }
@@ -297,8 +399,14 @@ impl Adapter for CargoAdapter {
         Ok(out)
     }
 
-    fn run(&self, crate_root: &Path, filter: &RunFilter) -> Result<RunOutcome, String> {
-        let targets = match build_targets(crate_root) {
+    fn run(
+        &self,
+        crate_root: &Path,
+        filter: &RunFilter,
+        env: &RunEnv,
+    ) -> Result<RunOutcome, String> {
+        let crate_root = &canonical_crate_root(crate_root)?;
+        let targets = match build_targets(crate_root, env) {
             Ok(t) => t,
             Err(e) => {
                 // Stage 1: the target did not build. Nothing runs.
@@ -348,8 +456,13 @@ impl Adapter for CargoAdapter {
             args.push(fn_path.clone());
         }
 
-        // attest: sanctioned spawn (Phase 4 census)
-        let out = Command::new(cargo_bin())
+        // Spawns `cargo test` scoped to one target and one `--exact` name.
+        // This is the replay itself — the whole point of the adapter.
+        #[allow(clippy::disallowed_methods)]
+        let mut cmd = Command::new(cargo_bin());
+        // `apply` first: it may `env_clear`, which drops earlier `.env()` calls.
+        env.apply(&mut cmd);
+        let out = cmd
             .args(&args)
             .current_dir(crate_root)
             .env("CARGO_TARGET_DIR", crate_root.join("target"))
@@ -792,7 +905,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 /// Discover, and hash every discovered test's body, in one build.
 pub fn discover_with_hashes(crate_root: &Path) -> Result<(Vec<TestIdentity>, BodyHashes), String> {
-    let targets = build_targets(crate_root)?;
+    let crate_root = &canonical_crate_root(crate_root)?;
+    let targets = build_targets(crate_root, &RunEnv::inherited())?;
     let mut identities = Vec::new();
     for target in &targets {
         for name in list_tests(&target.executable)? {
@@ -1097,6 +1211,7 @@ mod tests {
                     target: "attest_sample_crate".into(),
                     fn_path: "tests::unit_add_works".into(),
                 },
+                &RunEnv::inherited(),
             )
             .unwrap();
         assert_eq!(r.results[0].outcome, Some(TestOutcome::Passed));
@@ -1110,6 +1225,7 @@ mod tests {
                     target: "attest_sample_crate".into(),
                     fn_path: "tests::unit_ignored_test".into(),
                 },
+                &RunEnv::inherited(),
             )
             .unwrap();
         assert_eq!(
@@ -1126,6 +1242,7 @@ mod tests {
                     target: "attest_sample_crate".into(),
                     fn_path: "tests::no_such_test".into(),
                 },
+                &RunEnv::inherited(),
             )
             .unwrap();
         assert_eq!(
@@ -1154,6 +1271,7 @@ mod tests {
                     target: "attest_sample_crate".into(),
                     fn_path: "unit_aborts".into(),
                 },
+                &RunEnv::inherited(),
             )
             .unwrap();
         assert_eq!(
@@ -1190,8 +1308,49 @@ mod tests {
                     target: "attest_sample_crate".into(),
                     fn_path: "tests::unit_add_works".into(),
                 },
+                &RunEnv::inherited(),
             )
             .unwrap();
         assert_eq!(r.results[0].recipe_invalid, Some(RecipeInvalidCause::Build));
+    }
+
+    /// AC-ATTEST-P4C-3, the pure half. The allowlist is a pinned decision, so
+    /// it is tested by name rather than only through the e2e canary — an e2e
+    /// pass cannot say WHICH names survived.
+    #[test]
+    fn scrubbed_pairs_keeps_the_allowlist_and_drops_everything_else() {
+        let vars: Vec<(String, String)> = [
+            ("PATH", "/bin"),
+            ("HOME", "/h"),
+            ("CARGO_HOME", "/ch"),
+            ("RUSTUP_HOME", "/rh"),
+            ("RUSTUP_TOOLCHAIN", "stable"),
+            ("TMPDIR", "/tmp"),
+            ("TERM", "xterm"),
+            ("LLVM_COV", "/llvm-cov"),
+            ("LLVM_PROFDATA", "/llvm-profdata"),
+            ("ATTEST_CANARY", "leaked"),
+            ("PATHOLOGICAL", "not PATH"),
+            ("MY_LLVM_COV", "not a prefix match"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let kept: Vec<String> = scrubbed_pairs(vars).into_iter().map(|(k, _)| k).collect();
+
+        // The ALLOW half: every pinned name, plus the `LLVM_` prefix class.
+        for k in ENV_ALLOWLIST {
+            assert!(kept.contains(&k.to_string()), "{k} must survive the scrub");
+        }
+        assert!(kept.contains(&"LLVM_COV".to_string()));
+        assert!(kept.contains(&"LLVM_PROFDATA".to_string()));
+
+        // The REFUSE half, including two near-misses a sloppy `contains`-style
+        // match would wrongly keep.
+        assert!(!kept.contains(&"ATTEST_CANARY".to_string()));
+        assert!(!kept.contains(&"PATHOLOGICAL".to_string()));
+        assert!(!kept.contains(&"MY_LLVM_COV".to_string()));
+        assert_eq!(kept.len(), ENV_ALLOWLIST.len() + 2);
     }
 }

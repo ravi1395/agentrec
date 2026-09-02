@@ -308,18 +308,18 @@ fn ac_p4_6_a_first_run_failure_that_passes_on_rerun_is_flaky() {
     let f = Fixture::new();
 
     // A deterministically flaky test: it fails exactly once, keyed on a marker
-    // file that lives OUTSIDE the extract (the extract is rebuilt from the
-    // commit each verify, so an in-tree marker would reset every run). The
-    // path arrives through the environment, which the replay inherits.
+    // file that must survive BETWEEN the retries of one verify but be absent on
+    // the first.
     //
-    // COUPLING, recorded so a later break is diagnosed correctly: this fixture
-    // works only because the replay inherits this process's environment. The
-    // orchestrator's pinned `env_clear()` scrub is NOT implemented (see
-    // `replaycmd.rs`'s module doc); if it is implemented later,
-    // `ATTEST_FLAKY_MARKER` must join the re-added allowlist or this fixture
-    // must be rekeyed. The failure would look like a flaky-policy regression
-    // and would not be one.
-    let marker = f.path().join("flaky-marker");
+    // REKEYED for the env scrub (AC-ATTEST-P4C-3): the marker path used to
+    // arrive through `ATTEST_FLAKY_MARKER` in the inherited environment, which
+    // `env_clear()` now removes. The fixture computes the path itself instead,
+    // from its OWN `CARGO_MANIFEST_DIR` — which, compiled inside the extract,
+    // is the extract dir — under `target/`, the symlink into the per-commit
+    // build cache. That cache outlives the extract (which is rebuilt from the
+    // commit each verify) and is fresh for this fixture's commit, so run 1
+    // finds no marker and run 2 does. No environment variable is involved, so
+    // the scrub cannot break it.
     let lib = f.path().join("src/lib.rs");
     let text = std::fs::read_to_string(&lib).unwrap();
     std::fs::write(
@@ -328,8 +328,10 @@ fn ac_p4_6_a_first_run_failure_that_passes_on_rerun_is_flaky() {
             "{text}\n\
              #[test]\n\
              fn flaky_once() {{\n\
-             \x20   let p = std::env::var(\"ATTEST_FLAKY_MARKER\").unwrap();\n\
-             \x20   let p = std::path::Path::new(&p);\n\
+             \x20   let p = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n\
+             \x20       .join(\"target\")\n\
+             \x20       .join(\"flaky-marker\");\n\
+             \x20   let p = p.as_path();\n\
              \x20   if p.exists() {{ return; }}\n\
              \x20   std::fs::write(p, \"x\").unwrap();\n\
              \x20   panic!(\"first run always fails\");\n\
@@ -345,7 +347,6 @@ fn ac_p4_6_a_first_run_failure_that_passes_on_rerun_is_flaky() {
     let out = Command::new(bin())
         .args(["attest", "verify", &claim])
         .current_dir(f.path())
-        .env("ATTEST_FLAKY_MARKER", &marker)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -365,7 +366,18 @@ fn ac_p4_6_a_first_run_failure_that_passes_on_rerun_is_flaky() {
     // The load-bearing negative: a flake must NEVER mint the permanent verdict.
     assert_ne!(v["verdict"], "claim-false");
     assert!(stdout.contains("(2 runs)"), "{stdout}");
-    assert!(marker.exists(), "the fixture's first run must have run");
+    // The marker landed in the per-commit build cache, whose directory is named
+    // by a commit this test does not know; scan for it rather than guess.
+    let cache = f.path().join(".agentrec/attest-target/target");
+    let found = std::fs::read_dir(&cache)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", cache.display()))
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().join("flaky-marker").exists());
+    assert!(
+        found,
+        "the fixture's first run must have written a marker under {}",
+        cache.display()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -570,4 +582,119 @@ fn ac_p4_11_no_map_exists_before_capture_and_a_written_map_parses() {
     .unwrap();
     assert_eq!(parsed["version"], 1);
     assert_eq!(parsed["tests"].as_object().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P4C-3 — the replay environment is scrubbed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac_p4c_3_the_replay_env_is_scrubbed_to_the_allowlist() {
+    let f = Fixture::new();
+
+    // The fixture asserts BOTH halves from inside the replayed test body:
+    //   refuse — the canary this test sets on the `attest verify` child must
+    //     NOT reach the replay;
+    //   allow  — `PATH` must still be there.
+    // The allow half is not decoration: a canary-absent assertion alone passes
+    // vacuously if the parent never set the variable, or if the child's
+    // environment broke for a reason having nothing to do with the allowlist.
+    let lib = f.path().join("src/lib.rs");
+    let text = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(
+        &lib,
+        format!(
+            "{text}\n\
+             #[test]\n\
+             fn env_is_scrubbed() {{\n\
+             \x20   assert!(std::env::var(\"ATTEST_CANARY\").is_err(), \"canary leaked\");\n\
+             \x20   assert!(std::env::var(\"PATH\").is_ok(), \"PATH was not allowlisted\");\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    commit_all(f.path(), "add an environment-scrub assertion");
+
+    f.derive();
+    let claim = f.claim_for(UNIT_TARGET, "env_is_scrubbed");
+
+    let out = Command::new(bin())
+        .args(["attest", "verify", &claim])
+        .current_dir(f.path())
+        // Set on the child that RUNS the replay. It must not survive into the
+        // replay's own grandchild.
+        .env("ATTEST_CANARY", "leaked")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body = std::fs::read_to_string(f.path().join(".agentrec/attest.jsonl")).unwrap();
+    let v = body
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v["kind"] == "verdict" && v["claim_id"] == claim.as_str())
+        .expect("a verdict must be appended");
+    assert_eq!(v["verdict"], "confirmed", "stdout: {stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// AC-ATTEST-P4C-4 — a relative --crate path does not nest the target dir
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ac_p4c_4_a_relative_crate_path_does_not_nest_the_target_dir() {
+    // The Phase 3 defect `5bd5c0f` recorded: `build_targets` set
+    // `CARGO_TARGET_DIR` to a RELATIVE `crate_root.join("target")` while also
+    // setting `current_dir(crate_root)`, so cargo resolved the relative value
+    // against the child's cwd and built into `<crate>/<crate>/target`.
+    let parent = tempfile::tempdir().unwrap();
+    let crate_dir = parent.path().join("thecrate");
+    std::fs::create_dir_all(&crate_dir).unwrap();
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/attest_sample_crate");
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    std::fs::create_dir_all(crate_dir.join("tests")).unwrap();
+    for rel in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/lib.rs",
+        "tests/integration.rs",
+    ] {
+        std::fs::copy(src.join(rel), crate_dir.join(rel)).unwrap();
+    }
+    std::fs::create_dir_all(crate_dir.join(".agentrec")).unwrap();
+    // `derive` writes `attest.jsonl` under the ROOT (the cwd), not the crate.
+    std::fs::create_dir_all(parent.path().join(".agentrec")).unwrap();
+
+    // Run FROM the parent, naming the crate by a relative path — the exact
+    // shape that nested.
+    let out = Command::new(bin())
+        .args(["attest", "derive", "--crate", "thecrate"])
+        .current_dir(parent.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "derive failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        crate_dir.join("target").is_dir(),
+        "the build must land at <crate>/target"
+    );
+    assert!(
+        !crate_dir.join("thecrate").exists(),
+        "a nested <crate>/<crate>/ directory must not appear"
+    );
+    assert!(
+        !parent.path().join("target").exists(),
+        "nothing may be written to the PARENT's target dir"
+    );
 }

@@ -563,16 +563,15 @@ impl AttestStaleMarker {
         let mut seen: Vec<agentrec_core::attest::types::ClaimId> = Vec::new();
         for rel in &rels {
             let rel = rel.as_str();
-            for claim_id in crate::attest::coverage::claims_touched_by(map, rel) {
+            for (claim_id, kind) in crate::attest::coverage::claims_touched_by(map, rel) {
                 if seen.contains(&claim_id) {
                     continue;
                 }
-                let cause = Self::cause_for(map, &claim_id, rel);
                 seen.push(claim_id.clone());
                 events.push(AttestEvent::Stale {
                     ts,
                     claim_id,
-                    cause,
+                    cause: Self::cause_for(kind, rel),
                 });
             }
         }
@@ -592,38 +591,23 @@ impl AttestStaleMarker {
     }
 
     /// Which cause the `stale` line carries. An exact hit on the entry's
-    /// measured `files` is a `file-write` naming that path; otherwise the
-    /// claim matched a coarse `over_stale` glob, which is `coverage-incomplete`
-    /// naming the scope (`ATTEST-FORMAT.md` § `stale` documents both shapes).
+    /// measured `files` is a `file-write` naming that path; a coarse
+    /// `over_stale` glob is `coverage-incomplete` naming the scope
+    /// (`ATTEST-FORMAT.md` § `stale` documents both shapes).
     ///
-    /// When several entries share one claim id the first matching entry wins;
-    /// `claims_touched_by` reports the claim, not which entry or glob matched,
-    /// so the discrimination is redone here from the entry's own public fields.
-    fn cause_for(
-        map: &crate::attest::coverage::CoverageMap,
-        claim_id: &agentrec_core::attest::types::ClaimId,
-        rel: &str,
-    ) -> StaleCause {
-        for entry in map.tests.values() {
-            if &entry.claim_id != claim_id {
-                continue;
+    /// The discrimination is NOT redone here: `claims_touched_by` reports the
+    /// [`MatchKind`] that actually fired, including the glob, so there is one
+    /// copy of the rule and it cannot drift from the one the match used.
+    ///
+    /// [`MatchKind`]: crate::attest::coverage::MatchKind
+    fn cause_for(kind: crate::attest::coverage::MatchKind, rel: &str) -> StaleCause {
+        match kind {
+            crate::attest::coverage::MatchKind::ExactFile => StaleCause::FileWrite {
+                path: rel.to_string(),
+            },
+            crate::attest::coverage::MatchKind::OverStale(scope) => {
+                StaleCause::CoverageIncomplete { scope }
             }
-            if entry.files.iter().any(|f| f == rel) {
-                return StaleCause::FileWrite {
-                    path: rel.to_string(),
-                };
-            }
-            if let Some(scope) = crate::attest::coverage::over_stale_hit(entry, rel) {
-                return StaleCause::CoverageIncomplete {
-                    scope: scope.to_string(),
-                };
-            }
-        }
-        // Unreachable via `claims_touched_by`, whose match predicate is the
-        // union of the two arms above; recorded as a file write rather than
-        // dropped, so a future divergence still leaves a trace.
-        StaleCause::FileWrite {
-            path: rel.to_string(),
         }
     }
 

@@ -1026,7 +1026,8 @@ silently. —
 daemon's matcher discriminates — an entry with measured `files` and no
 `over_stale`, and an entry with an `over_stale` pattern and no `files` — under
 distinct claim ids. **Scope, stated rather than implied:** `claims_touched_by`
-and `over_stale_hit` live in the `agentrec` BINARY crate, which an integration
+and `match_kind` (which replaced `over_stale_hit` in chunk C,
+AC-ATTEST-P4C-5) live in the `agentrec` BINARY crate, which an integration
 test cannot link against, so the matching behavior itself is unit-tested in
 `attest::coverage::tests` (Phase 4B's file) and this AC pins only that the
 producer's wire shape is the one that matcher expects. Neither test alone closes
@@ -1146,3 +1147,53 @@ negative tests and cannot discriminate on their own, which is exactly why -3's
 "nothing appended" leg shares a daemon with two proven-positive legs.
 (b) Making the reload trigger fire only once reds -5 alone. (c) Forcing every
 cause to `file-write` reds -2 with the two shapes printed side by side.
+
+### attest v1 — Phase 4 chunk C (purity census, replay env scrub, match kinds)
+
+**AC-ATTEST-P4C-1.** `clippy.toml`'s `disallowed-methods` carries a
+`std::process::Command::new` entry, and every production spawn site in
+`cli/src` carries a per-site `#[allow(clippy::disallowed_methods)]` with its
+own one-line reason, so that `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` is CLEAN at HEAD on debug and release. This is
+the baseline-green half of the two-direction probe: it proves the sweep found
+every site the lint can see. `cli/src/daemon.rs` production code carries NO
+allow, which is the property the lint exists to hold. —
+`docs/verify/attest-purity-census.md` (the two clippy runs, pasted verbatim)
+
+**AC-ATTEST-P4C-2 (manual, recorded in the census doc).** The refusing half:
+one unannotated `std::process::Command::new("true")` planted inside an EXISTING
+production fn of `cli/src/daemon.rs` makes the identical clippy command fail
+with `clippy::disallowed_methods` naming the planted line. An existing fn, not
+a new one, because an unreferenced new fn co-fires `dead_code` under
+`-D warnings` and would let the probe pass with `clippy.toml` untouched. The
+plant is reverted by an inverse edit and the file's SHA-256 is recorded before
+and after. — manual; `docs/verify/attest-purity-census.md`
+
+**AC-ATTEST-P4C-3.** `attest verify` runs the replay with a scrubbed
+environment: `env_clear()` plus the allowlist {`PATH`, `HOME`, `CARGO_HOME`,
+`RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `TMPDIR`, `TERM`}, every `LLVM_`-prefixed
+variable, and `CARGO_TARGET_DIR`. Proven in both directions: a canary variable
+set on the `attest verify` child is ABSENT inside the replayed test body, and
+the same fixture asserts `PATH` IS present — absence alone would pass
+vacuously if the parent never set the canary. The pure allowlist filter is
+unit-tested separately from the spawn. —
+`attest_verify::ac_p4c_3_the_replay_env_is_scrubbed_to_the_allowlist` +
+`adapter_cargo::tests::scrubbed_pairs_keeps_the_allowlist_and_drops_everything_else`
+
+**AC-ATTEST-P4C-4.** `attest derive --crate <RELATIVE path>` run from a parent
+directory writes the crate's `target/` at `<crate>/target` and creates no
+nested `<crate>/<crate>/target`. Closes the Phase 3 defect `5bd5c0f` recorded:
+`build_targets` set `CARGO_TARGET_DIR` to a relative `crate_root.join("target")`
+while also setting `current_dir(crate_root)`, so cargo resolved the relative
+value against the child's cwd. Fixed by canonicalizing `crate_root` once at the
+adapter's entry points. —
+`attest_verify::ac_p4c_4_a_relative_crate_path_does_not_nest_the_target_dir`
+
+**AC-ATTEST-P4C-5.** `coverage::claims_touched_by` returns the MATCH KIND
+alongside each claim — `MatchKind::ExactFile` for a hit on the entry's measured
+`files`, `MatchKind::OverStale(glob)` for a coarse-glob hit — so the daemon
+consumes the kind instead of re-deriving it. `over_stale_hit` is deleted. The
+`attest_stale` cause assertions stay green UNCHANGED, which is what proves the
+refactor preserved the two `stale` cause shapes. —
+`attest::coverage::tests::match_kind_discriminates_an_exact_file_from_an_over_stale_glob`
++ the unchanged `attest_stale::ac_p4b_1_*` / `ac_p4b_2_*`

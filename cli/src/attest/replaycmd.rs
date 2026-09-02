@@ -27,21 +27,22 @@
 //! tree holds uncommitted changes would stamp `replay_commit` with a commit
 //! that never contained what the author was actually looking at.
 //!
-//! # Environment: a DEVIATION from the orchestrator's pinned decision
+//! # Environment: scrubbed
 //!
-//! The pinned decision was `env_clear()` plus a re-added allowlist. That is not
-//! implemented, and the reason is structural rather than an oversight: the
-//! spawn happens inside `adapter_cargo::CargoAdapter::run`, which the plan
-//! names as Phase 3's frozen contract, and which also pins `CARGO_TARGET_DIR`
-//! to `<crate_root>/target` itself. Scrubbing would mean changing that
-//! contract. What IS implemented is the half that does not touch it: the
-//! extract's `target/` is a SYMLINK to a per-root cache
-//! (`.agentrec/attest-target/`), so `crate_root.join("target")` resolves into a
-//! shared cache and replays do not rebuild the world each time. **The replay
-//! therefore inherits this process's environment**, and the cache is shared
-//! across replays and is NOT part of the pinned tree.
+//! The replay runs with `env_clear()` plus the pinned allowlist — see
+//! `adapter_cargo::ENV_ALLOWLIST` for the names and `ATTEST-FORMAT.md`
+//! § "Replay environment" for why. An inherited variable can change what a
+//! test does, and a verdict is meant to be a property of the committed bytes.
+//! `adapter_cargo::RunEnv` carries this as an explicit parameter, so every
+//! other adapter caller keeps inheriting.
+//!
+//! Independent of the scrub, the extract's `target/` is a SYMLINK to a
+//! per-commit cache under `.agentrec/attest-target/`, so
+//! `crate_root.join("target")` resolves into a shared build cache and replays
+//! do not rebuild the world each time. That cache is shared across replays and
+//! is NOT part of the pinned tree.
 
-use crate::attest::adapter_cargo::{Adapter, CargoAdapter, RunFilter};
+use crate::attest::adapter_cargo::{Adapter, CargoAdapter, RunEnv, RunFilter};
 use crate::attest::coveragecmd::attest_target_dir;
 use crate::attest::lock::{append_attest_locked, read_attest};
 use agentrec_core::attest::events::AttestEvent;
@@ -131,7 +132,7 @@ fn replay(extract: &Path, identity: &TestIdentity) -> Result<(VerdictKind, usize
     let mut runs = 0usize;
     let mut any_failed = false;
     loop {
-        let outcome = CargoAdapter.run(extract, &filter)?;
+        let outcome = CargoAdapter.run(extract, &filter, &RunEnv::scrubbed())?;
         runs += 1;
         let result = outcome
             .results
@@ -192,7 +193,8 @@ fn reconcile(first_failed: bool, verdict: VerdictKind) -> VerdictKind {
 }
 
 fn ensure_clean_tree(root: &Path) -> Result<(), String> {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `git status` to refuse a dirty tree before minting a verdict.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
@@ -218,7 +220,8 @@ fn ensure_clean_tree(root: &Path) -> Result<(), String> {
 }
 
 fn head_commit(root: &Path) -> Result<String, String> {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `git rev-parse` to pin the replay commit.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(root)
@@ -250,7 +253,8 @@ fn extract_commit(root: &Path, commit: &str) -> Result<PathBuf, String> {
 
     let tar = base.join("extract.tar");
     let _ = std::fs::remove_file(&tar);
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `git archive` to extract committed bytes; never `git worktree add`, which would write into the production repo's .git.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("git")
         .args(["archive", "--format=tar", "-o"])
         .arg(&tar)
@@ -264,7 +268,8 @@ fn extract_commit(root: &Path, commit: &str) -> Result<PathBuf, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `tar` to unpack the archive `git archive` just wrote.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("tar")
         .arg("-xf")
         .arg(&tar)

@@ -120,12 +120,17 @@ $ pgrep -fl 'agentrec record'
 One process, the pre-existing dogfood daemon (pid 39492). No daemon was started
 by either leg.
 
-## Environment deviation carried by both legs
+## Environment deviation carried by both legs — SINCE CLOSED
 
-The replay inherits this process's environment. The orchestrator's pinned
-decision was `env_clear()` plus a re-added allowlist; that is NOT implemented,
-because the spawn happens inside `adapter_cargo::CargoAdapter::run`, which the
-plan names as Phase 3's frozen contract and which pins `CARGO_TARGET_DIR`
-itself. The half that does not touch the contract IS implemented: the extract's
-`target/` is a symlink into a per-root, **per-commit** cache under
-`.agentrec/attest-target/`. Full reasoning: `replaycmd.rs`'s module doc.
+**Superseded by Phase 4 chunk C (AC-ATTEST-P4C-3); kept because it describes
+the environment the two legs below actually ran under.** At the time of these
+runs the replay inherited this process's environment: the orchestrator's pinned
+`env_clear()` plus allowlist was NOT implemented, on the reasoning that the
+spawn happens inside `adapter_cargo::CargoAdapter::run`, named as Phase 3's
+frozen contract. Chunk C implemented it additively instead — `RunEnv` is a
+parameter on `Adapter::run`, so the contract extended rather than broke, and
+`attest verify` now scrubs. The allowlist is stated once in `ATTEST-FORMAT.md`
+§ "Replay environment".
+
+Independent of the scrub, and true then and now: the extract's `target/` is a
+symlink into a per-root, **per-commit** cache under `.agentrec/attest-target/`.

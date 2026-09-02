@@ -181,7 +181,8 @@ pub fn open_turn_id(root: &Path) -> Option<String> {
 /// ran against a known commit" is the property the dev-loop-only flag records,
 /// and a non-repo satisfies it just as an edited tree does.
 pub fn tree_is_dirty(root: &Path) -> bool {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `git` with fixed subcommands for capture provenance.
+    #[allow(clippy::disallowed_methods)]
     let Ok(out) = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
@@ -232,7 +233,8 @@ pub fn run_wrapped(root: &Path, cmd: &[String]) -> Result<i32, String> {
         return Err("attest run: no command given (usage: attest run -- <cmd>)".to_string());
     };
 
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns the user's own test command for passive evidence capture; `program` is the argv the user invoked, not repo content.
+    #[allow(clippy::disallowed_methods)]
     let mut child = Command::new(program)
         .args(args)
         .current_dir(root)

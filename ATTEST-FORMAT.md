@@ -258,6 +258,30 @@ one-run verify would have made it permanently false.
 for it, and `VerdictKind` is a frozen core type. The count appears only in
 `attest verify`'s human-readable stdout line (`… -> claim-false (3 runs)`).
 
+## Replay environment
+
+Stated once, here. `attest verify` runs the replay with `env_clear()` plus an
+allowlist, because an inherited variable can change what a test does and a
+verdict is meant to be a property of the COMMITTED bytes, not of whoever ran
+the command.
+
+Inherited from the parent, if set: `PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`,
+`RUSTUP_TOOLCHAIN`, `TMPDIR`, `TERM`, and every variable whose name begins
+`LLVM_` (coverage tooling is located through `LLVM_COV`/`LLVM_PROFDATA` — stock
+`cargo llvm-cov` fails on a Homebrew rustc without them, so the prefix passes as
+a class rather than name by name).
+
+`CARGO_TARGET_DIR` is NOT inherited: a parent's value is dropped by the clear
+like any other, and the adapter then sets its own afterwards, so the replay
+always builds into the per-commit cache regardless of what the caller had set.
+
+Everything else is dropped. Widening this list is a founder decision, not an
+implementer's — the point of the scrub is that the set is small and stated.
+
+Only the replay is scrubbed. `attest coverage` and `attest capture` spawn with
+the inherited environment: the first needs the instrumenting variables
+`cargo llvm-cov show-env` emits, and the second runs the user's own command.
+
 ## Coverage map
 
 `.agentrec/attest-coverage.json`, written by `attest coverage`, read by the

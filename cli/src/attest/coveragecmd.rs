@@ -117,8 +117,11 @@ fn now_ms() -> u64 {
 
 /// `git rev-parse HEAD`, or empty when the crate is not in a git repo — the
 /// commit is provenance ON the map, not a precondition for capturing one.
+// Spawns `git rev-parse` for map provenance. The allow sits on the fn because
+// the spawn is its tail EXPRESSION, and expression-position attributes are not
+// stable.
+#[allow(clippy::disallowed_methods)]
 fn head_commit(dir: &Path) -> String {
-    // attest: sanctioned spawn (Phase 4 census)
     Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
@@ -133,7 +136,8 @@ fn head_commit(dir: &Path) -> String {
 /// or the user-facing reason they are unavailable.
 pub fn tooling_status() -> Result<(), String> {
     resolve_llvm_tools()?;
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `cargo llvm-cov --version` to test tooling availability.
+    #[allow(clippy::disallowed_methods)]
     let ok = Command::new(cargo_bin())
         .args(["llvm-cov", "--version"])
         .output()
@@ -155,14 +159,15 @@ pub fn run(
     if !all && ids.is_empty() {
         return Err("specify --all or one or more claim ids".to_string());
     }
-    // CANONICALIZED, and this is load-bearing rather than tidiness.
-    // `adapter_cargo::build_targets` sets `CARGO_TARGET_DIR` to
-    // `crate_root.join("target")` while ALSO setting `current_dir(crate_root)`,
-    // so a RELATIVE `--crate agentrec-core` yields the relative target dir
-    // `agentrec-core/target`, which cargo then resolves against the child's cwd
-    // — producing `agentrec-core/agentrec-core/target`. Measured live on a
-    // clone of this repo: 284 MB written to the wrong place, and the stray
-    // directory then made the tree dirty. An absolute path cannot compound.
+    // CANONICALIZED. This function does not call `adapter_cargo::build_targets`
+    // — it runs its own instrumented cargo invocation with an ABSOLUTE
+    // `CARGO_TARGET_DIR` (`attest_target_dir(root)`), so the relative-path
+    // nesting defect never applied to this path, and it is fixed at its own
+    // source anyway (`adapter_cargo::canonical_crate_root`). Kept because an
+    // absolute crate root is what the map's provenance and this function's own
+    // `current_dir` want. History, since the measurement is worth not losing:
+    // that defect wrote 284 MB to the wrong place on a clone of this repo, and
+    // the stray directory then made the tree dirty.
     let canonical;
     let crate_root = match crate_path {
         Some(p) => {
@@ -308,7 +313,8 @@ fn instrumented_build(
     target_dir: &Path,
     tools: &LlvmTools,
 ) -> Result<Vec<TargetInfo>, String> {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `cargo llvm-cov show-env` to read the instrumenting environment.
+    #[allow(clippy::disallowed_methods)]
     let env_out = Command::new(cargo_bin())
         .args(["llvm-cov", "show-env", "--sh"])
         .current_dir(crate_root)
@@ -324,7 +330,8 @@ fn instrumented_build(
         ));
     }
 
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns the instrumented `cargo test --no-run` build.
+    #[allow(clippy::disallowed_methods)]
     let mut build = Command::new(cargo_bin());
     build
         .args(["test", "--no-run", "--message-format=json"])
@@ -385,7 +392,8 @@ fn capture_one(
     objects: &[PathBuf],
     source_roots: &[String],
 ) -> Result<Vec<String>, String> {
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns a built libtest binary under instrumentation; the path came from cargo's artifact stream.
+    #[allow(clippy::disallowed_methods)]
     let _ = Command::new(&target.executable)
         .args(["--exact", fn_path, "--test-threads=1"])
         .env("LLVM_PROFILE_FILE", dir.join("p-%p-%10m.profraw"))
@@ -406,7 +414,8 @@ fn capture_one(
     }
 
     let profdata = dir.join("t.profdata");
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `llvm-profdata` from the resolved rustup toolchain.
+    #[allow(clippy::disallowed_methods)]
     let merge = Command::new(&tools.profdata)
         .arg("merge")
         .arg("-sparse")
@@ -431,7 +440,8 @@ fn capture_one(
         args.push("-object".into());
         args.push(obj.into());
     }
-    // attest: sanctioned spawn (Phase 4 census)
+    // Spawns `llvm-cov` from the resolved rustup toolchain.
+    #[allow(clippy::disallowed_methods)]
     let export = Command::new(&tools.cov)
         .args(&args)
         .output()

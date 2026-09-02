@@ -772,6 +772,9 @@ fn probe_mcp_initialize(exe: &Path, root: &Path) -> Result<(), String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
+    // Spawns THIS binary (`exe` is our own resolved path) to probe the
+    // daemon; never a repo-authored command.
+    #[allow(clippy::disallowed_methods)]
     let mut child = Command::new(exe)
         .arg("--root")
         .arg(root)
@@ -946,6 +949,10 @@ fn check_inotify(_root: &Path) -> Check {
 }
 
 #[cfg(test)]
+// This mod spawns `git` to build its own tempdir fixtures. Scoped to the test
+// mod so the single production spawn in this file stays per-site annotated
+// (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
