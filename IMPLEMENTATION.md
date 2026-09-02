@@ -1380,6 +1380,23 @@ simply had no `CLAIM_FALSE × fyi` row, and the gate returned `PASS (0 blocking)
 on that shape while `attest status` reported `claim_false: 1`.
 — `attest_gate::p5_2_gate_exit_code_table`
 
+**The paragraph above was FALSE at `c1d4dd5` and is made true by this commit.**
+At `c1d4dd5` the generator seeded `manual-declare` FIRST whenever a row carried
+a severity, and the fold's `ManualDeclare` arm only sets `ClaimStatus::Declared`
+on `first_sight`. Two recipes therefore stalled: `derived` (nothing after the
+declare moves status — the `Derive` arm assigns none) and `evidenced` (the
+`Evidence` arm only fires out of `Derived`, and the claim sat at `DECLARED`).
+`derived`/`evidenced` × {blocking, fyi} × {stale, not-stale} = **8 of the 59
+rows** were silently re-testing the `DECLARED` cell under another label, and no
+assertion checked that a row reached the status its name claims. `c1d4dd5`'s
+commit message says "60 cells" of that table; that claim did not hold then.
+Fixed here by appending `manual-declare` AFTER the recipe (severity is written
+unconditionally either way, so the recipe's real status survives) plus a per-row
+`status_label` assertion covering all 59 rows. One row is expected not to match
+its own name and is asserted positively as `derived`: `declared × severity=none
+× stale=true` writes only a `Stale` event, so the claim is born `DERIVED` and
+never becomes `DECLARED`.
+
 **AC-ATTEST-P5-3.** `recipe-invalid` and `flaky-observation` never produce a
 nonzero `attest gate` exit, on their own or in combination, and the ids appear
 in the advisory section with their cause.

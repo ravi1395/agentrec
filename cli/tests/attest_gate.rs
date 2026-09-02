@@ -207,9 +207,40 @@ fn p5_1_manual_declare_appends_and_status_shows_it() {
 // AC-ATTEST-P5-2, P5-3, P5-8
 // ---------------------------------------------------------------------------
 
+/// Maps a recipe's name to the `ClaimStatus` it must actually reach, so a
+/// recipe that silently stalls (e.g. stuck at `DECLARED` because the
+/// severity event landed first and the fold's `ManualDeclare` arm only sets
+/// status on `first_sight`) reds instead of quietly re-testing a different
+/// cell than its row claims to be.
+fn status_label(status: &ClaimStatus) -> &'static str {
+    match status {
+        ClaimStatus::Derived => "derived",
+        ClaimStatus::Declared => "declared",
+        ClaimStatus::Evidenced => "evidenced",
+        ClaimStatus::Confirmed => "confirmed",
+        ClaimStatus::ClaimFalse => "claim_false",
+        ClaimStatus::RecipeInvalid { .. } => "recipe_invalid",
+        ClaimStatus::Flaky => "flaky",
+        ClaimStatus::Human {
+            answer: HumanAnswer::Yes,
+        } => "human_yes",
+        ClaimStatus::Human {
+            answer: HumanAnswer::No,
+        } => "human_no",
+        ClaimStatus::Human {
+            answer: HumanAnswer::Skip,
+        } => "human_skip",
+    }
+}
+
 /// The full cross product AC-ATTEST-P5-2 describes, GENERATED rather than
-/// hand-listed: every reachable `ClaimStatus` × manual severity
-/// {none, blocking, fyi} × `STALE` overlay {no, yes}.
+/// hand-listed: 10 status recipes × manual severity {none, blocking, fyi} ×
+/// `STALE` overlay {no, yes}. A per-row assertion (`status_label`) checks the
+/// fold actually reached the status the recipe names, so a recipe that
+/// stalls short of it (see `status_label`'s doc) reds instead of quietly
+/// re-testing a different, unlabeled cell — this is what let 8 of the 59
+/// rows (`derived`/`evidenced` × {blocking, fyi} × {stale, not-stale}) pass
+/// as `DECLARED` before this assertion existed.
 ///
 /// Expected sections are derived from the folded state by re-stating the rule
 /// (`ATTEST-FORMAT.md` § "Gate blocking, precisely") over `agentrec_core`'s own
@@ -220,11 +251,25 @@ fn p5_1_manual_declare_appends_and_status_shows_it() {
 ///
 /// Each row gets its own root holding exactly ONE claim, so the exit code is
 /// attributable to that claim alone.
+///
+/// The product is over shapes the FOLD can reach, not over shapes a writer
+/// can produce: `manual-declare` mints a fresh `ClaimId`, so no production
+/// writer emits a declare onto a claim that already carries derives,
+/// evidence or a verdict — `fold.rs`'s `ManualDeclare` arm calls exactly
+/// that a writer bug and records the text without touching the status. The
+/// severity event is placed last anyway, because that is what isolates
+/// severity × status as two independent axes; the old ordering was equally
+/// unproducible, so this is not a change in what production can emit.
 #[test]
 fn p5_2_gate_exit_code_table() {
-    // Event recipes reaching each status. `manual-declare`, when the row has a
-    // severity, is appended FIRST so `first_sight` sets `DECLARED` and later
-    // events move the status while the severity persists.
+    // Event recipes reaching each status. `manual-declare`, when the row has
+    // a severity, is appended AFTER the recipe: the fold's `ManualDeclare`
+    // arm only sets status on `first_sight`, so declaring first would strand
+    // every non-empty recipe at `DECLARED` (`Evidence` only fires out of
+    // `Derived`, `Verdict`/`Human` only progress a status the recipe itself
+    // set) while still writing `manual_severity` unconditionally either way —
+    // appending last reaches the recipe's real status AND carries the
+    // severity.
     let recipes: Vec<(&str, Vec<AttestEvent>)> = vec![
         ("declared", vec![]),
         ("derived", vec![derive(1)]),
@@ -272,10 +317,10 @@ fn p5_2_gate_exit_code_table() {
         for (sev_name, severity) in severities {
             for stale in [false, true] {
                 let mut events = Vec::new();
+                events.extend(recipe.iter().cloned());
                 if let Some(severity) = severity {
                     events.push(declare(1, severity));
                 }
-                events.extend(recipe.iter().cloned());
                 if stale {
                     events.push(AttestEvent::Stale {
                         ts: 900,
@@ -299,6 +344,26 @@ fn p5_2_gate_exit_code_table() {
                     skipped += 1;
                     continue;
                 };
+
+                // Every row asserts the status the fold actually reached, so
+                // a stalled recipe reds instead of silently re-testing a
+                // different cell than the one it is labeled as. One row is
+                // expected NOT to match its own name: `declared × none ×
+                // stale=true` writes only a `Stale` event, so the claim is
+                // born `DERIVED` by `ClaimState::new` and never becomes
+                // `DECLARED` (see the `skipped` comment below). It is
+                // asserted positively rather than skipped.
+                let expected_label = if *status_name == "declared" && sev_name == "none" && stale {
+                    "derived"
+                } else {
+                    *status_name
+                };
+                assert_eq!(
+                    status_label(&state.status),
+                    expected_label,
+                    "{label}: recipe did not reach its expected status (actual: {:?})",
+                    state.status
+                );
 
                 // The rule, restated over the fold's truth.
                 let blocks = state.status.blocks_gate()
