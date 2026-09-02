@@ -58,6 +58,16 @@ pub fn attest_target_dir(root: &Path) -> PathBuf {
 /// and the daemon cannot disagree — see
 /// [`crate::attest::coverage::resolve_coverage_path`] for what that
 /// disagreement cost.
+/// **Keep the configured path under `.agentrec/` (or otherwise gitignored).**
+/// `.agentrec/` is ignored in a repo `init` set up, so the default map is
+/// invisible to git. A path outside it leaves the written map as an untracked
+/// file, which makes the working tree DIRTY — and `attest verify` refuses a
+/// dirty tree outright, because a verdict minted then would be stamped with a
+/// commit that never held those bytes. Measured: with
+/// `attest_coverage_path = "custom/cov.json"`, `git status --porcelain` reports
+/// `?? custom/` and the next `attest verify` exits 1 with "working tree is
+/// dirty". Nothing refuses the configuration itself; the cost lands on the next
+/// verify.
 pub fn coverage_path(root: &Path, cfg: &crate::config::Config) -> PathBuf {
     crate::attest::coverage::resolve_coverage_path(root, cfg)
 }
@@ -176,16 +186,22 @@ pub fn run(
     // `current_dir` want. History, since the measurement is worth not losing:
     // that defect wrote 284 MB to the wrong place on a clone of this repo, and
     // the stray directory then made the tree dirty.
-    let canonical;
-    let crate_root = match crate_path {
-        Some(p) => {
-            canonical = p
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve --crate {}: {e}", p.display()))?;
-            canonical.as_path()
-        }
-        None => root,
+    // BOTH arms, and the `--root` arm is not decoration: `spawn_scopes` strips
+    // the crate root off cargo's `src_path`, which cargo reports CANONICAL. A
+    // symlinked root (`/tmp` and `/var` are symlinks on macOS) therefore failed
+    // every strip, and the failure is silent in the dangerous direction —
+    // `over_stale` came out `[]` on every entry, so binary-spawning tests were
+    // never staled and nothing said so. Measured on one fixture: canonical root
+    // -> `["src/**"]`, same fixture through a symlink -> `[]`.
+    let canonical = match crate_path {
+        Some(p) => p
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve --crate {}: {e}", p.display()))?,
+        None => root
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve root {}: {e}", root.display()))?,
     };
+    let crate_root = canonical.as_path();
 
     // Refuse before writing anything: a partial or empty map is worse than no
     // map, because the daemon cannot tell the two apart.

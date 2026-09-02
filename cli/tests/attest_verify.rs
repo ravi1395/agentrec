@@ -490,8 +490,11 @@ fn ac_p4_8_coverage_maps_the_fixture_crate_at_file_granularity() {
             files.iter().any(|f| f == "src/lib.rs"),
             "{name} must cover src/lib.rs, got {files:?}"
         );
-        // The fixture's package is not `agentrec`, so the binary-spawning
-        // over-stale rule must NOT fire — this is the ALLOW half of the rule.
+        // The fixture crate declares no `[[bin]]`, so it builds no binary for
+        // a test to spawn and the over-stale rule derives no scope — this is
+        // the ALLOW half. (The rule keys on bin targets, not on the package
+        // name; `ac_p4c_7` adds a `[[bin]]` to a tempdir copy and gets
+        // `src/**`.)
         assert_eq!(
             entry["over_stale"],
             serde_json::json!([]),
@@ -932,5 +935,34 @@ fn ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope() {
         unit["over_stale"],
         serde_json::json!([]),
         "the lib target must carry no over_stale: {map}"
+    );
+
+    // A SYMLINKED --root must derive the same scope. `spawn_scopes` strips the
+    // crate root off cargo's `src_path`, which cargo reports canonical, so an
+    // uncanonicalized root failed every strip and produced `[]` on every entry
+    // with no warning — and `/tmp` and `/var` are symlinks on macOS, so this is
+    // the ordinary case, not an exotic one.
+    let link = f.path().parent().unwrap().join("linked-root");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(f.path(), &link).unwrap();
+    let out = Command::new(bin())
+        .args(["attest", "coverage", "--all", "--root"])
+        .arg(&link)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "coverage via symlinked root failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let map: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.path().join(".agentrec/attest-coverage.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        map["tests"]["integration::integration_add_works"]["over_stale"],
+        serde_json::json!(["src/**"]),
+        "a symlinked root must derive the same scope as a canonical one: {map}"
     );
 }

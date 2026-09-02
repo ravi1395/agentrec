@@ -1021,8 +1021,10 @@ afterwards. —
 **AC-ATTEST-P4-8.** `attest coverage` writes `.agentrec/attest-coverage.json`
 per the schema, atomically (fresh `create_new` tmp + rename). On the fixture
 crate both discovered tests carry `src/lib.rs` in their file set and
-`over_stale: []` — the fixture's package is not `agentrec`, so the
-binary-spawning over-stale rule does not fire. When `cargo llvm-cov` or the
+`over_stale: []` — the fixture crate declares no `[[bin]]`, so it builds no
+binary for a test to spawn and the over-stale rule derives no scope. (The rule
+keys on bin targets, not on the package name; AC-ATTEST-P4C-7 adds a `[[bin]]`
+to a tempdir copy of the same fixture and gets `src/**`.) When `cargo llvm-cov` or the
 LLVM tools are unavailable the test is skipped with a PRINTED reason, never
 silently. —
 `attest_verify::ac_p4_8_coverage_maps_the_fixture_crate_at_file_granularity`
@@ -1229,6 +1231,15 @@ is visible rather than merely absent. —
 `attest_stale::ac_p4c_6_the_daemon_stales_from_the_configured_coverage_path` +
 `attest::coverage::tests::resolve_coverage_path_honors_the_config_key_and_falls_back_to_the_default`
 
+**Caveat on the key, disclosed not enforced:** an `attest_coverage_path`
+outside `.agentrec/` (which `init` gitignores) leaves the written map as an
+untracked file, so the working tree is DIRTY and the next `attest verify`
+refuses outright — a verdict minted then would carry a commit that never held
+those bytes. Measured with `attest_coverage_path = "custom/cov.json"`:
+`git status --porcelain` reports `?? custom/`, `attest verify` exits 1 with
+"working tree is dirty". Nothing rejects the configuration itself; the cost
+lands on the next verify.
+
 **AC-ATTEST-P4C-7.** `over_stale` scopes are DERIVED from cargo's artifact
 stream — for each package that builds a binary, the bin target's source
 directory made repo-relative — instead of keying on the literal package name
@@ -1238,10 +1249,23 @@ package with a `[[bin]]` now yields `src/**` through a real producer run, which
 is what makes the non-empty branch testable at all. A bin whose source lies
 outside the crate root yields NO scope rather than an absolute glob — an
 absolute pattern would read as coverage while matching nothing, since
-`coverage::match_kind` refuses absolute paths. —
+`coverage::match_kind` refuses absolute paths (that refusal is cited as a
+mechanism, so it now carries its own test: removing it previously left every
+coverage test green).
+
+**The crate root is canonicalized on BOTH arms**, `--crate` and a bare
+`--root`. `spawn_scopes` strips the crate root off cargo's `src_path`, which
+cargo reports canonical, so a symlinked root failed every strip and produced
+`over_stale: []` on every entry with no warning — and `/tmp` and `/var` are
+symlinks on macOS, making that the ordinary case. Measured before the fix on
+one fixture: canonical root or cwd yields `["src/**"]`, the same fixture
+through a symlink yields `[]`. —
 `attest_verify::ac_p4c_7_a_binary_building_package_gets_a_derived_over_stale_scope`
+(three legs: the derived scope, the lib-target ALLOW half, and a symlinked
+`--root`)
 + `coveragecmd::tests::over_stale_fires_only_for_binary_spawning_targets_of_this_package`
 + `coveragecmd::tests::a_bin_outside_the_crate_root_yields_no_scope_rather_than_an_absolute_glob`
++ `attest::coverage::tests::absolute_paths_and_absolute_globs_both_match_nothing`
 
 **AC-ATTEST-P4C-8.** `attest verify --all-stale` verifies every stale claim: a
 fixture with two stale claims yields two `verdict` events. Previously untested. —

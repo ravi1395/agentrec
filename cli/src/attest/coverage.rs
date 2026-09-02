@@ -233,6 +233,39 @@ mod tests {
         assert!(claims_touched_by(&map, "src/a.rs.bak").is_empty());
     }
 
+    /// AC-ATTEST-P4C-7. `match_kind`'s `is_absolute()` refusal is cited as the
+    /// reason `spawn_scopes` emits NO scope rather than an absolute glob, so it
+    /// needs a test of its own — without one, removing the refusal left every
+    /// coverage test green and the cited mechanism unverified.
+    ///
+    /// Both directions: an absolute PATH matches nothing (even against a glob
+    /// that would match its relative form), and an absolute GLOB matches
+    /// nothing (even against the relative path it names).
+    #[test]
+    fn absolute_paths_and_absolute_globs_both_match_nothing() {
+        let entry = CoverageEntry {
+            claim_id: ClaimId::parse("c_00000000010W3GE1R70W3GE1R7").unwrap(),
+            files: Vec::new(),
+            over_stale: vec!["cli/src/**".to_string()],
+            captured_at: 1,
+            commit: "abc".into(),
+        };
+        // Control: the relative form DOES match, so the negatives below are
+        // about absoluteness and not about a broken fixture.
+        assert_eq!(
+            match_kind(&entry, "cli/src/x.rs"),
+            Some(MatchKind::OverStale("cli/src/**".to_string()))
+        );
+        assert_eq!(match_kind(&entry, "/r/cli/src/x.rs"), None);
+
+        let abs_glob = CoverageEntry {
+            over_stale: vec!["/r/cli/src/**".to_string()],
+            ..entry.clone()
+        };
+        assert_eq!(match_kind(&abs_glob, "cli/src/x.rs"), None);
+        assert_eq!(match_kind(&abs_glob, "/r/cli/src/x.rs"), None);
+    }
+
     /// AC-ATTEST-P4C-5. The kind is what the daemon writes its `stale` cause
     /// from, so the two arms must be distinguishable AND the glob that fired
     /// must travel with the `OverStale` arm — a bare bool would lose the scope

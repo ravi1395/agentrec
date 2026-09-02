@@ -1,9 +1,8 @@
 //! `agentrec attest verify [--all-stale | <claim_id>...]` — the INDEPENDENT
 //! replay, and the only writer of `verdict` events.
 //!
-//! The verdict policy (one run, retries only on failure, three runs before
-//! `claim-false`) is stated ONCE in `ATTEST-FORMAT.md` § "Verdict policy" and
-//! is not restated here — this module implements it in [`decide`].
+//! The verdict policy is stated ONCE in `ATTEST-FORMAT.md` § "Verdict policy".
+//! This module implements it ([`decide`], [`replay`]) and does not restate it.
 //!
 //! # Why `git archive`, never `git worktree add`
 //!
@@ -35,6 +34,12 @@
 //! test does, and a verdict is meant to be a property of the committed bytes.
 //! `adapter_cargo::RunEnv` carries this as an explicit parameter, so every
 //! other adapter caller keeps inheriting.
+//!
+//! Scoped precisely: the scrub covers the cargo invocations that BUILD and RUN
+//! the test. The `--list` membership precheck (`adapter_cargo::list_tests`)
+//! spawns the built libtest binary with the inherited environment — it
+//! enumerates test names and runs no test body, so it cannot carry an
+//! inherited variable into a verdict.
 //!
 //! Independent of the scrub, the extract's `target/` is a SYMLINK to a
 //! per-commit cache under `.agentrec/attest-target/`, so

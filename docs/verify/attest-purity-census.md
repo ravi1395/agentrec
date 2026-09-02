@@ -24,8 +24,8 @@ Two further limits, both real:
 
 - **Test code is out of scope by design.** All **19** spawning `cli/tests/*.rs`
   files carry a file-level `#![allow(clippy::disallowed_methods)]` (measured;
-  in `golden.rs` and `torture.rs` it sits at lines 111 and 53, below a long
-  module doc, so a short head-of-file scan misses it). In `cli/src`, exactly
+  in `golden.rs` and `torture.rs` it sits below a long module doc rather than at
+  the top of the file, so a short head-of-file scan misses it). In `cli/src`, exactly
   three `#[cfg(test)] mod tests` blocks contain a spawn: `daemon.rs` and
   `service.rs` already carried a module-scoped allow, and **`doctorcmd.rs`
   carried none** — this round added one there, with a reason true of that mod
@@ -80,9 +80,12 @@ landed 16 attest spawn sites after that measurement, and `bisectcmd.rs` /
 `feat/phase-3-0`). The plan itself says to re-enumerate at task time.
 
 **One correction to the task brief:** `service.rs`'s 6 production sites are
-launchctl/systemctl only. Its `mkfifo` spawn is at `:1395`, *after* the
-`#[cfg(test)]` at `:691` — it is test-side and already covered by that mod's
-blanket allow.
+launchctl/systemctl only. Its `mkfifo` spawn lives in
+`service.rs::tests::install_refuses_when_unit_path_is_a_fifo`, i.e. inside the
+`#[cfg(test)] mod tests` — it is test-side and already covered by that mod's
+blanket allow. (Anchors, not line numbers: the figures this sentence first
+carried had already rotted by two commits, which is the rot this repo records
+against itself.)
 
 ## Direction 1 — baseline green after the sweep
 
