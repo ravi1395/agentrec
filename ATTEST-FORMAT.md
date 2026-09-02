@@ -22,7 +22,7 @@ Unlike `log.jsonl`, this file has **multiple routine writers**: CLI commands
 append `evidence` / `verdict` / `human` / `manual-declare`, and the daemon
 appends `stale`. Every writer — the daemon included — takes the append lock in
 `cli/src/attest/lock.rs` (`append_attest_locked`, blocking); the daemon's own
-`stale` writer lands in Phase 4 and must use the same call.
+`stale` writer landed in Phase 4 and uses that same call.
 
 Every event carries `kind` (the serde tag) and `ts` (unix milliseconds), and
 names the claim it applies to with `claim_id`.

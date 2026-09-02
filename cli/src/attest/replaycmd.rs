@@ -136,7 +136,16 @@ pub fn run(root: &Path, all_stale: bool, ids: &[String]) -> Result<(), String> {
             Some(status) if status != expected_status_label(&verdict) => {
                 let appended_clause =
                     format!("{head} -> verdict {appended} appended ({runs} run{plural});");
-                println!("{appended_clause} claim remains {status} (permanent, decision 4)");
+                // The permanence clause is EARNED, not decoration: only
+                // `CLAIM_FALSE` is permanent (spec decision 4). Any other
+                // divergence — a `stale` overlay or a later event the fold
+                // resolved differently — is reported without claiming a
+                // permanence the fold does not enforce.
+                if status == status_label(&ClaimStatus::ClaimFalse) {
+                    println!("{appended_clause} claim remains {status} (permanent, decision 4)");
+                } else {
+                    println!("{appended_clause} claim status is {status}");
+                }
             }
             _ => println!("{head} -> {appended} ({runs} run{plural})"),
         }

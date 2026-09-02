@@ -1,9 +1,17 @@
 //! Phase 5 acceptance tests: `attest manual-declare` / `review` / `gate` /
 //! `report`, the unhidden subcommand, and `attest status`'s additive keys.
 //!
-//! Fixtures are literal `attest.jsonl` lines, written by hand from the shapes
-//! `ATTEST-FORMAT.md` documents, so a serializer regression cannot make a test
-//! agree with itself.
+//! Fixtures are built from real [`AttestEvent`] values and written out through
+//! this crate's own serde impls (`seed`). That is deliberate — these tests are
+//! about the verbs' BEHAVIOUR, and hand-typing every line would make each new
+//! case an exercise in transcribing the wire format — but it means a
+//! serializer regression would move the fixture and the code under test
+//! together, so nothing here can catch one.
+//!
+//! The literal-text fixture lives in `cli/tests/golden.rs::ATTEST_LOG`, which
+//! is hand-written from the shapes `ATTEST-FORMAT.md` documents and is where
+//! the "a serializer regression cannot make the test agree with itself"
+//! property actually holds.
 
 #![allow(clippy::disallowed_methods)]
 //  ^ Test code spawns the binary under test and `git`, and reads its own
@@ -721,9 +729,120 @@ fn p5_10_range_rejects_bad_input() {
     }
 }
 
+/// A `stale` event on an `fyi` claim must not sneak it into the advisory list.
+/// The severity guard runs before every branch, not just the manual one — an
+/// earlier version guarded only the manual note and this shape got through.
+#[test]
+fn p5_8_a_stale_fyi_claim_still_appears_nowhere_in_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stale = |n: u8| AttestEvent::Stale {
+        ts: 400 + u64::from(n),
+        claim_id: cid(n),
+        cause: StaleCause::FileWrite {
+            path: "cli/src/x.rs".into(),
+        },
+    };
+    seed(
+        root,
+        &[
+            declare(1, ManualSeverity::Fyi),
+            stale(1),
+            // A control in the same log: a stale NON-manual claim must still
+            // produce its advisory line, or this test would pass on a gate
+            // that lost the stale note entirely.
+            derive(2),
+            stale(2),
+        ],
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&out(&agentrec(root, &["attest", "gate", "--json"]))).unwrap();
+    assert_eq!(json["pass"], true);
+    assert!(json["blocking"].as_array().unwrap().is_empty(), "{json}");
+    let advisory: Vec<&str> = json["advisory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["claim_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        advisory,
+        vec![cid(2).to_string()],
+        "only the non-fyi stale claim may be advisory: {json}"
+    );
+
+    let text = agentrec(root, &["attest", "gate"]);
+    assert_eq!(code(&text), 0);
+    assert!(
+        !out(&text).contains(&cid(1).to_string()),
+        "the stale fyi claim must not appear in gate text: {}",
+        out(&text)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC-ATTEST-P5-11, P5-12
 // ---------------------------------------------------------------------------
+
+/// AC-ATTEST-P5-10: a reversed range is refused rather than normalized, and a
+/// root with no git history says so instead of blaming the revision.
+#[test]
+fn p5_10_range_refuses_a_reversed_pair_and_a_repo_less_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed(root, &[declare(1, ManualSeverity::Blocking)]);
+
+    // No git history at all: the error names the missing repo, not a sha.
+    let o = agentrec(root, &["attest", "report", "--range", "HEAD~1..HEAD"]);
+    assert_ne!(code(&o), 0);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(
+        err.contains("is not a git repository"),
+        "a repo-less root must say so: {err}"
+    );
+    assert!(
+        !err.contains("not a revision"),
+        "it must NOT blame the revision: {err}"
+    );
+
+    // Now a real repo with two commits at fixed, ordered dates.
+    git(root, &["init", "-q", "."]);
+    git(root, &["config", "user.email", "t@example.com"]);
+    git(root, &["config", "user.name", "t"]);
+    let commit = |msg: &str, date: &str| {
+        std::fs::write(root.join("a.txt"), msg).unwrap();
+        git(root, &["add", "-A"]);
+        let mut c = Command::new("git");
+        c.args(["commit", "-qm", msg])
+            .current_dir(root)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date);
+        assert!(c.output().unwrap().status.success());
+        String::from_utf8_lossy(&git(root, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string()
+    };
+    let base = commit("base", "@1000000 +0000");
+    let head = commit("head", "@2000000 +0000");
+
+    // Correct order works; reversed is an error naming the order.
+    let ok = agentrec(
+        root,
+        &["attest", "report", "--range", &format!("{base}..{head}")],
+    );
+    assert_eq!(code(&ok), 0, "{}", String::from_utf8_lossy(&ok.stderr));
+    let rev = agentrec(
+        root,
+        &["attest", "report", "--range", &format!("{head}..{base}")],
+    );
+    assert_ne!(code(&rev), 0, "a reversed range must be refused");
+    let err = String::from_utf8_lossy(&rev.stderr).into_owned();
+    assert!(
+        err.contains("base must not be later than head"),
+        "the error must name the order: {err}"
+    );
+}
 
 #[test]
 fn p5_11_attest_is_visible_and_lists_every_verb() {

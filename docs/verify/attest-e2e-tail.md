@@ -2,10 +2,15 @@
 
 Plan: `docs/superpowers/plans/2026-08-28-attest-plan.md` § "Manual E2E tail".
 Run 2026-09-02 on branch `feat/attest`. The first pass ran at `09276fd` + the
-Phase 5 working tree; sections 6 and 7 were **re-run** after the 2026-09-02
+Phase 5 working tree; **sections 6, 7 and 9** were re-run after the 2026-09-02
 founder ruling on `fyi` and the `attest verify` output fix (post-`bcccabc`
-working tree), and carry that re-run's output. Both passes used the **release**
-binary `target/release/agentrec` against a fresh fixture crate.
+working tree), and carry that re-run's output — their claim ids begin
+`c_01M1H5…`, the first pass's begin `c_01M1H4…`, which is how to tell them
+apart. Sections 1–5 and 8 are first-pass output and were NOT re-run: neither
+fix reaches them (section 5's gate output is a `claim-false` blocker, which the
+`fyi` ruling does not touch, and no section before 6 invokes `attest verify`
+after a refutation). Both passes used the **release** binary
+`target/release/agentrec` against a fresh fixture crate.
 
 **Not run on this repository.** The script ran against a throwaway two-test cargo
 crate under the session scratchpad
@@ -184,11 +189,13 @@ code and this record.
 ### 8. report, with and without `--range`
 
 *Provenance: this section is the FIRST pass's output (claim ids `c_01M1H4…`).
-The re-run that produced sections 6–7 stopped after `derive` — it did not
-repeat `attest run` or `coverage` — so its claims are `DERIVED` with no
-evidence and its `--range` window holds 0 claims. Neither the report renderer
-nor the range filter changed between the two passes; only the `last verdict`
-label did, and the line below carries the current wording.*
+The re-run that produced sections 6–7 ran `derive` and `verify` but NOT
+`attest run` or `coverage`, so in that pass no claim carries an `evidence`
+event: `add_is_sum` reached `CLAIM_FALSE` through verify alone and
+`add_is_commutative` stayed `DERIVED`. Its `--range` window also holds 0 claims,
+because every event it wrote landed after its last commit. Neither the report
+renderer nor the range filter changed between the two passes; only the
+`last verdict` label did, and the line below carries the current wording.*
 
 ```
 $ agentrec attest report --root $S

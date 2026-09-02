@@ -13,6 +13,7 @@
 
 use crate::attest::lock::read_attest;
 use crate::attest::statuscmd::{blocking_reason, cause_label};
+use agentrec_core::attest::events::ManualSeverity;
 use agentrec_core::attest::fold::{fold_claims, ClaimStatus};
 use std::path::Path;
 
@@ -31,6 +32,14 @@ pub fn run(root: &Path, json: bool) -> Result<bool, String> {
     let mut advisory: Vec<Item> = Vec::new();
 
     for claim in folded.claims.values() {
+        // `fyi` manual claims are skipped BEFORE any branch below, so they
+        // reach neither list by any route. Guarding only the manual note
+        // was not enough: a `stale` event on an `fyi` claim still produced an
+        // advisory line, which contradicts `ATTEST-FORMAT.md`'s "visible in
+        // `attest report` and in `attest status`'s counts, and nowhere else".
+        if claim.manual_severity == Some(ManualSeverity::Fyi) {
+            continue;
+        }
         let id = claim.claim_id.to_string();
         if let Some(reason) = blocking_reason(claim) {
             blocking.push(Item {
@@ -54,11 +63,6 @@ pub fn run(root: &Path, json: bool) -> Result<bool, String> {
             }
             _ => {}
         }
-        // `fyi` manual claims are deliberately absent from BOTH lists. They
-        // are informational, and the gate is where a release decision is
-        // made — listing an item that can never affect it is the nagging
-        // `fyi` exists to avoid. They remain visible in `attest report` and
-        // in `attest status`'s counts.
         if claim.is_stale() {
             notes.push("stale: a write landed in this claim's coverage scope".to_string());
         }

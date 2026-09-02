@@ -1323,6 +1323,15 @@ the round's brief, which had asked for `fyi` cards and advisory lines; an
 earlier version of this block recorded that as a deviation and it is now
 reverted, code and text together.
 
+**Correction to `8c917d2`'s commit message** (the message itself is immutable;
+this is the durable record, and the next commit message states it too). It said
+"Goldens unchanged (they hold no manual claims)". The parenthetical is false:
+`golden.rs::ATTEST_LOG` carries a `manual-declare` with `severity: blocking`
+(claim `c_00000000040W3GE1R70W3GE1R7`). The true reason the goldens did not move
+is that the fixture holds no **`fyi`** claim, and the ruling changed the handling
+of `fyi` only — a blocking manual claim renders in `attest report` exactly as it
+did before.
+
 **The gate's blocking rule is stated once**, in `ATTEST-FORMAT.md` § "Gate
 blocking, precisely" (that section's "lands in Phase 5" future tense is replaced
 by the implemented rule). `gatecmd.rs` and `reviewcmd.rs` point at it and do not
@@ -1380,6 +1389,11 @@ lists the cards and never prompts or appends.
 in `attest gate`'s blocking OR advisory list. It IS present in `attest report`
 and counted by `attest status`, so it is recorded rather than dropped.
 — `attest_gate::p5_8_fyi_is_absent_from_review_and_gate_but_present_in_report`
+and `attest_gate::p5_8_a_stale_fyi_claim_still_appears_nowhere_in_the_gate` (the
+severity guard runs before EVERY gate branch, not just the manual one — guarding
+only the manual note let a `stale` event on an `fyi` claim print an advisory
+line; the test carries a stale non-`fyi` control so it cannot pass on a gate
+that lost the stale note altogether)
 
 **AC-ATTEST-P5-9.** `attest report` prints a markdown bundle and `--json` the
 same data as one object: per claim its id, test identity or manual criterion
@@ -1397,8 +1411,13 @@ in the range. `git log -1 --format=%ct` reports SECONDS and `AttestEvent::ts` is
 unix MILLISECONDS, so the boundary multiplies by 1000. A `--range` whose base or
 head is not a resolvable revision is an error (detected from git's exit status),
 as is a range missing either side or written with `...`.
-— `attest_gate::p5_10_range_filters_by_commit_time` and
-`attest_gate::p5_10_range_rejects_bad_input`
+A **reversed** `head..base` is refused rather than normalized — sorting the pair
+would answer a different question than the header names — and a root with no git
+history reports the missing repository rather than blaming the revision (git's
+stderr distinguishes them).
+— `attest_gate::p5_10_range_filters_by_commit_time`,
+`attest_gate::p5_10_range_rejects_bad_input`, and
+`attest_gate::p5_10_range_refuses_a_reversed_pair_and_a_repo_less_root`
 
 **AC-ATTEST-P5-11.** `attest` is no longer `#[command(hide = true)]`: it appears
 in `agentrec --help`, and `agentrec attest --help` lists `status`, `derive`,
@@ -1413,7 +1432,10 @@ from re-reading and re-folding the log after the append, so `attest verify` and
 unchanged. — `attest_verify::p5_13_a_passing_replay_on_a_refuted_claim_prints_both`
 and `attest_verify::p5_13_an_agreeing_verdict_keeps_the_short_line` (the
 agreeing case must NOT grow the second clause, or the first test would pass on
-a line that always prints both)
+a line that always prints both). The permanence clause is printed only when the
+folded status is `CLAIM_FALSE`, the one status decision 4 makes permanent; any
+other divergence prints `claim status is <STATUS>` without asserting a
+permanence the fold does not enforce.
 
 **AC-ATTEST-P5-12.** `attest status --json` gains `recipe_invalid_causes` (a
 per-cause object) and `manual` (blocking/fyi × answered/unanswered counts). Every

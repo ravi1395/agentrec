@@ -40,6 +40,19 @@ fn commit_time_ms(root: &Path, rev: &str) -> Result<u64, String> {
         .output()
         .map_err(|e| format!("cannot run git in {}: {e}", root.display()))?;
     if !out.status.success() {
+        // Two different user errors, two different fixes: a typo'd sha in a
+        // real repo, versus running the verb somewhere that has no git
+        // history at all. Reporting the second as "not a revision in this
+        // repo" sends the reader hunting for a sha when the repo is what is
+        // missing. git names the condition on stderr; nothing else in its
+        // failure output says "not a git repository".
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("not a git repository") {
+            return Err(format!(
+                "--range needs git history, and {} is not a git repository",
+                root.display()
+            ));
+        }
         return Err(format!("--range: not a revision in this repo: {rev}"));
     }
     String::from_utf8_lossy(&out.stdout)
@@ -73,7 +86,16 @@ pub fn run(root: &Path, json: bool, range: Option<&str>) -> Result<(), String> {
             let (base, head) = parse_range(range)?;
             let lo = commit_time_ms(root, base)?;
             let hi = commit_time_ms(root, head)?;
-            Some((range.to_string(), lo.min(hi), lo.max(hi)))
+            // A reversed range is refused, not silently normalized. Sorting
+            // the pair would make `head..base` and `base..head` print the
+            // same report under a header naming the order the user asked
+            // for — a wrong question answered without complaint.
+            if lo > hi {
+                return Err(format!(
+                    "--range <base>..<head>: base must not be later than head,                      but {base} commits after {head}"
+                ));
+            }
+            Some((range.to_string(), lo, hi))
         }
         None => None,
     };
