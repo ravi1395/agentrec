@@ -50,6 +50,7 @@ use agentrec_core::attest::types::{
     RecipeInvalidCause, StructuredResult, TestIdentity, TestOutcome,
 };
 use quote::ToTokens;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -734,6 +735,56 @@ pub fn bulk_results(stdout: &str, targets: &[String]) -> Vec<StructuredResult> {
     out
 }
 
+/// Strip ANSI SGR sequences (`ESC [` digits/`;` `m`) from one line.
+///
+/// Cargo colorizes its OWN status lines whenever color is forced. The trigger
+/// is an explicit `CARGO_TERM_COLOR=always`: `.github/workflows/ci.yml` sets it
+/// in a workflow-level `env:` block, and a user can export it in their shell.
+/// It is NOT reached by attaching a terminal — [`crate::attest::capture::
+/// run_wrapped`] spawns the child with `Stdio::piped()` on both streams, so
+/// cargo's own TTY detection never fires under `attest run` (measured: a real
+/// `attest run` driven inside a pty with the variable unset captured zero ESC
+/// bytes). Forced color puts the escape BEFORE the leading whitespace and the
+/// reset BETWEEN the word and its trailing space, so on a raw colorized line
+/// `trim_start()` strips nothing and even `contains("Running ")` is false.
+/// [`section_targets`] therefore paired no marker at all, every result landed
+/// in an unattributable section, and the capture wrote zero evidence behind a
+/// single stderr warning.
+///
+/// SGR is the only escape class cargo emits here — measured on a passing and on
+/// a failing run, where the colorized lines were exactly `Compiling`,
+/// `Finished`, `Running`, `Doc-tests` and `error:`, and libtest's own
+/// `running N tests` / `test … ok` / `test result:` lines carried none. That
+/// is why this scanner is narrow rather than a general-purpose ANSI stripper,
+/// and why the libtest line parsers need no equivalent.
+///
+/// Anything that is not a complete SGR sequence — an unterminated `ESC [` from
+/// a truncated capture, a bare ESC, or some other CSI — ends the scan and
+/// returns what was accumulated. The remainder is not text this function can
+/// read, and refusing to pair beats pairing on a half-read marker.
+fn strip_sgr(line: &str) -> Cow<'_, str> {
+    if !line.contains('\u{1b}') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(esc) = rest.find('\u{1b}') {
+        out.push_str(&rest[..esc]);
+        let Some(body) = rest[esc..].strip_prefix("\u{1b}[") else {
+            return Cow::Owned(out);
+        };
+        let Some(end) = body.find(|c: char| !c.is_ascii_digit() && c != ';') else {
+            return Cow::Owned(out);
+        };
+        if body.as_bytes()[end] != b'm' {
+            return Cow::Owned(out);
+        }
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
 /// Target names for the sections of a bulk `cargo test`, read from cargo's own
 /// `Running` / `Doc-tests` markers in execution order.
 ///
@@ -756,6 +807,7 @@ pub fn bulk_results(stdout: &str, targets: &[String]) -> Vec<StructuredResult> {
 pub fn section_targets(stdout: &str, stderr: &str, sections: usize) -> Vec<String> {
     let mut names = Vec::new();
     for line in stdout.lines().chain(stderr.lines()) {
+        let line = strip_sgr(line);
         let line = line.trim_start();
         if line.starts_with("Doc-tests ") {
             names.push("doc-tests".to_string());
@@ -1071,6 +1123,34 @@ mod tests {
             vec!["attest_sample_crate", "integration", "doc-tests"]
         );
         // Wrong section count: refuse rather than mis-pair.
+        assert!(section_targets("", stderr, 2).is_empty());
+    }
+
+    /// `CARGO_TERM_COLOR=always` — which `.github/workflows/ci.yml` sets in a
+    /// workflow-level `env:` block, and which a user may export in their own
+    /// shell — makes cargo colorize its OWN status lines. An explicit variable
+    /// is the only trigger; `attest run` pipes both of the child's streams, so
+    /// a terminal alone does not produce this. The SGR sequence sits BEFORE the leading
+    /// whitespace and the reset lands between the word and its trailing space —
+    /// `\x1b[1m\x1b[92m     Running\x1b[0m unittests …` — so `trim_start()`
+    /// strips nothing, `strip_prefix("Running ")` never matches, every result
+    /// lands in an unattributable section, and the capture writes zero evidence
+    /// behind one stderr warning. The fixture below is a byte-for-byte copy of
+    /// real colorized cargo output, reset position included: a fix that merely
+    /// searched for the token `Running` rather than stripping would pass a
+    /// fixture without that reset, and still be broken on the real thing.
+    ///
+    /// Only cargo's own status lines are colorized — measured on both a passing
+    /// and a failing run — so the libtest line parsers need no equivalent.
+    #[test]
+    fn section_targets_pairs_markers_that_cargo_colorized() {
+        let stderr = "\u{1b}[1m\u{1b}[92m    Finished\u{1b}[0m `test` profile\n\u{1b}[1m\u{1b}[92m     Running\u{1b}[0m unittests src/lib.rs (target/debug/deps/attest_sample_crate-392ca9d12eda1cf9)\n\u{1b}[1m\u{1b}[92m     Running\u{1b}[0m tests/integration.rs (target/debug/deps/integration-12fc9e26ddfc6535)\n\u{1b}[1m\u{1b}[92m   Doc-tests\u{1b}[0m attest_sample_crate\n";
+        assert_eq!(
+            section_targets("", stderr, 3),
+            vec!["attest_sample_crate", "integration", "doc-tests"]
+        );
+        // The names must be right, not merely three of them: a stripper that
+        // ate the `(` would still count three and pair the wrong targets.
         assert!(section_targets("", stderr, 2).is_empty());
     }
 
