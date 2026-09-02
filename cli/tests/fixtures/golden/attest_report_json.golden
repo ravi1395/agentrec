@@ -1,0 +1,111 @@
+stdout:
+{
+  "claims": [
+    {
+      "claim_id": "c_00000000010W3GE1R70W3GE1R7",
+      "criterion": null,
+      "dirty": false,
+      "evidence_turn": "t_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "history": {
+        "claim_false": 0,
+        "confirmed": 1,
+        "derives": 1,
+        "evidence": 1,
+        "flaky_observations": 0,
+        "human_answers": 0,
+        "recipe_invalid": 0,
+        "stale_events": 0,
+        "verdicts": 1
+      },
+      "human_note": null,
+      "identity": "agentrec--import_claude::ac3_zero_bytes",
+      "last_verdict": "confirmed",
+      "output_blob": "1111111111111111111111111111111111111111111111111111111111111111",
+      "replay_commit": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "severity": null,
+      "stale": false,
+      "status": "CONFIRMED"
+    },
+    {
+      "claim_id": "c_00000000020W3GE1R70W3GE1R7",
+      "criterion": null,
+      "dirty": null,
+      "evidence_turn": null,
+      "history": {
+        "claim_false": 1,
+        "confirmed": 0,
+        "derives": 1,
+        "evidence": 0,
+        "flaky_observations": 0,
+        "human_answers": 0,
+        "recipe_invalid": 0,
+        "stale_events": 0,
+        "verdicts": 1
+      },
+      "human_note": null,
+      "identity": "agentrec--golden::golden_log_default",
+      "last_verdict": "claim-false",
+      "output_blob": null,
+      "replay_commit": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "severity": null,
+      "stale": false,
+      "status": "CLAIM_FALSE"
+    },
+    {
+      "claim_id": "c_00000000030W3GE1R70W3GE1R7",
+      "criterion": null,
+      "dirty": null,
+      "evidence_turn": null,
+      "history": {
+        "claim_false": 0,
+        "confirmed": 0,
+        "derives": 1,
+        "evidence": 0,
+        "flaky_observations": 0,
+        "human_answers": 0,
+        "recipe_invalid": 0,
+        "stale_events": 1,
+        "verdicts": 0
+      },
+      "human_note": null,
+      "identity": "agentrec--golden::golden_status",
+      "last_verdict": null,
+      "output_blob": null,
+      "replay_commit": null,
+      "severity": null,
+      "stale": true,
+      "status": "DERIVED"
+    },
+    {
+      "claim_id": "c_00000000040W3GE1R70W3GE1R7",
+      "criterion": "the README install line is correct",
+      "dirty": null,
+      "evidence_turn": null,
+      "history": {
+        "claim_false": 0,
+        "confirmed": 0,
+        "derives": 0,
+        "evidence": 0,
+        "flaky_observations": 0,
+        "human_answers": 1,
+        "recipe_invalid": 0,
+        "stale_events": 0,
+        "verdicts": 0
+      },
+      "human_note": "still says 0.1.0",
+      "identity": null,
+      "last_verdict": null,
+      "output_blob": null,
+      "replay_commit": null,
+      "severity": "blocking",
+      "stale": false,
+      "status": "HUMAN(no)"
+    }
+  ],
+  "range": null
+}
+
+--stderr--
+
+--exit--
+0

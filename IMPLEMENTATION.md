@@ -1306,3 +1306,135 @@ config reds BOTH AC-P4C-6 halves, each on its decoy assertion. (b) Restoring the
 batched append reds AC-P4C-9 on "the first claim's verdict must survive".
 (c) Restoring the hard-coded `package == "agentrec"` rule reds AC-P4C-7 with the
 whole map printed, `over_stale: []` on every entry.
+
+### Phase 5 — review cards, advisory gate, attestation report
+
+Four new verbs (`attest manual-declare` / `review` / `gate` / `report`), an
+extension of `attest status`, and the unhide of `attest` itself. Tests:
+`cli/tests/attest_gate.rs` unless another file is named.
+
+**Deviation from the plan's Phase 5 AC line, taken on orchestrator direction and
+recorded here rather than resolved silently.** The plan says "fyi items never
+appear in review or gate output". As implemented, an `fyi` manual claim DOES
+appear as a review card (it still needs an answer) and DOES appear in the gate's
+advisory section — it never appears in the gate's blocking list and never
+changes the exit code. `events.rs::ManualSeverity`'s "`fyi` never nags" is read
+as "`fyi` never blocks"; `agentrec-core` is out of Phase 5's scope and is not
+edited to reconcile the wording.
+
+**The gate's blocking rule is stated once**, in `ATTEST-FORMAT.md` § "Gate
+blocking, precisely" (that section's "lands in Phase 5" future tense is replaced
+by the implemented rule). `gatecmd.rs` and `reviewcmd.rs` point at it and do not
+restate it.
+
+**AC-ATTEST-P5-1.** `attest manual-declare --text <criterion> --severity
+blocking|fyi` appends exactly one `manual-declare` event through
+`attest::lock::append_attest_locked`, minting a fresh `ClaimId`, and prints that
+id on stdout. The claim then folds to `DECLARED` and `attest status` counts it.
+— `attest_gate::p5_1_manual_declare_appends_and_status_shows_it`
+
+**AC-ATTEST-P5-2.** `attest gate` exits **1** iff at least one claim either
+(a) has a status for which `ClaimStatus::blocks_gate()` is true (`CLAIM_FALSE`
+only), or (b) carries `manual_severity == Blocking` with a status that is not
+`Human { answer: Yes }` — `DECLARED`, `Human{No}` and `Human{Skip}` all block.
+Every other condition — `recipe-invalid` (any cause), `flaky`, the `STALE`
+overlay, and every `fyi` claim whatever its answer — is advisory and leaves the
+exit code 0. A claim satisfying both (a) and (b) is counted once.
+— `attest_gate::p5_2_gate_exit_code_table` (every verdict kind × blocking/fyi ×
+answered/unanswered, asserting exit code AND which ids land under blocking vs
+advisory)
+
+**AC-ATTEST-P5-3.** `recipe-invalid` and `flaky-observation` never produce a
+nonzero `attest gate` exit, on their own or in combination, and the ids appear
+in the advisory section with their cause.
+— `attest_gate::p5_3_recipe_invalid_and_flaky_never_block`
+
+**AC-ATTEST-P5-4.** `attest gate --json` emits `{"blocking": [...],
+"advisory": [...], "pass": <bool>}`; `pass` is false exactly when the exit code
+is 1, and the two arrays partition the ids the text form prints.
+— `attest_gate::p5_4_gate_json_matches_the_text_verdict`
+
+**AC-ATTEST-P5-5.** `attest review` renders one card per claim needing a human —
+a manual claim whose status is `DECLARED` or `Human{Skip}` — and the keys
+`y`/`n`/`s` append `human` events with answer `yes`/`no`/`skip`. After `n` the
+next stdin line is read as the note and stored VERBATIM. Each answer is appended
+immediately, so an interrupt keeps the answers already given.
+— `attest_gate::p5_5_review_scripted_stdin_appends_three_human_events`
+
+**AC-ATTEST-P5-6.** The card set is computed ONCE per invocation, so `s` does not
+re-ask inside the same run; a skipped card reappears on the NEXT `attest review`.
+`Human{No}` is deliberately NOT re-asked — it blocks the gate (AC-P5-2) and is a
+recorded rejection, not an open question — so only `DECLARED` and `Human{Skip}`
+are cards. Stated as intent, not an omission.
+— `attest_gate::p5_6_skip_reappears_next_run_and_no_does_not`
+
+**AC-ATTEST-P5-7.** Non-interactive stdin (immediate EOF) lists the remaining
+cards and exits **0** without appending anything; EOF arriving where a note was
+expected stores an empty note rather than panicking. `attest review --json`
+lists the cards and never prompts or appends.
+— `attest_gate::p5_7_review_eof_and_json_never_append`
+
+**AC-ATTEST-P5-8.** An `fyi` manual claim appears as a review card and in the
+gate's advisory list, and never in the gate's blocking list (the deviation
+recorded above).
+— `attest_gate::p5_8_fyi_is_a_card_and_advisory_never_blocking`
+
+**AC-ATTEST-P5-9.** `attest report` prints a markdown bundle and `--json` the
+same data as one object: per claim its id, test identity or manual criterion
+text, status, stale flag, verdict chain (history counters, the last verdict kind
+and its `replay_commit`), evidence provenance (the last `evidence` event's
+`turn_id`, `output_blob` and `dirty` bit), and the last human note. The report
+carries no wall-clock header, so a fixture log renders byte-identically on every
+run. — `golden::golden_attest_report` and `golden::golden_attest_report_json`
+
+**AC-ATTEST-P5-10.** `attest report --range <base>..<head>` keeps only claims
+with at least one event whose `ts` falls between the two commits' committer
+timestamps inclusive. The filter is TIME-based, deliberately and disclosed in
+the report's own header line: it does not prove an event was caused by a commit
+in the range. `git log -1 --format=%ct` reports SECONDS and `AttestEvent::ts` is
+unix MILLISECONDS, so the boundary multiplies by 1000. A `--range` whose base or
+head is not a resolvable revision is an error (detected from git's exit status),
+as is a range missing either side or written with `...`.
+— `attest_gate::p5_10_range_filters_by_commit_time` and
+`attest_gate::p5_10_range_rejects_bad_input`
+
+**AC-ATTEST-P5-11.** `attest` is no longer `#[command(hide = true)]`: it appears
+in `agentrec --help`, and `agentrec attest --help` lists `status`, `derive`,
+`run`, `verify`, `coverage`, `manual-declare`, `review`, `gate`, `report`.
+— `attest_gate::p5_11_attest_is_visible_and_lists_every_verb`
+
+**AC-ATTEST-P5-12.** `attest status --json` gains `recipe_invalid_causes` (a
+per-cause object) and `manual` (blocking/fyi × answered/unanswered counts). Every
+pre-existing key keeps its name and its value on the same fixture — the addition
+is additive, asserted by comparing the whole key set and each old key's value
+before and after.
+— `attest_gate::p5_12_status_json_is_additive`
+
+**Gate exit-code shape.** `attest gate` follows `doctor`'s precedent
+(`main.rs`: `Ok(false)` → `std::process::exit(1)`), not an `Err`: a failing gate
+is a verdict the command printed, not a command error, so no `agentrec: <msg>`
+line is prefixed.
+
+**One production spawn is added**, `git log -1 --format=%ct <rev>` in
+`reportcmd.rs`, carrying the per-site `#[allow(clippy::disallowed_methods)]`
+with its reason, in the same form `replaycmd.rs` uses. `cli/src/daemon.rs`
+gains none.
+
+**Golden normalization, deviation recorded.** The brief asked for
+`golden.rs::NORMALIZE_TABLE` to be extended for claim ids and attest
+timestamps. It is NOT extended: every `c_…` id and every `ts` reaching the attest
+report goldens originates from a named constant in the fixture this harness
+builds, so there is nothing dynamic to substitute, and adding a substitution for
+a static literal would only weaken the byte pin. This is the same reasoning the
+harness's module doc already gives for the table being empty. A pattern-based
+normalizer stays rejected there.
+
+**Mutation probes for Phase 5, run live** (`cargo build` before each and the
+source restored after, per the recorded stale-binary hazard). (a) Making
+`statuscmd::blocking_reason` treat `Human{Skip}` on a `blocking` manual claim as
+non-blocking reds `p5_2_gate_exit_code_table` and nothing else (11 passed / 1
+failed). (b) Dropping the `* 1000` seconds→milliseconds conversion in
+`reportcmd::commit_time_ms` reds `p5_10_range_filters_by_commit_time` while
+`p5_10_range_rejects_bad_input` stays green — so the range fixture's window
+genuinely discriminates the unit, rather than being wide enough to pass either
+way.

@@ -169,10 +169,9 @@ enum Command {
         /// Tool identity, e.g. "claude" or "codex".
         tool: String,
     },
-    /// Internal: the `attest` subsystem (claims derived from tests). Hidden
-    /// until Phase 5 — the surface is not stable and `ATTEST-FORMAT.md` is
-    /// explicitly outside `PROTOCOL.md` versioning.
-    #[command(hide = true)]
+    /// Claims derived from tests, their evidence, and the release gate over
+    /// them. The surface is UNSTABLE: `ATTEST-FORMAT.md` is explicitly outside
+    /// `PROTOCOL.md` versioning and may change without a major bump.
     Attest {
         #[command(subcommand)]
         cmd: AttestCmd,
@@ -456,6 +455,49 @@ enum AttestCmd {
         #[arg(long = "crate", value_name = "PATH")]
         crate_path: Option<PathBuf>,
     },
+    /// Declare a criterion no test covers, for a human to attest by hand.
+    /// Prints the new claim id.
+    ManualDeclare {
+        /// The criterion, in the words a reviewer will read.
+        #[arg(long)]
+        text: String,
+        /// `blocking` holds `attest gate` until answered yes; `fyi` never
+        /// blocks.
+        #[arg(long, value_enum)]
+        severity: SeverityArg,
+    },
+    /// Review the manual claims waiting on a human: one card each, answered
+    /// with y / n / s on stdin.
+    Review {
+        /// List the cards as JSON and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Exit nonzero if any claim is refuted or any blocking manual criterion
+    /// is unanswered. Everything else is advisory.
+    Gate {
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The attestation bundle: every claim's status, verdict chain, evidence
+    /// provenance and human notes.
+    Report {
+        /// Emit machine-readable JSON instead of markdown.
+        #[arg(long)]
+        json: bool,
+        /// Keep only claims with an event between two commits' committer
+        /// timestamps, as `<base>..<head>`. A time window, not a causal one.
+        #[arg(long, value_name = "BASE..HEAD")]
+        range: Option<String>,
+    },
+}
+
+/// `--severity` on `attest manual-declare`, mapped to the wire enum.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum SeverityArg {
+    Blocking,
+    Fyi,
 }
 
 /// Walk from `start` up through ancestors looking for a directory containing
@@ -596,6 +638,28 @@ fn main() {
                 ids,
                 crate_path,
             } => attest::coveragecmd::run(&root, crate_path.as_deref(), all, &ids),
+            AttestCmd::ManualDeclare { text, severity } => attest::manualcmd::run(
+                &root,
+                &text,
+                match severity {
+                    SeverityArg::Blocking => {
+                        agentrec_core::attest::events::ManualSeverity::Blocking
+                    }
+                    SeverityArg::Fyi => agentrec_core::attest::events::ManualSeverity::Fyi,
+                },
+            ),
+            AttestCmd::Review { json } => attest::reviewcmd::run(&root, json),
+            // Same shape as `doctor`: a failing gate is a verdict this command
+            // printed, not a command error, so it exits 1 without an
+            // `agentrec: <message>` prefix.
+            AttestCmd::Gate { json } => match attest::gatecmd::run(&root, json) {
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(1),
+                Err(e) => Err(e),
+            },
+            AttestCmd::Report { json, range } => {
+                attest::reportcmd::run(&root, json, range.as_deref())
+            }
         },
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not

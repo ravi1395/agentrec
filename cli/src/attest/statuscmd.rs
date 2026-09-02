@@ -3,15 +3,134 @@
 //! count, and the dev-loop-only figure.
 //!
 //! Minimal by design (plan Phase 3). Richer rendering — surfacing
-//! `recipe-invalid` causes and manual-card severity — needs Phase 4's verdict
-//! writer and is an extension of this same file, not a new one.
+//! `recipe-invalid` causes and manual-card severity — needed Phase 4's verdict
+//! writer and is an extension of this same file, not a new one; Phase 5 added
+//! it, along with the shared read helpers the review/gate/report verbs use
+//! ([`status_label`], [`Provenance`]).
+//!
+//! Why those helpers live here and not in the fold: `ClaimState` carries
+//! status, identity, body hash, the stale overlay, manual text/severity, the
+//! last human note, history counters and `last_ts` — and nothing about which
+//! turn an `evidence` event was joined to, which blob it captured, or which
+//! commit a verdict replayed. `agentrec-core` is frozen for Phase 5, so
+//! provenance is a SECOND pass over the same event slice, exactly as
+//! [`dirty_claims`] already does, and on the same convention: "latest" means
+//! APPEND ORDER, not the largest `ts`.
 
 use crate::attest::lock::read_attest;
-use agentrec_core::attest::events::AttestEvent;
-use agentrec_core::attest::fold::{fold_claims, ClaimStatus};
-use agentrec_core::attest::types::ClaimId;
+use agentrec_core::attest::events::{AttestEvent, HumanAnswer, ManualSeverity};
+use agentrec_core::attest::fold::{fold_claims, ClaimState, ClaimStatus};
+use agentrec_core::attest::types::{ClaimId, RecipeInvalidCause, VerdictKind};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// The wire spelling of a `recipe-invalid` cause, derived from serde so a new
+/// variant cannot drift out of sync with the events it is rendered beside
+/// (the AC-ATTEST-P4C-11 rule, reused).
+pub(crate) fn cause_label(cause: &RecipeInvalidCause) -> String {
+    serde_json::to_value(cause)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{cause:?}"))
+}
+
+/// The uppercase state name every attest verb prints for a status.
+pub(crate) fn status_label(status: &ClaimStatus) -> String {
+    match status {
+        ClaimStatus::Derived => "DERIVED".to_string(),
+        ClaimStatus::Declared => "DECLARED".to_string(),
+        ClaimStatus::Evidenced => "EVIDENCED".to_string(),
+        ClaimStatus::Confirmed => "CONFIRMED".to_string(),
+        ClaimStatus::ClaimFalse => "CLAIM_FALSE".to_string(),
+        ClaimStatus::RecipeInvalid { cause } => {
+            format!("RECIPE_INVALID({})", cause_label(cause))
+        }
+        ClaimStatus::Flaky => "FLAKY".to_string(),
+        ClaimStatus::Human { answer } => match answer {
+            HumanAnswer::Yes => "HUMAN(yes)".to_string(),
+            HumanAnswer::No => "HUMAN(no)".to_string(),
+            HumanAnswer::Skip => "HUMAN(skip)".to_string(),
+        },
+    }
+}
+
+/// Whether this claim blocks `attest gate`, and why.
+///
+/// The rule itself is stated ONCE, in `ATTEST-FORMAT.md` § "Gate blocking,
+/// precisely". This function is that section's implementation and adds no
+/// policy of its own. A claim meeting both halves reports only the first, so
+/// the gate's count is one per claim.
+pub(crate) fn blocking_reason(claim: &ClaimState) -> Option<String> {
+    if claim.status.blocks_gate() {
+        return Some("claim-false: independent replay refuted this claim".to_string());
+    }
+    if claim.manual_severity == Some(ManualSeverity::Blocking) {
+        return match claim.status {
+            ClaimStatus::Human {
+                answer: HumanAnswer::Yes,
+            } => None,
+            ClaimStatus::Human {
+                answer: HumanAnswer::No,
+            } => Some("blocking manual criterion rejected".to_string()),
+            ClaimStatus::Human {
+                answer: HumanAnswer::Skip,
+            } => Some("blocking manual criterion skipped".to_string()),
+            _ => Some("blocking manual criterion unanswered".to_string()),
+        };
+    }
+    None
+}
+
+/// The last `evidence` and last `verdict` a claim saw, in append order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Provenance {
+    pub(crate) turn_id: Option<String>,
+    pub(crate) output_blob: Option<String>,
+    pub(crate) dirty: Option<bool>,
+    pub(crate) last_verdict: Option<String>,
+    pub(crate) replay_commit: Option<String>,
+}
+
+/// Walk the event slice once, collecting per-claim provenance the fold does
+/// not retain. Append order wins, matching [`dirty_claims`].
+pub(crate) fn provenance(events: &[AttestEvent]) -> BTreeMap<ClaimId, Provenance> {
+    let mut out: BTreeMap<ClaimId, Provenance> = BTreeMap::new();
+    for event in events {
+        match event {
+            AttestEvent::Evidence {
+                claim_id,
+                turn_id,
+                dirty,
+                output_blob,
+                ..
+            } => {
+                let entry = out.entry(claim_id.clone()).or_default();
+                entry.turn_id = turn_id.clone();
+                entry.output_blob = output_blob.clone();
+                entry.dirty = Some(*dirty);
+            }
+            AttestEvent::Verdict {
+                claim_id,
+                verdict,
+                replay_commit,
+                ..
+            } => {
+                let entry = out.entry(claim_id.clone()).or_default();
+                entry.last_verdict = Some(match verdict {
+                    VerdictKind::Confirmed => "confirmed".to_string(),
+                    VerdictKind::ClaimFalse => "claim-false".to_string(),
+                    VerdictKind::RecipeInvalid { cause } => {
+                        format!("recipe-invalid({})", cause_label(cause))
+                    }
+                    VerdictKind::FlakyObservation => "flaky-observation".to_string(),
+                });
+                entry.replay_commit = Some(replay_commit.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Claim counts, one field per `ClaimStatus` variant in the order they are
 /// rendered.
@@ -104,6 +223,28 @@ pub fn run(root: &Path, json: bool) -> Result<(), String> {
     let dirty = dirty_claims(&events);
     let total = folded.claims.len();
 
+    // Phase 5 additions, both purely additive to the payload below.
+    //
+    // `recipe_invalid_causes` breaks the existing flat `recipe_invalid` count
+    // out by cause; the flat key keeps its name and value.
+    //
+    // `manual` counts manual claims by severity. "answered" means a `human`
+    // event has landed on the claim, whatever the answer — a `skip` is an
+    // answer that was given, and the gate (not this counter) is what decides
+    // whether it is good enough.
+    let mut causes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut manual = [[0usize; 2]; 2]; // [severity: blocking, fyi][answered]
+    for claim in folded.claims.values() {
+        if let ClaimStatus::RecipeInvalid { cause } = &claim.status {
+            *causes.entry(cause_label(cause)).or_default() += 1;
+        }
+        if let Some(severity) = claim.manual_severity {
+            let sev = usize::from(severity == ManualSeverity::Fyi);
+            let answered = usize::from(matches!(claim.status, ClaimStatus::Human { .. }));
+            manual[sev][answered] += 1;
+        }
+    }
+
     if json {
         let payload = serde_json::json!({
             "claims": total,
@@ -119,6 +260,11 @@ pub fn run(root: &Path, json: bool) -> Result<(), String> {
             "dev_loop_only": dirty,
             "unparsed_lines": census.unparsed_lines,
             "unknown_kind_lines": census.unknown_kind_lines,
+            "recipe_invalid_causes": causes,
+            "manual": {
+                "blocking": {"unanswered": manual[0][0], "answered": manual[0][1]},
+                "fyi": {"unanswered": manual[1][0], "answered": manual[1][1]},
+            },
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return Ok(());
@@ -128,6 +274,13 @@ pub fn run(root: &Path, json: bool) -> Result<(), String> {
     for (label, n) in counts.rows() {
         println!("  {label}: {n}");
     }
+    for (cause, n) in &causes {
+        println!("  recipe-invalid/{cause}: {n}");
+    }
+    println!(
+        "manual: blocking {} unanswered / {} answered, fyi {} unanswered / {} answered",
+        manual[0][0], manual[0][1], manual[1][0], manual[1][1]
+    );
     println!("stale (overlay): {stale}");
     println!("dev-loop-only (dirty tree): {dirty}");
     if census.unparsed_lines > 0 {

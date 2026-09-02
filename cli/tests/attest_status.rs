@@ -85,8 +85,34 @@ fn ac_p3_1_status_on_a_fresh_root_is_all_zeros_and_exits_zero() {
     assert!(!text.contains("unknown-kind"), "{text}");
 
     let json = status_json(tmp.path());
-    for (key, _) in json.as_object().unwrap() {
-        assert_eq!(json[key], 0, "{key} must be zero on a fresh root");
+    // Phase 5 added two structured keys, so "all zeros" is now stated over
+    // both shapes rather than only the scalars — an added key that is silently
+    // non-zero on a fresh root must still red here.
+    for (key, value) in json.as_object().unwrap() {
+        match value {
+            serde_json::Value::Object(map) => {
+                assert!(
+                    map.values().all(is_all_zero),
+                    "{key} must be zero on a fresh root: {value}"
+                );
+            }
+            _ => assert_eq!(json[key], 0, "{key} must be zero on a fresh root"),
+        }
+    }
+    assert_eq!(
+        json["recipe_invalid_causes"],
+        serde_json::json!({}),
+        "no causes are known on a fresh root"
+    );
+    assert_eq!(json["manual"]["blocking"]["unanswered"], 0);
+    assert_eq!(json["manual"]["fyi"]["answered"], 0);
+}
+
+/// Zero, recursively: a number equal to 0, or an object every leaf of which is.
+fn is_all_zero(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.values().all(is_all_zero),
+        other => other == &serde_json::json!(0),
     }
 }
 

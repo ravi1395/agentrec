@@ -219,10 +219,26 @@ identity to carry.
 
 ## Gate blocking, precisely
 
-`ClaimStatus::blocks_gate()` answers for the **status alone**, and only
-`CLAIM_FALSE` returns true. The gate's other blocking condition — an unanswered
-or rejected `blocking` manual item — is not a status: it is the gate reading
-`manual_severity` against the claim's `human` answer, and it lands in Phase 5.
+**This is the single statement of the rule; `gatecmd.rs` and `reviewcmd.rs`
+point here rather than restating it.**
+
+`attest gate` fails (exit 1) iff at least one claim meets either condition:
+
+1. `ClaimStatus::blocks_gate()` is true for its status. That is `CLAIM_FALSE`
+   and nothing else — the status-only half.
+2. Its `manual_severity` is `blocking` AND its status is not
+   `Human { answer: yes }`. `DECLARED` (never answered), `Human{no}` and
+   `Human{skip}` therefore all block. This half is not a status and
+   `blocks_gate()` cannot see it: it is the gate reading `manual_severity`
+   against the claim's `human` answer.
+
+Everything else is **advisory** — surfaced with its reason, exit code 0:
+`recipe-invalid` (any cause), `flaky`, the `STALE` overlay, and every `fyi`
+manual claim whatever its answer. "`fyi` never nags" means `fyi` never blocks;
+an `fyi` claim still appears as an `attest review` card and as a gate advisory
+line.
+
+A claim meeting both conditions is counted once.
 
 ## Verdict naming
 

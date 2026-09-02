@@ -1,5 +1,6 @@
-//! CLI side of the `attest` subsystem: the `attest.jsonl` append lock and the
-//! read-only `attest status` verb.
+//! CLI side of the `attest` subsystem: the `attest.jsonl` append lock, the
+//! derive/run/verify/coverage writers, and the read verbs
+//! (`status`/`review`/`gate`/`report`).
 //!
 //! Wire format and state machine: `ATTEST-FORMAT.md`. Event types and the
 //! deterministic fold live in `agentrec_core::attest` — this module only does
@@ -13,6 +14,10 @@ pub mod capture;
 pub mod coverage;
 pub mod coveragecmd;
 pub mod derivecmd;
+pub mod gatecmd;
 pub mod lock;
+pub mod manualcmd;
 pub mod replaycmd;
+pub mod reportcmd;
+pub mod reviewcmd;
 pub mod statuscmd;
