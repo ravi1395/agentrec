@@ -229,3 +229,60 @@ or rejected `blocking` manual item — is not a status: it is the gate reading
 One concept, three casings, no fourth: the **wire kind** is `flaky-observation`,
 the **fold state** is `FLAKY`, and spec decision 4's word "flaky" names that
 state.
+
+## Verdict policy
+
+The **single canonical statement** of how `attest verify` turns replay runs into
+a `verdict` event. Nothing else in this repo restates it; other documents point
+here.
+
+`attest verify` extracts the pinned commit (`git archive`, never `git worktree
+add` — the extract must not share a `.git` with the working tree) and runs the
+staged single-test pipeline once:
+
+- `1 passed` → `confirmed`.
+- `recipe-invalid` at any stage (`build`, `missing`, `ignored`, `harness`) →
+  that verdict immediately. **No retries** — a retry cannot change a recipe that
+  is invalid, and re-running a broken build only costs time.
+- `1 failed` → rerun, up to **2 more times (3 runs total)**:
+  - any rerun passing → `flaky-observation`. Never `claim-false`.
+  - all 3 runs failing → `claim-false`.
+
+`claim-false` is permanent (spec decision 4), which is the whole reason a single
+failing run may not mint it: this repo has a recorded live flake
+(`approve.rs::a_killed_approve_never_leaves_a_phantom_approval`), and a
+one-run verify would have made it permanently false.
+
+**The run count is NOT on the wire.** `AttestEvent::Verdict` carries `ts`,
+`claim_id`, the flattened `VerdictKind` and `replay_commit` — there is no slot
+for it, and `VerdictKind` is a frozen core type. The count appears only in
+`attest verify`'s human-readable stdout line (`… -> claim-false (3 runs)`).
+
+## Coverage map
+
+`.agentrec/attest-coverage.json`, written by `attest coverage`, read by the
+daemon to decide which claims a write stales. Draft and unstable, like the rest
+of this document.
+
+```json
+{
+  "version": 1,
+  "granularity": "file",
+  "tests": {
+    "<target>::<fn_path>": {
+      "claim_id": "c_...",
+      "files": ["cli/src/x.rs"],
+      "over_stale": ["cli/src/**"],
+      "captured_at": 1756000000000,
+      "commit": "<sha>"
+    }
+  }
+}
+```
+
+`files` are repo-relative and sorted. `over_stale` is `["cli/src/**"]` for every
+test in a non-`lib` target of the `agentrec` package — those tests may spawn the
+binary, and a SIGKILLed child writes no profile at all, so their measured file
+set is knowingly incomplete (founder ruling, AC-ATTEST-P1-3). It is `[]`
+otherwise. A write matches a test when its repo-relative path is in `files`
+**or** matches an `over_stale` pattern.

@@ -50,6 +50,7 @@ cli/src/state.rs::write_state                     1  # is_nonregular(&tmp) befor
 # ---- [excl] create_new: EEXIST on any pre-existing inode ------------------
 agentrec-core/src/store.rs::create_tmp_file       4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh CAS tmp name
 cli/src/purgecmd.rs::create_tmp_file              4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh rewrite tmp name
+cli/src/attest/coveragecmd.rs::write_map_atomically 2  # create_new on a fresh pid+millis tmp name beside the coverage map; EEXIST on any planted inode, so a FIFO cannot be opened here
 
 # ---- [upstream] refused by a guarded read earlier on the same path --------
 agentrec-core/src/store.rs::put_result            1  # mtime touch on a dedup HIT: reached only after fsguard::read_regular returned bytes hashing to the expected value, which a FIFO cannot do

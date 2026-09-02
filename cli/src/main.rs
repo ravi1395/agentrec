@@ -433,6 +433,29 @@ enum AttestCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Independently replay claims from a `git archive` extract of HEAD and
+    /// append a `verdict` each. Refuses on a dirty tree — verify replays
+    /// COMMITTED state only.
+    Verify {
+        /// Verify every claim the daemon has marked stale.
+        #[arg(long)]
+        all_stale: bool,
+        /// Specific claim ids to verify.
+        ids: Vec<String>,
+    },
+    /// Capture per-test, file-granularity coverage into
+    /// `.agentrec/attest-coverage.json`, which the daemon consults to decide
+    /// which claims a write stales.
+    Coverage {
+        /// Capture for every claim carrying a test identity.
+        #[arg(long)]
+        all: bool,
+        /// Specific claim ids to capture.
+        ids: Vec<String>,
+        /// The crate to capture, if not the repo root.
+        #[arg(long = "crate", value_name = "PATH")]
+        crate_path: Option<PathBuf>,
+    },
 }
 
 /// Walk from `start` up through ancestors looking for a directory containing
@@ -567,6 +590,12 @@ fn main() {
                 Ok(code) => std::process::exit(code),
                 Err(e) => Err(e),
             },
+            AttestCmd::Verify { all_stale, ids } => attest::replaycmd::run(&root, all_stale, &ids),
+            AttestCmd::Coverage {
+                all,
+                ids,
+                crate_path,
+            } => attest::coveragecmd::run(&root, crate_path.as_deref(), all, &ids),
         },
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not

@@ -56,10 +56,10 @@ use std::process::Command;
 
 // The [`Adapter`] surface below — `RunFilter`, `RunOutcome`, `CargoAdapter`,
 // its `run`, and the staged single-test pipeline `single_test_result` feeds —
-// is this phase's declared CONTRACT (plan Phase 3 "Contract (produces)") and is
-// consumed by Phase 4's `attest verify`. Phase 3's own production callers use
-// only `discover_with_hashes` and `bulk_results`, so the rest is exercised by
-// this module's tests and allowed dead rather than deleted and rebuilt.
+// is Phase 3's declared CONTRACT (plan Phase 3 "Contract (produces)"). Phase 4's
+// `attest verify` (`replaycmd.rs`) is now its production caller, so the
+// `#[allow(dead_code)]` markers Phase 3 carried on it are gone: the compiler,
+// not a comment, is what keeps this surface live from here on.
 
 /// What a caller asks [`Adapter::run`] to execute.
 ///
@@ -67,9 +67,12 @@ use std::process::Command;
 /// in one workspace (measured, real — plan Phase 1), so every variant names its
 /// target.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum RunFilter {
     /// Every test in one target.
+    ///
+    /// Still allowed dead: Phase 4's `attest verify` uses only `Exact`, and
+    /// the bulk path goes through `bulk_results` rather than this variant.
+    #[allow(dead_code)]
     Target { target: String },
     /// The staged single-test pipeline: build → `--list` precheck → scoped
     /// `--exact` run.
@@ -78,25 +81,30 @@ pub enum RunFilter {
 
 /// The result of one [`Adapter::run`], plus what it took to produce it.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct RunOutcome {
     pub results: Vec<StructuredResult>,
     /// Everything the child wrote, stdout and stderr, for the CAS blob.
+    ///
+    /// Allowed dead: `attest verify` reads only `results`; the CAS blob is
+    /// Phase 5's consumer.
+    #[allow(dead_code)]
     pub raw: String,
     /// `None` when the child was killed by a signal.
+    #[allow(dead_code)]
     pub exit_code: Option<i32>,
 }
 
 /// A test-runner backend. One implementation today (cargo); the trait exists
 /// because Phase 4's `attest verify` consumes it and the plan's contract names
 /// it.
-#[allow(dead_code)]
 pub trait Adapter {
+    /// Allowed dead through the trait: `derivecmd` calls the free function
+    /// `discover_with_hashes` instead, so nothing dispatches this dynamically.
+    #[allow(dead_code)]
     fn discover(&self, crate_root: &Path) -> Result<Vec<TestIdentity>, String>;
     fn run(&self, crate_root: &Path, filter: &RunFilter) -> Result<RunOutcome, String>;
 }
 
-#[allow(dead_code)]
 pub struct CargoAdapter;
 
 // ---------------------------------------------------------------------------
@@ -112,7 +120,6 @@ pub struct TargetInfo {
     /// and loses the package, so package scope is RECOMPUTED here at run time
     /// rather than encoded into the identity (which is Phase 2's type and not
     /// this phase's to change).
-    #[allow(dead_code)]
     pub package: String,
     pub name: String,
     /// `lib` / `test` / `bin` — the target kind, which decides the scoping flag.
@@ -123,7 +130,6 @@ pub struct TargetInfo {
 
 impl TargetInfo {
     /// The cargo flags that scope an invocation to exactly this target.
-    #[allow(dead_code)]
     fn scope_args(&self) -> Vec<String> {
         let mut args = vec!["-p".to_string(), self.package.clone()];
         match self.kind.as_str() {
@@ -167,7 +173,16 @@ fn build_targets(crate_root: &Path) -> Result<Vec<TargetInfo>, String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_artifact_stream(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The pure half of [`build_targets`]: cargo's `--message-format=json`
+/// compiler-artifact stream -> the built test executables.
+///
+/// Split out because Phase 4's coverage capture runs its OWN cargo invocation
+/// (`cargo llvm-cov test --no-run`, which emits the identical stream) and must
+/// not re-derive this parsing.
+pub fn parse_artifact_stream(stdout: &str) -> Vec<TargetInfo> {
     let mut targets = Vec::new();
     for line in stdout.lines() {
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -209,7 +224,7 @@ fn build_targets(crate_root: &Path) -> Result<Vec<TargetInfo>, String> {
         });
     }
     targets.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
-    Ok(targets)
+    targets
 }
 
 /// `path+file:///a/b#0.0.0` → `b`; `path+file:///a/b#name@1.2.3` → `name`.
@@ -502,7 +517,6 @@ fn finish_section(per_test: Vec<(String, TestOutcome)>, summary: Option<Summary>
 
 /// Stage 3 of the staged single-test pipeline: interpret a scoped `--exact`
 /// capture for the one test it named. See this module's state-mapping table.
-#[allow(dead_code)]
 pub fn single_test_result(identity: &TestIdentity, stdout: &str) -> StructuredResult {
     let sections = parse_libtest(stdout);
     // A scoped `--exact` run produces exactly one libtest section. More than one

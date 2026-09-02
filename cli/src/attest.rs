@@ -10,6 +10,9 @@
 
 pub mod adapter_cargo;
 pub mod capture;
+pub mod coverage;
+pub mod coveragecmd;
 pub mod derivecmd;
 pub mod lock;
+pub mod replaycmd;
 pub mod statuscmd;

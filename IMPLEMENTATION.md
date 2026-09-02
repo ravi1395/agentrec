@@ -729,7 +729,11 @@ because for `attest.jsonl` the daemon is one routine writer among several
 lock.rs`'s module doc; `append_attest_locked` is the single choke point that
 makes it structural. No automated check exists in chunk A because the daemon's
 `stale` writer does not exist until Phase 4; Phase 4 wires it and owns the
-enforcing test. Marked manual for that reason.
+enforcing test. Marked manual for that reason. **CLOSED by Phase 4B: the
+daemon's `stale` writer now goes through `append_attest_locked` and is
+exercised against concurrent CLI appenders by
+`attest_stale::ac_p4b_7_concurrent_cli_appends_leave_no_torn_line`** — no
+longer manual.
 **AC-ATTEST-P3-7.** The fixture crate is excluded from the parent workspace:
 `cargo metadata --no-deps` at the workspace root does not list the
 `attest_sample_crate` package. — `attest_status::
@@ -959,3 +963,186 @@ pins), and the scoped `--exact` run produces the real shape — libtest's `runni
 string is kept as a second case, pinning the same mapping without a signal. —
 `attest::adapter_cargo::tests::
 ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct`
+
+### attest v1 — Phase 4A: `attest verify` (independent replay) + coverage capture
+
+Verdict policy is stated ONCE, in `ATTEST-FORMAT.md` § "Verdict policy"; the
+coverage map schema ONCE, in § "Coverage map". These ACs do not restate either.
+
+**AC-ATTEST-P4-1.** `attest verify` replays from a `git archive` extract of the
+pinned commit, never a `git worktree add` (which would share `.git` with the
+working tree). A derive-then-verify round trip on the fixture crate yields
+`confirmed`, and the appended `verdict` event's `replay_commit` equals the
+repo's `git rev-parse HEAD`. —
+`attest_verify::ac_p4_1_derive_then_verify_confirms_and_pins_the_replay_commit`
+
+**AC-ATTEST-P4-2.** A failing test yields `claim-false` only after 3 failing
+runs. The mutation probe breaks the tested function and COMMITS it (the extract
+carries committed state only), then asserts the verdict is `claim-false` and the
+stdout line reports `(3 runs)` — the run count has no wire slot, so stdout is
+where it is asserted. —
+`attest_verify::ac_p4_2_a_committed_mutation_yields_claim_false_after_three_runs`
+
+**AC-ATTEST-P4-3.** A deleted test function, with the build still green, yields
+`recipe-invalid` with cause **`missing`** — asserted positively AND asserted not
+to be `build`. The two causes come from different stages of the pipeline
+(`--list` membership vs. the build), and conflating them would let a broken
+build masquerade as a deleted test. —
+`attest_verify::ac_p4_3_a_deleted_test_is_missing_not_build`
+
+**AC-ATTEST-P4-4.** A broken build yields `recipe-invalid` with cause `build`,
+asserted not to be `missing`. Same test as AC-ATTEST-P4-3's second half, so the
+two causes are discriminated against each other in one place. —
+`attest_verify::ac_p4_4_a_broken_build_is_build_not_missing`
+
+**AC-ATTEST-P4-5.** An `#[ignore]`d test yields `recipe-invalid` cause
+`ignored`, and restoring the source and re-verifying yields `confirmed` — the
+retry path proven end to end, not just the failure path. —
+`attest_verify::ac_p4_5_ignored_then_restored_verifies_again`
+
+**AC-ATTEST-P4-6.** A deterministically flaky test — fails on its first run,
+passes on the rerun, keyed on a marker file outside the extract — yields
+`flaky-observation` and NEVER `claim-false`. Together with AC-ATTEST-P4-2 this
+pins both branches of the retry policy. —
+`attest_verify::ac_p4_6_a_first_run_failure_that_passes_on_rerun_is_flaky`
+
+**AC-ATTEST-P4-7.** A dirty working tree refuses verification and appends
+NOTHING: verify replays committed state, and a verdict minted against
+uncommitted bytes would be attributed to a commit that never contained them.
+The test asserts both the refusal and that `attest.jsonl` is byte-identical
+afterwards. —
+`attest_verify::ac_p4_7_a_dirty_tree_refuses_and_appends_nothing`
+
+**AC-ATTEST-P4-8.** `attest coverage` writes `.agentrec/attest-coverage.json`
+per the schema, atomically (fresh `create_new` tmp + rename). On the fixture
+crate both discovered tests carry `src/lib.rs` in their file set and
+`over_stale: []` — the fixture's package is not `agentrec`, so the
+binary-spawning over-stale rule does not fire. When `cargo llvm-cov` or the
+LLVM tools are unavailable the test is skipped with a PRINTED reason, never
+silently. —
+`attest_verify::ac_p4_8_coverage_maps_the_fixture_crate_at_file_granularity`
+
+**AC-ATTEST-P4-9.** The map the PRODUCER writes carries the two shapes the
+daemon's matcher discriminates — an entry with measured `files` and no
+`over_stale`, and an entry with an `over_stale` pattern and no `files` — under
+distinct claim ids. **Scope, stated rather than implied:** `claims_touched_by`
+and `over_stale_hit` live in the `agentrec` BINARY crate, which an integration
+test cannot link against, so the matching behavior itself is unit-tested in
+`attest::coverage::tests` (Phase 4B's file) and this AC pins only that the
+producer's wire shape is the one that matcher expects. Neither test alone closes
+the pair. —
+`attest_verify::ac_p4_9_the_producers_wire_shape_carries_both_matcher_inputs`
+
+**AC-ATTEST-P4-10.** Missing coverage tooling refuses with exit 2 and writes no
+map, rather than writing an empty one that the daemon would read as "nothing is
+covered". —
+`attest_verify::ac_p4_10_absent_coverage_tooling_refuses_without_writing_a_map`
+
+**AC-ATTEST-P4-11.** Before any capture there is no map file at all — the
+normal pre-capture state, which the daemon reads as `Ok(None)` rather than as an
+error — and a written map parses back to the same version and entry count. Same
+crate-boundary scope note as AC-ATTEST-P4-9: `load_coverage_map`'s own
+`Ok(None)`/error branches are unit-tested in `attest::coverage::tests`. —
+`attest_verify::ac_p4_11_no_map_exists_before_capture_and_a_written_map_parses`
+
+**AC-ATTEST-P4-12 (found by AC-ATTEST-P4-8, recorded because it failed
+SILENTLY).** `cargo llvm-cov show-env --sh` emits BOTH single-quoted and bare
+values in one block, and `parse_show_env` takes both. The first implementation
+accepted only the quoted form and therefore dropped `RUSTC_WRAPPER` — the
+instrumentation itself — so every build succeeded, every test ran, the exit
+status was 0, and the map came out with an empty `files` array for every test.
+Nothing in the exit code or the output said anything was wrong. The unit test
+drives a verbatim capture of the real output, warning chatter included. —
+`attest::coveragecmd::tests::show_env_parsing_takes_quoted_and_bare_values_alike`
+
+Two invocations were MEASURED not to work and are recorded so nobody retries
+them: `cargo llvm-cov test --no-run` is rejected (`--no-run is specific to
+[nextest,...] and not supported for subcommand 'test'`), and `cargo llvm-cov
+--no-run` rejects `--message-format`. The `show-env` + plain `cargo test
+--no-run --message-format=json` path is what works.
+
+**Probe hygiene, applied throughout.** Every mutation in `attest_verify.rs`
+edits the fixture repo's SOURCE and commits it; the replayed binary is built
+inside the extract from that commit, so the recorded stale-binary hazard
+(editing a source and re-running against a stale `target/`) cannot apply — but
+the replay build cache is keyed BY COMMIT for a measured reason: `git archive`
+stamps every extracted file with the commit's timestamp, and cargo fingerprints
+on mtime, so two commits made inside the same second extract byte-different
+sources carrying identical mtimes. Measured on this machine — three successive
+fixture commits all landed on one second, and a single shared cache made a
+restored test still report `ignored`, which is what AC-ATTEST-P4-5 caught before
+the fix. Per-commit keying keeps the cache across a claim's RETRIES by construction
+(the retries reuse one extract at one commit, the case the 3-run policy needs)
+and gives a different commit a cold build. The retry speed-up was not timed
+separately — stated as construction, not as a measurement.
+
+
+### Phase 4B — daemon stale-marking
+
+Chunk B of Phase 4: the `record` daemon consults the coverage map on writes it
+already receives and appends `stale`. **Security posture: the daemon never
+executes a repo-authored command.** `cli/src/daemon.rs` production code
+contains zero `std::process::Command` call sites (the `Command::new`
+occurrences in that file are all inside its `#[cfg(test)]` module); chunk C's
+`clippy.toml` census makes reintroduction a build failure.
+
+Structural notes that these ACs rest on, stated once: the daemon appends at
+the SETTLED-BATCH flush point (never per watch event), after the H7 undo-guard
+`retain`, so undo's own writes stale nothing; it TAKES the attest append lock,
+unlike `loglock.rs`'s daemon exemption; and idempotence belongs to
+`fold.rs`, so the daemon dedupes per BATCH only and appends without asking
+whether a claim is already stale. **Disclosed cost of that choice:** a hot
+editing loop over a covered file appends one `stale` line per settled batch,
+and `attest.jsonl` has no rewrite class, so those lines are not reclaimable.
+
+**AC-ATTEST-P4B-1.** A write to a file in a claim's measured `files` appends
+exactly one `stale` for exactly that claim, with cause `file-write` naming the
+path. — `attest_stale::ac_p4b_1_2_3_exact_glob_and_unmapped_writes`
+
+**AC-ATTEST-P4B-2.** A write matching a claim's coarse `over_stale` glob (and
+no measured file) appends `stale` for that claim alone, with cause
+`coverage-incomplete` naming the scope — not `file-write`. —
+`attest_stale::ac_p4b_1_2_3_exact_glob_and_unmapped_writes`
+
+**AC-ATTEST-P4B-3.** A write to an unmapped path appends nothing. Meaningful
+only because the same daemon, in the same test, has already been shown to
+stale twice. — `attest_stale::ac_p4b_1_2_3_exact_glob_and_unmapped_writes`
+
+**AC-ATTEST-P4B-4.** With no coverage map present the daemon records normally
+and never creates `attest.jsonl`. —
+`attest_stale::ac_p4b_4_absent_coverage_map_appends_nothing`
+
+**AC-ATTEST-P4B-5.** A coverage map rewritten while the daemon runs takes
+effect without a restart. The fixture's rewrite is BYTE-LENGTH-PRESERVING
+(`src/a.rs` -> `src/b.rs`), so an mtime- or length-keyed reload trigger fails
+this AC; the daemon keys on a content hash. —
+`attest_stale::ac_p4b_5_coverage_map_reloads_while_the_daemon_runs`
+
+**AC-ATTEST-P4B-6.** `attest_stale = false` in `.agentrec/config.toml`
+disables the append entirely, against a fixture otherwise identical to
+AC-ATTEST-P4B-1's. Both new keys (`attest_stale`, `attest_coverage_path`) are
+read, are listed in `KNOWN_KEYS` so neither warns as unknown, and degrade
+per-key on a wrong-shaped value rather than failing the load — `mcp_destructive`
+remains the only named-values hard error. —
+`attest_stale::ac_p4b_6_config_off_switch_appends_nothing` +
+`config::tests::attest_keys_are_read_and_degrade_per_key`
+
+**AC-ATTEST-P4B-7.** The daemon appending `stale` concurrently with separate
+CLI processes appending through `append_attest_locked` leaves no torn line:
+`parse_log` reports 0 unparsed and 0 unknown-kind lines, and the event count
+equals the seed plus what each CLI process reported writing. **Substitution,
+recorded not quietly satisfied:** the plan's text names `verdict` lines, but
+`cli` has no `[lib]` target (so a test binary cannot call
+`append_attest_locked` directly) and `attest verify` is chunk A's. The
+concurrent writer is `agentrec attest derive`, which appends `derive` events
+through the SAME choke point; the property proven — two processes appending
+concurrently tear no line — does not depend on the event kind. —
+`attest_stale::ac_p4b_7_concurrent_cli_appends_leave_no_torn_line`
+
+**Mutation probes, run live (`cargo build` before each, per the recorded
+stale-binary hazard).** (a) Removing the `attest_stale.on_batch` call from the
+flush point reds -1/-2/-3, -5 and -7 and leaves -4 and -6 GREEN — those two are
+negative tests and cannot discriminate on their own, which is exactly why -3's
+"nothing appended" leg shares a daemon with two proven-positive legs.
+(b) Making the reload trigger fire only once reds -5 alone. (c) Forcing every
+cause to `file-write` reds -2 with the two shapes printed side by side.
