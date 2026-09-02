@@ -799,18 +799,41 @@ ac_p3_18_undeclared_results_are_counted_on_stderr_and_not_written`
 records for it — asserted as the full `(outcome, recipe_invalid, parse_failed)`
 triple, not just the one field a state name mentions. — `attest::adapter_cargo::
 tests::ac_p3_19_every_spike_fixture_parses_to_its_documented_state`
-**AC-ATTEST-P3-20.** Unparseable output fails closed: no per-test outcome is
-trusted, the `evidence` event carries `parse_failed: true`, and the full raw
-output is retained in the CAS and referenced by the event. — `attest_capture::
+**AC-ATTEST-P3-20.** Unparseable output fails closed, in two shapes, and the
+raw output survives both.
+(a) A section that DOES name tests (per-test lines present, summary missing or
+mismatched): no per-test outcome is trusted, one `evidence` event per named test
+carries `parse_failed: true`, and the full raw output is retained in the CAS and
+referenced by the event. — `attest_capture::
 ac_p3_20_unparseable_output_writes_parse_failed_evidence_with_the_raw_blob`
+(b) A section that names NOTHING — the harness died before libtest wrote a
+single result line (`process::abort`, SIGABRT): no event is written, because no
+test was named and attributing the run to a claim it never mentioned would be
+fabrication. The section is COUNTED and the raw output is retained: stderr
+carries `N section(s) unparseable (harness crash — no test named), raw output
+retained at sha256:…`. — `attest_capture::
+ac_p3_20_a_harness_crash_retains_its_raw_output_and_is_counted`
+**Two consequences, stated rather than hidden.** When every section is
+unattributable the retained blob is cited by no event, so `purge --orphans` may
+later archive it — retention here is durable only until a reclaim runs.
+And the count is gated on the capture looking like libtest at all (a `running N
+tests` header), so `attest run -- <any non-test command>` still stores nothing;
+a harness that crashes mid-run has already printed that header, which is why the
+gate does not lose the case this exists for.
 **AC-ATTEST-P3-21.** The test-runner command matcher recognizes a `cargo test`
 invocation and rejects lookalikes (`cargo testfoo`, `cargo build`, a path
 containing the word), so an arbitrary `Bash` tool call is not captured. —
 `attest::capture::tests::ac_p3_21_the_test_runner_matcher_accepts_only_cargo_test`
-**AC-ATTEST-P3-22.** `attest run` tees the child's output to the terminal and
-exits with the child's own status, so wrapping a command does not change what the
-user sees or what a script downstream reads. — `attest_capture::
-ac_p3_22_run_tees_output_and_propagates_the_child_exit_code`
+**AC-ATTEST-P3-22.** `attest run` tees the child's stdout and stderr to its own
+stdout and stderr, line by line as they arrive, and exits with the child's own
+status — so the text a user reads and the bytes a downstream script reads are
+the child's. **Not byte-identical to running the command bare:** the child's
+stdio is a PIPE, not the terminal, so a child that adapts to a tty sees a
+non-tty and renders its plain form (cargo's colour and progress output being the
+one users meet). MEASURED, under a real pty via `script -q /dev/null`: `[ -t 1 ]`
+reports TTY run bare and NOTTY run through `attest run --`. — `attest_capture::
+ac_p3_22_run_tees_output_and_propagates_the_child_exit_code` (which covers the
+tee and the exit code; the tty difference is the manual probe just described)
 **AC-ATTEST-P3-24.** A CAS blob cited ONLY by `attest.jsonl` is protected by
 BOTH reclaim paths: `purge --orphans` (manual) does not archive it, and the
 daemon's automatic eviction tick does not evict it. Reproduced before the fix on
@@ -822,9 +845,13 @@ result's `raw_blob` (`derive.body_hash` is a bare hex token digest with no
 `sha256:` prefix and no CAS object, so the raw scan correctly ignores it). —
 `attest_capture::ac_p3_24_purge_orphans_protects_a_blob_cited_only_by_attest_jsonl`
 and `cmds::tests::ac_p3_24_a_blob_cited_only_by_attest_jsonl_survives_the_eviction_tick`.
-**Mutation-probed:** removing `attest_path` from each protect set reds its own
-test (purge: 0 passed / 1 failed, and the reclaim line reappears verbatim;
-eviction: 0 passed / 1 failed).
+The eviction half drives the daemon's own harvest -> `plan_eviction` -> `execute`
+sequence, not `status`'s dry run: `status` deletes nothing, so a survival
+assertion behind it could not red. Its fixture also makes the attest-cited blob a
+real eviction CANDIDATE (an older turn snapshots it, a newer turn snapshots
+something else, budget 100), because a blob no turn references is never a
+candidate and would survive whatever the protect set said. **Mutation-probed:**
+removing `attest_path` from each protect set reds its own test.
 **AC-ATTEST-P3-25.** `open.json` is a MIRROR of live daemon state, so a journal
 left behind by a crashed or killed daemon names a turn that will never be
 persisted. `open_turn_id` gates on the same liveness probe `status`/`doctor` use
@@ -859,6 +886,20 @@ parse error — its same-section siblings keep their own outcomes, and cargo's
 after the first target that fails, so the `integration` target never runs and a
 failing bulk capture records 3 results where a green one records 5. —
 `attest_capture::ac_p3_28_a_real_failing_test_is_captured_as_a_failed_outcome`
+**AC-ATTEST-P3-29.** A `PostToolUse` event NEVER maps to a signal. `init`
+installs `PostToolUse[Bash]` for every repo (AC-ATTEST-P3-27), and `cmds::hook`
+maps every non-`UserPromptSubmit` event to `stop` — so before this fix an
+ordinary Bash call (`ls`, `git status`) fell through and appended a stop signal,
+closing the open bracket. Measured by the Fable skeptic gate at `74a0a2c`, with
+a real daemon: one prompt + two non-test Bash calls + `Stop` wrote
+start,stop,stop,stop and produced THREE rich turns where bracketing requires
+one; the test below pins the mechanism (an unmatched `PostToolUse` appends a
+signal), not that count. `cmds::hook` now returns for EVERY
+`PostToolUse` regardless of capture outcome; unmatched shapes (a non-test Bash
+command, a non-Bash tool) leave `signal.jsonl` byte-identical and write no
+attest event, while `UserPromptSubmit`/`Stop` still map to start/stop. —
+`attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
+
 **Dependency note.** `check-versions.sh` does not track the three new direct
 deps (`syn`, `proc-macro2`, `quote`) — it asserts the release version across six
 files and has no per-dependency pin check — so a version bump on them is not
@@ -870,8 +911,12 @@ version movement from any of it.
 `recipe-invalid` causes distinct. THREE are driven end to end against real
 cargo output on the fixture crate — `missing` (name absent from `--list`),
 `ignored` (`#[ignore]`d) and `build` (the target does not compile) — alongside a
-real passing run, so a cause is never a pass. The fourth, `harness`, is asserted
-against a SYNTHETIC string (per-test lines with no summary line): reproducing it
-for real needs a test binary that aborts mid-harness, which this fixture crate
-does not have. — `attest::adapter_cargo::tests::
+real passing run, so a cause is never a pass. The fourth, `harness`, is driven for real
+too: a `std::process::abort()` test is appended to the SCRATCH COPY of the
+fixture crate (never the committed one, whose five-test count AC-ATTEST-P3-10
+pins), and the scoped `--exact` run produces the real shape — libtest's `running
+1 test` header, then SIGABRT, with no per-test line and no summary — yielding
+`recipe_invalid: Harness, parse_failed: true, outcome: None`. The synthetic
+string is kept as a second case, pinning the same mapping without a signal. —
+`attest::adapter_cargo::tests::
 ac_p3_23_the_staged_pipeline_keeps_its_recipe_invalid_causes_distinct`

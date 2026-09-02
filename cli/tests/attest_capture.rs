@@ -7,10 +7,13 @@
 //! from earlier builds), `git init`ed and `agentrec init`ed, so a test that
 //! renames a test fn cannot touch the repo.
 //!
-//! **`open.json` is written by hand here**, the way `daemon.rs::sync_journal`
-//! writes it, and only its `id` field is read back. That proves the READER;
-//! it is not evidence that the daemon's writer and this reader agree on the
-//! field — the daemon is not running in these fixtures.
+//! **Two of the eighteen tests here run a REAL daemon** — `ac_p3_15` and
+//! `ac_p3_16`, the two that assert on a turn id, both via `open_bracketed_turn`
+//! — so the id they compare against is the one `daemon.rs::sync_journal` itself
+//! wrote, and writer and reader are both proven. `open.json` is written BY HAND
+//! in exactly one test, `ac_p3_25_a_stale_open_json_yields_unjoined_evidence_on_a_clean_tree`,
+//! whose whole subject is a journal left behind with no daemon running. The
+//! remaining fifteen need no daemon at all.
 
 #![allow(clippy::disallowed_methods)]
 //  ^ Test code reads its own tempdir fixtures; production reads stay
@@ -182,7 +185,11 @@ fn open_bracketed_turn(root: &Path) -> (Child, String) {
         root,
         r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"go"}"#,
     );
-    // A watched mutation is what actually opens the turn.
+    // The start signal alone is what opens the turn — measured: a daemon that
+    // receives only `UserPromptSubmit` mirrors `{"source":"bracket", …,
+    // "files":[]}` to `open.json` with no file mutation at all. This write is
+    // kept anyway so the open turn also carries a file, which is the ordinary
+    // shape the evidence below is joined to.
     std::fs::write(root.join("src/marker.rs"), "// bracket marker\n").unwrap();
     let id = poll_until(Duration::from_secs(20), || {
         let text = std::fs::read_to_string(root.join(".agentrec/open.json")).ok()?;
@@ -848,4 +855,147 @@ fn ac_p3_28_a_real_failing_test_is_captured_as_a_failed_outcome() {
         !by_test.contains_key("integration::integration_add_works"),
         "cargo never ran the integration target: {by_test:#?}"
     );
+}
+
+/// AC-ATTEST-P3-20 (harness-crash half) — a run whose test binary dies before
+/// libtest reports anything names no test, so nothing can be attributed. It
+/// must still be visible: the raw output is retained in the CAS and the
+/// unparseable section is counted on stderr. Before this fix the whole run
+/// vanished — exit 101, zero events, no blob, no count.
+///
+/// The aborting test is appended to THIS tempdir copy only; the committed
+/// fixture crate keeps its five tests (AC-ATTEST-P3-10 pins that count).
+#[test]
+fn ac_p3_20_a_harness_crash_retains_its_raw_output_and_is_counted() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    let lib = root.join("src/lib.rs");
+    let text = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(
+        &lib,
+        format!("{text}\n#[test]\nfn unit_aborts() {{ std::process::abort() }}\n"),
+    )
+    .unwrap();
+    ok(agentrec(root, &["attest", "derive"]));
+
+    // Scoped to the aborting test alone, which makes the shape deterministic:
+    // libtest prints `running 1 test` and SIGABRT ends the process before any
+    // per-test line or summary is written.
+    let out = agentrec(
+        root,
+        &[
+            "attest",
+            "run",
+            "--",
+            "cargo",
+            "test",
+            "--lib",
+            "unit_aborts",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "cargo's own status still propagates: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("1 section(s) unparseable"),
+        "the crash must be counted, not silent: {stderr}"
+    );
+
+    // No event: the run named no test, and inventing an attribution would be
+    // worse than the count.
+    let events = attest_events(root);
+    assert!(
+        of_kind(&events, "evidence").is_empty(),
+        "nothing may be attributed to a claim the run never named: {events:#?}"
+    );
+
+    // The raw output IS retained, and the reported hash resolves in the CAS.
+    let blob = stderr
+        .split("raw output retained at ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("stderr must name the retained blob: {stderr}"))
+        .to_string();
+    let hex = blob.strip_prefix("sha256:").expect("a sha256 ref");
+    let path = root
+        .join(".agentrec/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    let stored = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("blob {} missing: {e}", path.display()));
+    assert!(
+        stored.contains("running 1 test"),
+        "the retained output must be the crashed run's own: {stored}"
+    );
+    assert!(
+        stored.contains("SIGABRT") || stored.contains("signal: 6"),
+        "stderr is retained alongside stdout: {stored}"
+    );
+}
+
+/// AC-ATTEST-P3-29 — `PostToolUse` is never a turn boundary. `init` installs
+/// `PostToolUse[Bash]` for every repo, so an ordinary Bash call that is not a
+/// test runner reaches `cmds::hook`; before this fix it fell through to the
+/// `_ => "stop"` arm and appended a stop signal, closing the open bracket.
+/// Measured by the Fable skeptic gate at `74a0a2c` with a real daemon: one
+/// prompt + two non-test Bash calls + `Stop` wrote start,stop,stop,stop and
+/// produced three rich turns where bracketing requires one. This test pins the
+/// MECHANISM (an unmatched `PostToolUse` appends a signal), not that count.
+#[test]
+fn ac_p3_29_no_post_tool_use_event_ever_emits_a_signal() {
+    let tmp = fixture_repo();
+    let root = tmp.path();
+    ok(agentrec(root, &["attest", "derive"]));
+    let signal = root.join(".agentrec/signal.jsonl");
+
+    ok(send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"go"}"#,
+    ));
+    let after_start = std::fs::read(&signal).unwrap_or_default();
+    assert_eq!(
+        signal_lines(root),
+        1,
+        "precondition: the bracket is open with exactly one start signal"
+    );
+
+    // A Bash call that is not a test runner, and a non-Bash tool call.
+    for payload in [
+        r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash",
+            "tool_input":{"command":"git status"},
+            "tool_response":{"stdout":"nothing to commit\n","stderr":""}}"#,
+        r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash",
+            "tool_input":{"command":"ls"},"tool_response":{"stdout":"src\n","stderr":""}}"#,
+        r#"{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Edit",
+            "tool_input":{"file_path":"src/lib.rs"},"tool_response":{"stdout":"","stderr":""}}"#,
+    ] {
+        ok(send_hook(root, payload));
+        assert_eq!(
+            std::fs::read(&signal).unwrap_or_default(),
+            after_start,
+            "an unmatched PostToolUse must leave signal.jsonl byte-identical: {payload}"
+        );
+    }
+    assert!(
+        of_kind(&attest_events(root), "evidence").is_empty(),
+        "an unmatched PostToolUse writes no attest evidence either"
+    );
+
+    // The two events that ARE turn boundaries still map as before.
+    ok(send_hook(
+        root,
+        r#"{"hook_event_name":"Stop","session_id":"s1"}"#,
+    ));
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&signal)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "exactly one start and one stop: {lines:#?}");
+    assert_eq!(lines[0]["event"], "start");
+    assert_eq!(lines[1]["event"], "stop");
 }

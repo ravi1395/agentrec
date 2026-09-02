@@ -997,25 +997,22 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         .and_then(|v| v.as_str())
         .unwrap_or("Stop");
 
-    // Attest capture path 2 (plan Phase 3): a `PostToolUse` `Bash` firing whose
-    // command is a test runner is an evidence capture, not a turn boundary, so
-    // it RETURNS here rather than falling through.
+    // `PostToolUse` is NEVER a turn boundary, so it returns here whatever the
+    // capture outcome — matched (attest evidence written) or unmatched (nothing
+    // written at all).
     //
-    // Falling through would be wrong, not merely redundant: this function maps
-    // every non-`UserPromptSubmit` event to `"stop"`, so a captured
-    // `PostToolUse` would also append a stop signal and CLOSE the bracket the
-    // evidence is supposed to be joined to. `attest_capture::
-    // ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence` pins that: it
-    // drives this arm with a real `PostToolUse` `Bash` payload and asserts
-    // `signal.jsonl` stays empty.
-    //
-    // Only a MATCHED capture returns here. Every other `PostToolUse` —
-    // non-`Bash`, or a `Bash` command that is not a test runner — keeps its
-    // existing path untouched, because `capture_from_hook_payload` returns
-    // false for those.
-    if event_name == "PostToolUse"
-        && crate::attest::capture::capture_from_hook_payload(root, &payload)
-    {
+    // Returning unconditionally is the load-bearing part. The `match` below maps
+    // every non-`UserPromptSubmit` event to `"stop"`, and `init` installs
+    // `PostToolUse[Bash]` for every repo (`initcmd::CLAUDE_HOOK_EVENTS`) — so an
+    // ordinary Bash call (`ls`, `git status`) falling through would append a stop
+    // signal and CLOSE the open bracket. Measured before this fix by the Fable
+    // skeptic gate at `74a0a2c`, with a real daemon: one prompt + two non-test
+    // Bash calls + `Stop` wrote start,stop,stop,stop and produced THREE rich
+    // turns where bracketing requires one. `attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
+    // pins the unmatched shapes; `ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence`
+    // pins the matched one.
+    if event_name == "PostToolUse" {
+        crate::attest::capture::capture_from_hook_payload(root, &payload);
         return Ok(());
     }
 
@@ -1708,21 +1705,53 @@ mod tests {
             "a blob referenced only by attest.jsonl must stay protected"
         );
 
-        // Same fixture shape as the unknown-record test above: a real,
-        // parseable turn so the over-budget branch is actually reached and the
-        // survival assertion is not vacuous.
+        // The survival half must be a REAL deletion pass, not `status`'s dry
+        // run — `status` deletes nothing, so `store.contains` could not red
+        // there whatever the protect set said. It must also make `captured` a
+        // genuine eviction CANDIDATE, which only a turn's snapshot hash can be:
+        // an OLDER turn snapshots it, a NEWER turn snapshots something else.
+        // Under a tiny budget the walk keeps the newest turn and marks the
+        // older turn's hashes as candidates — so with the harvest removed,
+        // `captured` is a victim and `execute` deletes it.
+        let older = turn_with_snapshot("t_ATTESTBLOBOLDER000000001", "captured.bin", &captured);
+        append_log(&log_path(root), &LogRecord::Turn(older)).unwrap();
         let parseable = store.put(&[0xDFu8; 4_000]).unwrap();
-        let turn = turn_with_snapshot("t_ATTESTBLOBPEER0000000001", "peer.bin", &parseable);
-        append_log(&log_path(root), &LogRecord::Turn(turn)).unwrap();
+        let newer = turn_with_snapshot("t_ATTESTBLOBPEER0000000001", "peer.bin", &parseable);
+        append_log(&log_path(root), &LogRecord::Turn(newer)).unwrap();
 
-        let out = status_report(root, 100).unwrap();
-        assert!(
-            out.contains("would free"),
-            "fixture must reach the eviction dry-run branch: {out}"
+        let owned: Vec<TurnRecord> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            owned.len(),
+            2,
+            "fixture: two turns, oldest citing `captured`"
+        );
+
+        // The same harvest -> plan -> execute sequence `daemon::run_eviction_pass`
+        // runs on its tick.
+        let plan = agentrec_core::retention::plan_eviction(
+            &store,
+            &owned,
+            100,
+            &extra_protected_refs(root),
         );
         assert!(
+            plan.protected_bytes >= 4_000,
+            "the attest-cited candidate must be the thing the protect set spared: {plan:?}"
+        );
+        assert!(
+            plan.victims.is_empty(),
+            "nothing else is evictable in this fixture: {plan:?}"
+        );
+        agentrec_core::retention::execute(&store, plan);
+        assert!(
             store.contains(&captured),
-            "eviction dropped a blob referenced only by attest.jsonl"
+            "the eviction tick deleted a blob referenced only by attest.jsonl"
         );
     }
 

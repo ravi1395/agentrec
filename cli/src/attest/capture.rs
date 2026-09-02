@@ -25,13 +25,20 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// What one capture did, for the caller's own reporting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureReport {
     pub written: usize,
     /// Results for tests no `derive` knows.
     pub skipped_undeclared: usize,
     /// The captured output exceeded the CAS snapshot cap, so no blob was kept.
     pub blob_over_cap: bool,
+    /// Sections that produced NO per-test line and no summary — a harness that
+    /// died before libtest could report anything (`process::abort`,
+    /// `process::exit`, SIGABRT/SIGSEGV). Such a section names no test, so no
+    /// claim can be attributed from it; it is counted and its raw output kept.
+    pub unattributable_sections: usize,
+    /// The CAS ref of the retained raw output, when a blob was stored.
+    pub raw_blob: Option<String>,
 }
 
 /// The single evidence writer both capture paths call.
@@ -43,12 +50,22 @@ pub struct CaptureReport {
 ///
 /// An over-cap blob is a NOTE, never a failure: losing the raw text is worse
 /// than losing nothing, but losing the evidence too is worse still.
+///
+/// `unattributable_sections` is the count of libtest sections that produced no
+/// per-test line at all (a harness crash). Such a section yields zero
+/// `results`, so there is nothing to attach evidence to — but the raw output is
+/// the only artifact that exists, so it is STORED and its hash reported. When
+/// every section is unattributable no event cites that blob, which makes it an
+/// orphan `purge --orphans` may later archive; retaining it and saying so is
+/// still better than dropping the one record of a crashed run, and attributing
+/// it to a claim the run never named would be fabrication.
 pub fn write_evidence(
     root: &Path,
     results: &[StructuredResult],
     raw: &str,
     turn_id: Option<String>,
     dirty: bool,
+    unattributable_sections: usize,
 ) -> Result<CaptureReport, String> {
     let (events, _) = read_attest(root)?;
     let folded = fold_claims(&events);
@@ -58,7 +75,10 @@ pub fn write_evidence(
     // results were all undeclared — a blob no event references, which is
     // exactly what `purge --orphans` exists to clean up and which nothing
     // should be creating on a routine path.
-    let mut report = CaptureReport::default();
+    let mut report = CaptureReport {
+        unattributable_sections,
+        ..CaptureReport::default()
+    };
     let mut resolved = Vec::new();
     for result in results {
         match folded.claim_for(&result.identity) {
@@ -66,7 +86,7 @@ pub fn write_evidence(
             None => report.skipped_undeclared += 1,
         }
     }
-    if resolved.is_empty() {
+    if resolved.is_empty() && unattributable_sections == 0 {
         return Ok(report);
     }
 
@@ -81,6 +101,12 @@ pub fn write_evidence(
             None
         }
     };
+    report.raw_blob = blob.clone();
+    if resolved.is_empty() {
+        // Only unattributable sections: the blob is kept and reported, and no
+        // event is written because none could name a test.
+        return Ok(report);
+    }
 
     let ts = crate::cmds::wall_now_ms();
     let mut batch = Vec::new();
@@ -248,13 +274,43 @@ pub fn capture_output(root: &Path, stdout: &str, stderr: &str) -> Result<Capture
     let sections = parse_libtest(stdout);
     let targets = section_targets(stderr, sections.len());
     let results = bulk_results(stdout, &targets);
+    // A section with no per-test line contributes nothing to `results` — that
+    // is the harness-crash shape (`process::abort`, SIGABRT), which used to
+    // vanish entirely: no event, no blob, no count. Counted here so
+    // `write_evidence` still retains the raw output.
+    //
+    // Gated on the capture looking like libtest at all. `parse_libtest` also
+    // returns one empty flagged section for output with no test lines
+    // whatsoever, and `attest run -- <any non-test command>` is exactly that —
+    // storing a CAS blob for every wrapped `echo` would be pure orphan churn.
+    // A harness that dies mid-run has already printed its `running N tests`
+    // header, so the gate does not lose the case this exists for.
+    let unattributable = if looks_like_libtest(stdout) {
+        sections
+            .iter()
+            .filter(|s| s.parse_failed && s.per_test.is_empty())
+            .count()
+    } else {
+        0
+    };
     write_evidence(
         root,
         &results,
         &format!("{stdout}{stderr}"),
         open_turn_id(root),
         tree_is_dirty(root),
+        unattributable,
     )
+}
+
+/// Did this capture come from libtest at all? `running N test(s)` is the header
+/// libtest prints before it executes anything, so it is present even in a run
+/// that aborts before its first result line.
+fn looks_like_libtest(stdout: &str) -> bool {
+    stdout.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("running ") && (l.ends_with(" test") || l.ends_with(" tests"))
+    })
 }
 
 fn report_to_stderr(report: &CaptureReport) {
@@ -267,11 +323,26 @@ fn report_to_stderr(report: &CaptureReport) {
     if report.blob_over_cap {
         eprintln!("agentrec attest: captured output exceeded the snapshot cap; no blob retained");
     }
+    if report.unattributable_sections > 0 {
+        match &report.raw_blob {
+            Some(blob) => eprintln!(
+                "agentrec attest: {} section(s) unparseable (harness crash — no test named), \
+                 raw output retained at {blob}",
+                report.unattributable_sections
+            ),
+            None => eprintln!(
+                "agentrec attest: {} section(s) unparseable (harness crash — no test named), \
+                 raw output NOT retained",
+                report.unattributable_sections
+            ),
+        }
+    }
 }
 
 /// Hook path (capture path 2): a `PostToolUse` `Bash` firing whose command is a
-/// test runner. Returns `true` when this payload was captured, so the caller
-/// knows not to fall through to the ordinary signal path.
+/// test runner. Returns whether this payload was captured — informational only:
+/// the caller (`cmds::hook`) returns without emitting a signal for EVERY
+/// `PostToolUse`, matched or not, because a tool call is never a turn boundary.
 ///
 /// **Field names.** `tool_input.command`, `tool_response.stdout` and
 /// `tool_response.stderr` are Claude Code's documented `PostToolUse` `Bash`

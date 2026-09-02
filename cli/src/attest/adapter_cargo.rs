@@ -1092,11 +1092,50 @@ mod tests {
         );
         assert!(r.raw.is_empty(), "nothing ran");
 
-        // harness — no summary line at all, from the parser's own branch.
+        // harness — driven for real. A test calling `std::process::abort()` is
+        // appended to THIS scratch copy of the fixture crate (never the
+        // committed one, whose test count AC-ATTEST-P3-10 pins at 5), and the
+        // scoped `--exact` run then produces the real shape: libtest prints its
+        // `running 1 test` header, SIGABRT kills the binary, and no per-test
+        // line and no summary are ever written.
+        let lib = root.join("src/lib.rs");
+        let text = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(
+            &lib,
+            format!("{text}\n#[test]\nfn unit_aborts() {{ std::process::abort() }}\n"),
+        )
+        .unwrap();
+        let r = CargoAdapter
+            .run(
+                root,
+                &RunFilter::Exact {
+                    target: "attest_sample_crate".into(),
+                    fn_path: "unit_aborts".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            r.results[0].recipe_invalid,
+            Some(RecipeInvalidCause::Harness),
+            "raw: {}",
+            r.raw
+        );
+        assert!(r.results[0].parse_failed, "{:?}", r.results[0]);
+        assert!(r.results[0].outcome.is_none(), "{:?}", r.results[0]);
+        assert!(
+            r.raw.contains("running 1 test"),
+            "the header libtest printed before the abort: {}",
+            r.raw
+        );
+        // Second case, kept: the same cause from the parser's own branch on a
+        // synthetic string, which pins the mapping independently of a signal.
         assert_eq!(
             single_test_result(&ident(), "running 1 test\ntest a ... ok\n").recipe_invalid,
             Some(RecipeInvalidCause::Harness)
         );
+        // Restore the pre-abort source so the `build` case below breaks the
+        // build for its OWN reason.
+        std::fs::write(&lib, &text).unwrap();
 
         // build
         let lib = root.join("src/lib.rs");
