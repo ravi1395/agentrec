@@ -934,13 +934,20 @@ fn eviction_plan(
 /// carrying a hash needs revisiting this function, not just PROTOCOL.md.
 pub(crate) fn extra_protected_refs(root: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
-    // open.json + memory.jsonl are never themselves a `TurnRecord`, so
-    // every ref in them is "extra" by construction — no validity filter
-    // needed (mirrors `recover_orphan`'s own tolerance of a corrupt
-    // journal: raw bytes are scanned whether or not they parse).
+    // open.json + memory.jsonl + attest.jsonl are never themselves a
+    // `TurnRecord`, so every ref in them is "extra" by construction — no
+    // validity filter needed (mirrors `recover_orphan`'s own tolerance of a
+    // corrupt journal: raw bytes are scanned whether or not they parse).
+    //
+    // `attest.jsonl` carries the CAS hash of a captured test-output blob on
+    // every `evidence` event (`output_blob`, repeated as the result's
+    // `raw_blob` when the capture failed closed). Without it this tick would
+    // evict a blob that only attest cites — the same omission `purge
+    // --orphans` had, fixed in the same change.
     for path in [
         crate::open_path(root),
         agentrec_core::memory::memory_path(root),
+        crate::attest::lock::attest_path(root),
     ] {
         if let Ok(text) = agentrec_core::fsguard::read_regular_to_string(&path) {
             crate::purgecmd::harvest_refs(&text, &mut out);
@@ -989,6 +996,27 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("Stop");
+
+    // `PostToolUse` is NEVER a turn boundary, so it returns here whatever the
+    // capture outcome — matched (attest evidence written) or unmatched (nothing
+    // written at all).
+    //
+    // Returning unconditionally is the load-bearing part. The `match` below maps
+    // every non-`UserPromptSubmit` event to `"stop"`, and `init` installs
+    // `PostToolUse[Bash]` for every repo (`initcmd::CLAUDE_HOOK_EVENTS`) — so an
+    // ordinary Bash call (`ls`, `git status`) falling through would append a stop
+    // signal and CLOSE the open bracket. Measured before this fix by the Fable
+    // skeptic gate on the `f1da261` extract, with a real daemon: one prompt +
+    // one non-test Bash call (`ls -la`) + `Stop` wrote start,stop,stop and
+    // produced TWO rich turns, the first with `files: []`, where bracketing
+    // requires one. `attest_capture::ac_p3_29_no_post_tool_use_event_ever_emits_a_signal`
+    // pins the unmatched shapes; `ac_p3_16_hook_post_tool_use_bash_writes_the_same_evidence`
+    // pins the matched one.
+    if event_name == "PostToolUse" {
+        crate::attest::capture::capture_from_hook_payload(root, &payload);
+        return Ok(());
+    }
+
     let event = match event_name {
         "UserPromptSubmit" => "start",
         _ => "stop",
@@ -1637,6 +1665,94 @@ mod tests {
         assert!(
             store.contains(&referenced),
             "eviction dropped a blob referenced by a record it could not parse"
+        );
+    }
+
+    /// AC-ATTEST-P3-24 (eviction half) — mirrors
+    /// `an_unknown_record_type_still_contributes_to_the_protected_ref_set`
+    /// above, for `attest.jsonl`. The daemon's eviction tick runs
+    /// automatically, so a blob cited only by an `evidence` event would be
+    /// silently evicted with no user action at all.
+    #[test]
+    fn ac_p3_24_a_blob_cited_only_by_attest_jsonl_survives_the_eviction_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(objects_dir(root)).unwrap();
+        let store = BlobStore::new(objects_dir(root));
+        let captured = store.put(&[0xEEu8; 4_000]).unwrap();
+
+        // One `evidence` event citing that blob, and nothing else does.
+        let attest = crate::attest::lock::attest_path(root);
+        std::fs::create_dir_all(attest.parent().unwrap()).unwrap();
+        let line = serde_json::json!({
+            "kind": "evidence",
+            "ts": 1,
+            "claim_id": "c_00000000010W3GE1R70W3GE1R7",
+            "turn_id": null,
+            "dirty": false,
+            "output_blob": captured,
+            "result": {
+                "identity": {"target": "t", "fn_path": "f"},
+                "outcome": null,
+                "recipe_invalid": null,
+                "parse_failed": true,
+                "raw_blob": captured,
+            }
+        });
+        std::fs::write(&attest, format!("{line}\n")).unwrap();
+
+        assert!(
+            extra_protected_refs(root).contains(&captured),
+            "a blob referenced only by attest.jsonl must stay protected"
+        );
+
+        // The survival half must be a REAL deletion pass, not `status`'s dry
+        // run — `status` deletes nothing, so `store.contains` could not red
+        // there whatever the protect set said. It must also make `captured` a
+        // genuine eviction CANDIDATE, which only a turn's snapshot hash can be:
+        // an OLDER turn snapshots it, a NEWER turn snapshots something else.
+        // Under a tiny budget the walk keeps the newest turn and marks the
+        // older turn's hashes as candidates — so with the harvest removed,
+        // `captured` is a victim and `execute` deletes it.
+        let older = turn_with_snapshot("t_ATTESTBLOBOLDER000000001", "captured.bin", &captured);
+        append_log(&log_path(root), &LogRecord::Turn(older)).unwrap();
+        let parseable = store.put(&[0xDFu8; 4_000]).unwrap();
+        let newer = turn_with_snapshot("t_ATTESTBLOBPEER0000000001", "peer.bin", &parseable);
+        append_log(&log_path(root), &LogRecord::Turn(newer)).unwrap();
+
+        let owned: Vec<TurnRecord> = agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|r| match r {
+                LogRecord::Turn(t) => Some(t),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            owned.len(),
+            2,
+            "fixture: two turns, oldest citing `captured`"
+        );
+
+        // The same harvest -> plan -> execute sequence `daemon::run_eviction_pass`
+        // runs on its tick.
+        let plan = agentrec_core::retention::plan_eviction(
+            &store,
+            &owned,
+            100,
+            &extra_protected_refs(root),
+        );
+        assert!(
+            plan.protected_bytes >= 4_000,
+            "the attest-cited candidate must be the thing the protect set spared: {plan:?}"
+        );
+        assert!(
+            plan.victims.is_empty(),
+            "nothing else is evictable in this fixture: {plan:?}"
+        );
+        agentrec_core::retention::execute(&store, plan);
+        assert!(
+            store.contains(&captured),
+            "the eviction tick deleted a blob referenced only by attest.jsonl"
         );
     }
 

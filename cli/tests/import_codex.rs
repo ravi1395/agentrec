@@ -603,9 +603,8 @@ mod persist {
             format!(
                 r#"{{"timestamp":"2026-06-15T09:00:00.000Z","type":"session_meta","payload":{{"id":"s_upd","cwd":"{cwd}","originator":"Codex CLI","cli_version":"0.146.0"}}}}"#
             ),
-            format!(
-                r#"{{"timestamp":"2026-06-15T09:00:01.000Z","type":"event_msg","payload":{{"type":"user_message","message":"tweak u.txt","images":[],"local_images":[],"text_elements":[]}}}}"#
-            ),
+            r#"{"timestamp":"2026-06-15T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"tweak u.txt","images":[],"local_images":[],"text_elements":[]}}"#
+                .to_string(),
             format!(
                 r#"{{"timestamp":"2026-06-15T09:00:02.000Z","type":"event_msg","payload":{{"type":"patch_apply_end","call_id":"call_u","turn_id":"t_u","stdout":"","stderr":"","success":true,"changes":{{"{cwd}/u.txt":{{"type":"update","unified_diff":"@@ -1,1 +1,1 @@\n-before\n+after\n","move_path":null}}}}}}}}"#
             ),

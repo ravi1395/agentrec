@@ -32,6 +32,8 @@
 agentrec-core/src/record.rs::open_append          2  # is_nonregular(path); the one primitive behind every log/signal/memory append
 agentrec-core/src/undo_coordinator.rs::append_event 2  # is_nonregular(&path) on the undo event ledger
 agentrec-core/src/undo_coordinator.rs::acquire    2  # UndoLock::acquire; is_nonregular(path) on the lock file
+cli/src/attest/lock.rs::open_lock_file_at       2  # is_nonregular(&path) on the lock path (attest.lock, attest-verify.lock)
+cli/src/attest/lock.rs::append_attest_locked   2  # is_nonregular(&path) on attest.jsonl before the append
 cli/src/daemon.rs::sync_journal                   1  # is_nonregular(&tmp) before the open.json tmp write
 cli/src/daemon.rs::acquire_lock                   2  # is_nonregular(&path) on the daemon lock file
 cli/src/daemon.rs::daemon_is_running              1  # is_nonregular(&path) before the liveness probe open
@@ -48,6 +50,7 @@ cli/src/state.rs::write_state                     1  # is_nonregular(&tmp) befor
 # ---- [excl] create_new: EEXIST on any pre-existing inode ------------------
 agentrec-core/src/store.rs::create_tmp_file       4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh CAS tmp name
 cli/src/purgecmd.rs::create_tmp_file              4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh rewrite tmp name
+cli/src/attest/coveragecmd.rs::write_map_atomically 2  # create_new on a fresh pid+millis tmp name beside the coverage map; EEXIST on any planted inode, so a FIFO cannot be opened here
 
 # ---- [upstream] refused by a guarded read earlier on the same path --------
 agentrec-core/src/store.rs::put_result            1  # mtime touch on a dedup HIT: reached only after fsguard::read_regular returned bytes hashing to the expected value, which a FIFO cannot do

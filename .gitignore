@@ -10,3 +10,4 @@
 .mcp.json
 HANDOFF.md
 .sutra/tasks.json
+/cli/tests/fixtures/attest_sample_crate/target/

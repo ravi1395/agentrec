@@ -14,6 +14,178 @@ carries only current state, what's next, and standing debts.
 
 ### Current state
 
+- **PR #23 CI-red fix: cargo's own ANSI SGR broke attest's target attribution — Fable skeptic
+  GATE PASS at round 2 (`feat/attest`, code identical to the round-1 tree, whose code criteria
+  all passed; unpushed).**
+  Under an explicit `CARGO_TERM_COLOR=always` — which `.github/workflows/ci.yml` sets in a
+  workflow-level `env:` block — cargo colorizes its OWN status lines, putting the escape BEFORE
+  the leading whitespace and the reset BETWEEN the word and its trailing space. So
+  `attest::adapter_cargo::section_targets`'s `trim_start()` stripped nothing,
+  `strip_prefix("Running ")` never matched, no marker paired, and every libtest result landed in
+  an unattributable section: **zero evidence captured, behind one stderr warning.**
+  That reddened the three `test (…)` jobs on run 33650989104. Fixed by
+  `attest::adapter_cargo::strip_sgr`, a narrow `ESC [` digits/`;` `m` scanner applied per line
+  inside `section_targets` — deliberately NOT to `stdout`/`stderr` up front, because
+  `attest::capture::capture_output` writes those same strings to the CAS as the evidence blob and
+  stripping there would silently change stored evidence bytes (the gate confirmed the blob still
+  carries its ESC bytes after a real `attest run`). The new test fails `left: []` with the call
+  site neutered, and fails on the pre-fix tree.
+  **Scope stayed one function, on measurement:** ANSI appears only on cargo's own
+  Compiling/Finished/Running/Doc-tests/error: lines — measured here on a passing and a failing
+  run, and re-measured by the gate over an ignored test and a failing doc-test too — so `parse_per_test`/`parse_summary` need nothing.
+  No CI leg added: `ci.yml` already forces color workflow-wide, so the existing jobs ARE the
+  regression coverage. The gate also fuzzed `strip_sgr` (200k generated strings + hand edge cases:
+  no panic, no hang) and independently reproduced both directions of the repro.
+  **Round 1 GATE FAIL was RECORD-only, and one blocker was this repo's signature defect committed
+  again after the ingested handoff warned about it:** the commit message and TWO source doc
+  comments claimed a "TTY-attached `attest run`" also gets colorized output. **Measured FALSE** —
+  `attest::capture::run_wrapped` spawns the child with `Stdio::piped()` on both streams, so
+  cargo's TTY detection never fires; the gate drove a real `attest run` inside a pty with the
+  variable unset and captured zero ESC bytes. Two further record defects: "four CI test jobs"
+  (three `test (…)` jobs failed; the fourth failing job is `fmt + clippy`, different cause), and
+  an unverifiable "it passed in an earlier full run carrying this fix" — **deleted, not
+  reworded**, since the artifact behind it carried no sha and no per-test line. Round 2 also
+  named two count imprecisions in the replacement text (a suite total that omitted the ignored
+  tests; a provenance sentence naming the wrong sha), both fixed.
+  **Residuals, disclosed:** all measurement is macOS + Homebrew cargo 1.97.1, so the first Linux
+  exercise is CI on push; the `PostToolUse` hook capture path was not driven live under a
+  color-forcing shell (`ac_p3_16` covers it under the env var); `strip_sgr` truncates a line at
+  any NON-SGR escape, so a future cargo emitting e.g. `ESC[K` before a marker would leave it
+  unpaired — loudly, as unattributable — disclosed in the fn doc. **The separate `fmt + clippy`
+  CI failure is NOT this branch's:** `useless_format` in
+  `import_codex.rs::update_only_turn_persists_with_baseline_unknown_never_fabricated` (an
+  argument-less `format!`) fires under CI's clippy 1.98.0; `git diff main...HEAD` for that file is empty and the line is
+  byte-identical on `main`, whose last CI run predates the `dtolnay/rust-toolchain@stable` float.
+  Local clippy is Homebrew 0.1.97 and rustup stable here is 1.96.1, so it cannot be reproduced
+  locally without changing the machine's toolchain. **PR #23 CI therefore stays red on that job
+  regardless of this fix** — founder call on whether to fix it here or separately.
+
+- **attest v1 Phase 5 (review cards, advisory gate, attestation report, `manual-declare`,
+  unhide) — Fable skeptic GATE PASS at `22db674` (2026-09-02, `feat/attest`), after three
+  FAILED rounds.** `attest {review,gate,report,manual-declare}` unhidden; suite 1159→1179/0/4,
+  clippy `-D warnings` debug+release + fmt clean, goldens unchanged,
+  `scripts/check-write-opens.sh` ok (63/34). **Round 1 (`2ba1e30`) failed on the only CODE
+  blocker of the phase:** `gatecmd.rs` ran its `fyi` skip BEFORE the claim-false check, so a
+  hand-authored `fyi manual-declare` on a `CLAIM_FALSE` claim exited 0 while `attest status`
+  still reported the refutation. Fixed at `c1d4dd5` — the skip now follows `blocking_reason`,
+  so refutation always outranks severity.
+  **Rounds 2–4 all failed on the RECORD, never the code, and each blocker was a COUNT that
+  lived only in a sentence** — this repo's signature defect, three times in one phase:
+  - Round 2 (at `c1d4dd5`): the exit-code table was generated but partly vacuous. The
+    generator appended `manual-declare` FIRST when a row carried a severity, and `fold.rs`'s
+    `ManualDeclare` arm only sets `DECLARED` on `first_sight`, so `derived` (the `Derive` arm
+    assigns no status) and `evidenced` (the `Evidence` arm fires only out of `Derived`)
+    stalled — 8 of 59 rows silently re-testing the `DECLARED` cell under another label, with
+    nothing asserting a row reached the status its name claims. Fixed at `ff8365c`: declare
+    appended AFTER the recipe (`manual_severity` is written unconditionally either way), plus
+    a per-row `status_label` assertion. The one row expected not to match its own name
+    (`declared × none × stale=true`, born `DERIVED` because it writes only a `Stale` event) is
+    asserted positively rather than skipped.
+  - Round 3 (at `ff8365c`): a comment claimed declaring first would strand "every non-empty
+    recipe" — false, only those two strand; the other seven are overwritten by the `Verdict`
+    and `Human` arms. That sentence also contradicted the same commit's own 8-row figure.
+    Fixed at `4063e81`, comments only.
+  - Round 4 (at `4063e81`): "the 59 rows cover 58 distinct fold states" — **transcribed from
+    the gate's own prior residual note without re-derivation**, the recorded failure mode, this
+    time seeded by the skeptic and caught by the skeptic. Measured: **55** distinct
+    (status, severity, stale) cells and 59 distinct `ClaimState` values; there are FOUR
+    collapsing pairs, not one — `declared × none × stale=true` ≡ `derived × none × stale=true`,
+    plus `claim_false × {none, blocking, fyi} × stale=true` ≡ their `stale=false` siblings
+    (the fold's `Stale` arm returns early on a refuted claim). Those three were never disclosed
+    before. Fixed at `22db674` by making the count **executable** — `p5_2` collects each row's
+    axis triple into a `BTreeSet` and asserts `len() == 55` — rather than writing a third prose
+    count. The gate reproduced 55/59 on its own probe and red-verified both mutations
+    (expected-count forced to 59; declare-first ordering restored).
+  **Residuals, disclosed:** the per-row `assert_eq!` names only the FIRST stalled row, so a
+  multi-row regression needs re-running or an external enumeration; the 55-cell assertion pins
+  the current fold's answer, not an independent oracle (a fold regression would move the test
+  and any same-fold probe together); Phase 4's residuals all still stand (nothing captures this
+  repo's own coverage; `sweep_leaked_profraw` never fired; Claude Code's real `PostToolUse`
+  Bash payload field names unbacked by a fixture; `doctor` does not require the `PostToolUse`
+  entry; `attest review`'s cards read "evidence: none recorded" for every real manual claim by
+  construction). **Plan-exit checklist and the PR are NOT done** — `feat/attest` is unpushed
+  since this session's commits.
+- **attest v1 Phase 4 (independent replay + coverage staleness) — Fable skeptic GATE PASS at
+  `7e23ba9` (2026-09-02, `feat/attest`; hygiene follow-up `7c416ff`).** `attest verify`
+  (git-archive extract into a stable per-root dir, `target/` → per-COMMIT cache, scrubbed env
+  via `RunEnv`, staged pipeline with four distinct recipe-invalid causes, flaky policy: 1 run,
+  fail → up to 2 reruns, any pass → flaky-observation, 3 fails → claim-false), `attest coverage`
+  (cargo llvm-cov `show-env` recipe, `.agentrec/attest-coverage.json`, `over_stale` scopes
+  derived from bin targets' source dirs → `cli/src/**` here), daemon stale-marking at the batch
+  flush point through the attest lock (closes AC-P3-6), `clippy.toml` disallows
+  `Command::new` with 27 per-site allows and a two-direction plant probe
+  (`docs/verify/attest-purity-census.md`; direct-call census, not transitivity). Suite
+  1120→1159/0/4. Real defects found by measuring, all fixed: `show-env` quoted/bare mix dropped
+  `RUSTC_WRAPPER` (instrumentation silently absent); same-second commits sharing a build cache
+  served the wrong build; producer ignored the configured coverage path the daemon read; a
+  symlinked `--root` yielded `over_stale: []` (under-staling, the forbidden direction); batched
+  verdict append lost all progress on one Err. Record fix: README's "invalid TOML hard-errors on
+  every verb" was false — it is path-dependent (six `config::load` sites named). Residuals,
+  disclosed: nothing captures this repo's own coverage yet (`cli/src/**` reaching a real map is
+  unit-pinned only); `sweep_leaked_profraw` never fired in any run; `5bd5c0f`'s message says
+  "tempdir" of a stable dir and restates the verdict policy (unpushed; founder call on amend);
+  `approve.rs::a_killed_approve_never_leaves_a_phantom_approval` flaked 1/2 in one gate run
+  (the recorded flake). Phase 5 (review/gate/report/unhide) dispatched.
+- **attest v1 Phase 3 (cargo adapter + passive capture) — Fable skeptic GATE PASS at `78b9fb0`
+  (2026-09-02, `feat/attest`).** `cli/src/attest/{lock,statuscmd,adapter_cargo,capture,
+  derivecmd}.rs`, hidden `attest {status,derive,run}`, fixture crate
+  `cli/tests/fixtures/attest_sample_crate` (both test-target shapes; workspace-excluded; absent
+  from `cargo package`). Suite 1077→1120/0/4. Direct deps added: syn/proc-macro2/quote (no
+  lockfile version movement; NOT tracked by `check-versions.sh` — disclosed debt). Review +
+  gate found four real defects, all fixed with discriminating tests: CAS protect sets (purge
+  AND eviction tick) omitted `attest.jsonl`, so an attest-only blob was archived; the
+  orchestrator's ruling to install Claude `PostToolUse[Bash]` made `cmds::hook`'s unreachable
+  `_ => "stop"` arm live and every non-test Bash call split the turn (PostToolUse now never
+  emits a signal; live-daemon test pins one rich turn); hashing the whole `ItemFn` folded the
+  name in so rename detection could never fire (body block only now); `cargo test 2>&1 | tail`
+  put cargo's `Running` markers in stdout and every result went "undeclared" (both streams
+  scanned; unattributable ≠ undeclared). **Two sessions committed to this branch concurrently
+  on 2026-09-02** (`74a0a2c`, `e106bae` are not this session's); `e106bae` mis-transcribed the
+  skeptic's measurement in three sites — corrected at `78b9fb0`. Open: Claude Code's real
+  PostToolUse Bash payload field names (`tool_response.stdout/stderr`) remain unbacked by any
+  captured fixture — a live `claude -p` session would settle it; `doctor` does not require the
+  PostToolUse entry (pre-existing installs keep passing; a lost entry is undetected);
+  AC-ATTEST-P3-6 (daemon takes the lock) is manual until Phase 4B's daemon writer.
+- **attest v1 Phase 2 (pure claim core) — Fable skeptic GATE PASS at `cd94b73` (2026-09-02,
+  `feat/attest`).** `agentrec-core::attest::{types,events,fold}` + `ATTEST-FORMAT.md` (draft,
+  unstable, outside PROTOCOL versioning). Core lib 230→259 tests. Three gate rounds: round 1
+  FAILED on three CODE blockers (hex32 deserializer panicked on a 64-byte multibyte body_hash,
+  taking down every reader; Derive arm regressed EVIDENCED/CONFIRMED to DERIVED on any later
+  derive; STALE on a CLAIM_FALSE claim could never clear), round 2 FAILED on prose only (the
+  narrowed STALE rule restated in full in the spec beside a "single statement" sentence),
+  round 3 PASS. Opus review before the gate had caught a fourth real defect (a `human` event
+  erased permanent claim-false). **Contract deviations Phase 3 must read:** `fold_claims`
+  returns `FoldResult { claims, by_identity }` with `claim_for(&TestIdentity)` (plan amended);
+  STALE clears only on confirmed/claim-false (orchestrator-ratified under decision 5, founder
+  may override; stated once in ATTEST-FORMAT.md § "The STALE overlay"); `stale` on a refuted
+  claim is a history-only no-op; a later `derive` never touches status. Skeptic's open risk:
+  whether `[evidence, derive]` ordering occurs in production depends on Phase 3's writer using
+  `by_identity` for its lookup — Phase 3's fixture must exercise it.
+- **attest v1 Phase 1 spike — Fable skeptic GATE PASS at `59fbbf7` (2026-09-01, branch
+  `feat/attest`, cut from `main`; round 1 FAILED on one record blocker, narrow re-gate PASSED).**
+  Findings only, no product code: `docs/verify/attest-coverage-spike.md` (Probe A),
+  `docs/verify/attest-output-channel-spike.md` + `docs/fixtures/attest/` (Probe B),
+  `IMPLEMENTATION.md` §attest (AC-ATTEST-P1-1..7). Baseline on this branch 1035/0/4.
+  Measured: suite-level instrumented run +0.5% wall (quietness not re-verified before it);
+  per-test isolated capture extrapolated from a 50-test stratified sample to a ~2–13 min
+  range (median-based lower bound to a mean-based upper bound dominated by one 21.5 s test —
+  never quote either end bare); spawned `agentrec` child coverage IS attributed to the
+  spawning test (measured YES), but a SIGKILLed child writes no profraw and this repo
+  SIGKILLs daemons routinely, plus an untemplated-child `.profraw` leak of UNDETERMINED
+  mechanism — two under-attribution channels, detection mechanism for neither yet (disclosed
+  in the schema sketch). Founder-ratified libtest parser validated on real captured output,
+  fails closed on a corrupted fixture. **Round-1 blocker:** the pasted SIGKILL probe script had
+  a relative binary path its own `cd` broke, so run as pasted both legs reported a profraw —
+  the "reproduced identically" sentence was false of the pasted text (fixed by extracting the
+  block out of the doc and running that). Environment facts worth knowing: stock
+  `cargo llvm-cov` fails on Homebrew `rustc 1.97.1` (no `llvm-profdata` in the sysroot) —
+  export `LLVM_COV`/`LLVM_PROFDATA` from the rustup component; the plan names
+  `cli/tests/bisect.rs` as a spawn site but that file lives on `feat/phase-3-0`, not `main`.
+  **Exit criterion 7 RULED 2026-09-01: recommendation adopted (per-test, file granularity;
+  binary-spawning tests staled on `cli/src/**` writes until Phase 4 detects both channels).
+  Phase 2 dispatched.** claimd: `.claims/` is untracked on `main` since `23a2e0d`; the 273-claim log
+  lives only on `feat/phase-3-0`; three new claims here are local-only, and claimd's coverage
+  lint does not count `manual` claims toward file coverage.
 - **PR #20 fsguard remediation round — GATE PASS at `832ad63` (2026-08-07, rounds 8–11),
   pushed.** Round 7 had FAILED the PR on three blockers; this round closed them and survived
   four Fable gates. Code: purge liveness reads hard-error on non-regular files (refusal

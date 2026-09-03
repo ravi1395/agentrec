@@ -1279,6 +1279,9 @@ impl GitTrackCache {
     /// unique `cwd`, instead of a `git ls-files --error-unmatch` fork per
     /// file entry.
     fn load(cwd: &Path) -> Option<(PathBuf, HashSet<PathBuf>)> {
+        // Spawns `git` with fixed subcommands to locate the repo top level;
+        // never a repo-authored command.
+        #[allow(clippy::disallowed_methods)]
         let toplevel_out = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
@@ -1297,6 +1300,8 @@ impl GitTrackCache {
         let repo_root =
             fs::canonicalize(&toplevel_str).unwrap_or_else(|_| PathBuf::from(&toplevel_str));
 
+        // Spawns `git` with fixed subcommands to list tracked files.
+        #[allow(clippy::disallowed_methods)]
         let ls_out = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo_root)
@@ -2434,6 +2439,8 @@ mod persist {
         let rel = abs_file.strip_prefix(&repo_root).ok()?;
 
         let before_arg = format!("--before={ts}");
+        // Spawns `git log` to derive commit provenance for imported turns.
+        #[allow(clippy::disallowed_methods)]
         let log_out = Command::new("git")
             .arg("-C")
             .arg(&repo_root)
@@ -2451,6 +2458,8 @@ mod persist {
             return None;
         }
 
+        // Spawns `git show` to read a committed blob as an import `before`.
+        #[allow(clippy::disallowed_methods)]
         let show_out = Command::new("git")
             .arg("-C")
             .arg(&repo_root)

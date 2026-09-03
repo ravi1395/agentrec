@@ -200,8 +200,13 @@ fn check_hooks(root: &Path) -> Check {
     let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Check::fail("hook presence", REMEDY);
     };
-    let has_both = crate::initcmd::event_has_marker(&settings, "UserPromptSubmit")
-        && crate::initcmd::event_has_marker(&settings, "Stop");
+    // Only the BRACKETING pair is required. `init` also installs
+    // `PostToolUse[Bash]` for attest capture, but requiring it here would fail
+    // `doctor` on every repo initialized before that hook existed — and turn
+    // recording, which is what this check is about, does not depend on it.
+    let has_both = crate::initcmd::CLAUDE_BRACKET_EVENTS
+        .iter()
+        .all(|event| crate::initcmd::event_has_marker(&settings, event));
     if has_both {
         Check::pass("hook presence")
     } else {
@@ -767,6 +772,9 @@ fn probe_mcp_initialize(exe: &Path, root: &Path) -> Result<(), String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
+    // Spawns THIS binary (`exe` is our own resolved path) to probe the
+    // daemon; never a repo-authored command.
+    #[allow(clippy::disallowed_methods)]
     let mut child = Command::new(exe)
         .arg("--root")
         .arg(root)
@@ -941,6 +949,10 @@ fn check_inotify(_root: &Path) -> Check {
 }
 
 #[cfg(test)]
+// This mod spawns `git` to build its own tempdir fixtures. Scoped to the test
+// mod so the single production spawn in this file stays per-site annotated
+// (clippy.toml).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

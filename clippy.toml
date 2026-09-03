@@ -8,8 +8,8 @@
 # `open_regular`) resolve the path type before opening and error instead of
 # blocking.
 #
-# SCOPE — reads only. The three entries below are the blocking read entry
-# points. The WRITE half of the same hazard is NOT covered by this lint and
+# SCOPE — the first three entries are reads only. They are the blocking read
+# entry points. The WRITE half of the same hazard is NOT covered by this lint and
 # is a disclosed open class: `OpenOptions::open` with `.write(true)` or
 # `.append(true)`, `fs::write`, and `fs::copy` (which blocks on a FIFO
 # SOURCE) all block identically, and none is expressible here — clippy
@@ -39,8 +39,29 @@
 # reason (fsguard itself; test code reading its own fixtures; the documented
 # `/dev/urandom`, `/proc`, and directory-fsync sites, where the target is
 # deliberately not a regular file).
+#
+# ---------------------------------------------------------------------------
+# The FOURTH entry is a different hazard with the same mechanism: process
+# spawning, not file reading.
+#
+# attest spec decision 6: the daemon must never execute repo-authored
+# commands. `cli/src/daemon.rs` production code therefore carries no
+# `#[allow]` at all, so a direct spawn added there is a build failure. Every
+# legitimate spawn elsewhere in `cli/src` carries a per-site allow naming what
+# it runs and why.
+#
+# HONEST SCOPE, stated in full at
+# `docs/verify/attest-purity-census.md`: this is a census of DIRECT call
+# sites, not a transitivity proof. It does not establish that no daemon
+# function can reach a spawn through another module's allowed site. The
+# standalone-script alternative (mirroring `scripts/check-write-opens.sh`) was
+# rejected — that precedent needed ~100 lines of cfg-classifying awk, took
+# seven gate rounds, and still carries a disclosed residual, while clippy is
+# compiler-integrated and already wired into CI.
+# ---------------------------------------------------------------------------
 disallowed-methods = [
     { path = "std::fs::read", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::read_regular" },
     { path = "std::fs::read_to_string", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::read_regular_to_string" },
     { path = "std::fs::File::open", reason = "blocks forever on a fifo/socket/device; use agentrec_core::fsguard::open_regular" },
+    { path = "std::process::Command::new", reason = "the daemon must never execute repo-authored commands (attest spec decision 6); every legitimate spawn carries a per-site #[allow(clippy::disallowed_methods)] with its reason" },
 ]

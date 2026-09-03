@@ -1289,8 +1289,9 @@ fn rewrite_signal_atomic(sig_path: &Path, tail: &[u8]) -> Result<(), String> {
 //     torn lines, epochs, future record types. `load_log` drops those, so a
 //     structured read alone would treat a blob cited only by a torn line as
 //     unreferenced-outside-the-match and archive it;
-//   * every ref in `open.json` (in-flight crash journal) and `memory.jsonl`
-//     (pin hashes), via the same `referenced_hashes` primitive `--orphans` uses.
+//   * every ref in `open.json` (in-flight crash journal), `memory.jsonl`
+//     (pin hashes) and `attest.jsonl` (captured test-output blobs), via the
+//     same `referenced_hashes` primitive `--orphans` uses.
 //
 // `log.jsonl` IS NOT REWRITTEN. The matching paths and hashes stay in the
 // record — dropping them would be a fourth sanctioned rewrite class, which
@@ -1472,9 +1473,10 @@ fn scan_for_path(root: &Path, pattern: &str) -> Result<Scan, String> {
         }
     }
 
-    // `open.json` + `memory.jsonl` (and `log.jsonl` again, harmlessly — this
-    // primitive scans all three). Anything it finds is protected: an in-flight
-    // turn or a memory pin is not a matching file entry.
+    // `open.json` + `memory.jsonl` + `attest.jsonl` (and `log.jsonl` again,
+    // harmlessly — this primitive scans all four). Anything it finds is
+    // protected: an in-flight turn, a memory pin and a captured test-output
+    // blob are none of them a matching file entry.
     for hash in referenced_hashes_outside_log(root)? {
         protect.insert(hash);
     }
@@ -1486,13 +1488,18 @@ fn scan_for_path(root: &Path, pattern: &str) -> Result<Scan, String> {
     })
 }
 
-/// The `open.json` + `memory.jsonl` half of [`referenced_hashes`] — the refs
+/// The `open.json` + `memory.jsonl` + `attest.jsonl` half of
+/// [`referenced_hashes`] — the refs
 /// that exist OUTSIDE `log.jsonl`. `purge_path` needs these separately because
 /// it derives its own per-entry view of `log.jsonl`; folding in the whole-log
 /// scan would protect every blob and make the op a no-op.
 fn referenced_hashes_outside_log(root: &Path) -> Result<HashSet<String>, String> {
     let mut out = HashSet::new();
-    for path in [crate::open_path(root), memory_path(root)] {
+    for path in [
+        crate::open_path(root),
+        memory_path(root),
+        crate::attest::lock::attest_path(root),
+    ] {
         harvest_refs(&read_liveness_input(&path)?, &mut out);
     }
     Ok(out)
@@ -1579,12 +1586,17 @@ fn glob_rec(p: &[u8], t: &[u8]) -> bool {
 // ref-set complete in the safe (over-keep) direction:
 //
 //  (1) It is harvested by a raw `sha256:<64hex>` byte-scan of every file that
-//      can cite a CAS blob — ALL THREE: `log.jsonl` (snapshot `before`/`after`
+//      can cite a CAS blob — ALL FOUR: `log.jsonl` (snapshot `before`/`after`
 //      + `prompt_ref`), `open.json` (the in-flight crash-journal turn a future
-//      `recover_orphan` will resurrect), and `memory.jsonl` (a memory pin's
+//      `recover_orphan` will resurrect), `memory.jsonl` (a memory pin's
 //      `hash` is a file-content sha256 that `verify`'s `print_pin_diff` looks
 //      up as a CAS blob to render old content — a pinned version that was
-//      snapshotted then superseded would otherwise look orphaned). NEVER via
+//      snapshotted then superseded would otherwise look orphaned), and
+//      `attest.jsonl` (an `evidence` event's `output_blob`, and the same hash
+//      repeated as its result's `raw_blob` on a fail-closed capture — the only
+//      two CAS refs any `AttestEvent` variant carries; `derive`'s `body_hash`
+//      is a bare hex token-stream digest with no `sha256:` prefix and no CAS
+//      object behind it, so the raw scan correctly ignores it). NEVER via
 //      `load_log`, which silently drops torn/unknown-type lines; a blob cited
 //      only by such a line would then look orphaned. The raw scan yields the
 //      hash whether or not the line parses, so it can only ever KEEP more than
@@ -1664,7 +1676,12 @@ fn purge_orphans(root: &Path) -> Result<(), String> {
 /// matching `BlobStore::list_hashes`.
 pub(crate) fn referenced_hashes(root: &Path) -> Result<HashSet<String>, String> {
     let mut out = HashSet::new();
-    for path in [log_path(root), crate::open_path(root), memory_path(root)] {
+    for path in [
+        log_path(root),
+        crate::open_path(root),
+        memory_path(root),
+        crate::attest::lock::attest_path(root),
+    ] {
         harvest_refs(&read_liveness_input(&path)?, &mut out);
     }
     Ok(out)

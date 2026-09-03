@@ -1,0 +1,45 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/import_claude.rs (target/debug/deps/import_claude-d11919c114bb5b5f)
+
+running 37 tests
+test dry_run_false_persists_instead_of_refusing_now_that_p2_has_landed ... ok
+test missing_cwd_disqualifies_session_but_does_not_abort ... ok
+test json_flag_round_trips_through_serde_json ... ok
+test missing_old_string_classifies_t15_unverified_not_content_proven ... ok
+test missing_tool_use_result_disqualifies_session ... ok
+test empty_projects_dir_is_a_legitimate_zero_session_corpus ... ok
+test default_source_resolves_via_home_env_when_source_omitted ... ok
+test malformed_lines_all_skip_exit_zero_and_session_not_importable ... ok
+test nonexistent_source_is_a_loud_error_not_a_fake_empty_corpus ... ok
+test opaque_call_counts_as_importable_with_no_file_entries ... ok
+test intervening_edit_between_snapshot_and_second_edit_is_rejected_as_stale ... ok
+test persist::ac5b_oracle_real_corpus_measurement ... ignored
+test non_utf8_line_mid_file_does_not_truncate_remaining_lines ... ok
+test ac3_zero_bytes_under_agentrec_in_tempdir ... ok
+test persist::ac4_import_missing_before_never_sets_baseline_unknown ... ok
+test persist::ac6_planted_secret_in_prompt_never_appears_in_blob_or_excerpt ... ok
+test persist::ac7_log_marks_imported_turns_partial_and_never_relabels_bare ... ok
+test persist::ac2_rerun_appends_zero_new_records ... ok
+test persist::blocker1_out_of_cwd_entry_is_counted_not_silently_dropped ... ok
+test redundant_reannouncement_of_same_backup_name_does_not_clear_staleness ... ok
+test relative_key_harvested_before_cwd_is_known_still_resolves ... ok
+test sidechain_excluded_by_field_and_path_yields_zero_turns ... ok
+test session_level_cwd_survives_a_headless_summary_line ... ok
+test sidechain_flagged_opaque_call_counts_as_sidechain_not_opaque ... ok
+test t15_relative_backup_key_resolves_against_session_cwd ... ok
+test stale_backup_blob_is_rejected_not_classified_t15 ... ok
+test t1_and_t15_resolve_with_matching_sha256 ... ok
+test text_report_contains_every_json_field_in_prose ... ok
+test persist::d7_secret_path_parity_between_dry_run_and_persist ... ok
+test persist::ac2_resume_after_simulated_interruption_matches_uninterrupted_run ... ok
+test persist::ac5_t2_never_falls_back_to_a_near_miss_commit ... ok
+test persist::ac5b_oracle_fixture_negative_git_blob_disagrees_with_true_before ... ok
+test persist::multi_turn_session_file_still_appends_every_turn ... ok
+test persist::ac5b_oracle_fixture_positive_git_blob_matches_true_before ... ok
+test persist::ac5_t2_candidate_resolves_exact_committed_blob ... ok
+test t2_candidate_vs_t3_classification ... ok
+test persist::intra_run_duplicate_session_id_appends_one_turn_and_counts_the_skip ... ok
+
+test result: ok. 36 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+EXIT: 0
