@@ -1,0 +1,34 @@
+HAND-CRAFTED — NOT a captured real run. No `#[ignore]`d or existing test in this
+repo's suite currently fails, and repo source may not be modified to manufacture
+one for this spike. This fixture reproduces the real libtest single-`--exact`
+failure format from memory of prior real cargo-test runs in this repo (panic
+line, "note: run with `RUST_BACKTRACE=1`...", "failures:" list, "failures:"
+section restating the name) applied to a real test name
+(`ac3_zero_bytes_under_agentrec_in_tempdir`) with a plausible assertion.
+Command shown is what would have produced this shape; it was NOT executed.
+
+$ cargo test -p agentrec --test import_claude -- --exact ac3_zero_bytes_under_agentrec_in_tempdir
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/import_claude.rs (target/debug/deps/import_claude-d11919c114bb5b5f)
+
+running 1 test
+test ac3_zero_bytes_under_agentrec_in_tempdir ... FAILED
+
+failures:
+
+---- ac3_zero_bytes_under_agentrec_in_tempdir stdout ----
+
+thread 'ac3_zero_bytes_under_agentrec_in_tempdir' panicked at cli/tests/import_claude.rs:214:5:
+assertion `left == right` failed: expected zero bytes written under .agentrec on --dry-run
+  left: 128
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ac3_zero_bytes_under_agentrec_in_tempdir
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.41s
+
+error: test failed, to rerun pass `-p agentrec --test import_claude`
+EXIT: 101

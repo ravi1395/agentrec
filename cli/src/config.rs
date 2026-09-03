@@ -40,6 +40,23 @@ pub struct Config {
     pub memory_enabled: bool,
     pub memory_inject_max: usize,
     pub mcp_destructive: McpDestructive,
+    /// Phase 4B: whether the `record` daemon appends `stale` events to
+    /// `.agentrec/attest.jsonl` when a write lands in a claim's coverage
+    /// scope. Default on — staleness is the attest subsystem's whole
+    /// freshness signal, and a repo with no coverage map never reaches the
+    /// append path anyway (the daemon does nothing when the map is absent).
+    pub attest_stale: bool,
+    /// Phase 4B: override for the coverage map's location, repo-relative.
+    /// `None` means the default, `.agentrec/attest-coverage.json`.
+    ///
+    /// Read by BOTH readers, through the single resolver
+    /// `attest::coverage::resolve_coverage_path`: the producer
+    /// (`attest coverage`, which writes the map) and the `record` daemon
+    /// (which reads it to decide what a write stales). They disagreed once —
+    /// the producer ignored this key — and the failure was silent in the
+    /// dangerous direction: the daemon read a path nothing had written, got a
+    /// legitimate-looking "no map yet", and staled nothing.
+    pub attest_coverage_path: Option<String>,
 }
 
 impl Default for Config {
@@ -56,6 +73,8 @@ impl Default for Config {
             memory_enabled: true,
             memory_inject_max: crate::memorycmds::HOOK_MAX_FACTS_DEFAULT,
             mcp_destructive: McpDestructive::Off,
+            attest_stale: true,
+            attest_coverage_path: None,
         }
     }
 }
@@ -81,6 +100,8 @@ const KNOWN_KEYS: &[&str] = &[
     "memory_enabled",
     "memory_inject_max",
     "mcp_destructive",
+    "attest_stale",
+    "attest_coverage_path",
 ];
 
 /// Guards the unknown-key stderr warning to once per process — `load` is
@@ -174,6 +195,21 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
                 )));
             }
         };
+    }
+
+    // Value-level tolerant, like every key except `mcp_destructive`: a
+    // wrong-shaped value falls back to this key's default rather than
+    // failing the whole load. D16's named-values hard error is deliberately
+    // NOT extended to a second key here.
+    if let Some(v) = raw.get("attest_stale") {
+        if let Some(b) = v.as_bool() {
+            cfg.attest_stale = b;
+        }
+    }
+    if let Some(v) = raw.get("attest_coverage_path") {
+        if let Some(s) = v.as_str() {
+            cfg.attest_coverage_path = Some(s.to_string());
+        }
     }
 
     Ok(cfg)
@@ -305,6 +341,25 @@ mod tests {
         assert!(cfg.memory_enabled);
         assert_eq!(cfg.memory_inject_max, 5);
         assert_eq!(cfg.mcp_destructive, McpDestructive::Off);
+        assert!(cfg.attest_stale);
+        assert_eq!(cfg.attest_coverage_path, None);
+    }
+
+    /// AC-ATTEST-P4B-6 (loader half): both new keys read, and both degrade
+    /// per-key on a wrong-shaped value instead of failing the load.
+    #[test]
+    fn attest_keys_are_read_and_degrade_per_key() {
+        let cfg = load(&root_with(
+            "attest_stale = false\nattest_coverage_path = \"cov.json\"\n",
+        ))
+        .unwrap();
+        assert!(!cfg.attest_stale);
+        assert_eq!(cfg.attest_coverage_path, Some("cov.json".to_string()));
+
+        // Wrong shapes: valid TOML, so the file loads; each key falls back.
+        let cfg = load(&root_with("attest_stale = 1\nattest_coverage_path = 7\n")).unwrap();
+        assert!(cfg.attest_stale);
+        assert_eq!(cfg.attest_coverage_path, None);
     }
 
     #[test]

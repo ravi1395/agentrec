@@ -107,6 +107,17 @@
 //! established here: derive the exact shape from the renderer, add the
 //! minimal fixture data to reach it, capture, review the bytes once before
 //! committing.
+//!
+//! # Phase 5 (`attest report`) — normalization deviation, recorded
+//!
+//! Phase 5's brief asked for [`NORMALIZE_TABLE`] to be extended with entries
+//! for claim ids (`c_` + 26 chars) and attest timestamps. It is NOT extended.
+//! Every `c_…` id, `ts` and blob hash reaching `attest_report*.golden`
+//! originates from a literal in [`ATTEST_LOG`], and `attest report` emits no
+//! wall-clock header, so nothing dynamic reaches those goldens — adding a
+//! substitution for a static literal would only weaken the byte pin, for the
+//! same reason the "Normalization" section above already gives. A
+//! pattern-based normalizer stays rejected.
 
 #![allow(clippy::disallowed_methods)]
 //  ^ Test code reads its own tempdir fixtures, which this harness created;
@@ -1488,5 +1499,64 @@ fn harness_never_spawns_the_daemon() {
         !src.contains("\"record\""),
         "golden.rs must never invoke `agentrec record` — this whole harness runs \
          with the daemon stopped and starts none (AC5)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// attest report goldens (Phase 5, AC-ATTEST-P5-9)
+// ---------------------------------------------------------------------------
+
+/// Literal `attest.jsonl` lines, written from the shapes documented in
+/// `ATTEST-FORMAT.md` rather than produced by this repo's own serializer, so a
+/// serializer regression cannot make the golden agree with itself.
+///
+/// Every claim id, timestamp and blob hash below is a literal in THIS
+/// constant — the "documented stable mapping" this harness's module doc
+/// describes. That is why [`NORMALIZE_TABLE`] is still empty for these
+/// goldens: nothing dynamically generated reaches them, so a substitution
+/// would only weaken the byte pin. `attest report` emits no wall-clock header,
+/// which is what makes that true.
+const ATTEST_LOG: &str = concat!(
+    r#"{"kind":"derive","ts":1000,"claim_id":"c_00000000010W3GE1R70W3GE1R7","test_identity":{"target":"agentrec--import_claude","fn_path":"ac3_zero_bytes"}}"#,
+    "\n",
+    r#"{"kind":"evidence","ts":2000,"claim_id":"c_00000000010W3GE1R70W3GE1R7","turn_id":"t_01ARZ3NDEKTSV4RRFFQ69G5FAV","dirty":false,"output_blob":"1111111111111111111111111111111111111111111111111111111111111111","result":{"identity":{"target":"agentrec--import_claude","fn_path":"ac3_zero_bytes"},"outcome":"passed"}}"#,
+    "\n",
+    r#"{"kind":"verdict","ts":3000,"claim_id":"c_00000000010W3GE1R70W3GE1R7","verdict":"confirmed","replay_commit":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"}"#,
+    "\n",
+    r#"{"kind":"derive","ts":4000,"claim_id":"c_00000000020W3GE1R70W3GE1R7","test_identity":{"target":"agentrec--golden","fn_path":"golden_log_default"}}"#,
+    "\n",
+    r#"{"kind":"verdict","ts":5000,"claim_id":"c_00000000020W3GE1R70W3GE1R7","verdict":"claim-false","replay_commit":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"}"#,
+    "\n",
+    r#"{"kind":"derive","ts":6000,"claim_id":"c_00000000030W3GE1R70W3GE1R7","test_identity":{"target":"agentrec--golden","fn_path":"golden_status"}}"#,
+    "\n",
+    r#"{"kind":"stale","ts":7000,"claim_id":"c_00000000030W3GE1R70W3GE1R7","cause":"file-write","path":"cli/src/cmds.rs"}"#,
+    "\n",
+    r#"{"kind":"manual-declare","ts":8000,"claim_id":"c_00000000040W3GE1R70W3GE1R7","text":"the README install line is correct","severity":"blocking"}"#,
+    "\n",
+    r#"{"kind":"human","ts":9000,"claim_id":"c_00000000040W3GE1R70W3GE1R7","answer":"no","note":"still says 0.1.0"}"#,
+    "\n",
+);
+
+fn build_attest_fixture(root: &Path) {
+    init(root);
+    write_file(root, ".agentrec/attest.jsonl", ATTEST_LOG.as_bytes());
+}
+
+#[test]
+fn golden_attest_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_attest_fixture(root);
+    assert_golden("attest_report", &agentrec(root, &["attest", "report"]));
+}
+
+#[test]
+fn golden_attest_report_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_attest_fixture(root);
+    assert_golden(
+        "attest_report_json",
+        &agentrec(root, &["attest", "report", "--json"]),
     );
 }

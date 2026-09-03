@@ -103,13 +103,19 @@ fn remove_claude_hooks(root: &Path) -> Result<bool, String> {
     })?;
 
     let mut changed = false;
-    // E4: only the specific `UserPromptSubmit`/`Stop` keys that OUR OWN
-    // removal just emptied are candidates for deletion — a pre-existing
-    // empty array under some other key (or one that was already empty
-    // before we touched it) is the user's own placeholder and must survive.
+    // E4: only the specific keys that OUR OWN removal just emptied are
+    // candidates for deletion — a pre-existing empty array under some other
+    // key (or one that was already empty before we touched it) is the user's
+    // own placeholder and must survive.
+    //
+    // The event list is `initcmd::CLAUDE_HOOK_EVENTS`, not a second literal:
+    // an event installed but not enumerated here is an entry uninstall leaves
+    // behind, which is how the `PostToolUse[Bash]` attest-capture hook would
+    // have leaked if this had been copied instead of shared.
     let mut emptied_by_us: Vec<&str> = Vec::new();
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in ["UserPromptSubmit", "Stop"] {
+        for (event, _matcher) in crate::initcmd::CLAUDE_HOOK_EVENTS {
+            let event = *event;
             if let Some(arr) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
                 let mut event_changed = false;
                 // Command-granular: strip only the agentrec command(s) out of

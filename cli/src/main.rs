@@ -3,6 +3,7 @@
 
 mod annotatecmd;
 mod approvecmd;
+mod attest;
 mod bisectcmd;
 mod cmds;
 mod config;
@@ -171,6 +172,13 @@ enum Command {
     Hook {
         /// Tool identity, e.g. "claude" or "codex".
         tool: String,
+    },
+    /// Claims derived from tests, their evidence, and the release gate over
+    /// them. The surface is UNSTABLE: `ATTEST-FORMAT.md` is explicitly outside
+    /// `PROTOCOL.md` versioning and may change without a major bump.
+    Attest {
+        #[command(subcommand)]
+        cmd: AttestCmd,
     },
     /// Remove agentrec from this repo: hooks, service unit, and archive
     /// .agentrec/ to a sibling directory. Nothing is ever deleted.
@@ -501,6 +509,97 @@ enum ImportSource {
     },
 }
 
+#[derive(Subcommand)]
+enum AttestCmd {
+    /// Read-only summary of `.agentrec/attest.jsonl`: claim counts by status,
+    /// the STALE overlay count, and the dev-loop-only (dirty-tree) figure.
+    Status {
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover this crate's tests and append the `derive` events that mint
+    /// (or carry forward, across a rename) their claims. Idempotent.
+    Derive {
+        /// The crate to discover, if not the repo root.
+        #[arg(long = "crate", value_name = "PATH")]
+        crate_path: Option<PathBuf>,
+    },
+    /// Run a test command, showing its output unchanged, and record one
+    /// `evidence` event per known test. Exits with the command's own status.
+    Run {
+        /// The command to run, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Independently replay claims from a `git archive` extract of HEAD and
+    /// append a `verdict` each. Refuses on a dirty tree — verify replays
+    /// COMMITTED state only.
+    Verify {
+        /// Verify every claim the daemon has marked stale.
+        #[arg(long)]
+        all_stale: bool,
+        /// Specific claim ids to verify.
+        ids: Vec<String>,
+    },
+    /// Capture per-test, file-granularity coverage into
+    /// `.agentrec/attest-coverage.json`, which the daemon consults to decide
+    /// which claims a write stales.
+    Coverage {
+        /// Capture for every claim carrying a test identity.
+        #[arg(long)]
+        all: bool,
+        /// Specific claim ids to capture.
+        ids: Vec<String>,
+        /// The crate to capture, if not the repo root.
+        #[arg(long = "crate", value_name = "PATH")]
+        crate_path: Option<PathBuf>,
+    },
+    /// Declare a criterion no test covers, for a human to attest by hand.
+    /// Prints the new claim id.
+    ManualDeclare {
+        /// The criterion, in the words a reviewer will read.
+        #[arg(long)]
+        text: String,
+        /// `blocking` holds `attest gate` until answered yes; `fyi` never
+        /// blocks.
+        #[arg(long, value_enum)]
+        severity: SeverityArg,
+    },
+    /// Review the manual claims waiting on a human: one card each, answered
+    /// with y / n / s on stdin.
+    Review {
+        /// List the cards as JSON and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Exit nonzero if any claim is refuted or any blocking manual criterion
+    /// is unanswered. Everything else is advisory.
+    Gate {
+        /// Emit machine-readable JSON instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The attestation bundle: every claim's status, verdict chain, evidence
+    /// provenance and human notes.
+    Report {
+        /// Emit machine-readable JSON instead of markdown.
+        #[arg(long)]
+        json: bool,
+        /// Keep only claims with an event between two commits' committer
+        /// timestamps, as `<base>..<head>`. A time window, not a causal one.
+        #[arg(long, value_name = "BASE..HEAD")]
+        range: Option<String>,
+    },
+}
+
+/// `--severity` on `attest manual-declare`, mapped to the wire enum.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum SeverityArg {
+    Blocking,
+    Fyi,
+}
+
 /// Walk from `start` up through ancestors looking for a directory containing
 /// a `.agentrec/` subdirectory — mirrors git's `.git` discovery. Returns the
 /// nearest such ancestor (closest to `start`, including `start` itself), or
@@ -621,6 +720,47 @@ fn main() {
             let hook_root = resolve_hook_root(explicit_root.as_deref(), &root);
             cmds::hook(&hook_root, &tool)
         }
+        Command::Attest { cmd } => match cmd {
+            AttestCmd::Status { json } => attest::statuscmd::run(&root, json),
+            AttestCmd::Derive { crate_path } => {
+                attest::derivecmd::run(&root, crate_path.as_deref())
+            }
+            // The wrapped command's own exit status is the user-visible one —
+            // `attest run` must be transparent to a script downstream.
+            AttestCmd::Run { cmd } => match attest::capture::run_wrapped(&root, &cmd) {
+                Ok(0) => Ok(()),
+                Ok(code) => std::process::exit(code),
+                Err(e) => Err(e),
+            },
+            AttestCmd::Verify { all_stale, ids } => attest::replaycmd::run(&root, all_stale, &ids),
+            AttestCmd::Coverage {
+                all,
+                ids,
+                crate_path,
+            } => attest::coveragecmd::run(&root, crate_path.as_deref(), all, &ids),
+            AttestCmd::ManualDeclare { text, severity } => attest::manualcmd::run(
+                &root,
+                &text,
+                match severity {
+                    SeverityArg::Blocking => {
+                        agentrec_core::attest::events::ManualSeverity::Blocking
+                    }
+                    SeverityArg::Fyi => agentrec_core::attest::events::ManualSeverity::Fyi,
+                },
+            ),
+            AttestCmd::Review { json } => attest::reviewcmd::run(&root, json),
+            // Same shape as `doctor`: a failing gate is a verdict this command
+            // printed, not a command error, so it exits 1 without an
+            // `agentrec: <message>` prefix.
+            AttestCmd::Gate { json } => match attest::gatecmd::run(&root, json) {
+                Ok(true) => Ok(()),
+                Ok(false) => std::process::exit(1),
+                Err(e) => Err(e),
+            },
+            AttestCmd::Report { json, range } => {
+                attest::reportcmd::run(&root, json, range.as_deref())
+            }
+        },
         Command::Doctor { json } => match doctorcmd::run(&root, json) {
             // Checks ran and printed their own report; a failing check is not
             // a command error (no "agentrec: <message>" line) — just a

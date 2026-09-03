@@ -62,6 +62,9 @@ pub fn annotate(root: &Path, range: String, json: bool, md: bool) -> Result<(), 
 /// revision, malformed range — git's own stderr is relayed rather than
 /// second-guessed), or its output is not UTF-8.
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    // Spawns `git` with fixed subcommands (`log`, `show`) to read commit history;
+    // `args` are built by this module, never repo content.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new("git")
         .arg("-C")
         .arg(root)

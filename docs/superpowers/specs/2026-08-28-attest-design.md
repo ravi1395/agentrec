@@ -178,8 +178,10 @@ surviving core, reimplemented in Rust):
 - `manual-declare` — the only hand-authored event: an un-testable criterion's text + blocking|fyi
 
 Claim states (fold output): `DERIVED → EVIDENCED → CONFIRMED | CLAIM-FALSE |
-RECIPE-INVALID(retryable) | FLAKY`, with a `STALE` overlay that queues re-verify and
-drops on the next verdict.
+RECIPE-INVALID(retryable) | FLAKY`, with a `STALE` overlay that queues re-verify.
+When the overlay clears is defined in `ATTEST-FORMAT.md` § "The `STALE` overlay"
+*(narrowed 2026-09-01 from this document's original "drops on the next verdict",
+orchestrator-ratified under decision 5; founder may override)*.
 
 Components (all in the existing two-crate workspace):
 

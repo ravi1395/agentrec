@@ -219,10 +219,11 @@ question.
     hash cannot survive a rename, since `test_identity` includes the fn
     name). Minted once at first derive — machine-scoped ULID, same scheme
     as turn ids — and never changes for the life of the claim.
-    `fold_claims(&[AttestEvent]) -> BTreeMap<ClaimId, ClaimState>` also
-    maintains the `test_identity → ClaimId` mapping internally (latest
-    identity wins per claim; `ClaimState` carries its current
-    `test_identity`).
+    `fold_claims(&[AttestEvent]) -> FoldResult { claims: BTreeMap<ClaimId,
+    ClaimState>, by_identity: BTreeMap<TestIdentity, ClaimId> }` — the
+    identity index is RETURNED, not internal (`claim_for(&TestIdentity)` is
+    Phase 3's rename lookup); detail in `ATTEST-FORMAT.md` § "The identity
+    index".
   - `test_identity` MUST include the cargo target/binary component, not
     just the bare fn name (measured collision, Phase 1 Probe B — two
     identically-named fns in different targets must map to two claims, or
@@ -505,6 +506,128 @@ heaviest gate. Phase 5 is UX polish on proven substrate.
    change (provenance chain end-to-end).
 5. One manual-declare blocking item; `attest gate` red; `attest review` y; gate
    green.
+
+## Final acceptance — plan exit
+
+Written at plan exit (2026-09-02), AFTER all five phases gated, at the founder's
+request. Each item names the exact command and the exact expected output, so a
+fresh reader can re-run it rather than trust this table. Verdicts below were
+measured at `22b72f7` on `feat/attest` unless stated. **An item nobody ran says
+OPEN — it is never checked on the strength of an adjacent green.**
+
+### Phase gates (the binding ones)
+
+- [x] **E1. Every phase carries a Fable skeptic GATE PASS at a named commit.**
+      Phase 1 `cd94b73`, Phase 2 `cd94b73`, Phase 3 `78b9fb0`, Phase 4 `7e23ba9`,
+      Phase 5 `22db674`. Verify: each sha's phase bullet in `CLAUDE.md` § Current
+      state names its gate; `git log --oneline feat/attest` shows all five.
+      Round-1 failures and their blockers are recorded per phase — a phase that
+      passed round 1 outright would be the anomaly, not the norm.
+
+- [x] **E2. No gate was passed by weakening an AC.** The ratchet rule. Two ACs in
+      this plan were amended, both recorded in place with the reason, neither to
+      make a failing thing pass: Phase 2's `fold_claims` returns
+      `FoldResult { claims, by_identity }` (plan text amended to the shipped
+      signature), and AC-P5-2's "60 cells" was corrected to 59 rows / 55 axis
+      cells because the original figure was measurably wrong. Verify:
+      `git log -p -- IMPLEMENTATION.md | grep -n 'AC-ATTEST'` and read the
+      correction blocks; each states what was false and what replaced it.
+
+### Suite, lint, and build hygiene
+
+- [x] **E3. Suite green, and the delta is accounted for.**
+      `cargo test --workspace --no-fail-fast -- --test-threads=3` →
+      **1179 passed / 0 failed / 4 ignored**, zero `failures:` blocks. Branch
+      fork baseline was 1035/0/4; the +144 are this plan's tests across five
+      `cli/tests/attest_*.rs` binaries plus `agentrec-core::attest`.
+      `--no-fail-fast` is mandatory for the total: a fail-fast run stops at the
+      first binary and under-reports.
+
+- [x] **E4. Clippy clean debug AND release, fmt clean.**
+      `cargo clippy --workspace --all-targets --all-features -- -D warnings` →
+      exit 0 (debug); the same with `--release` → exit 0;
+      `cargo fmt --check` → exit 0.
+
+- [x] **E5. No test seam reaches the release binary.**
+      `cargo build --release` then
+      `strings target/release/agentrec | grep -c AGENTREC_TEST_` → **0**
+      (also 0 for `AGENTREC_DEBUG_`). A seam that survives into release is a
+      product defect, not a test detail.
+
+- [x] **E6. The write-open guard still holds over the new code.**
+      `bash scripts/check-write-opens.sh` →
+      `ok — 63 production write-open line(s) across 34 allowlisted function(s)`.
+      attest's writers went through the same audit as every other writer.
+
+### Scope honesty
+
+- [x] **E7. `PROTOCOL.md` is untouched by this plan.** `attest` is explicitly
+      outside frozen-protocol versioning; a wire change smuggled in here would
+      break the 1.0 freeze. Verify: `git diff --stat main...HEAD -- PROTOCOL.md`
+      → **empty**. `ATTEST-FORMAT.md` carries the attest schema instead and says
+      so in its own header, and `attest --help` states the surface is UNSTABLE.
+
+- [x] **E8. Every AC id in the plan exists in `IMPLEMENTATION.md` and maps to a
+      named test.** `grep -c 'AC-ATTEST-P[1-5]' IMPLEMENTATION.md` → **121**.
+      Each AC block ends with a `— <test path>::<test name>` line; the house rule
+      is no AC without an automated test, with manual/`DECLARED` items marked as
+      such rather than silently absent.
+
+### Manual E2E and the gaps it leaves
+
+- [~] **E9. The plan's manual E2E tail ran end to end — PARTIAL, gaps named.**
+      `docs/verify/attest-e2e-tail.md` records a real run of the release binary
+      over steps 1, 3, 4, 5 (derive → break-and-commit → verify goes claim-false
+      → revert → confirmed → report → manual-declare blocks the gate → review
+      answers it → gate green). **Step 2 (a live Claude Code session with the
+      daemon running, watching evidence attach to real turns) was NOT run.**
+      Consequence, stated rather than papered over: every `evidence` event in
+      that run carries `turn_id: null`, so the turn-join half of the report's
+      provenance chain is unexercised. The run also used a throwaway two-test
+      fixture crate, not this repository.
+
+- [ ] **E10. attest has never been run against agentrec's own corpus. OPEN.**
+      Nothing captures this repo's own coverage yet: `cli/src/**` reaching a real
+      coverage map is unit-test-pinned only. Closing this needs `attest derive`
+      + `attest coverage` on this repo with the daemon live, which is also what
+      would close E9's step 2. Fixture-only evidence cannot close a claim about
+      real-corpus shape (this repo's own recorded rule).
+
+- [ ] **E11. Two under-attribution channels remain undetected. OPEN, disclosed.**
+      A SIGKILLed child writes no profraw and this repo SIGKILLs daemons
+      routinely; and an untemplated-child `.profraw` leak of undetermined
+      mechanism. `sweep_leaked_profraw` exists but **has never fired in any
+      run** — an unexercised path. Phase 1's founder ruling accepted this by
+      staling binary-spawning tests on `cli/src/**` writes instead of detecting
+      the channels; that ruling stands, and this row is why it was needed.
+
+- [ ] **E12. Claude Code's real `PostToolUse` Bash payload is unbacked by a
+      fixture. OPEN.** The field names `tool_response.stdout`/`stderr` are
+      inferred, not captured. A live `claude -p` session with the hook installed
+      would settle it. Related: `doctor` does not require the `PostToolUse` hook
+      entry, so a lost entry silently kills capture path 2 undetected.
+
+### Known-open residuals carried past exit (founder-owned, none blocking)
+
+- `attest review`'s cards read `evidence: none recorded` for every real-world
+  manual claim by construction — `attest run` joins evidence by test identity and
+  manual claims have none. Recorded as a design gap in Phase 5, not redesigned.
+- `p5_2_gate_exit_code_table`'s per-row `assert_eq!` names only the FIRST stalled
+  row; a multi-row regression needs re-running or an external enumeration.
+- The 55-axis-cell assertion pins the CURRENT fold's answer, not an independent
+  oracle: a fold regression would move the test and any same-fold probe together.
+- `5bd5c0f`'s commit message has two known-wrong sentences (says "tempdir" of a
+  stable extract dir; restates the verdict policy in the sentence saying it
+  won't). Immutable without a history rewrite — founder call.
+- Single machine, macOS, Homebrew rustc 1.97.1 with `LLVM_COV`/`LLVM_PROFDATA`
+  exported from the rustup component. **No Linux leg for any attest code.**
+
+### Exit rule
+
+Items E1–E8 are the ones this plan claims. **E9 is partial and E10–E12 are open
+by disclosure, not by oversight** — they all need a live agent session against
+this repository, which is one piece of work, not four. Whether that work gates
+the merge or follows it is the founder's call; nothing in E1–E8 depends on it.
 
 ## Deferred (returns as its own plan)
 

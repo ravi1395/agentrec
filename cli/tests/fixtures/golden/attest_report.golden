@@ -1,0 +1,44 @@
+stdout:
+# attest report
+
+Every claim in `.agentrec/attest.jsonl`.
+
+claims: 4
+
+## c_00000000010W3GE1R70W3GE1R7
+- identity: agentrec--import_claude::ac3_zero_bytes
+- status: CONFIRMED
+- stale: false
+- history: 1 derive(s), 1 evidence, 1 verdict(s) (confirmed 1, claim-false 0, recipe-invalid 0, flaky 0), 0 stale event(s), 0 human answer(s)
+- last verdict appended: confirmed (replay 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f)
+- evidence: turn t_01ARZ3NDEKTSV4RRFFQ69G5FAV, blob 1111111111111111111111111111111111111111111111111111111111111111, dirty false
+
+## c_00000000020W3GE1R70W3GE1R7
+- identity: agentrec--golden::golden_log_default
+- status: CLAIM_FALSE
+- stale: false
+- history: 1 derive(s), 0 evidence, 1 verdict(s) (confirmed 0, claim-false 1, recipe-invalid 0, flaky 0), 0 stale event(s), 0 human answer(s)
+- last verdict appended: claim-false (replay 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f)
+- evidence: no turn joined
+
+## c_00000000030W3GE1R70W3GE1R7
+- identity: agentrec--golden::golden_status
+- status: DERIVED
+- stale: true
+- history: 1 derive(s), 0 evidence, 0 verdict(s) (confirmed 0, claim-false 0, recipe-invalid 0, flaky 0), 1 stale event(s), 0 human answer(s)
+- last verdict appended: none
+- evidence: no turn joined
+
+## c_00000000040W3GE1R70W3GE1R7
+- criterion (blocking): the README install line is correct
+- status: HUMAN(no)
+- stale: false
+- history: 0 derive(s), 0 evidence, 0 verdict(s) (confirmed 0, claim-false 0, recipe-invalid 0, flaky 0), 0 stale event(s), 1 human answer(s)
+- last verdict appended: none
+- evidence: no turn joined
+- human note: still says 0.1.0
+
+--stderr--
+
+--exit--
+0

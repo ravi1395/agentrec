@@ -1,0 +1,16 @@
+# Fixture crate for the attest cargo adapter (AC-ATTEST-P3-9).
+#
+# The empty `[workspace]` table makes this package its own workspace root, so
+# it builds standalone even though it sits inside the agentrec tree. The
+# parent workspace additionally lists it under `[workspace] exclude` — both
+# are needed: `exclude` stops the parent claiming it, the empty table stops
+# cargo walking up to find one.
+[package]
+name = "attest_sample_crate"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]

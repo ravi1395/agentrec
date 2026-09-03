@@ -14,6 +14,7 @@ use crate::state::{
     record_prompt_put_failure, write_state, State,
 };
 use crate::{log_path, memorycmds, objects_dir, open_path, signal_path};
+use agentrec_core::attest::events::{AttestEvent, StaleCause};
 use agentrec_core::engine::{ChangeObs, ClosedTurn, TurnEngine};
 use agentrec_core::id::turn_id;
 use agentrec_core::record::{
@@ -143,6 +144,13 @@ pub fn run(root: &Path) -> Result<(), String> {
              fix the file (or delete it to use defaults) and retry"
         ));
     }
+
+    // Phase 4B: read the attest-staleness switch ONCE, at startup. A
+    // mid-run toggle needs a daemon restart, which is stated in the key's
+    // `config.rs` doc — that is deliberate: every per-tick config read this
+    // process already does is a read it cannot avoid, and adding another for
+    // a switch nobody flips mid-session buys nothing.
+    let mut attest_stale = AttestStaleMarker::new(&root, &crate::config::load_or_default(&root));
 
     // A journal left behind by an unclean shutdown (kill -9) is closed and
     // logged before this session opens its own epoch (AC B2).
@@ -358,6 +366,11 @@ pub fn run(root: &Path) -> Result<(), String> {
                         .unwrap_or(true)
                 });
             }
+            // Phase 4B: attest staleness. Deliberately HERE, at the
+            // settled-batch flush, and after the undo-guard `retain` above —
+            // so undo's own writes never stale a claim — rather than on the
+            // per-event path, which is hot.
+            attest_stale.on_batch(&root, &pending, clock.wall_ms(now));
             let changes = recorder.stage(&pending);
             engine.observe_changes(now, &changes);
             drain_recorder_stats(&root, &mut recorder);
@@ -468,6 +481,166 @@ pub fn run(root: &Path) -> Result<(), String> {
     release_lock(&root);
     println!("\nstopped recording {}", root.display());
     Ok(())
+}
+
+/// Phase 4B: the daemon's attest note-taking.
+///
+/// **The daemon appends `stale` events and does nothing else.** It never
+/// executes a test, a build, or any repo-authored command — that is the whole
+/// security property of this chunk, and it is enforced mechanically: there is
+/// no `std::process::Command` anywhere in this file's production code (the
+/// `clippy.toml` `disallowed-methods` census is chunk C's).
+///
+/// **It TAKES the attest append lock** (`attest::lock::append_attest_locked`),
+/// which is the deliberate difference from `loglock.rs`. For `log.jsonl` the
+/// daemon is the sole steady writer, so `loglock` exempts it; `attest.jsonl`
+/// has several routine writers (CLI `derive`/`evidence`/`verdict`/`human`
+/// alongside this `stale`), so an unlocked append here would interleave with a
+/// CLI append and tear a line. `lock.rs`'s module doc is the canonical
+/// statement.
+///
+/// **Idempotence is the fold's job, not this marker's.** `fold.rs` collapses
+/// repeated `stale` events for one claim, and a `stale` on a refuted claim is
+/// a history-only no-op there — so the daemon appends and moves on rather than
+/// tracking what it has already staled. Dedup is per-BATCH only. The disclosed
+/// cost: a hot editing loop over a covered file appends one `stale` line per
+/// settled debounce batch, so `attest.jsonl` grows with editing churn. There
+/// is no rewrite class for that file (`ATTEST-FORMAT.md`), so nothing reclaims
+/// those lines today.
+struct AttestStaleMarker {
+    enabled: bool,
+    /// Absolute location of the coverage map, from
+    /// `coverage::resolve_coverage_path`.
+    path: PathBuf,
+    /// Hash of the map bytes as last loaded — the reload trigger. Bytes, not
+    /// mtime: an edit that keeps a file's length and lands inside one
+    /// filesystem timestamp tick is exactly the shape the reload test drives.
+    fingerprint: Option<String>,
+    map: Option<crate::attest::coverage::CoverageMap>,
+    /// One warning per process for a map that will not load, so a corrupt map
+    /// cannot spam `daemon.log` (same posture as `config.rs`'s warn-once).
+    warned: bool,
+}
+
+impl AttestStaleMarker {
+    fn new(root: &Path, cfg: &crate::config::Config) -> Self {
+        AttestStaleMarker {
+            enabled: cfg.attest_stale,
+            // Resolved through the ONE resolver, so the daemon and the
+            // producer cannot disagree about where the map lives.
+            path: crate::attest::coverage::resolve_coverage_path(root, cfg),
+            fingerprint: None,
+            map: None,
+            warned: false,
+        }
+    }
+
+    /// One settled batch. Reloads the map when its bytes changed, then appends
+    /// at most one `stale` per touched claim.
+    fn on_batch(&mut self, root: &Path, paths: &HashSet<PathBuf>, ts: u64) {
+        if !self.enabled || paths.is_empty() {
+            return;
+        }
+        self.refresh(root);
+        let Some(map) = &self.map else { return };
+
+        // `pending` is a HashSet, so sort the repo-relative paths: which path a
+        // `file-write` cause names must not depend on hash iteration order.
+        let mut rels: Vec<String> = paths
+            .iter()
+            // Not measured to always succeed: a staged path that is not under
+            // the root is simply skipped here.
+            .filter_map(|p| p.strip_prefix(root).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            // `.agentrec/` is the recorder's own state, never repo work — and
+            // `attest.jsonl` itself lives there, so staling on it would be a
+            // feedback loop.
+            .filter(|rel| !rel.starts_with(".agentrec/"))
+            .collect();
+        rels.sort();
+
+        let mut events: Vec<AttestEvent> = Vec::new();
+        let mut seen: Vec<agentrec_core::attest::types::ClaimId> = Vec::new();
+        for rel in &rels {
+            let rel = rel.as_str();
+            for (claim_id, kind) in crate::attest::coverage::claims_touched_by(map, rel) {
+                if seen.contains(&claim_id) {
+                    continue;
+                }
+                seen.push(claim_id.clone());
+                events.push(AttestEvent::Stale {
+                    ts,
+                    claim_id,
+                    cause: Self::cause_for(kind, rel),
+                });
+            }
+        }
+
+        if events.is_empty() {
+            return;
+        }
+        // NOT `?`: every surrounding call in `run` propagates, but an attest
+        // bookkeeping failure must not kill the recorder. `append_attest_locked`
+        // has reachable errors (it refuses a FIFO'd lock path rather than
+        // hanging), and losing a `stale` note costs freshness, while losing
+        // the daemon costs every turn after it. stderr is `daemon.log` under
+        // launchd.
+        if let Err(e) = crate::attest::lock::append_attest_locked(root, &events) {
+            eprintln!("agentrec: warning: could not append attest stale event(s): {e}");
+        }
+    }
+
+    /// Which cause the `stale` line carries. An exact hit on the entry's
+    /// measured `files` is a `file-write` naming that path; a coarse
+    /// `over_stale` glob is `coverage-incomplete` naming the scope
+    /// (`ATTEST-FORMAT.md` § `stale` documents both shapes).
+    ///
+    /// The discrimination is NOT redone here: `claims_touched_by` reports the
+    /// [`MatchKind`] that actually fired, including the glob, so there is one
+    /// copy of the rule and it cannot drift from the one the match used.
+    ///
+    /// [`MatchKind`]: crate::attest::coverage::MatchKind
+    fn cause_for(kind: crate::attest::coverage::MatchKind, rel: &str) -> StaleCause {
+        match kind {
+            crate::attest::coverage::MatchKind::ExactFile => StaleCause::FileWrite {
+                path: rel.to_string(),
+            },
+            crate::attest::coverage::MatchKind::OverStale(scope) => {
+                StaleCause::CoverageIncomplete { scope }
+            }
+        }
+    }
+
+    fn refresh(&mut self, root: &Path) {
+        let _ = root;
+        let path = self.path.clone();
+        let fingerprint = match agentrec_core::fsguard::read_regular(&path) {
+            Ok(bytes) => Some(hash_bytes(&bytes)),
+            Err(_) => None,
+        };
+        if fingerprint == self.fingerprint && (self.map.is_some() || fingerprint.is_none()) {
+            return;
+        }
+        let absent = fingerprint.is_none();
+        self.fingerprint = fingerprint;
+        if absent {
+            self.map = None;
+            return;
+        }
+        match crate::attest::coverage::load_coverage_map_at(&path) {
+            Ok(m) => {
+                self.map = m;
+                self.warned = false;
+            }
+            Err(e) => {
+                self.map = None;
+                if !self.warned {
+                    self.warned = true;
+                    eprintln!("agentrec: warning: attest coverage map unusable: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// D4: a system sleep/wake halts `Instant::now()`'s progress relative to wall

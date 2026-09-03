@@ -279,6 +279,9 @@ impl Driver<'_> {
 /// way a user typing it into a terminal expects. This is the unsandboxed
 /// surface `--help` discloses.
 fn run_test(cmd: &str, dir: &Path) -> Result<bool, String> {
+    // Spawns the user's own `--test` command, typed on the CLI by the user who
+    // invoked `bisect`; never the daemon, never repo content.
+    #[allow(clippy::disallowed_methods)]
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)

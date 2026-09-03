@@ -640,6 +640,11 @@ pub fn uninstall(root: &Path) -> Vec<String> {
 /// failures were swallowed by `load`'s existing "could not auto-load, run
 /// manually" fallback, so `init` still reported success while the OLD unit
 /// content kept running.
+// Spawns `launchctl` / `systemctl`: fixed program names, never a
+// repo-authored command, and installing a service unit is inherently an
+// out-of-process operation. Both arms are `cfg!` (runtime), so clippy sees
+// both on every platform.
+#[allow(clippy::disallowed_methods)]
 fn load(path: &Path) -> Result<(), ()> {
     let status = if cfg!(target_os = "macos") {
         // Best-effort: fails harmlessly if nothing was loaded yet.
@@ -665,6 +670,9 @@ fn load(path: &Path) -> Result<(), ()> {
     }
 }
 
+// Spawns `launchctl` / `systemctl` to unload the unit `load` installed —
+// same fixed program names, same reason.
+#[allow(clippy::disallowed_methods)]
 fn unload(path: &Path) -> Result<(), ()> {
     let status = if cfg!(target_os = "macos") {
         Command::new("launchctl").arg("unload").arg(path).status()

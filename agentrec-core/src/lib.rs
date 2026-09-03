@@ -1,5 +1,6 @@
 //! agentrec-core: pure engine + persistence primitives for the agentrec recorder.
-//! Modules: id (ULID), time (RFC 3339), store (content-addressed blobs),
+//! Modules: attest (claim events + deterministic fold; ATTEST-FORMAT.md),
+//! id (ULID), time (RFC 3339), store (content-addressed blobs),
 //! record (protocol types), scrub (secret redaction), engine (turn boundaries),
 //! diff (unified text diff + binary detection for the `diff` verb), memory
 //! (hash-pinned semantic memory records, fold, fsynced append), undo_coordinator
@@ -13,6 +14,7 @@
 //! disagree, the doc wins and the code is a bug.
 
 pub mod annotate;
+pub mod attest;
 pub mod bisect;
 pub mod diff;
 pub mod engine;
