@@ -6,11 +6,16 @@
 //! (hash-pinned semantic memory records, fold, fsynced append), undo_coordinator
 //! (the destructive-decision seam: undo plan classification + reservations),
 //! text (rendering primitives shared with the CLI's formatters), pathenc
-//! (OS path → wire-string conversion decision — never lossy).
+//! (OS path → wire-string conversion decision — never lossy), stats
+//! (per-repository analytics fold), search (substring/regex search over
+//! prompts and turn metadata), bisect (probe-state reverse-apply walk for
+//! the first-bad-turn search).
 //! Normative semantics live in PROTOCOL.md at the repo root; when code and doc
 //! disagree, the doc wins and the code is a bug.
 
+pub mod annotate;
 pub mod attest;
+pub mod bisect;
 pub mod diff;
 pub mod engine;
 pub mod fsguard;
@@ -21,6 +26,8 @@ pub mod perms;
 pub mod record;
 pub mod retention;
 pub mod scrub;
+pub mod search;
+pub mod stats;
 pub mod store;
 pub mod text;
 pub mod time;

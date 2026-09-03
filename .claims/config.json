@@ -5,7 +5,12 @@
   "lint": {
     "breadth_max": 0.25,
     "ignore": [
-      "**"
+      "CLAUDE.md",
+      "VERIFY-LEDGER.md",
+      "IMPLEMENTATION.md",
+      "docs/**",
+      "scripts/**",
+      "claim:clm_7ABS991MHZPBGF54NPGWJSWH8P"
     ],
     "denylist": [
       "true",

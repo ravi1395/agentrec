@@ -40,7 +40,7 @@ Two further limits, both real:
   both on every platform (measured — the sweep annotated `load`/`unload` once
   each and both arms were covered).
 
-## Per-site census — 27 production sites
+## Per-site census — 30 production sites
 
 Measured at task time by scanning the region of each file before its first
 `#[cfg(test)]`, not copied from the plan. Each site carries a per-site
@@ -62,14 +62,20 @@ Measured at task time by scanning the region of each file before its first
 | `attest/coveragecmd.rs` | `tooling_status` | `cargo llvm-cov --version`, an availability check. |
 | `attest/coveragecmd.rs` | `instrumented_build` ×2 | `cargo llvm-cov show-env`, then the instrumented `cargo test --no-run`. |
 | `attest/coveragecmd.rs` | `capture_one` ×3 | a built libtest binary under instrumentation, then `llvm-profdata` and `llvm-cov` from the resolved rustup toolchain. |
+| `attest/reportcmd.rs` | `commit_time_ms` | `git log -1 --format=%ct` on a user-supplied revision passed as one argv element (Phase 5; absent from this table until the `feat/phase-3-0` merge re-measured it). |
 | `attest/replaycmd.rs` | `ensure_clean_tree` | `git status` — refuses a dirty tree before minting a verdict. |
 | `attest/replaycmd.rs` | `head_commit` | `git rev-parse` to pin the replay commit. |
+| `annotatecmd.rs` | `git` | `git log` / `git show` with fixed subcommands to read commit history (added at the `feat/phase-3-0` merge). |
+| `bisectcmd.rs` | `run_test` | the user's own `--test` command, typed on the CLI by the invoker (added at the `feat/phase-3-0` merge). |
 | `attest/replaycmd.rs` | `extract_commit` ×2 | `git archive` (never `git worktree add`, which writes into the production repo's `.git`), then `tar` to unpack it. |
 | **`daemon.rs`** | — | **0 sites. No allow anywhere in its production code.** |
 
 Per-file totals: `service.rs` 6, `importcmd.rs` 4, `doctorcmd.rs` 1,
+`annotatecmd.rs` 1, `bisectcmd.rs` 1, `attest/reportcmd.rs` 1,
 `attest/coveragecmd.rs` 7, `attest/replaycmd.rs` 4, `attest/adapter_cargo.rs` 3,
-`attest/capture.rs` 2, `daemon.rs` 0 — **27**.
+`attest/capture.rs` 2, `daemon.rs` 0 — **30** (re-measured at the `feat/phase-3-0`
+merge by counting `Command::new` before each file's first `#[cfg(test)]`; the
+earlier **27** predated Phase 5's `reportcmd.rs` site).
 
 **This count differs from the plan's, and the difference is expected.** The
 plan's Phase 4 section names 13 production sites over

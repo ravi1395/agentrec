@@ -1,0 +1,5 @@
+error: unexpected argument 'zero_measurable_renders_the_literal_no_measurable_events' found
+
+Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]
+
+For more information, try '--help'.

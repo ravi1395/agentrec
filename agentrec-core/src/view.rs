@@ -956,6 +956,84 @@ impl RepositoryView {
             next: page.next,
         })
     }
+
+    /// Per-repository analytics (Phase 3.0 T1) — turn census, file churn,
+    /// agent-vs-human share, and the normative rework rate with every
+    /// exclusion bucket beside it. Definitions live in
+    /// [`crate::stats`] and, normatively, in the phase-3 design §3.0.1.
+    ///
+    /// A pure read of three surfaces: `log.jsonl`, the CAS (blob sizes), and
+    /// the current working tree (live content hashes — `excluded_unknown_mtime`
+    /// and the human share are uncomputable from the ledger alone). Writes
+    /// nothing.
+    ///
+    /// The wall clock is read here and passed down, so the fold itself is
+    /// deterministic and its right-censoring boundary is testable.
+    pub fn stats(
+        &self,
+        opts: &crate::stats::StatsOptions,
+    ) -> Result<crate::stats::StatsResult, crate::stats::StatsError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        crate::stats::compute_stats(&self.ledger(), &self.root, opts, now_ms)
+    }
+
+    /// Join already-parsed `git blame` ranges against turn records + CAS
+    /// blobs (Phase 3.0 T4, spec §3.0.3). Definitions — and the normative
+    /// best-effort precision contract — live in [`crate::annotate`].
+    ///
+    /// Git is deliberately NOT reachable from here: the caller supplies
+    /// [`crate::annotate::BlameRange`]s it parsed itself, keeping core
+    /// git-free. A pure read of `log.jsonl` + the CAS; writes nothing.
+    pub fn annotate(
+        &self,
+        ranges: &[crate::annotate::BlameRange],
+    ) -> crate::annotate::AnnotateResult {
+        crate::annotate::attribute(&self.ledger(), &self.objects_dir(), ranges)
+    }
+
+    /// Substring/regex search over stored prompt text, turn metadata
+    /// (`tool`/`model`), and file paths (Phase 3.0 T3, spec §3.0.2).
+    /// Definitions live in [`crate::search`]. A pure read: reads
+    /// `log.jsonl` and, for the prompt field, the CAS; never reads
+    /// file-SNAPSHOT blobs.
+    pub fn search(
+        &self,
+        q: &crate::search::SearchQuery,
+        cursor: Option<Cursor>,
+    ) -> Result<crate::search::SearchPage, crate::search::SearchError> {
+        crate::search::compute_search(
+            &self.ledger(),
+            &self.objects_dir(),
+            q,
+            cursor,
+            crate::search::SEARCH_PAGE_SIZE,
+        )
+    }
+
+    /// The probe state at sequence position `after` (Phase 3.0 T5, spec
+    /// §3.0.4) — the path→action edits that turn a copy of the CURRENT
+    /// working tree into "the working tree minus later agent turns".
+    /// Definitions, and the reverse-apply order, live in [`crate::bisect`].
+    ///
+    /// The seam exists so the CLI driver never constructs a [`BlobStore`]
+    /// itself: the only I/O this whole feature performs against the
+    /// repository is the CAS reads behind this call plus reading
+    /// `log.jsonl`. Nothing under `.agentrec/`, and nothing in the working
+    /// tree, is ever written by bisect.
+    pub fn bisect_probe_state(
+        &self,
+        seq: &[&TurnRecord],
+        after: Option<usize>,
+    ) -> Result<crate::bisect::ProbeState, Vec<crate::bisect::Unanswerable>> {
+        crate::bisect::probe_state(
+            seq,
+            after,
+            &crate::store::BlobStore::new(self.objects_dir()),
+        )
+    }
 }
 
 /// The one selection + pagination walk behind [`RepositoryView::list_of`] and

@@ -46,6 +46,7 @@ cli/src/purgecmd.rs::write_full_file_synced       3  # is_nonregular(path) befor
 cli/src/readcmds.rs::write_undo_guard             1  # is_nonregular(&path) before the undo-guard write
 cli/src/service.rs::install                       1  # is_nonregular(&path) before the service-unit write
 cli/src/state.rs::write_state                     1  # is_nonregular(&tmp) before the state tmp write
+cli/src/bisectcmd.rs::guarded_write               1  # is_nonregular(target) before the write; the single write-open behind every byte bisect puts on disk, and the only one with a FIFO-planting unit test behind the refusal
 
 # ---- [excl] create_new: EEXIST on any pre-existing inode ------------------
 agentrec-core/src/store.rs::create_tmp_file       4  # cfg(unix)+cfg(not(unix)) arms; create_new on a fresh CAS tmp name

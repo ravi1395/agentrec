@@ -1,8 +1,10 @@
 //! agentrec CLI: init, record (daemon), log, status, diff, blame, undo, hook
 //! (called by agent lifecycle hooks), doctor.
 
+mod annotatecmd;
 mod approvecmd;
 mod attest;
+mod bisectcmd;
 mod cmds;
 mod config;
 mod daemon;
@@ -18,8 +20,10 @@ mod memorycmds;
 mod noise;
 mod purgecmd;
 mod readcmds;
+mod searchcmd;
 mod service;
 mod state;
+mod statscmd;
 mod uninstallcmd;
 
 use clap::{Parser, Subcommand};
@@ -364,6 +368,102 @@ enum Command {
     Import {
         #[command(subcommand)]
         source: ImportSource,
+    },
+    /// Per-repository analytics: turn census, file churn, agent-vs-human
+    /// share, and the rework rate — every figure printed beside its
+    /// exclusion counts (read-only; no daemon required).
+    Stats {
+        /// How far back to look: `<N>d`/`<N>h`/`<N>m`/`<N>s`, or `all` for
+        /// full history. Defaults to 30 days.
+        #[arg(long, default_value = "30d")]
+        since: statscmd::SinceArg,
+        /// N in "reworked within N days of the write event".
+        #[arg(long = "rework-window", default_value_t = agentrec_core::stats::DEFAULT_REWORK_WINDOW_DAYS)]
+        rework_window: u32,
+        /// Emit `serde_json` of the exact `StatsResult` `RepositoryView::stats`
+        /// returned, instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Substring (default) or regex search over stored prompt text, turn
+    /// metadata (tool/model), and file paths (read-only; no daemon required).
+    Search {
+        /// Substring, or a regex when `--regex` is passed.
+        pattern: String,
+        /// Treat `pattern` as a regex rather than a plain substring.
+        #[arg(long)]
+        regex: bool,
+        /// RESERVED, not implemented: search inside file-snapshot content
+        /// rather than prompts/metadata/paths. Errors rather than silently
+        /// degrading to the metadata search this command performs today.
+        #[arg(long)]
+        content: bool,
+        /// Emit `serde_json` of the exact `SearchPage` `RepositoryView::search`
+        /// returned, instead of the text report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Join `git blame` over a git range against recorded turns: which
+    /// turn(s), if any, wrote each blamed line range (read-only; no daemon
+    /// required). Line attribution is BEST-EFFORT — turns record file-level
+    /// snapshots, not per-line provenance — and every output mode says so.
+    Annotate {
+        /// A git range, e.g. `HEAD~5..HEAD`.
+        range: String,
+        /// Emit `serde_json` of the exact `AnnotateResult`
+        /// `RepositoryView::annotate` returned, instead of the text report.
+        #[arg(long, conflicts_with = "md")]
+        json: bool,
+        /// Render as Markdown (still carrying the best-effort disclaimer).
+        #[arg(long)]
+        md: bool,
+    },
+    /// Binary-search recorded turns for the first one whose state fails a
+    /// command you supply. Each probe materializes into a fresh scratch
+    /// directory under the system temp root: bisect never writes to the
+    /// working tree or to `.agentrec/`.
+    ///
+    /// FIDELITY: a probe state is the working tree minus later agent turns;
+    /// not a historical snapshot. Human edits, untracked files and build
+    /// output stay exactly as they are now, so bisect answers "which agent
+    /// turn introduced the failure given everything else stays current".
+    /// (This sentence is pinned by `cli/tests/bisect.rs`; it must stay
+    /// byte-identical to `agentrec_core::bisect::FIDELITY`.)
+    ///
+    /// The --test command is NOT sandboxed: it runs through your shell with
+    /// full ambient authority — network, credentials, and the real repository
+    /// are all reachable from it. Only pass a command you would run yourself.
+    ///
+    /// --good/--bad are taken on trust: bisect does not verify that the good
+    /// state passes or that the bad state fails.
+    Bisect {
+        /// Shell command run at each probe, with cwd set to the scratch
+        /// directory. Exit 0 = good, nonzero = bad.
+        #[arg(long)]
+        test: String,
+        /// A turn known to be good. Defaults to the state before the first
+        /// turn in the sequence.
+        #[arg(long)]
+        good: Option<String>,
+        /// A turn known to be bad. Defaults to the newest turn.
+        #[arg(long)]
+        bad: Option<String>,
+        /// Admit bare turns as subtraction and as probe candidates. Prints a
+        /// misattribution warning: a bare turn is an unattributed activity
+        /// window, so naming one is not evidence an agent wrote it.
+        #[arg(long)]
+        include_bare: bool,
+        /// Re-run the command this many extra times per probe; runs that
+        /// disagree make the probe unanswerable rather than picking a side.
+        #[arg(long, default_value_t = 0)]
+        flaky_retries: u32,
+        /// Leave each probe's scratch directory on disk and print its path.
+        #[arg(long)]
+        keep: bool,
+        /// Emit `serde_json` of the exact `BisectResult` instead of the text
+        /// report.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -722,6 +822,36 @@ fn main() {
             mcpcmd::run(&mcp_root)
         }
         Command::Import { source } => importcmd::run(&root, source),
+        Command::Stats {
+            since,
+            rework_window,
+            json,
+        } => statscmd::stats(&root, since, rework_window, json),
+        Command::Search {
+            pattern,
+            regex,
+            content,
+            json,
+        } => searchcmd::search(&root, pattern, regex, content, json),
+        Command::Annotate { range, json, md } => annotatecmd::annotate(&root, range, json, md),
+        Command::Bisect {
+            test,
+            good,
+            bad,
+            include_bare,
+            flaky_retries,
+            keep,
+            json,
+        } => bisectcmd::bisect(
+            &root,
+            test,
+            good,
+            bad,
+            include_bare,
+            flaky_retries,
+            keep,
+            json,
+        ),
     };
     if let Err(message) = result {
         eprintln!("agentrec: {message}");
