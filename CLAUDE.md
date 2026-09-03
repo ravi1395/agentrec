@@ -848,7 +848,7 @@ fs mutations ─→ watcher ─→    TurnEngine: signal boundary,
 transcripts (prompt) ─→ scrub ─────┘                            (sha256 CAS, 10MiB cap)─→ Sutra GUI (v3)
 ```
 
-Two crates in one cargo workspace: `agentrec-core` (lib: TurnEngine, BlobStore, formats, scrub) and `agentrec` (bin: daemon + clap CLI). Threads + `notify`, no async runtime. Consumers never need the daemon running — all reads are file-based.
+Two crates in one cargo workspace: `agentrec-core` (lib: TurnEngine, BlobStore, formats, scrub) and `agentrec` (bin: daemon + clap CLI; lives in the `cli/` directory). Threads + `notify`, no async runtime. Consumers never need the daemon running — all reads are file-based.
 
 ### Key semantics (do not violate)
 
@@ -864,12 +864,12 @@ Two crates in one cargo workspace: `agentrec-core` (lib: TurnEngine, BlobStore, 
 - **Watch filtering:** gitignore-derived by default, plus denylist `.git` contents (except HEAD/index/refs — needed for git-turn classification), `.agentrec` (self-write suppression — no feedback loops), `node_modules`, `target`, `dist`, and user globs. Linux inotify limit exhaustion = loud startup error.
 - **Clocks:** UTC wall clock in records; monotonic clock for quiet-window measurement.
 
-## Commands (once code lands)
+## Commands
 
 ```bash
 cargo test                    # unit + engine table tests (agentrec-core)
-cargo test --test integration # drives the real binary against tempdir fixtures
-cargo clippy && cargo fmt     # CI-enforced
+cargo test -p agentrec --test integration # drives the real binary against tempdir fixtures
+cargo clippy && cargo fmt     # CI-enforced (CI runs clippy --workspace --all-targets --all-features -- -D warnings)
 agentrec init && agentrec record   # dogfood in this repo itself
 ```
 
