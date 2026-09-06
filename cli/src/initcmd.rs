@@ -1122,18 +1122,13 @@ fn codex_hooks_shape_toml(hooks_table: &toml::Table) -> Result<(), String> {
 //   agentrec mcp` under a throwaway `CODEX_HOME` and reading the file it
 //   wrote (exactly those three keys, in that shape).
 //
-// **Recorded gap, deliberately not papered over.** `codex mcp add` writes the
-// USER-GLOBAL `$CODEX_HOME/config.toml`; that a repo-local `.codex/
-// config.toml` is honored for the `mcp_servers` layer is NOT confirmed —
-// `codex mcp list` under an isolated `CODEX_HOME` did not list a project-local
-// entry, but that probe is weakly discriminating (the management subcommand
-// may only ever consult `CODEX_HOME`, regardless of what the agent runtime
-// loads). What IS confirmed live is that Codex loads repo-local
-// `.codex/config.toml` for the `[hooks]` layer (spike: the merge warning names
-// the scratch repo's own path). The location is pinned by parent spec :582,
-// which is founder-owned; this code states what the config declares, not what
-// Codex does with it — the same honest form `doctorcmd.rs::
-// check_codex_hook_flags` already uses for this exact class of gap.
+// Codex's official MCP documentation now explicitly supports project-scoped
+// `.codex/config.toml` in trusted projects and specifies
+// `[mcp_servers.<name>]` with `command` / `args` for stdio servers:
+// https://developers.openai.com/codex/mcp (verified 2026-09-06). This closes
+// the earlier documentation gap where only user-global `codex mcp add` had
+// been measured live. Project trust remains load-bearing: an untrusted Codex
+// project ignores its `.codex/config.toml`, including this registration.
 // ============================================================================
 
 /// The registry key agentrec registers itself under in both hosts.

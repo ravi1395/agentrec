@@ -45,7 +45,7 @@ shapes, trust flow, and continuation semantics this integration is built against
 live against this exact pinned binary, not inferred from docs. Full spike writeup:
 `docs/verify/codex-spike.md`; ledger row: `VERIFY-LEDGER.md` § "Phase A — Codex hook spike".
 
-References: [Codex hooks](https://developers.openai.com/codex/hooks), [advanced config / notify](https://developers.openai.com/codex/config-advanced), [session storage](https://codex.danielvaughan.com/2026/06/02/codex-cli-session-archiving-lifecycle-management-v0136/).
+References: [Codex hooks](https://developers.openai.com/codex/hooks), [advanced config](https://developers.openai.com/codex/config-advanced), [project-scoped MCP configuration](https://developers.openai.com/codex/mcp), [session storage](https://codex.danielvaughan.com/2026/06/02/codex-cli-session-archiving-lifecycle-management-v0136/).
 
 ### 3. VS Code — the first render surface
 

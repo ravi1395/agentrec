@@ -8,7 +8,7 @@
 agentrec is a local, tool-agnostic flight recorder for coding agents. A small daemon watches your repository, segments activity into *turns*, and snapshots every file each turn touched into a content-addressed store. After a bad session you can see exactly what changed, who changed it — agent, human, or `git` — and safely undo it, file by file.
 
 - **Local-first.** No cloud, no telemetry, no account. Everything lives in `.agentrec/` inside your repo, and every read verb works straight off those files — the daemon doesn't even need to be running to ask questions.
-- **Tool-agnostic.** Deep integration with Claude Code today (hooks installed by `agentrec init`); Codex is next. Any tool that can fire a lifecycle hook can emit the open signal format ([PROTOCOL.md](PROTOCOL.md)) — and a tool with *no* hooks at all is still recorded as unattributed activity windows.
+- **Tool-agnostic.** First-party lifecycle hooks and transcript import support both Claude Code and Codex. Any tool that can fire a lifecycle hook can emit the open signal format ([PROTOCOL.md](PROTOCOL.md)) — and a tool with *no* hooks at all is still recorded as unattributed activity windows.
 - **The layer git misses.** Git records committed outcomes. agentrec preserves what happens between an agent's intent and the final state: every intermediate file state, the prompt behind each change, and every revert.
 
 **Platforms:** macOS and Linux.
@@ -44,9 +44,11 @@ t_01J8…MB · claude-code · "add rate limiting to login" · 14:04 · human-edi
 Install (see [Install](#install) for all options), then in any repo:
 
 ```sh
-agentrec init            # scaffolds .agentrec/, installs Claude Code hooks + a per-repo recorder service
-agentrec import claude   # optional: backfill history from your existing Claude Code transcripts
-agentrec doctor          # verifies the whole chain: daemon up, hooks present, signals flowing
+agentrec init              # Claude Code: hooks + MCP config + per-repo recorder service
+agentrec init --codex      # Codex too: installs hooks and writes project MCP config
+agentrec import claude     # optional: backfill Claude Code transcript history
+agentrec import codex      # optional: backfill Codex rollout history
+agentrec doctor            # verifies daemon, hooks, signals, store, and permissions
 ```
 
 Work with your agent as usual, then ask questions:
@@ -60,9 +62,13 @@ agentrec undo <turn>             # preview a revert; --confirm applies it
 agentrec status                  # store size, recording gaps, daemon liveness
 ```
 
-Notes on the two setup-time commands:
+Notes on setup:
 
-- A freshly initialized repo has no history yet — `import claude` is what makes `blame` useful on day one. It persists by default, is idempotent (re-running appends nothing new), and `--dry-run` previews without writing. Claude Code prunes its transcript store on a rolling window (30 days by default), so import reaches back about that far.
+- Codex support is opt-in because it writes repo-local `.codex/` configuration. After `agentrec init --codex`, open Codex's `/hooks` screen and trust the three installed hooks (`UserPromptSubmit`, `PostToolUse` for `apply_patch`, and `Stop`). Codex otherwise skips untrusted hooks; `codex exec` may do so without a warning.
+- The live hook contract is verified against Codex CLI 0.146.0. That is the current minimum supported version; older payload and trust behavior is unverified.
+- A freshly initialized repo has no history yet. `import claude` and `import codex` make `blame` useful on day one by backfilling the corresponding local transcript store. Both persist by default, are idempotent, and support `--dry-run` to preview without writing.
+- If both `.codex/hooks.json` and an inline `[hooks]` table in `.codex/config.toml` exist, `init --codex` refuses to choose between them and leaves both untouched. Consolidate to one representation and rerun it.
+- A malformed Codex hook config is left untouched and its hook install is skipped, but the rest of `init` can continue. Read the command output before assuming every integration surface was installed.
 - `doctor` is the first thing to run when anything looks wrong — it checks daemon liveness, hook presence, signal freshness, store health, permissions, and (on Linux) inotify headroom in one shot.
 
 ## Install
@@ -113,6 +119,7 @@ Uninstall the binary: `rm ~/.local/bin/agentrec`. Uninstall everything agentrec 
 ```mermaid
 flowchart LR
     CC["Claude Code hooks<br/>UserPromptSubmit = start<br/>Stop = stop"]
+    CX["Codex hooks<br/>UserPromptSubmit = start<br/>PostToolUse = touched paths<br/>Stop = stop"]
     ANY["any hook-capable tool<br/>(open signal format)"]
     FS["filesystem mutations<br/>(agent or human)"]
     subgraph AG[".agentrec/ — append-only store"]
@@ -125,9 +132,10 @@ flowchart LR
         TE["TurnEngine<br/>signal brackets · 10 s quiet window<br/>git-turn classification"]
     end
     CLI["CLI<br/>log · diff · blame · undo · status …"]
-    MCP["MCP server + editor surfaces<br/>(v2, on the roadmap)"]
+    MCP["MCP server<br/>log · diff · blame · recall · status · gated undo"]
 
     CC --> SIG
+    CX --> SIG
     ANY --> SIG
     SIG --> TE
     FS --> W --> TE
@@ -135,20 +143,21 @@ flowchart LR
     TE --> OBJ
     LOG --> CLI
     OBJ --> CLI
-    LOG -.-> MCP
+    LOG --> MCP
+    OBJ --> MCP
 ```
 
 The vocabulary the rest of this README (and the CLI output) uses:
 
 - **Turn** — the unit of history: one contiguous burst of recorded activity, with the list of files it touched and their before/after snapshots.
 - **Rich vs bare turns.** A *rich* turn was signaled by a tool's lifecycle hook, so it carries the tool, model, and prompt. A *bare* turn was inferred from a quiet window in filesystem activity alone — it is an *unattributed activity window* (a human `vim` save produces the same signature), so agentrec never renders a bare turn as agent activity and never fabricates attribution for it.
-- **Bracketing.** Claude Code's `UserPromptSubmit` hook opens a turn and `Stop` closes it. While the bracket is open, quiet-window closure is suppressed; on stop, interim bare turns are retroactively merged into the rich turn.
+- **Bracketing.** Claude Code and Codex use `UserPromptSubmit` to open a turn and `Stop` to close it. While the bracket is open, quiet-window closure is suppressed; on stop, interim bare turns are retroactively merged into the rich turn. Codex's `PostToolUse` hook also declares paths from `apply_patch` on the closing signal; the daemon does not yet persist that declaration as per-file authorship, so the recorded file list remains the filesystem activity observed inside the turn window.
 - **Git turns.** Mutation bursts coinciding with `.git/HEAD`/index/ref transitions are recorded as rich turns with `tool: "git"` and hidden from `log` by default (`--all` shows them) — a branch switch never becomes a 400-file "agent" turn.
 - **Epochs and recording gaps.** Daemon start/stop append epoch records. Any interval the daemon didn't cover is a *recording gap*; `blame` across one says `attribution stale — recording gap` instead of guessing.
 - **Append-only.** `log.jsonl` and `signal.jsonl` are only ever appended to; history is corrected by appending, never rewritten. (The narrow, manual, archive-first `purge` exceptions are documented under [Commands](#commands).)
 - **Undo is a turn.** Every revert snapshots current state first and appends a new turn with `tool: "agentrec"` — reverts are blame-able and re-revertible, and history is never destroyed.
 
-**Supported agents today:** Claude Code has first-party hook integration (installed by `init` or the plugin) plus transcript import. Codex integration is the next planned emitter. Any other tool can integrate by emitting the signal format — [PROTOCOL.md](PROTOCOL.md) defines conformance levels L0–L3, and even at L0 (no integration at all) the daemon still records activity as bare turns you can diff and undo; you just don't get attribution.
+**Supported agents today:** Claude Code has first-party hooks (installed by `init` or the plugin), transcript import, and MCP registration. Codex CLI 0.146.0 has verified first-party hooks and transcript import; `init --codex` also writes its supported project-scoped MCP configuration. Both project hooks and MCP configuration load only for a trusted Codex project. Any other tool can integrate by emitting the signal format — [PROTOCOL.md](PROTOCOL.md) defines conformance levels L0–L3, and even at L0 (no integration at all) the daemon still records activity as bare turns you can diff and undo; you just don't get attribution.
 
 ## How we try to break it
 
@@ -235,6 +244,8 @@ that fires only when it thinks it found one. The remedy is still separation by r
 | `agentrec init` | Scaffold `.agentrec/`, install agent hooks, install+load a per-repo recorder service. Idempotent. Details below. |
 | `agentrec record` | Run the recorder daemon in the foreground for this repo (the service unit runs this for you) |
 | `agentrec import claude` | Backfill turns from Claude Code's local transcript store (`~/.claude/projects`). Persists by default; `--dry-run` previews; idempotent. `--json` |
+| `agentrec import codex` | Backfill turns from Codex's local rollout store (`~/.codex/sessions`). Persists by default; `--dry-run` previews; idempotent. `--json` |
+| `agentrec mcp` | Serve the repo's read tools over stdio JSON-RPC. Undo is exposed only when `mcp_destructive` opts in. Works with the recorder stopped. |
 | `agentrec log` | List recorded turns, newest first (git turns hidden by default). `--all`, `--json`, `--limit`, `--utc`, `--explain`, `--all-files` |
 | `agentrec show <turn> [--prompt]` | Print a turn's header (excerpt discipline: no full prompt without the flag); `--prompt` prints the full post-scrub prompt text. `--all-files` |
 | `agentrec diff <turn>` | Unified diff of a turn's file changes (turn id or unambiguous prefix). `--json`. Details below. |
@@ -256,7 +267,7 @@ Every command accepts `--root <path>`. Run `agentrec <command> --help` for the f
 <details>
 <summary><strong><code>init</code> details</strong></summary>
 
-`agentrec init` scaffolds `.agentrec/`, installs Claude Code hooks (`UserPromptSubmit` + `Stop`, merged additively into `.claude/settings.local.json` — existing third-party hooks on the same events are preserved), adds `.agentrec/` to `.gitignore`, tightens store permissions (0700/0600), and installs+loads a per-repo recorder service. Flags: `--no-hook`, `--no-service`, `--dry-run`. **Under a temporary directory** (`$TMPDIR`, `/tmp`, `/private/tmp`) the service unit is skipped by default and the reason is printed: the unit is user-scoped with `RunAtLoad`+`KeepAlive`, so it outlives the directory it records and nothing reaps it when that directory is deleted. `--service` installs it anyway; `--service` together with `--no-service` is rejected.
+`agentrec init` scaffolds `.agentrec/`, installs Claude Code hooks (`UserPromptSubmit` + `Stop`, merged additively into `.claude/settings.local.json` — existing third-party hooks on the same events are preserved), writes Claude Code's MCP registration, adds `.agentrec/` to `.gitignore`, tightens store permissions (0700/0600), and installs+loads a per-repo recorder service. `--codex` additionally installs Codex hooks (`UserPromptSubmit`, `PostToolUse` matched to `apply_patch`, and `Stop`) plus repo-local MCP configuration; Codex requires the trust step described in [Quickstart](#quickstart). Flags: `--codex`, `--no-hook`, `--no-service`, `--service`, `--dry-run`. **Under a temporary directory** (`$TMPDIR`, `/tmp`, `/private/tmp`) the service unit is skipped by default and the reason is printed: the unit is user-scoped with `RunAtLoad`+`KeepAlive`, so it outlives the directory it records and nothing reaps it when that directory is deleted. `--service` installs it anyway; `--service` together with `--no-service` is rejected.
 
 </details>
 
@@ -338,6 +349,7 @@ tail), so multi-line arrays are fine.
 | `memory_enabled` | `true` | Kill switch for the automatic memory paths (hook injection + candidate ingestion); manual `remember`/`verify`/`forget` always work |
 | `memory_inject_max` | `5` | Max memory facts injected per prompt |
 | `noise_globs` | `[]` | Display-only folding of noisy file entries in `log`/`show` (see above) |
+| `mcp_destructive` | `off` | MCP undo policy: `off`, human-approved `confirm`, or two-phase-token `auto` |
 | `attest_stale` | `true` | Whether the `record` daemon appends `stale` events to `.agentrec/attest.jsonl` when a write lands in a claim's coverage scope. Off means claims are never marked stale by file writes |
 | `attest_coverage_path` | `.agentrec/attest-coverage.json` | Repo-relative location of the attest coverage map, read by both `attest coverage` (which writes it) and the daemon (which reads it to decide what a write stales) |
 
@@ -369,9 +381,10 @@ On Claude Code's `UserPromptSubmit` hook, agentrec injects the top matching Fres
 
 ## Troubleshooting
 
-- **`no turns recorded — is agentrec record running?`** — either nothing has happened in this repo yet, or the recording chain is broken. Run `agentrec doctor`: it checks the daemon, hooks, and signal freshness end-to-end and prints the remedy for whatever it finds. For history from before agentrec was installed, run `agentrec import claude`.
+- **`no turns recorded — is agentrec record running?`** — either nothing has happened in this repo yet, or the recording chain is broken. Run `agentrec doctor`: it checks the daemon, hooks, and signal freshness end-to-end and prints the remedy for whatever it finds. For history from before agentrec was installed, run `agentrec import claude` or `agentrec import codex`.
 - **`blame` says `attribution stale — recording gap`** — the daemon wasn't running over that interval. This is deliberate honesty, not an error: agentrec never guesses across a gap. `agentrec status` shows every gap.
 - **Turns record, but they're all bare (no tool/prompt)** — the hooks aren't firing. `doctor` verifies hook presence; if you installed via the Claude Code plugin, the hooks are global and repo-local `init` should be run with `--no-hook`.
+- **Codex turns stay bare after `init --codex`** — open `/hooks` in Codex and trust the three repo-local agentrec hooks. Codex can silently skip untrusted hooks in non-interactive `codex exec` runs.
 - **Every signal appears twice** — plugin hooks *and* repo-local hooks are both installed. Re-run `agentrec init --no-hook`, or remove the repo-local hooks from `.claude/settings.local.json`.
 - **`status` shows a DEGRADED banner** — snapshot or prompt writes failed at some point; the banner enumerates the counters. Investigate (disk full? permissions?), then clear with `status --ack-degraded`.
 - **Linux: daemon fails loudly at startup about watches** — inotify watch-limit exhaustion. The error prints the exact `sysctl` remedy; `doctor` reports headroom before it bites.
