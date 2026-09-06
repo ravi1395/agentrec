@@ -34,7 +34,8 @@ Codex now ships a first-class lifecycle hook system — `Stop`, `UserPromptSubmi
 
 The integration is therefore a structural mirror of Claude Code's:
 
-- `agentrec init --codex` installs three hooks — `UserPromptSubmit` (start signal), `PostToolUse` scoped to the `apply_patch` matcher (accumulates the turn's touched file paths from the patch-DSL text, no signal emitted), and `Stop` (stop signal, carrying the accumulated `files_written` and `emitter_turn` for decision-17 keying) — all `tool: "codex"`, the rollout path as `transcript`.
+- `agentrec init --codex` installs three hooks — `UserPromptSubmit` (start signal), `PostToolUse` scoped to the `apply_patch` matcher (accumulates the turn's touched file paths from the patch-DSL text, no signal emitted), and `Stop` (stop signal, carrying the accumulated `files_written` and `emitter_turn` for decision-17 keying) — all `tool: "codex"`, the rollout path as `transcript`. Every start/stop invocation also mints `emitter_event`, allowing exact-replay dedup without collapsing separately-fired blocked continuations.
+- The recorder resolves declared writes from the Stop signal's `files_written`, falling back to its named transcript, and intersects that set with the Stop-closed turn's observed mutations. Matching entries persist `attribution: "declared"`; other observed entries persist `"undeclared"`; no resolved declaration leaves the field absent. Declared paths outside the root are omitted and reported in daemon diagnostics.
 - `agentrec import codex` backfills history from rollout files — same cold-start killer, second ecosystem.
 - MCP registration for Codex's MCP client config, so Codex agents get all five read tools — `log`/`diff`/`blame`/`recall`/`status` — (and gated `undo`) too.
 
@@ -45,7 +46,7 @@ shapes, trust flow, and continuation semantics this integration is built against
 live against this exact pinned binary, not inferred from docs. Full spike writeup:
 `docs/verify/codex-spike.md`; ledger row: `VERIFY-LEDGER.md` § "Phase A — Codex hook spike".
 
-References: [Codex hooks](https://developers.openai.com/codex/hooks), [advanced config / notify](https://developers.openai.com/codex/config-advanced), [session storage](https://codex.danielvaughan.com/2026/06/02/codex-cli-session-archiving-lifecycle-management-v0136/).
+References: [Codex hooks](https://developers.openai.com/codex/hooks), [advanced config](https://developers.openai.com/codex/config-advanced), [project-scoped MCP configuration](https://developers.openai.com/codex/mcp), [session storage](https://codex.danielvaughan.com/2026/06/02/codex-cli-session-archiving-lifecycle-management-v0136/).
 
 ### 3. VS Code — the first render surface
 

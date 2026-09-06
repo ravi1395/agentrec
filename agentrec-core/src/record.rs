@@ -79,9 +79,9 @@ pub struct SignalEvent {
     /// PROTOCOL §4 additive (Phase 2 tail C1): a stable turn identity the
     /// EMITTER assigns, present on `start`/`stop` only. Motivating producer:
     /// Codex's own hook `turn_id` (docs/verify/codex-spike.md) — the daemon
-    /// uses it to detect an emitter-resent start/stop (retry, or a daemon
-    /// restart racing the emitter's own retry) by
-    /// `(tool, event, session, emitter_turn)` instead of timing heuristics.
+    /// uses it to correlate boundaries and detect bracket mismatches. Replay
+    /// detection additionally requires [`SignalEvent::emitter_event`]; one
+    /// turn may legitimately fire multiple Stops.
     /// Claude Code's hook emitter has no equivalent stable id today and
     /// omits this field entirely; `None` means "emitter did not declare",
     /// never "no upstream turn" — a recorder MUST fall back to today's
@@ -89,6 +89,13 @@ pub struct SignalEvent {
     /// lacks it (see `cli/src/daemon.rs`'s dedup + mismatch handling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitter_turn: Option<String>,
+    /// PROTOCOL §4 additive: stable identity for this individual signal
+    /// emission. A separately-fired continuation gets a new value even when
+    /// `emitter_turn`, timestamp, and declared paths coincide; an exact replay
+    /// retains it. Recorders may therefore deduplicate without guessing from
+    /// millisecond timestamps or mutable content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitter_event: Option<String>,
     /// PROTOCOL §4 additive (Phase 2 tail C2 fix 2): the model the emitting
     /// tool was running, when the emitter has it. Motivating producer:
     /// Codex's hook payload carries `model` on all three of its lifecycle
@@ -197,10 +204,10 @@ pub struct FileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_kind: Option<String>,
     /// Per-file attribution (PROTOCOL §5, additive, open string enum).
-    /// **Writer-optional, and never written by this code** — reserved for
-    /// the D6 transcript-correlation producer, which defines the value set.
-    /// Every entry this workspace constructs leaves it `None`, so it is
-    /// absent from the wire and existing records are unaffected. Consumers
+    /// Writer-optional: the live daemon writes [`attribution::DECLARED`] or
+    /// [`attribution::UNDECLARED`] when a closing signal supplies a declared-
+    /// write set; otherwise this remains `None` and is absent from the wire.
+    /// Consumers
     /// MUST tolerate any value (including unknown ones) and MUST NOT derive
     /// undo safety from it — undo safety keys on `modified-since`
     /// (PROTOCOL §5) and on the refusal gates, never on attribution.
@@ -216,6 +223,18 @@ pub mod link_kind {
     /// The path was a symbolic link at snapshot time; the entry's hashes
     /// address the link target string, not file content.
     pub const SYMLINK: &str = "symlink";
+}
+
+/// Values emitted by the live daemon for [`FileEntry::attribution`]. This is
+/// an open enum on the wire: consumers must treat unknown values as
+/// unattributed and must never gate destructive behavior on this field.
+pub mod attribution {
+    /// The closing emitter explicitly included this observed path in its
+    /// declared-write set.
+    pub const DECLARED: &str = "declared";
+    /// The emitter supplied a declared-write set, but this observed path was
+    /// absent from it. This is not proof of human authorship.
+    pub const UNDECLARED: &str = "undeclared";
 }
 
 /// Open string enum of [`FileEntry::skipped_reason`] values (PROTOCOL §5).
@@ -650,6 +669,24 @@ mod tests {
         let re = serde_json::to_string(&sig).unwrap();
         let back: SignalEvent = serde_json::from_str(&re).unwrap();
         assert_eq!(back.emitter_turn, sig.emitter_turn);
+    }
+
+    #[test]
+    fn signal_emitter_event_roundtrips_and_absence_stays_absent() {
+        let absent = r#"{"v":1,"ts":5000,"tool":"codex","event":"stop"}"#;
+        let sig: SignalEvent = serde_json::from_str(absent).unwrap();
+        assert_eq!(sig.emitter_event, None);
+        assert!(!serde_json::to_string(&sig)
+            .unwrap()
+            .contains("emitter_event"));
+
+        let present =
+            r#"{"v":1,"ts":5000,"tool":"codex","event":"stop","emitter_event":"01JXEVENT"}"#;
+        let sig: SignalEvent = serde_json::from_str(present).unwrap();
+        assert_eq!(sig.emitter_event.as_deref(), Some("01JXEVENT"));
+        let back: SignalEvent =
+            serde_json::from_str(&serde_json::to_string(&sig).unwrap()).unwrap();
+        assert_eq!(back.emitter_event, sig.emitter_event);
     }
 
     /// D51 wire half: the type-level byte-identity proof for every epoch line

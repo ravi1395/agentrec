@@ -1,14 +1,14 @@
-//! Phase 2 tail, Task C1: `SignalEvent.emitter_turn` (PROTOCOL §4 additive)
-//! and its two daemon-side behaviors — restart-safe dedup of a resent
-//! start/stop, and a mismatched-emitter_turn stop leaving the open bracket
-//! alone. Deliberately a separate file from `cli/tests/hardening_daemon.rs`
+//! Phase 2 tail, Task C1: `SignalEvent.emitter_turn` plus D52's
+//! `SignalEvent.emitter_event` (PROTOCOL §4 additive) and their two daemon-
+//! side behaviors — restart-safe dedup of a resent start/stop, and a
+//! mismatched-emitter_turn stop leaving the open bracket alone. Deliberately
+//! a separate file from `cli/tests/hardening_daemon.rs`
 //! (whose own header states the same convention): helpers below are
 //! intentionally duplicated rather than shared.
 //!
-//! `emitter_turn` has no CLI-facing emitter yet (Codex's `agentrec hook
-//! codex` is Task C2, not built here) — every signal below is planted
-//! directly into `signal.jsonl`, bypassing `agentrec hook` entirely, same
-//! convention `hardening_daemon.rs`'s memory-candidate tests already use.
+//! Every signal below is planted directly into `signal.jsonl`, bypassing
+//! `agentrec hook`; the explicit `emitter_event` values model the stable
+//! per-invocation IDs that the Codex hook now emits.
 
 #![allow(clippy::disallowed_methods)]
 //  ^ Test code reads its own tempdir fixtures, which this harness created;
@@ -60,6 +60,7 @@ fn start_signal(tool: &str, session: &str, emitter_turn: &str) -> String {
         "event": "start",
         "session": session,
         "emitter_turn": emitter_turn,
+        "emitter_event": "event-start-1",
     })
     .to_string()
 }
@@ -72,6 +73,7 @@ fn stop_signal(tool: &str, session: &str, emitter_turn: &str) -> String {
         "event": "stop",
         "session": session,
         "emitter_turn": emitter_turn,
+        "emitter_event": "event-stop-1",
     })
     .to_string()
 }

@@ -193,26 +193,20 @@ pub struct State {
     #[serde(default)]
     pub mismatched_stop_emitter_turns: u64,
     /// Content fingerprint of the signal `last_emitter_turn_key` was last
-    /// set for (Phase 2 tail, C1 fix 1 — content-aware dedup). Identity
+    /// set for (Phase 2 tail, C1 fix 1 — per-emission dedup). Turn identity
     /// alone (`last_emitter_turn_key`) cannot distinguish a genuine emitter
     /// RETRY (byte-identical resend) from a genuine SECOND firing that
     /// happens to share the same `(tool, event, session, emitter_turn)`
     /// tuple: Codex's `Stop` hook fires twice for one `turn_id` on a
     /// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
-    /// "Continuation semantics"), and the second firing can carry
-    /// genuinely NEW `files_written` from `apply_patch` calls made during
-    /// the continuation. `daemon.rs::emitter_turn_content_fingerprint`
-    /// computes what this holds for each event kind. `None` when no key
-    /// has been recorded yet, OR when the currently-stored key predates
-    /// this field (every pre-fix `state.json`, which has
-    /// `last_emitter_turn_key` but never wrote this one): a key match
-    /// against a `None` fingerprint is treated the same as the pre-fix
-    /// behavior — identity alone means duplicate — rather than risk
-    /// double-applying a genuine crash-restart resend in the one-time
-    /// window right after a binary upgrade. That comparison ALSO stamps
-    /// this field with the incoming signal's fingerprint before returning
-    /// (see `handle_emitter_turn_signal`), so the gap self-heals on this
-    /// exact occurrence, not just on some later non-duplicate signal.
+    /// "Continuation semantics"). The Codex emitter therefore supplies a
+    /// per-invocation `emitter_event`: a separately-fired continuation gets
+    /// a new value while an exact replay retains the old one.
+    /// `daemon.rs::emitter_turn_content_fingerprint` computes what this
+    /// holds for each event kind. Signals without `emitter_event` do not
+    /// participate in dedup because a legacy path/timestamp fingerprint
+    /// cannot distinguish a replay from a continuation. Existing legacy
+    /// values remain deserializable but are not evidence for dropping input.
     #[serde(default)]
     pub last_emitter_turn_fingerprint: Option<String>,
 }

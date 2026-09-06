@@ -89,6 +89,15 @@ fn spawn_record(root: &Path) -> Child {
         .expect("spawn record")
 }
 
+fn spawn_record_with_stderr(root: &Path) -> Child {
+    Command::new(bin())
+        .args(["record", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn record")
+}
+
 fn send_hook(root: &Path, payload: &str) {
     let mut child = Command::new(bin())
         .args(["hook", "claude", "--root", root.to_str().unwrap()])
@@ -593,6 +602,112 @@ fn bare_turn_undo_carries_unattributed_window_caution() {
 }
 
 // ---- D6 phase 2b: emitter-side files_written (PROTOCOL §4) ------------------
+
+/// D6-ATTR: the daemon consumes, rather than merely parses, a Stop signal's
+/// declaration. Only observed files are persisted: the declared intersection
+/// is `declared`, other observed files are `undeclared`, and external
+/// declarations are counted in the daemon's user-visible diagnostics.
+#[test]
+fn d6_attr_stop_declaration_persists_declared_and_undeclared_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_buf = tmp.path().canonicalize().unwrap();
+    let root = root_buf.as_path();
+    init(root);
+
+    let mut daemon = spawn_record_with_stderr(root);
+    let started = poll_until(Duration::from_secs(10), || {
+        epoch_events(root)
+            .contains(&"start".to_string())
+            .then_some(())
+    });
+    assert!(started.is_some(), "daemon never appended a start epoch");
+
+    send_hook(
+        root,
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"s_attr","prompt":"attribute writes"}"#,
+    );
+    let opened = poll_until(Duration::from_secs(5), || {
+        root.join(".agentrec/open.json").exists().then_some(())
+    });
+    assert!(opened.is_some(), "daemon never opened the Codex bracket");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let declared = root.join("declared.rs");
+    let concurrent = root.join("concurrent.md");
+    std::fs::write(&declared, "fn declared() {}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    std::fs::write(&concurrent, "human note\n").unwrap();
+    let staged = poll_until(Duration::from_secs(10), || {
+        let text = std::fs::read_to_string(root.join(".agentrec/open.json")).ok()?;
+        let journal: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let paths: Vec<&str> = journal["files"]
+            .as_array()?
+            .iter()
+            .filter_map(|file| file["path"].as_str())
+            .collect();
+        (paths.contains(&"declared.rs") && paths.contains(&"concurrent.md")).then_some(())
+    });
+    assert!(
+        staged.is_some(),
+        "daemon never staged both bracketed writes"
+    );
+
+    let transcript_dir = tempfile::tempdir().unwrap();
+    let transcript = transcript_dir.path().join("turn.jsonl");
+    std::fs::write(
+        &transcript,
+        format!(
+            concat!(
+                r#"{{"timestamp":"2026-09-06T10:00:00.000Z","message":{{"role":"user","content":"attribute writes"}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-09-06T10:00:01.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"{}"}}}},{{"type":"tool_use","name":"Write","input":{{"file_path":"/outside-agentrec-root.rs"}}}}]}}}}"#,
+                "\n"
+            ),
+            declared.display()
+        ),
+    )
+    .unwrap();
+    send_hook(
+        root,
+        &format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s_attr","transcript_path":"{}"}}"#,
+            transcript.display()
+        ),
+    );
+
+    let turn = poll_until(Duration::from_secs(15), || {
+        live_rich_turns(root).into_iter().find(|turn| {
+            let paths = turn_paths(turn);
+            paths.iter().any(|p| p == "declared.rs") && paths.iter().any(|p| p == "concurrent.md")
+        })
+    })
+    .expect("declared and concurrent writes did not land in one rich turn");
+
+    let _ = daemon.kill();
+    let output = daemon.wait_with_output().expect("collect daemon output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignored 1 declared write path outside recording root"),
+        "out-of-root declarations must be visible in daemon diagnostics: {stderr}"
+    );
+
+    let files = turn["files"].as_array().expect("turn files");
+    let attribution = |path: &str| {
+        files
+            .iter()
+            .find(|file| file["path"] == path)
+            .and_then(|file| file.get("attribution"))
+            .and_then(|value| value.as_str())
+    };
+    assert_eq!(attribution("declared.rs"), Some("declared"));
+    assert_eq!(attribution("concurrent.md"), Some("undeclared"));
+    assert!(
+        files
+            .iter()
+            .all(|file| file["path"] != "/outside-agentrec-root.rs"),
+        "a declaration without an observed mutation must not invent a file entry: {turn}"
+    );
+}
 
 /// The Stop hook is the emitter: given a transcript declaring writes for the
 /// current turn, the signal line it appends must carry `files_written` with

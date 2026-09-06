@@ -195,13 +195,19 @@ pub fn run(
         }
     }
 
-    if !codex {
+    if no_hook {
+        actions.push("skipped Codex hook install (--no-hook)".to_string());
+        actions.push("skipped Codex MCP registration (--no-hook)".to_string());
+    } else if !codex {
         actions.push("skipped Codex hook install (pass --codex to enable)".to_string());
         actions.push("skipped Codex MCP registration (pass --codex to enable)".to_string());
     } else {
-        match install_codex_hooks(root) {
-            Ok(CodexHooksOutcome::Refused) => actions.push(codex_refuse_line(root)),
-            Ok(CodexHooksOutcome::Installed { target, changed: c }) => {
+        let codex_hooks_refused = match install_codex_hooks(root)? {
+            CodexHooksOutcome::Refused => {
+                actions.push(codex_refuse_line(root));
+                true
+            }
+            CodexHooksOutcome::Installed { target, changed: c } => {
                 changed = changed || c;
                 actions.push(format!(
                     "Codex hooks {} ({})",
@@ -209,9 +215,9 @@ pub fn run(
                     codex_target_label(target, root),
                 ));
                 actions.push(CODEX_TRUST_REMINDER.to_string());
+                false
             }
-            Err(e) => actions.push(format!("Codex hook install skipped: {e}")),
-        }
+        };
         // MCP registration lives in a DIFFERENT table (`[mcp_servers]`) of a
         // different layer than `[hooks]`, so it does not create a second hook
         // representation — but it is still gated on the dual-representation
@@ -220,7 +226,7 @@ pub fn run(
         // `config.toml` (re-serialized, comments dropped, `.bak` left behind)
         // while printing that we refused to touch it would make that printed
         // line false. Pinned by `codex_init_both_present_refuses_untouched`.
-        if matches!(codex_hooks_target(root), Ok(CodexHooksTarget::Refuse)) {
+        if codex_hooks_refused {
             actions.push(
                 "skipped Codex MCP registration: the dual hook-representation state above \
                  leaves .codex/config.toml untouched — consolidate to one hook file, then \
@@ -296,7 +302,10 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
     // Same read-only inspect function the real run uses to decide, so
     // `--dry-run` can never claim an install (or a refuse) the real run
     // would not also do.
-    if !codex {
+    if no_hook {
+        println!("[dry-run] would skip Codex hook install (--no-hook)");
+        println!("[dry-run] would skip Codex MCP registration (--no-hook)");
+    } else if !codex {
         println!("[dry-run] would skip Codex hook install (pass --codex to enable)");
         println!("[dry-run] would skip Codex MCP registration (pass --codex to enable)");
     } else {
@@ -1122,18 +1131,13 @@ fn codex_hooks_shape_toml(hooks_table: &toml::Table) -> Result<(), String> {
 //   agentrec mcp` under a throwaway `CODEX_HOME` and reading the file it
 //   wrote (exactly those three keys, in that shape).
 //
-// **Recorded gap, deliberately not papered over.** `codex mcp add` writes the
-// USER-GLOBAL `$CODEX_HOME/config.toml`; that a repo-local `.codex/
-// config.toml` is honored for the `mcp_servers` layer is NOT confirmed —
-// `codex mcp list` under an isolated `CODEX_HOME` did not list a project-local
-// entry, but that probe is weakly discriminating (the management subcommand
-// may only ever consult `CODEX_HOME`, regardless of what the agent runtime
-// loads). What IS confirmed live is that Codex loads repo-local
-// `.codex/config.toml` for the `[hooks]` layer (spike: the merge warning names
-// the scratch repo's own path). The location is pinned by parent spec :582,
-// which is founder-owned; this code states what the config declares, not what
-// Codex does with it — the same honest form `doctorcmd.rs::
-// check_codex_hook_flags` already uses for this exact class of gap.
+// Codex's official MCP documentation now explicitly supports project-scoped
+// `.codex/config.toml` in trusted projects and specifies
+// `[mcp_servers.<name>]` with `command` / `args` for stdio servers:
+// https://developers.openai.com/codex/mcp (verified 2026-09-06). This closes
+// the earlier documentation gap where only user-global `codex mcp add` had
+// been measured live. Project trust remains load-bearing: an untrusted Codex
+// project ignores its `.codex/config.toml`, including this registration.
 // ============================================================================
 
 /// The registry key agentrec registers itself under in both hosts.
@@ -1645,7 +1649,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let before = walk(root);
-        run(root, true, true, true, false, true).unwrap();
+        run(root, false, true, true, false, true).unwrap();
         let after = walk(root);
         assert_eq!(
             before, after,

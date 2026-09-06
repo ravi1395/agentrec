@@ -49,6 +49,11 @@ shows this shape to third parties, so the reader must accept it), everything in
 that drift from the real wire are this repository's known failure mode; keep
 the hand-written set to shapes the serializer provably cannot emit.
 
+The Codex full-stop and emitter-turn start fixtures also carry
+`emitter_event`, the per-hook-invocation identity added by D52 so a recorder
+can distinguish a blocked continuation from an exact replay without relying
+on timestamp resolution.
+
 ## Closed gap — four shipped fields PROTOCOL.md now describes
 
 An earlier revision of this file recorded these four as appearing on the wire
