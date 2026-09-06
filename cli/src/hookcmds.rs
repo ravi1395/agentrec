@@ -48,36 +48,23 @@
 //! RESTART strictly between a session's `start` and `stop` loses the model
 //! for that one turn — no different from a restart losing `prompt`.
 //!
-//! **Known interaction with C1's resend dedup — FIXED at the dedup layer
-//! by Phase 2 tail's fix 1, NOT fully closed end-to-end.** The spike's
+//! **C1 resend dedup and blocked continuations.** The spike's
 //! block-continuation finding (`docs/verify/codex-spike.md`, "Continuation
 //! semantics") measured `turn_id` staying IDENTICAL across a blocked
 //! `Stop` firing twice for one turn (`stop_hook_active: false` then
 //! `true`), and confirmed `UserPromptSubmit` never re-fires for the
 //! synthetic continuation prompt. Both `Stop` firings therefore produce
 //! the exact same C1 dedup key `(tool, event="stop", session,
-//! emitter_turn)` in `daemon.rs::emitter_turn_dedup_key`. If `apply_patch`
-//! runs during the continuation (between the two `Stop`s), this module
-//! correctly drains those NEW paths into the second `Stop` signal's
-//! `files_written`. Before fix 1, `daemon.rs::handle_emitter_turn_signal`
-//! saw a repeat of the immediately-previous key and silently dropped the
-//! second signal — the NEW `files_written` never reached the engine at
-//! all. **Fix 1 (`daemon.rs::emitter_turn_content_fingerprint`) closes
-//! that: the second Stop's DIFFERENT `files_written` gives it a different
-//! content fingerprint, so it is no longer read as a resend and reaches
-//! `apply_signal`.** It still does not reach a PERSISTED turn record,
-//! though: `apply_signal` finds the bracket the first `Stop` already
-//! closed and — since nothing is open to fold into — mints the second
-//! `Stop` its own near-empty turn instead (no open bracket for
-//! `stop_mismatches_open_bracket` to even compare against); `files_written`
-//! itself is still discarded before persistence regardless
-//! (`daemon.rs`'s `_declared` — D6 phase 3, unbuilt, is what would
-//! eventually thread it into a record). So: the signal is no longer
-//! silently swallowed before the engine sees it, but nothing downstream
-//! folds its declared paths into the FIRST `Stop`'s turn yet. See
+//! emitter_turn)` in `daemon.rs::emitter_turn_dedup_key`. Every start/stop
+//! invocation therefore also mints an `emitter_event` ULID: a separately-
+//! fired continuation is distinguishable even when it lands in the same
+//! millisecond with the same `files_written`, while an exact replay retains
+//! the signal's original id. The daemon persists each Stop's declaration on
+//! only the turn that Stop closes; a continuation appends its own turn and
+//! never rewrites the first. See
 //! `daemon.rs::tests::
 //! handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped`
-//! for the exact, measured behavior this produces today.
+//! and `handle_emitter_turn_signal_same_files_same_ms_new_event_is_a_continuation`.
 
 use crate::cmds::wall_now_ms;
 use crate::{agentrec_dir, signal_path};
@@ -401,6 +388,7 @@ pub fn hook_codex(root: &Path) -> Result<(), String> {
                 prompt: Some(prompt),
                 files_written: None,
                 emitter_turn: Some(turn_id),
+                emitter_event: Some(agentrec_core::id::ulid()),
                 model,
                 kind: None,
                 fact: None,
@@ -459,6 +447,7 @@ pub fn hook_codex(root: &Path) -> Result<(), String> {
                 prompt: None,
                 files_written,
                 emitter_turn: Some(turn_id),
+                emitter_event: Some(agentrec_core::id::ulid()),
                 // Not re-sent: the start signal already carried it (or
                 // didn't) — see the module doc's "model" paragraph.
                 model: None,

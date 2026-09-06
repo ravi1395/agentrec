@@ -1068,6 +1068,7 @@ pub fn hook(root: &Path, tool: &str) -> Result<(), String> {
         // C1: Claude Code's hook emitter has no equivalent stable upstream
         // turn id today — see `SignalEvent::emitter_turn`'s doc.
         emitter_turn: None,
+        emitter_event: None,
         // C2 fix 2: Claude Code's hook emitter has no `model` field either —
         // Claude's model attribution is the separate, pre-existing
         // transcript-parse mechanism (`daemon.rs::parse_transcript`), left

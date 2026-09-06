@@ -195,13 +195,19 @@ pub fn run(
         }
     }
 
-    if !codex {
+    if no_hook {
+        actions.push("skipped Codex hook install (--no-hook)".to_string());
+        actions.push("skipped Codex MCP registration (--no-hook)".to_string());
+    } else if !codex {
         actions.push("skipped Codex hook install (pass --codex to enable)".to_string());
         actions.push("skipped Codex MCP registration (pass --codex to enable)".to_string());
     } else {
-        match install_codex_hooks(root) {
-            Ok(CodexHooksOutcome::Refused) => actions.push(codex_refuse_line(root)),
-            Ok(CodexHooksOutcome::Installed { target, changed: c }) => {
+        let codex_hooks_refused = match install_codex_hooks(root)? {
+            CodexHooksOutcome::Refused => {
+                actions.push(codex_refuse_line(root));
+                true
+            }
+            CodexHooksOutcome::Installed { target, changed: c } => {
                 changed = changed || c;
                 actions.push(format!(
                     "Codex hooks {} ({})",
@@ -209,9 +215,9 @@ pub fn run(
                     codex_target_label(target, root),
                 ));
                 actions.push(CODEX_TRUST_REMINDER.to_string());
+                false
             }
-            Err(e) => actions.push(format!("Codex hook install skipped: {e}")),
-        }
+        };
         // MCP registration lives in a DIFFERENT table (`[mcp_servers]`) of a
         // different layer than `[hooks]`, so it does not create a second hook
         // representation — but it is still gated on the dual-representation
@@ -220,7 +226,7 @@ pub fn run(
         // `config.toml` (re-serialized, comments dropped, `.bak` left behind)
         // while printing that we refused to touch it would make that printed
         // line false. Pinned by `codex_init_both_present_refuses_untouched`.
-        if matches!(codex_hooks_target(root), Ok(CodexHooksTarget::Refuse)) {
+        if codex_hooks_refused {
             actions.push(
                 "skipped Codex MCP registration: the dual hook-representation state above \
                  leaves .codex/config.toml untouched — consolidate to one hook file, then \
@@ -296,7 +302,10 @@ fn print_dry_run(root: &Path, no_hook: bool, codex: bool, no_service: bool, forc
     // Same read-only inspect function the real run uses to decide, so
     // `--dry-run` can never claim an install (or a refuse) the real run
     // would not also do.
-    if !codex {
+    if no_hook {
+        println!("[dry-run] would skip Codex hook install (--no-hook)");
+        println!("[dry-run] would skip Codex MCP registration (--no-hook)");
+    } else if !codex {
         println!("[dry-run] would skip Codex hook install (pass --codex to enable)");
         println!("[dry-run] would skip Codex MCP registration (pass --codex to enable)");
     } else {
@@ -1640,7 +1649,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let before = walk(root);
-        run(root, true, true, true, false, true).unwrap();
+        run(root, false, true, true, false, true).unwrap();
         let after = walk(root);
         assert_eq!(
             before, after,

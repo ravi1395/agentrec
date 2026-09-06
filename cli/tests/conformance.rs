@@ -308,12 +308,14 @@ fn named_fixtures_carry_the_semantics_they_are_named_for() {
         plain_start.emitter_turn, None,
         "minimal start must omit emitter_turn (Claude Code's shape)"
     );
+    assert_eq!(plain_start.emitter_event, None);
     let id_start = &parse_signals(&read_fixture(
         "valid",
         "signal_start_with_emitter_turn.jsonl",
     ))[0];
     assert!(id_start.is_start());
     assert!(id_start.emitter_turn.is_some());
+    assert!(id_start.emitter_event.is_some());
 
     // §4: `files_written` present vs absent is a real distinction — absence
     // means "did not declare", never "wrote nothing".
@@ -327,6 +329,7 @@ fn named_fixtures_carry_the_semantics_they_are_named_for() {
         .as_ref()
         .is_some_and(|f| !f.is_empty()));
     assert!(full_stop.model.is_some());
+    assert!(full_stop.emitter_event.is_some());
 
     // §10: an absent `v` reads as major 1 on both schemas.
     let absent_v_sig = &parse_signals(&read_fixture("valid", "signal_absent_v.jsonl"))[0];
@@ -460,6 +463,7 @@ fn regenerate_conformance_fixtures() {
         prompt: None,
         files_written: None,
         emitter_turn: None,
+        emitter_event: None,
         model: None,
         kind: None,
         fact: None,
@@ -475,6 +479,7 @@ fn regenerate_conformance_fixtures() {
             "/Users/dev/repo/src/lib.rs".into(),
         ]),
         emitter_turn: Some("turn_7f3a91".into()),
+        emitter_event: Some("event_01JXSTOP0000000000000000".into()),
         model: Some("gpt-5-codex".into()),
         tool: "codex".into(),
         ..base_stop.clone()
@@ -493,6 +498,7 @@ fn regenerate_conformance_fixtures() {
             tool: "codex".into(),
             session: Some("01JXSESSION0000000000000000".into()),
             emitter_turn: Some("turn_7f3a91".into()),
+            emitter_event: Some("event_01JXSTART00000000000000".into()),
             model: Some("gpt-5-codex".into()),
             ..start.clone()
         }),

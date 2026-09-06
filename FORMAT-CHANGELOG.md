@@ -290,7 +290,7 @@ turn".
   `sig.kind.is_none()` so an unrecognized future `type` never enters it)
   does two things for a signal that carries `emitter_turn`: (1) restart-safe
   dedup — a resend of the immediately-previous processed
-  `(tool, event, session, emitter_turn)` tuple is dropped, counted in
+  `(tool, event, session, emitter_turn)` tuple was originally dropped, counted in
   `state.json`'s new `duplicate_emitter_turn_signals`, and never reaches the
   engine; (2) a mismatched stop (per `stop_mismatches_open_bracket`) is
   likewise dropped and counted in `mismatched_stop_emitter_turns`, leaving
@@ -306,7 +306,7 @@ turn".
   resend, not an arbitrary-history duplicate — a different signal arriving
   in between clears the slot (state.rs doc comment on the field).
 
-## Phase 2 tail C1 fix 1 — content-aware `emitter_turn` dedup (2026-08-05)
+## Phase 2 tail C1 fix 1 — content-aware `emitter_turn` dedup (2026-08-05, superseded)
 
 Not a wire change (`state.json` is operational, off-wire per PROTOCOL §5) —
 recorded here for continuity with the C1 entry above, which this directly
@@ -329,6 +329,33 @@ that exact read (`state::tests::state_json_with_key_but_no_fingerprint_parses_cl
 `daemon::tests::handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing`).
 Load-bearing test:
 `daemon::tests::handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped`.
+
+Superseded by D52 below: payload-content equality still cannot distinguish
+two same-millisecond, same-path continuation Stops, and the legacy
+identity-only fallback has the same ambiguity.
+
+## Codex completion D52 — `SignalEvent.emitter_event` and persisted attribution (2026-09-06)
+
+Added to `SignalEvent`, after `emitter_turn`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub emitter_event: Option<String>,
+```
+
+Additive, `v` stays `1`. Codex start/stop hook invocations mint a fresh ULID;
+an exact replay retains the serialized value. The daemon now deduplicates
+only when this explicit per-emission identity is present. Signals without it
+remain valid but are never dropped from turn identity, timestamps, or mutable
+payload content alone. The generated conformance corpus covers present and
+absent forms (`signal_start_with_emitter_turn.jsonl`,
+`signal_stop_full.jsonl`, and the minimal signal fixtures).
+
+The live daemon also consumes a resolved Stop declaration at persistence:
+observed paths in the declaration write `FileEntry.attribution: "declared"`;
+other observed paths write `"undeclared"`; no resolved declaration leaves the
+field absent. Attribution applies only to the final turn that Stop closes,
+does not invent file entries, and is never an undo-safety predicate.
 
 ## Phase 2 tail C2 fix 2 — `SignalEvent.model` (2026-08-05)
 

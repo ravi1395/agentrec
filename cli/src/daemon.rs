@@ -441,21 +441,18 @@ pub fn run(root: &Path) -> Result<(), String> {
             if let (Some(m), Some(s)) = (&model, &sig.session) {
                 recorder.set_model(s.clone(), m.clone());
             }
-            // D6 phase 2b: resolved but not yet consumed — phase 3 threads
-            // this into persist() to populate per-file attribution. Dark by
-            // design; resolution itself is unit-tested.
-            let _declared = if !sig.is_start() {
+            let declared = if !sig.is_start() {
                 resolve_declared(&sig, transcript_raw.as_deref(), &root)
             } else {
                 None
             };
             let closed = apply_signal(&root, &mut engine, &sig, prompt, now);
-            persist(&root, &recorder, &clock, closed)?;
+            persist(&root, &recorder, &clock, closed, declared.as_ref())?;
         }
 
         // Quiet-window / settle / bracket-timeout closures.
         let closed = engine.tick(now);
-        persist(&root, &recorder, &clock, closed)?;
+        persist(&root, &recorder, &clock, closed, None)?;
 
         // Mirror the open turn to the crash journal (or clear it when idle).
         sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
@@ -474,7 +471,7 @@ pub fn run(root: &Path) -> Result<(), String> {
         drain_recorder_stats(&root, &mut recorder);
     }
     let closed = engine.force_close(now);
-    persist(&root, &recorder, &clock, closed)?;
+    persist(&root, &recorder, &clock, closed, None)?;
     // Clean shutdown: the turn is persisted, so drop the crash journal.
     sync_journal(&root, &engine, &recorder, &clock, &mut journal_cache);
     append_epoch(&root, "stop", clock.wall_ms(clock.now_ms()), 0)?;
@@ -1495,8 +1492,8 @@ impl Recorder {
                 .link_kinds
                 .contains(&obs.path)
                 .then(|| link_kind::SYMLINK.to_string()),
-            // Never written here — see `FileEntry::attribution`. Populating
-            // it is the D6 transcript-correlation producer's job.
+            // Stop-signal declarations are applied at persistence, where the
+            // closing signal and the exact turn it closed are both known.
             attribution: None,
         }
     }
@@ -2003,9 +2000,10 @@ fn reject_candidate(root: &Path, state: &mut State) {
     }
 }
 
-/// C1 dedup key for a start/stop signal carrying `emitter_turn` (PROTOCOL §4
-/// additive): `(tool, event, session, emitter_turn)`, joined on the U+0001
-/// control character as a delimiter.
+/// C1 grouping key for a start/stop signal carrying `emitter_turn` (PROTOCOL
+/// §4 additive): `(tool, event, session, emitter_turn)`, joined on the U+0001
+/// control character as a delimiter. This is not sufficient replay evidence;
+/// [`emitter_turn_content_fingerprint`] supplies the per-emission identity.
 ///
 /// NOT collision-proof against an adversarial component, and not claimed to
 /// be: a JSON string can carry that control character via its own numeric
@@ -2029,45 +2027,15 @@ fn emitter_turn_dedup_key(sig: &SignalEvent) -> Option<String> {
     Some(format!("{}\u{1}{event}\u{1}{session}\u{1}{et}", sig.tool))
 }
 
-/// C1 fix 1 (content-aware dedup): what varies, per event kind, between two
-/// signals that share one `emitter_turn_dedup_key`. Identity alone cannot
-/// tell a genuine emitter RETRY (byte-identical resend, e.g. racing a
-/// daemon restart) apart from a real SECOND firing under the same key —
-/// Codex's `Stop` hook fires twice for one `turn_id` on a
-/// `decision:"block"` continuation (`docs/verify/codex-spike.md`,
-/// "Continuation semantics"), and the second firing can carry genuinely
-/// NEW `files_written` from `apply_patch` calls made during the
-/// continuation. Two signals with the same key AND the same fingerprint
-/// are a genuine resend; same key, different fingerprint, is real new
-/// data.
-///
-/// **Starts get a constant fingerprint, deliberately.** The same spike
-/// confirmed (answer 2, "Continuation semantics") that `UserPromptSubmit`
-/// fires exactly ONCE per turn — never resent with different content for
-/// one `emitter_turn`, even across a `Stop` block-continuation. A start's
-/// content is therefore already fully determined by its identity tuple
-/// (all of which is already in the dedup key), so a constant fingerprint
-/// reproduces the pre-fix identity-only verdict for starts exactly,
-/// without a start-side carve-out.
-///
-/// **Stops hash `files_written`** — the only `SignalEvent` field that can
-/// vary between two `Stop` firings sharing a key (`session`/`tool`/
-/// `event`/`emitter_turn` are already in the key; `prompt` is always
-/// `None` on a Codex stop). The `"-"` / `"+"` prefix discriminates an
-/// undeclared list (`None`) from a declared-but-empty one
-/// (`Some(vec![])`) — `record.rs` pins that distinction as meaningful on
-/// the wire (`signal_files_written_roundtrips_and_absence_stays_absent`),
-/// and collapsing the two here would let a `(None, then Some([]))` pair
-/// (or the reverse) wrongly compare equal.
-fn emitter_turn_content_fingerprint(sig: &SignalEvent) -> String {
-    if sig.is_start() {
-        String::new()
-    } else {
-        match &sig.files_written {
-            Some(paths) => format!("+{}", paths.join("\u{1}")),
-            None => "-".to_string(),
-        }
-    }
+/// Unambiguous identity for one signal emission. The Codex hook mints a fresh
+/// `emitter_event` for every invocation, including separately-fired blocked
+/// continuations, while an exact replay retains it. Signals without this
+/// field do not participate in resend dedup: timestamp/content equality is
+/// insufficient evidence and may silently collapse a real continuation.
+fn emitter_turn_content_fingerprint(sig: &SignalEvent) -> Option<String> {
+    sig.emitter_event
+        .as_ref()
+        .map(|event| format!("v3:{event}"))
 }
 
 /// C1: emitter_turn restart-safe dedup + bracket-mismatch check for a
@@ -2080,22 +2048,18 @@ fn emitter_turn_content_fingerprint(sig: &SignalEvent) -> String {
 /// blocking `run()` loop — see `cli/tests/emitter_turn.rs` for the
 /// real-daemon-restart integration coverage this alone can't provide.
 ///
-/// C1 fix 1: dedup is now content-aware, not identity-only — see
+/// C1 fix 1: dedup is now per-emission-aware, not turn-identity-only — see
 /// `emitter_turn_content_fingerprint`'s doc for the motivating bug and the
 /// per-event-kind fingerprint it computes.
 fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEvent) -> bool {
-    if let Some(key) = emitter_turn_dedup_key(sig) {
+    if let (Some(key), Some(content_fp)) = (
+        emitter_turn_dedup_key(sig),
+        emitter_turn_content_fingerprint(sig),
+    ) {
         let mut state = read_state(root);
-        let content_fp = emitter_turn_content_fingerprint(sig);
         if state.last_emitter_turn_key.as_deref() == Some(key.as_str()) {
-            let is_genuine_resend = match &state.last_emitter_turn_fingerprint {
-                Some(prev_fp) => *prev_fp == content_fp,
-                // Legacy/first-sighting state.json for this key (see
-                // `State::last_emitter_turn_fingerprint`'s doc): fall back
-                // to the pre-fix, identity-only verdict rather than risk
-                // double-applying a genuine crash-restart resend.
-                None => true,
-            };
+            let is_genuine_resend =
+                state.last_emitter_turn_fingerprint.as_deref() == Some(content_fp.as_str());
             if is_genuine_resend {
                 // A resend of the immediately-previous processed signal
                 // (emitter retry, or a resend racing a daemon restart):
@@ -2105,18 +2069,13 @@ fn handle_emitter_turn_signal(root: &Path, engine: &TurnEngine, sig: &SignalEven
                 // close) a second bracket for a turn that already
                 // happened.
                 state.duplicate_emitter_turn_signals += 1;
-                // Heal a missing/legacy fingerprint on this exact
-                // occurrence (see the field's doc) — the key is unchanged
-                // either way, only the fingerprint needs stamping.
-                state.last_emitter_turn_fingerprint = Some(content_fp);
                 if let Err(e) = write_state(root, &state) {
                     eprintln!("agentrec: warning: failed to persist emitter_turn dedup state: {e}");
                 }
                 return true;
             }
-            // Key matches but content differs (fix 1: e.g. a Stop
-            // block-continuation's second firing carrying NEW
-            // files_written) — this is NOT a duplicate. Fall through to
+            // Key matches but the per-emission identity differs — this is
+            // NOT a duplicate. Fall through to
             // the mark-and-continue path below so the caller applies it,
             // and so a genuine resend of THIS signal is still caught next
             // time.
@@ -2322,18 +2281,12 @@ pub(crate) enum DeclaredTier {
 }
 
 /// Root-relative declared-write set for one stop signal.
-// Fields are read only by unit tests until phase 3 threads this into
-// `persist()` (per-file attribution) — dead in a release build BY DESIGN
-// (dark launch); remove the allows when phase 3 lands.
 #[derive(Clone, Debug)]
 pub(crate) struct DeclaredWrites {
-    #[allow(dead_code)]
     pub(crate) paths: std::collections::HashSet<String>,
-    #[allow(dead_code)]
     pub(crate) tier: DeclaredTier,
     /// Declared paths outside the watched root — counted, never silently
     /// dropped (the `skipped_out_of_cwd` lesson from import P1/P2).
-    #[allow(dead_code)]
     pub(crate) out_of_root: usize,
 }
 
@@ -2543,9 +2496,47 @@ fn persist(
     recorder: &Recorder,
     clock: &Clock,
     closed: Vec<ClosedTurn>,
+    declared: Option<&DeclaredWrites>,
 ) -> Result<(), String> {
-    for turn in closed {
-        let files: Vec<FileEntry> = turn.files.iter().map(|o| recorder.resolve(o)).collect();
+    let attribution_target = declared.and_then(|_| closed.len().checked_sub(1));
+    for (index, turn) in closed.into_iter().enumerate() {
+        let files: Vec<FileEntry> = turn
+            .files
+            .iter()
+            .map(|observation| {
+                let mut entry = recorder.resolve(observation);
+                if Some(index) == attribution_target {
+                    let declared = declared.expect("target exists only with a declaration");
+                    entry.attribution = Some(
+                        if declared.paths.contains(&entry.path) {
+                            agentrec_core::record::attribution::DECLARED
+                        } else {
+                            agentrec_core::record::attribution::UNDECLARED
+                        }
+                        .to_string(),
+                    );
+                }
+                entry
+            })
+            .collect();
+        if Some(index) == attribution_target {
+            let declared = declared.expect("target exists only with a declaration");
+            if declared.out_of_root > 0 {
+                let noun = if declared.out_of_root == 1 {
+                    "path"
+                } else {
+                    "paths"
+                };
+                let source = match declared.tier {
+                    DeclaredTier::SignalField => "signal",
+                    DeclaredTier::TranscriptFallback => "transcript",
+                };
+                eprintln!(
+                    "agentrec: ignored {} declared write {noun} outside recording root for turn {} (source: {source})",
+                    declared.out_of_root, turn.id,
+                );
+            }
+        }
         // Scrub runs inside persistence (AC I4): no pre-scrub prompt text is
         // ever written to the log or the object store.
         let (prompt_ref, prompt_excerpt) = match &turn.prompt {
@@ -3044,6 +3035,142 @@ fn watch_error(e: &notify::Error) -> String {
 mod tests {
     use super::*;
 
+    // ---- D6 phase 3: declared-write persistence -----------------------------
+
+    fn closed_turn(
+        id: &str,
+        grade: &'static str,
+        boundary: &'static str,
+        files: Vec<ChangeObs>,
+    ) -> ClosedTurn {
+        ClosedTurn {
+            id: id.to_string(),
+            grade,
+            boundary,
+            truncated: false,
+            tool: (grade == "rich").then(|| "codex".to_string()),
+            prompt: None,
+            session: None,
+            opened_at: 0,
+            closed_at: 1,
+            files,
+            merges: vec![],
+        }
+    }
+
+    fn staged_fixture(root: &Path) -> (Recorder, Vec<ChangeObs>) {
+        std::fs::create_dir_all(root.join(".agentrec/objects")).unwrap();
+        let store = BlobStore::new(root.join(".agentrec/objects"));
+        let mut recorder = Recorder::scan(root, store);
+        std::fs::write(root.join("declared.rs"), "fn declared() {}\n").unwrap();
+        std::fs::write(root.join("concurrent.md"), "human note\n").unwrap();
+        let paths = HashSet::from([root.join("declared.rs"), root.join("concurrent.md")]);
+        let observations = recorder.stage(&paths);
+        (recorder, observations)
+    }
+
+    fn persisted_turns(root: &Path) -> Vec<TurnRecord> {
+        agentrec_core::record::load_log(&log_path(root))
+            .into_iter()
+            .filter_map(|record| match record {
+                LogRecord::Turn(turn) => Some(turn),
+                LogRecord::Epoch(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn d6_attr_persist_writes_exact_declared_and_undeclared_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (recorder, observations) = staged_fixture(root);
+        let declared = DeclaredWrites {
+            paths: HashSet::from(["declared.rs".to_string()]),
+            tier: DeclaredTier::SignalField,
+            out_of_root: 0,
+        };
+
+        persist(
+            root,
+            &recorder,
+            &Clock::start(),
+            vec![closed_turn("t_attr", "rich", "bracket", observations)],
+            Some(&declared),
+        )
+        .unwrap();
+
+        let turns = persisted_turns(root);
+        let files = &turns[0].files;
+        let attr = |path: &str| {
+            files
+                .iter()
+                .find(|file| file.path == path)
+                .and_then(|file| file.attribution.as_deref())
+        };
+        assert_eq!(attr("declared.rs"), Some("declared"));
+        assert_eq!(attr("concurrent.md"), Some("undeclared"));
+    }
+
+    #[test]
+    fn d6_attr_absent_declaration_stays_absent_on_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (recorder, observations) = staged_fixture(root);
+
+        persist(
+            root,
+            &recorder,
+            &Clock::start(),
+            vec![closed_turn("t_none", "rich", "bracket", observations)],
+            None,
+        )
+        .unwrap();
+
+        assert!(persisted_turns(root)[0]
+            .files
+            .iter()
+            .all(|file| file.attribution.is_none()));
+    }
+
+    #[test]
+    fn d6_attr_stop_declaration_applies_only_to_final_closed_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (recorder, observations) = staged_fixture(root);
+        let first = observations
+            .iter()
+            .find(|observation| observation.path == "concurrent.md")
+            .unwrap()
+            .clone();
+        let final_observation = observations
+            .iter()
+            .find(|observation| observation.path == "declared.rs")
+            .unwrap()
+            .clone();
+        let declared = DeclaredWrites {
+            paths: HashSet::from(["declared.rs".to_string()]),
+            tier: DeclaredTier::SignalField,
+            out_of_root: 0,
+        };
+
+        persist(
+            root,
+            &recorder,
+            &Clock::start(),
+            vec![
+                closed_turn("t_prior", "bare", "quiet", vec![first]),
+                closed_turn("t_stop", "rich", "stop-only", vec![final_observation]),
+            ],
+            Some(&declared),
+        )
+        .unwrap();
+
+        let turns = persisted_turns(root);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].files[0].attribution, None);
+        assert_eq!(turns[1].files[0].attribution.as_deref(), Some("declared"));
+    }
+
     // ---- D6 phase 2b: declared-write resolution ladder ----------------------
 
     fn stop_sig(files_written: Option<Vec<String>>, transcript: Option<&str>) -> SignalEvent {
@@ -3057,6 +3184,7 @@ mod tests {
             prompt: None,
             files_written,
             emitter_turn: None,
+            emitter_event: None,
             model: None,
             kind: None,
             fact: None,
@@ -3082,6 +3210,7 @@ mod tests {
             prompt: None,
             files_written: None,
             emitter_turn: emitter_turn.map(String::from),
+            emitter_event: None,
             model: None,
             kind: None,
             fact: None,
@@ -3173,7 +3302,8 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".agentrec")).unwrap();
         let engine = TurnEngine::new();
-        let start = et_sig("codex", Some("start"), Some("s1"), Some("et-abc"));
+        let mut start = et_sig("codex", Some("start"), Some("s1"), Some("et-abc"));
+        start.emitter_event = Some("start-fire-1".to_string());
 
         // First delivery: not a resend, marks the key, lets the caller
         // proceed to `apply_signal`.
@@ -3268,7 +3398,7 @@ mod tests {
         assert_eq!(read_state(root).mismatched_stop_emitter_turns, 0);
     }
 
-    // C1 fix 1 (content-aware dedup) — the load-bearing test for the fix.
+    // C1 fix 1 (per-emission dedup) — the load-bearing test for the fix.
     // Reproduces the exact bug: Codex's Stop fires twice for one turn_id on
     // a decision:"block" continuation (docs/verify/codex-spike.md), sharing
     // the identical C1 dedup key, but the second firing carries genuinely
@@ -3280,15 +3410,29 @@ mod tests {
     fn handle_emitter_turn_signal_second_stop_with_new_files_written_is_applied_not_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let (recorder, observations) = staged_fixture(root);
+        let first_observation = observations
+            .iter()
+            .find(|observation| observation.path == "declared.rs")
+            .unwrap()
+            .clone();
+        let continuation_observation = observations
+            .iter()
+            .find(|observation| observation.path == "concurrent.md")
+            .unwrap()
+            .clone();
+        let clock = Clock::start();
         let mut engine = TurnEngine::new();
         engine.observe_start(0, "codex", None, Some("s1".into()), Some("et-block".into()));
+        engine.observe_changes(500, &[first_observation]);
         assert!(engine.has_open_turn());
 
         // (a) the first Stop must be applied: not swallowed by dedup, and
         // it closes the open bracket through the real engine.
         let mut first_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
-        first_stop.files_written = Some(vec!["/repo/a.rs".to_string()]);
+        first_stop.files_written =
+            Some(vec![root.join("declared.rs").to_string_lossy().to_string()]);
+        first_stop.emitter_event = Some("stop-fire-1".to_string());
         assert!(
             !handle_emitter_turn_signal(root, &engine, &first_stop),
             "(a) the first Stop must not be swallowed"
@@ -3299,30 +3443,42 @@ mod tests {
             1,
             "(a) the first Stop closes the open bracket"
         );
+        let first_declared = resolve_declared(&first_stop, None, root).unwrap();
+        persist(root, &recorder, &clock, closed_first, Some(&first_declared)).unwrap();
         assert!(!engine.has_open_turn());
 
         // (b) a second Stop sharing the IDENTICAL dedup key but carrying
         // NEW files_written must ALSO be applied — this is the bug.
+        engine.observe_changes(1_100, &[continuation_observation]);
         let mut second_stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
-        second_stop.files_written = Some(vec!["/repo/a.rs".to_string(), "/repo/b.rs".to_string()]);
+        second_stop.files_written = Some(vec![
+            root.join("declared.rs").to_string_lossy().to_string(),
+            root.join("concurrent.md").to_string_lossy().to_string(),
+        ]);
+        second_stop.emitter_event = Some("stop-fire-2".to_string());
         assert!(
             !handle_emitter_turn_signal(root, &engine, &second_stop),
             "(b) a second Stop sharing the same key but carrying DIFFERENT \
              files_written must not be treated as a duplicate — dropping it \
              would silently lose the continuation's real file-attribution data"
         );
-        let closed_second = apply_signal(root, &mut engine, &second_stop, None, 1_000);
+        let closed_second = apply_signal(root, &mut engine, &second_stop, None, 1_200);
         assert_eq!(
             closed_second.len(),
             1,
             "(b) once not dropped by dedup, the second Stop reaches the engine \
-             (today's architecture mints it as its own stop-only turn rather \
-             than folding into the first, since no bracket is left open to \
-             fold into — D6 phase 3 is what would eventually thread \
-             files_written into a persisted record; this assertion only \
-             proves the signal is no longer silently discarded before the \
-             engine ever sees it)"
+             as its own stop-only continuation turn rather than rewriting the \
+             already-appended first turn)"
         );
+        let second_declared = resolve_declared(&second_stop, None, root).unwrap();
+        persist(
+            root,
+            &recorder,
+            &clock,
+            closed_second,
+            Some(&second_declared),
+        )
+        .unwrap();
         assert_eq!(
             read_state(root).duplicate_emitter_turn_signals,
             0,
@@ -3339,15 +3495,89 @@ mod tests {
              recognized as a duplicate and dropped"
         );
         assert_eq!(read_state(root).duplicate_emitter_turn_signals, 1);
+
+        let turns = persisted_turns(root);
+        assert_eq!(turns.len(), 2, "a resend must append no third turn");
+        assert_eq!(turns[0].files.len(), 1);
+        assert_eq!(turns[0].files[0].path, "declared.rs");
+        assert_eq!(turns[0].files[0].attribution.as_deref(), Some("declared"));
+        assert_eq!(turns[1].files.len(), 1);
+        assert_eq!(turns[1].files[0].path, "concurrent.md");
+        assert_eq!(turns[1].files[0].attribution.as_deref(), Some("declared"));
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_same_files_same_ms_new_event_is_a_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let mut engine = TurnEngine::new();
+        let mut first = et_sig("codex", Some("stop"), Some("s1"), Some("et-block"));
+        first.files_written = Some(vec!["/repo/same.rs".to_string()]);
+        first.emitter_event = Some("stop-fire-1".to_string());
+        assert!(!handle_emitter_turn_signal(root, &engine, &first));
+        assert_eq!(
+            apply_signal(root, &mut engine, &first, None, 1_000).len(),
+            1,
+            "the first Stop must reach the engine"
+        );
+
+        let mut continuation = first.clone();
+        continuation.emitter_event = Some("stop-fire-2".to_string());
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &continuation),
+            "a separately-fired Stop in the same millisecond with the same declared paths is real continuation data"
+        );
+        assert_eq!(
+            apply_signal(root, &mut engine, &continuation, None, 1_001).len(),
+            1,
+            "the same-path continuation must become its own stop-only turn"
+        );
+
+        assert!(
+            handle_emitter_turn_signal(root, &engine, &continuation),
+            "an exact replay with the same emitter_event must still be deduplicated"
+        );
+        assert_eq!(read_state(root).duplicate_emitter_turn_signals, 1);
+    }
+
+    #[test]
+    fn handle_emitter_turn_signal_accepts_ambiguous_legacy_path_fingerprint_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".agentrec")).unwrap();
+        let engine = TurnEngine::new();
+        let mut stop = et_sig("codex", Some("stop"), Some("s1"), Some("et-legacy-paths"));
+        stop.files_written = Some(vec!["/repo/same.rs".to_string()]);
+        write_state(
+            root,
+            &State {
+                last_emitter_turn_key: emitter_turn_dedup_key(&stop),
+                last_emitter_turn_fingerprint: Some("+/repo/same.rs".to_string()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !handle_emitter_turn_signal(root, &engine, &stop),
+            "an old path-only fingerprint cannot prove replay versus continuation"
+        );
+        let state = read_state(root);
+        assert_eq!(state.duplicate_emitter_turn_signals, 0);
+        assert_eq!(
+            state.last_emitter_turn_fingerprint.as_deref(),
+            Some("+/repo/same.rs"),
+            "a signal without emitter_event must not mutate dedup state"
+        );
     }
 
     // Backward-compat companion to the fix-1 test above: a legacy
     // state.json that has `last_emitter_turn_key` but predates
-    // `last_emitter_turn_fingerprint` (see that field's doc) must still
-    // dedup a resend by identity alone, exactly like pre-fix behavior — and
-    // must heal the missing fingerprint on this exact occurrence.
+    // `last_emitter_turn_fingerprint` (see that field's doc) is ambiguous.
+    // Accept one possible duplicate rather than drop a possible continuation.
     #[test]
-    fn handle_emitter_turn_signal_dedups_by_identity_when_fingerprint_is_legacy_missing() {
+    fn handle_emitter_turn_signal_accepts_legacy_missing_fingerprint_once() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".agentrec")).unwrap();
@@ -3367,15 +3597,14 @@ mod tests {
         assert_eq!(read_state(root).last_emitter_turn_fingerprint, None);
 
         assert!(
-            handle_emitter_turn_signal(root, &engine, &stop),
-            "identity match against a missing (legacy) fingerprint must \
-             still be treated as a duplicate"
+            !handle_emitter_turn_signal(root, &engine, &stop),
+            "identity alone cannot safely classify a legacy signal as a replay"
         );
         let state = read_state(root);
-        assert_eq!(state.duplicate_emitter_turn_signals, 1);
+        assert_eq!(state.duplicate_emitter_turn_signals, 0);
         assert!(
-            state.last_emitter_turn_fingerprint.is_some(),
-            "the gap must self-heal on this exact occurrence"
+            state.last_emitter_turn_fingerprint.is_none(),
+            "a signal without emitter_event must not invent dedup evidence"
         );
     }
 

@@ -5971,7 +5971,7 @@ fn codex_init_none_creates_hooks_json() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Codex hooks installed"), "{stdout}");
@@ -6014,7 +6014,7 @@ fn codex_init_hooks_json_only_preserves_foreign_entries() {
     )
     .unwrap();
 
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
     // SUBSTITUTED ASSERTION (Task E4, recorded in VERIFY-LEDGER.md § "Task E4").
     // This line read `assert!(!root.join(".codex/config.toml").exists())`. E4
@@ -6063,7 +6063,7 @@ fn codex_init_config_toml_only_merges_inline_hooks() {
     )
     .unwrap();
 
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
     assert!(
         !root.join(".codex/hooks.json").exists(),
@@ -6073,6 +6073,52 @@ fn codex_init_config_toml_only_merges_inline_hooks() {
     let text = std::fs::read_to_string(root.join(".codex/config.toml")).unwrap();
     assert!(text.contains("agentrec hook codex"), "{text}");
     assert!(text.contains("model"), "unrelated key must survive: {text}");
+}
+
+// O1: malformed existing Codex hook configuration is an abort, not a
+// best-effort skip. In particular, init must not continue by creating the
+// second Codex surface (`config.toml`) for MCP after hooks.json failed.
+#[test]
+fn codex_init_malformed_hooks_json_aborts_without_codex_side_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let malformed = "{ not-json\n";
+    std::fs::write(root.join(".codex/hooks.json"), malformed).unwrap();
+
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
+    assert_eq!(out.status.code(), Some(1), "expected refusal: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not valid JSON"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+        malformed
+    );
+    assert!(!root.join(".codex/hooks.json.bak").exists());
+    assert!(
+        !root.join(".codex/config.toml").exists(),
+        "MCP registration must not run after hook validation fails"
+    );
+}
+
+#[test]
+fn codex_init_malformed_config_toml_aborts_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".codex")).unwrap();
+    let malformed = "[hooks\n";
+    std::fs::write(root.join(".codex/config.toml"), malformed).unwrap();
+
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
+    assert_eq!(out.status.code(), Some(1), "expected refusal: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not valid TOML"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        malformed
+    );
+    assert!(!root.join(".codex/config.toml.bak").exists());
+    assert!(!root.join(".codex/hooks.json").exists());
 }
 
 // Dry-run must PRINT the same codex decision the real run would take, and
@@ -6087,10 +6133,7 @@ fn codex_init_dry_run_prints_install_line_and_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
-    let out = agentrec(
-        root,
-        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
-    );
+    let out = agentrec(root, &["init", "--no-service", "--codex", "--dry-run"]);
     assert!(
         out.status.success(),
         "init --codex --dry-run failed: {out:?}"
@@ -6120,10 +6163,7 @@ fn codex_init_dry_run_prints_refuse_line_when_both_present() {
     std::fs::write(root.join(".codex/hooks.json"), hooks_json_before).unwrap();
     std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
 
-    let out = agentrec(
-        root,
-        &["init", "--no-hook", "--no-service", "--codex", "--dry-run"],
-    );
+    let out = agentrec(root, &["init", "--no-service", "--codex", "--dry-run"]);
     assert!(
         out.status.success(),
         "init --codex --dry-run failed: {out:?}"
@@ -6157,7 +6197,7 @@ fn codex_init_both_present_refuses_untouched() {
     let config_toml_before = "[hooks]\n";
     std::fs::write(root.join(".codex/config.toml"), config_toml_before).unwrap();
 
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("skipped Codex hook install"), "{stdout}");
@@ -6188,7 +6228,7 @@ fn codex_init_both_present_writes_no_mcp_registration_either() {
     let config_before = "[hooks]\n";
     std::fs::write(root.join(".codex/config.toml"), config_before).unwrap();
 
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success(), "init --codex failed: {out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -6212,12 +6252,12 @@ fn codex_init_idempotent_reinstall_is_byte_identical() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
-    let out1 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out1 = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out1.status.success());
     let first_bytes = std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap();
     let first = read_codex_hooks_json(root);
 
-    let out2 = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out2 = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out2.status.success());
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     assert!(
@@ -6250,13 +6290,59 @@ fn codex_init_without_flag_touches_nothing_under_codex_dir() {
     assert!(!root.join(".codex").exists());
 }
 
+// A6/D40: --no-hook means bare-turn-only capture for every agent integration,
+// even when --codex is also present. The opt-in flag selects Codex; it does
+// not override the explicit hook/MCP opt-out.
+#[test]
+fn codex_init_no_hook_skips_hooks_and_mcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    let out = agentrec(root, &["init", "--codex", "--no-hook", "--no-service"]);
+    assert!(out.status.success(), "init failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("skipped Codex hook install (--no-hook)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped Codex MCP registration (--no-hook)"),
+        "{stdout}"
+    );
+    assert!(
+        !root.join(".codex").exists(),
+        "--no-hook --codex must not create any Codex integration config"
+    );
+
+    let dry_tmp = tempfile::tempdir().unwrap();
+    let dry_root = dry_tmp.path();
+    let dry = agentrec(
+        dry_root,
+        &["init", "--codex", "--no-hook", "--no-service", "--dry-run"],
+    );
+    assert!(dry.status.success(), "dry-run init failed: {dry:?}");
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_stdout.contains("[dry-run] would skip Codex hook install (--no-hook)"),
+        "{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains("[dry-run] would skip Codex MCP registration (--no-hook)"),
+        "{dry_stdout}"
+    );
+    assert!(
+        !dry_root.join(".agentrec").exists() && !dry_root.join(".codex").exists(),
+        "--no-hook --codex --dry-run must write nothing"
+    );
+}
+
 // `agentrec uninstall` reverses `init --codex` — mirrors the Claude Code
 // hook removal, which is already covered by existing uninstall tests.
 #[test]
 fn codex_uninstall_removes_installed_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success());
     assert!(root.join(".codex/hooks.json").exists());
 
@@ -6281,7 +6367,7 @@ fn codex_uninstall_removes_installed_hooks() {
 fn doctor_codex_hooks_feature_off_reports_degraded() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success());
     std::fs::write(
         root.join(".codex/config.toml"),
@@ -6302,7 +6388,7 @@ fn doctor_codex_hooks_feature_off_reports_degraded() {
 fn doctor_codex_managed_hooks_only_reports_degraded() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let out = agentrec(root, &["init", "--no-hook", "--no-service", "--codex"]);
+    let out = agentrec(root, &["init", "--no-service", "--codex"]);
     assert!(out.status.success());
     std::fs::write(
         root.join(".codex/config.toml"),
@@ -12037,6 +12123,11 @@ mod codex_hook {
         assert_eq!(sig["session"], "019fd1b4-aa34-7721-8d1d-fb198c45ecd6");
         assert_eq!(sig["emitter_turn"], "019fd1b4-aa71-7a41-a9b2-fa189d8689e8");
         assert_eq!(
+            sig["emitter_event"].as_str().map(str::len),
+            Some(26),
+            "each hook invocation must carry a ULID discriminator: {sig:?}"
+        );
+        assert_eq!(
             sig["prompt"], "Say hello. Do not run any commands or edit any files.",
             "harmless prompt must survive scrub unchanged: {sig:?}"
         );
@@ -12176,6 +12267,10 @@ mod codex_hook {
         assert_eq!(sig["event"], "stop");
         assert_eq!(sig["session"], session_id);
         assert_eq!(sig["emitter_turn"], turn_id);
+        let first_emitter_event = sig["emitter_event"]
+            .as_str()
+            .expect("Stop must carry its invocation id")
+            .to_string();
         assert_eq!(
             sig["files_written"],
             serde_json::json!([
@@ -12206,6 +12301,11 @@ mod codex_hook {
         assert!(out2.stdout.is_empty());
         let events2 = signal_events(root);
         assert_eq!(events2.len(), 2, "{events2:?}");
+        assert_ne!(
+            events2[1]["emitter_event"].as_str(),
+            Some(first_emitter_event.as_str()),
+            "a separately-fired Stop must mint a new invocation id"
+        );
         assert!(
             events2[1].get("files_written").is_none(),
             "a second identical Stop must not redeliver the drained files: {:?}",
